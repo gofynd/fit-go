@@ -58,10 +58,10 @@ func TestDefaultDialFunc_CreatesStandaloneConnection(t *testing.T) {
 	dial := DefaultDialFunc()
 
 	opts := &DialOptions{
-		Addr: "localhost:6379",
+		Addr:     "localhost:6379",
 		Password: "secret",
 		Username: "user",
-		DB: 2,
+		DB:       2,
 	}
 
 	conn, err := dial(context.Background(), opts)
@@ -107,23 +107,23 @@ func TestDefaultDialFunc_AppliesAllOptions(t *testing.T) {
 
 	tlsCfg := &tls.Config{
 		InsecureSkipVerify: true,
-		MinVersion: tls.VersionTLS12,
+		MinVersion:         tls.VersionTLS12,
 	}
 
 	opts := &DialOptions{
-		Addr: "myhost:6380",
-		Password: "pass",
-		Username: "admin",
-		DB: 3,
-		ClientName: "test-client",
-		TLSConfig: tlsCfg,
+		Addr:           "myhost:6380",
+		Password:       "pass",
+		Username:       "admin",
+		DB:             3,
+		ClientName:     "test-client",
+		TLSConfig:      tlsCfg,
 		ConnectTimeout: 5 * time.Second,
-		SocketTimeout: 10 * time.Second,
-		KeepAlive: 30 * time.Second,
-		MaxRetries: 3,
-		PoolSize: 50,
-		MinIdleConns: 10,
-		ReadOnly: false,
+		SocketTimeout:  10 * time.Second,
+		KeepAlive:      30 * time.Second,
+		MaxRetries:     3,
+		PoolSize:       50,
+		MinIdleConns:   10,
+		ReadOnly:       false,
 	}
 
 	conn, err := dial(context.Background(), opts)
@@ -212,7 +212,7 @@ func TestDefaultClusterDialFunc_CreatesClusterConnection(t *testing.T) {
 	dial := DefaultClusterDialFunc()
 
 	opts := &ClusterDialOptions{
-		Addrs: []string{"node1:6379", "node2:6379", "node3:6379"},
+		Addrs:    []string{"node1:6379", "node2:6379", "node3:6379"},
 		Password: "cluster-pass",
 		Username: "cluster-user",
 	}
@@ -246,17 +246,17 @@ func TestDefaultClusterDialFunc_AppliesOptions(t *testing.T) {
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
 
 	opts := &ClusterDialOptions{
-		Addrs: []string{"h1:6379", "h2:6379"},
-		Password: "pass",
-		Username: "admin",
-		ClientName: "cluster-client",
-		TLSConfig: tlsCfg,
+		Addrs:          []string{"h1:6379", "h2:6379"},
+		Password:       "pass",
+		Username:       "admin",
+		ClientName:     "cluster-client",
+		TLSConfig:      tlsCfg,
 		ConnectTimeout: 3 * time.Second,
-		SocketTimeout: 5 * time.Second,
-		KeepAlive: 15 * time.Second,
-		ReadOnly: true,
-		PoolSize: 100,
-		MinIdleConns: 20,
+		SocketTimeout:  5 * time.Second,
+		KeepAlive:      15 * time.Second,
+		ReadOnly:       true,
+		PoolSize:       100,
+		MinIdleConns:   20,
 	}
 
 	conn, err := dial(context.Background(), opts)
@@ -294,9 +294,9 @@ func TestDefaultSentinelDialFunc_CreatesSentinelConnection(t *testing.T) {
 	dial := DefaultSentinelDialFunc()
 
 	opts := &SentinelDialOptions{
-		MasterName: "mymaster",
+		MasterName:    "mymaster",
 		SentinelAddrs: []string{"sentinel1:26379", "sentinel2:26379"},
-		Password: "master-pass",
+		Password:      "master-pass",
 	}
 
 	conn, err := dial(context.Background(), opts)
@@ -328,21 +328,21 @@ func TestDefaultSentinelDialFunc_AppliesAllOptions(t *testing.T) {
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
 
 	opts := &SentinelDialOptions{
-		MasterName: "mymaster",
-		SentinelAddrs: []string{"s1:26379", "s2:26379", "s3:26379"},
-		Password: "master-pass",
-		Username: "master-user",
-		SentinelPassword: "sentinel-pass",
-		SentinelUsername: "sentinel-user",
-		DB: 1,
-		ClientName: "sentinel-client",
-		TLSConfig: tlsCfg,
+		MasterName:           "mymaster",
+		SentinelAddrs:        []string{"s1:26379", "s2:26379", "s3:26379"},
+		Password:             "master-pass",
+		Username:             "master-user",
+		SentinelPassword:     "sentinel-pass",
+		SentinelUsername:     "sentinel-user",
+		DB:                   1,
+		ClientName:           "sentinel-client",
+		TLSConfig:            tlsCfg,
 		EnableTLSForSentinel: true,
-		ConnectTimeout: 3 * time.Second,
-		SocketTimeout: 5 * time.Second,
-		KeepAlive: 10 * time.Second,
-		PoolSize: 25,
-		MinIdleConns: 5,
+		ConnectTimeout:       3 * time.Second,
+		SocketTimeout:        5 * time.Second,
+		KeepAlive:            10 * time.Second,
+		PoolSize:             25,
+		MinIdleConns:         5,
 	}
 
 	conn, err := dial(context.Background(), opts)
@@ -368,9 +368,9 @@ func TestDefaultSentinelDialFunc_ReadOnly(t *testing.T) {
 	dial := DefaultSentinelDialFunc()
 
 	opts := &SentinelDialOptions{
-		MasterName: "mymaster",
+		MasterName:    "mymaster",
 		SentinelAddrs: []string{"s1:26379"},
-		ReadOnly: true,
+		ReadOnly:      true,
 	}
 
 	conn, err := dial(context.Background(), opts)
@@ -407,7 +407,7 @@ func TestDefaultDialFunc_DB0NotSkipped(t *testing.T) {
 
 	opts := &DialOptions{
 		Addr: "localhost:6379",
-		DB: 0,
+		DB:   0,
 	}
 
 	conn, err := dial(context.Background(), opts)
@@ -427,7 +427,7 @@ func TestDefaultClusterDialFunc_ReadOnlyRouting(t *testing.T) {
 	dial := DefaultClusterDialFunc()
 
 	opts := &ClusterDialOptions{
-		Addrs: []string{"node1:6379"},
+		Addrs:    []string{"node1:6379"},
 		ReadOnly: true,
 	}
 

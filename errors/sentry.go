@@ -38,14 +38,14 @@ import (
 
 // SentryConfig holds Sentry SDK configuration.
 type SentryConfig struct {
-	DSN string `json:"dsn"`
-	Environment string `json:"environment"`
-	Release string `json:"release,omitempty"`
-	Debug bool `json:"debug,omitempty"`
-	SampleRate float64 `json:"sample_rate,omitempty"`
-	TracesSampleRate float64 `json:"traces_sample_rate,omitempty"`
-	Tags map[string]string `json:"tags,omitempty"`
-	ServerName string `json:"server_name,omitempty"`
+	DSN              string            `json:"dsn"`
+	Environment      string            `json:"environment"`
+	Release          string            `json:"release,omitempty"`
+	Debug            bool              `json:"debug,omitempty"`
+	SampleRate       float64           `json:"sample_rate,omitempty"`
+	TracesSampleRate float64           `json:"traces_sample_rate,omitempty"`
+	Tags             map[string]string `json:"tags,omitempty"`
+	ServerName       string            `json:"server_name,omitempty"`
 	// Transport allows overriding the Sentry transport (useful for testing).
 	Transport sentrylib.Transport `json:"-"`
 }
@@ -99,29 +99,29 @@ type SentryReporter interface {
 type SentryLevel string
 
 const (
-	SentryLevelDebug SentryLevel = "debug"
-	SentryLevelInfo SentryLevel = "info"
+	SentryLevelDebug   SentryLevel = "debug"
+	SentryLevelInfo    SentryLevel = "info"
 	SentryLevelWarning SentryLevel = "warning"
-	SentryLevelError SentryLevel = "error"
-	SentryLevelFatal SentryLevel = "fatal"
+	SentryLevelError   SentryLevel = "error"
+	SentryLevelFatal   SentryLevel = "fatal"
 )
 
 // sentrySdk wraps the real sentry-go SDK.
 type sentrySdk struct {
-	once sync.Once
+	once        sync.Once
 	initialized bool
-	config SentryConfig
+	config      SentryConfig
 }
 
 func (s *sentrySdk) Init() error {
 	return s.InitWithConfig(SentryConfig{
-		DSN: os.Getenv("SENTRY_DSN"),
-		Environment: os.Getenv("SENTRY_ENVIRONMENT"),
-		Release: os.Getenv("SENTRY_RELEASE"),
-		Debug: envBoolSentry("SENTRY_DEBUG", false),
-		SampleRate: envFloatSentry("SENTRY_SAMPLE_RATE", 1.0),
+		DSN:              os.Getenv("SENTRY_DSN"),
+		Environment:      os.Getenv("SENTRY_ENVIRONMENT"),
+		Release:          os.Getenv("SENTRY_RELEASE"),
+		Debug:            envBoolSentry("SENTRY_DEBUG", false),
+		SampleRate:       envFloatSentry("SENTRY_SAMPLE_RATE", 1.0),
 		TracesSampleRate: envFloatSentry("SENTRY_TRACES_SAMPLE_RATE", 0.0),
-		ServerName: os.Getenv("K8S_POD_NAME"),
+		ServerName:       os.Getenv("K8S_POD_NAME"),
 	})
 }
 
@@ -135,13 +135,13 @@ func (s *sentrySdk) InitWithConfig(cfg SentryConfig) error {
 		}
 
 		opts := sentrylib.ClientOptions{
-			Dsn: cfg.DSN,
-			Environment: cfg.Environment,
-			Release: cfg.Release,
-			Debug: cfg.Debug,
-			SampleRate: cfg.SampleRate,
+			Dsn:              cfg.DSN,
+			Environment:      cfg.Environment,
+			Release:          cfg.Release,
+			Debug:            cfg.Debug,
+			SampleRate:       cfg.SampleRate,
 			TracesSampleRate: cfg.TracesSampleRate,
-			ServerName: cfg.ServerName,
+			ServerName:       cfg.ServerName,
 		}
 
 		if cfg.Transport != nil {
@@ -242,9 +242,9 @@ func (s *sentrySdk) AddBreadcrumb(category, message string, data map[string]inte
 	}
 	sentrylib.AddBreadcrumb(&sentrylib.Breadcrumb{
 		Category: category,
-		Message: message,
-		Data: data,
-		Level: sentrylib.LevelInfo,
+		Message:  message,
+		Data:     data,
+		Level:    sentrylib.LevelInfo,
 	})
 }
 
@@ -254,8 +254,8 @@ func (s *sentrySdk) SetUser(id, email, username string) {
 	}
 	sentrylib.ConfigureScope(func(scope *sentrylib.Scope) {
 		scope.SetUser(sentrylib.User{
-			ID: id,
-			Email: email,
+			ID:       id,
+			Email:    email,
 			Username: username,
 		})
 	})

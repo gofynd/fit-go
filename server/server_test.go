@@ -31,8 +31,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fynd/commerce/fit/errors"
 	"github.com/gin-gonic/gin"
+	"github.com/gofynd/fit-go/errors"
 )
 
 func init() {
@@ -45,9 +45,9 @@ func init() {
 
 func TestParseServerType(t *testing.T) {
 	tests := []struct {
-		input string
+		input    string
 		expected ServerType
-		wantErr bool
+		wantErr  bool
 	}{
 		{"platform", ServerTypePlatform, false},
 		{"application", ServerTypeApplication, false},
@@ -83,10 +83,10 @@ func TestParseServerType(t *testing.T) {
 
 func TestParseServerTypes(t *testing.T) {
 	tests := []struct {
-		name string
-		input string
+		name     string
+		input    string
 		expected []ServerType
-		wantErr bool
+		wantErr  bool
 	}{
 		{"single type", "platform", []ServerType{ServerTypePlatform}, false},
 		{"multiple types", "platform,application,internal", []ServerType{ServerTypePlatform, ServerTypeApplication, ServerTypeInternal}, false},
@@ -118,7 +118,7 @@ func TestParseServerTypes(t *testing.T) {
 
 func TestServerType_String(t *testing.T) {
 	tests := []struct {
-		st ServerType
+		st       ServerType
 		expected string
 	}{
 		{ServerTypePlatform, "platform"},
@@ -508,7 +508,7 @@ func TestCORS(t *testing.T) {
 			AllowOrigins: []string{"https://example.com"},
 			AllowMethods: []string{"GET", "POST"},
 			AllowHeaders: []string{"X-Custom-Header"},
-			MaxAge: 3600,
+			MaxAge:       3600,
 		}
 		r.Use(CORS(cfg))
 		r.GET("/test", func(c *gin.Context) {
@@ -576,7 +576,7 @@ func TestMaxPayloadSize(t *testing.T) {
 
 func TestParseSize(t *testing.T) {
 	tests := []struct {
-		input string
+		input    string
 		expected int64
 	}{
 		{"2mb", 2 * 1024 * 1024},
@@ -600,7 +600,7 @@ func TestParseSize(t *testing.T) {
 
 func TestNormalizeRoutePath(t *testing.T) {
 	tests := []struct {
-		input string
+		input    string
 		expected string
 	}{
 		{"/users/123", "/users/:id"},
@@ -774,13 +774,13 @@ func TestSecureHeadersMiddleware(t *testing.T) {
 	r.ServeHTTP(rec, req)
 
 	expectedHeaders := map[string]string{
-		"X-Content-Type-Options": "nosniff",
-		"X-DNS-Prefetch-Control": "off",
-		"X-Download-Options": "noopen",
-		"X-Frame-Options": "SAMEORIGIN",
-		"X-XSS-Protection": "0",
+		"X-Content-Type-Options":    "nosniff",
+		"X-DNS-Prefetch-Control":    "off",
+		"X-Download-Options":        "noopen",
+		"X-Frame-Options":           "SAMEORIGIN",
+		"X-XSS-Protection":          "0",
 		"Strict-Transport-Security": "max-age=15552000; includeSubDomains",
-		"Referrer-Policy": "no-referrer",
+		"Referrer-Policy":           "no-referrer",
 	}
 
 	for header, expected := range expectedHeaders {
@@ -813,7 +813,7 @@ func TestAuthorizeJWTToken(t *testing.T) {
 	t.Run("valid token", func(t *testing.T) {
 		claims := map[string]interface{}{
 			"company_id": "123",
-			"exp": float64(time.Now().Add(time.Hour).Unix()),
+			"exp":        float64(time.Now().Add(time.Hour).Unix()),
 		}
 		token := createJWT(claims)
 
@@ -878,7 +878,7 @@ func TestAuthorizeJWTToken(t *testing.T) {
 	t.Run("expired token", func(t *testing.T) {
 		claims := map[string]interface{}{
 			"company_id": "123",
-			"exp": float64(time.Now().Add(-time.Hour).Unix()),
+			"exp":        float64(time.Now().Add(-time.Hour).Unix()),
 		}
 		token := createJWT(claims)
 
@@ -901,12 +901,12 @@ func TestAuthorizeJWTToken(t *testing.T) {
 	t.Run("payload mismatch", func(t *testing.T) {
 		claims := map[string]interface{}{
 			"company_id": "123",
-			"exp": float64(time.Now().Add(time.Hour).Unix()),
+			"exp":        float64(time.Now().Add(time.Hour).Unix()),
 		}
 		token := createJWT(claims)
 
 		opts := JWTOptions{
-			Secret: secret,
+			Secret:          secret,
 			ExpectedPayload: map[string]interface{}{"company_id": "456"},
 		}
 
@@ -1035,10 +1035,10 @@ func TestNew(t *testing.T) {
 	t.Run("custom config", func(t *testing.T) {
 		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 		s := New(Config{
-			Logger: logger,
-			ReadTimeout: 60 * time.Second,
+			Logger:       logger,
+			ReadTimeout:  60 * time.Second,
 			WriteTimeout: 60 * time.Second,
-			IdleTimeout: 300 * time.Second,
+			IdleTimeout:  300 * time.Second,
 		})
 
 		if s.cfg.ReadTimeout != 60*time.Second {
@@ -1140,8 +1140,8 @@ func TestServer_Addr(t *testing.T) {
 
 func TestCoalesce(t *testing.T) {
 	tests := []struct {
-		name string
-		values []string
+		name     string
+		values   []string
 		expected string
 	}{
 		{"first non-empty", []string{"", "first", "second"}, "first"},
@@ -1161,7 +1161,7 @@ func TestCoalesce(t *testing.T) {
 
 func TestEnvGetBool(t *testing.T) {
 	tests := []struct {
-		value string
+		value    string
 		expected bool
 	}{
 		{"true", true},

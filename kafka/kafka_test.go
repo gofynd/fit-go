@@ -27,7 +27,7 @@ import (
 
 func TestParseLogLevel(t *testing.T) {
 	tests := []struct {
-		input string
+		input    string
 		expected LogLevel
 	}{
 		{"ERROR", LogLevelError},
@@ -56,7 +56,7 @@ func TestParseLogLevel(t *testing.T) {
 
 func TestSplitBrokers(t *testing.T) {
 	tests := []struct {
-		input string
+		input    string
 		expected []string
 	}{
 		{"broker1:9092", []string{"broker1:9092"}},
@@ -211,7 +211,7 @@ func TestConfigFromEnv(t *testing.T) {
 func TestNewClient(t *testing.T) {
 	t.Run("with explicit config", func(t *testing.T) {
 		cfg := &Config{
-			Brokers: []string{"broker:9092"},
+			Brokers:  []string{"broker:9092"},
 			ClientID: "test-client",
 		}
 		client, err := NewClient(cfg)

@@ -18,7 +18,7 @@
 // MongoDB connections with sensible defaults.
 //
 // This is the Go equivalent of the mongoose.createConnection() calls in
-///src/mongo/index.ts.
+// /src/mongo/index.ts.
 package mongo
 
 import (
@@ -152,7 +152,7 @@ func applyDriverOptions(clientOpts *options.ClientOptions, opts *DialOptions) {
 //	db := users.Write.Raw().(*mongo.Client).Database("users")
 func InitDefault(ctx context.Context) (*Client, error) {
 	return Init(ConnectionOptions{
-		Dial: DefaultDialFunc(),
+		Dial:    DefaultDialFunc(),
 		Context: ctx,
 	})
 }

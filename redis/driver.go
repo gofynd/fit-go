@@ -18,7 +18,7 @@
 // connections with sensible defaults.
 //
 // This is the Go equivalent of the ioredis connection calls in
-///src/redis/index.ts.
+// /src/redis/index.ts.
 package redis
 
 import (
@@ -266,7 +266,7 @@ func DefaultClusterDialFunc() ClusterDialFunc {
 func DefaultSentinelDialFunc() SentinelDialFunc {
 	return func(ctx context.Context, opts *SentinelDialOptions) (Connection, error) {
 		failoverOpts := &goredis.FailoverOptions{
-			MasterName: opts.MasterName,
+			MasterName:    opts.MasterName,
 			SentinelAddrs: opts.SentinelAddrs,
 		}
 
@@ -351,9 +351,9 @@ func DefaultSentinelDialFunc() SentinelDialFunc {
 //	rdb.Set(ctx, "key", "value", 0)
 func InitDefault(ctx context.Context) (*Client, error) {
 	return Init(ConnectionOptions{
-		Dial: DefaultDialFunc(),
-		ClusterDial: DefaultClusterDialFunc(),
+		Dial:         DefaultDialFunc(),
+		ClusterDial:  DefaultClusterDialFunc(),
 		SentinelDial: DefaultSentinelDialFunc(),
-		Context: ctx,
+		Context:      ctx,
 	})
 }

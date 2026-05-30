@@ -22,28 +22,28 @@ import "time"
 // ---------------------------------------------------------------------------
 
 // MessagePayload is the payload delivered to a MessageHandler for each
-// individual message. It mirrors the kafkajs EachMessagePayload.
+// individual message. It mirrors the EachMessagePayload.
 type MessagePayload struct {
-	Topic string
+	Topic     string
 	Partition int
-	Offset int64
-	Key []byte
-	Value []byte
-	Headers []Header
+	Offset    int64
+	Key       []byte
+	Value     []byte
+	Headers   []Header
 	Timestamp time.Time
 }
 
 // BatchPayload is the payload delivered to a BatchHandler for each batch.
-// It mirrors the kafkajs EachBatchPayload.
+// It mirrors the EachBatchPayload.
 type BatchPayload struct {
-	Topic string
+	Topic     string
 	Partition int
-	Messages []MessagePayload
+	Messages  []MessagePayload
 
 	// FirstOffset and LastOffset are the offset range of the batch,
 	// populated automatically from Messages for logging convenience.
 	FirstOffset int64
-	LastOffset int64
+	LastOffset  int64
 }
 
 // MessageHandler processes a single consumed message.
@@ -59,7 +59,7 @@ type BatchHandler func(payload BatchPayload) error
 // Topic configuration
 // ---------------------------------------------------------------------------
 
-// TopicConfig describes a topic subscription. It mirrors the kafkajs
+// TopicConfig describes a topic subscription. It mirrors the
 // ConsumerSubscribeTopics interface.
 type TopicConfig struct {
 	// Topic is the Kafka topic name.
@@ -75,7 +75,7 @@ type TopicConfig struct {
 // ---------------------------------------------------------------------------
 
 // ConsumerConfig holds settings for a Kafka consumer group.
-// Mirrors the kafkajs ConsumerConfig options.
+// Mirrors the ConsumerConfig options.
 type ConsumerConfig struct {
 	// GroupID is the consumer group identifier (required).
 	GroupID string
@@ -126,26 +126,26 @@ type ConsumerConfig struct {
 }
 
 // DefaultConsumerConfig returns a ConsumerConfig with sensible defaults that
-// match the kafkajs defaults used.
+// match the defaults used.
 func DefaultConsumerConfig(groupID string) ConsumerConfig {
 	return ConsumerConfig{
-		GroupID: groupID,
-		SessionTimeout: 30 * time.Second,
-		HeartbeatInterval: 3 * time.Second,
-		RebalanceTimeout: 60 * time.Second,
+		GroupID:              groupID,
+		SessionTimeout:       30 * time.Second,
+		HeartbeatInterval:    3 * time.Second,
+		RebalanceTimeout:     60 * time.Second,
 		MaxBytesPerPartition: 1 << 20, // 1 MB
-		MinBytes: 1,
-		MaxBytes: 10 << 20, // 10 MB
-		MaxWaitTime: 5 * time.Second,
-		RetryBackoff: 100 * time.Millisecond,
-		AutoCommit: true,
-		AutoCommitInterval: 5 * time.Second,
-		MaxPollInterval: 5 * time.Minute,
+		MinBytes:             1,
+		MaxBytes:             10 << 20, // 10 MB
+		MaxWaitTime:          5 * time.Second,
+		RetryBackoff:         100 * time.Millisecond,
+		AutoCommit:           true,
+		AutoCommitInterval:   5 * time.Second,
+		MaxPollInterval:      5 * time.Minute,
 	}
 }
 
 // ConsumerOptions holds per-run options passed to Consume/ConsumeBatch.
-// Mirrors the kafkajs ConsumerRunConfig.
+// Mirrors the ConsumerRunConfig.
 type ConsumerOptions struct {
 	// AutoCommit overrides the ConsumerConfig AutoCommit for this run.
 	// nil means use the ConsumerConfig default.
@@ -157,10 +157,9 @@ type ConsumerOptions struct {
 
 	// PollTimeout is how long each poll call waits for new messages before
 	// returning an empty batch. Default: 0 means use the driver default.
-	// Mirrors wildrider's TIMEOUT_MS per-consumer poll setting.
 	PollTimeout time.Duration
 
 	// MaxRecords limits the number of records returned per poll. Default: 0
-	// means use the driver default. Mirrors wildrider's MAX_RECORDS setting.
+	// means use the driver default.
 	MaxRecords int
 }

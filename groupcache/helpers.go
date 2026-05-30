@@ -48,9 +48,9 @@ import (
 //
 //	user, err := users.Get(ctx, "user-123")
 type TypedGroup[T any] struct {
-	group *gc.Group
+	group  *gc.Group
 	client *Client
-	name string
+	name   string
 }
 
 // NewTypedGroup creates a typed wrapper around a groupcache group. The loader
@@ -74,15 +74,15 @@ func NewTypedGroup[T any](client *Client, name string, maxBytes int64, loader fu
 	})
 
 	g := client.CreateGroup(GroupConfig{
-		Name: name,
+		Name:     name,
 		MaxBytes: maxBytes,
-		Getter: getter,
+		Getter:   getter,
 	})
 
 	return &TypedGroup[T]{
-		group: g,
+		group:  g,
 		client: client,
-		name: name,
+		name:   name,
 	}
 }
 
@@ -102,15 +102,15 @@ func NewTypedGroupWithTTL[T any](client *Client, name string, maxBytes int64, tt
 	})
 
 	g := client.CreateGroup(GroupConfig{
-		Name: name,
+		Name:     name,
 		MaxBytes: maxBytes,
-		Getter: getter,
+		Getter:   getter,
 	})
 
 	return &TypedGroup[T]{
-		group: g,
+		group:  g,
 		client: client,
-		name: name,
+		name:   name,
 	}
 }
 

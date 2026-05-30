@@ -77,7 +77,7 @@ import (
 
 // ServiceConnection holds read and write *sql.DB connections for a single service.
 type ServiceConnection struct {
-	Read *sql.DB
+	Read  *sql.DB
 	Write *sql.DB
 }
 
@@ -111,14 +111,14 @@ type ConnectionOptions struct {
 
 // ServicePoolOverrides allows programmatic pool configuration per service.
 type ServicePoolOverrides struct {
-	Read *PoolOverrides
+	Read  *PoolOverrides
 	Write *PoolOverrides
 }
 
 // PoolOverrides holds optional pool tuning values. Zero values are ignored.
 type PoolOverrides struct {
-	MaxOpenConns int
-	MaxIdleConns int
+	MaxOpenConns    int
+	MaxIdleConns    int
 	ConnMaxIdleTime time.Duration
 	ConnMaxLifetime time.Duration
 }
@@ -131,10 +131,10 @@ type PoolOverrides struct {
 type ParsedURI struct {
 	Username string
 	Password string
-	Host string
-	Port string
+	Host     string
+	Port     string
 	Database string
-	Options map[string]string
+	Options  map[string]string
 	// SSLMode for PostgreSQL connections.
 	SSLMode string
 	// ApplicationName to set on the connection.
@@ -153,7 +153,7 @@ func (p *ParsedURI) Addr() string {
 func DefaultPostgresDSN(p *ParsedURI) string {
 	u := &url.URL{
 		Scheme: "postgres",
-		Host: p.Addr(),
+		Host:   p.Addr(),
 	}
 
 	if p.Username != "" {
@@ -189,7 +189,7 @@ func DefaultPostgresDSN(p *ParsedURI) string {
 
 // Client manages PostgreSQL connections for all discovered services.
 type Client struct {
-	mu sync.RWMutex
+	mu       sync.RWMutex
 	services map[string]*ServiceConnection
 }
 
@@ -209,7 +209,7 @@ func InitDefault() (*Client, error) {
 func InitDefaultWithContext(ctx context.Context) (*Client, error) {
 	return Init(ConnectionOptions{
 		DriverName: "postgres",
-		Context: ctx,
+		Context:    ctx,
 	})
 }
 
@@ -234,11 +234,11 @@ func Init(opts ConnectionOptions) (*Client, error) {
 
 	// Phase 1: Collect all env vars into a connection mapping.
 	type connEntry struct {
-		readRef string
+		readRef  string
 		writeRef string
 	}
 	connMap := make(map[string]*connEntry) // keyed by lowercase service name
-	upperNames := make(map[string]string) // lowercase -> UPPER
+	upperNames := make(map[string]string)  // lowercase -> UPPER
 
 	for _, env := range os.Environ() {
 		idx := strings.IndexByte(env, '=')
@@ -503,7 +503,7 @@ func applyPoolSettings(
 
 	envMapping := []struct {
 		suffix string
-		apply func(int)
+		apply  func(int)
 	}{
 		{"MAX_POOL_SIZE", func(v int) { db.SetMaxOpenConns(v) }},
 		{"MIN_POOL_SIZE", func(v int) { db.SetMaxIdleConns(v) }},
@@ -560,10 +560,10 @@ func parseURI(rawURI string) (*ParsedURI, error) {
 	}
 
 	p := &ParsedURI{
-		Host: u.Hostname(),
-		Port: u.Port(),
+		Host:     u.Hostname(),
+		Port:     u.Port(),
 		Database: strings.TrimPrefix(u.Path, "/"),
-		Options: make(map[string]string),
+		Options:  make(map[string]string),
 	}
 
 	if u.User != nil {
@@ -659,10 +659,10 @@ func loadPostgresTLSConfig(serviceNameUpper string) (*tls.Config, string) {
 	caCertPool.AppendCertsFromPEM(caCert)
 
 	return &tls.Config{
-		ServerName: serverName,
-		RootCAs: caCertPool,
+		ServerName:   serverName,
+		RootCAs:      caCertPool,
 		Certificates: []tls.Certificate{cert},
-		MinVersion: tls.VersionTLS12,
+		MinVersion:   tls.VersionTLS12,
 	}, serverName
 }
 
@@ -691,7 +691,7 @@ func resolveConnectionString(value string) (string, error) {
 type GSMResolverFunc func(secretName, version string) (string, error)
 
 var (
-	gsmMu sync.RWMutex
+	gsmMu       sync.RWMutex
 	gsmResolver GSMResolverFunc
 )
 

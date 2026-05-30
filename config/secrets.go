@@ -33,15 +33,13 @@ var gsmHTTPClient = &http.Client{
 // GetSecretFromGSM fetches a secret from Google Cloud Secret Manager using
 // the GCP REST API with Application Default Credentials (ADC).
 //
-// The project ID is auto-detected from the GCE/GKE metadata server, matching
-// the Node.js behavior where SecretManagerServiceClient auto-detects the project.
+// The project ID is auto-detected from the GCE/GKE metadata server.
 //
 // Parameters:
 // - secretName: the secret ID within the project (not the full resource path)
 // - version: the secret version ("latest", "1", "2", etc.)
 //
 // Returns the secret payload as a string, or an error if retrieval fails.
-//
 func GetSecretFromGSM(secretName, version string) (string, error) {
 	if secretName == "" {
 		return "", fmt.Errorf("gsm: secret name must not be empty")
@@ -110,7 +108,7 @@ func GetSecretFromGSM(secretName, version string) (string, error) {
 // secretVersionResponse represents the JSON response from the Secret Manager
 // accessSecretVersion API.
 type secretVersionResponse struct {
-	Name string `json:"name"`
+	Name    string        `json:"name"`
 	Payload secretPayload `json:"payload"`
 }
 
@@ -191,8 +189,8 @@ func getAccessToken() (string, error) {
 		if resp.StatusCode == http.StatusOK {
 			var tokenResp struct {
 				AccessToken string `json:"access_token"`
-				TokenType string `json:"token_type"`
-				ExpiresIn int `json:"expires_in"`
+				TokenType   string `json:"token_type"`
+				ExpiresIn   int    `json:"expires_in"`
 			}
 			if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err == nil && tokenResp.AccessToken != "" {
 				return tokenResp.AccessToken, nil

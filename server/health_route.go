@@ -31,7 +31,7 @@ type HealthChecker interface {
 // defaultHealthChecker is a simple in-process health checker that external
 // packages (e.g. health.Checker) can register checks with.
 type defaultHealthChecker struct {
-	mu sync.RWMutex
+	mu     sync.RWMutex
 	checks []func() string
 }
 
@@ -96,6 +96,6 @@ func ginHealthHandler(c *gin.Context) {
 
 	c.JSON(http.StatusOK, map[string]interface{}{
 		"status": "healthy",
-		"ok": "ok",
+		"ok":     "ok",
 	})
 }

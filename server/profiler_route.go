@@ -29,12 +29,12 @@ import (
 // This is a port profiler.route.ts. In Go, we use runtime/pprof
 // and provide on-demand profiling control rather than wrapping Pyroscope.
 type ProfilerState struct {
-	mu sync.Mutex
-	cpuRunning atomic.Bool
+	mu          sync.Mutex
+	cpuRunning  atomic.Bool
 	heapRunning atomic.Bool
 	wallRunning atomic.Bool
-	cpuFile *profilerBuffer
-	enabled bool
+	cpuFile     *profilerBuffer
+	enabled     bool
 }
 
 // profilerBuffer is an in-memory buffer for pprof output.
@@ -75,9 +75,9 @@ func (p *ProfilerState) ginJSONOK(c *gin.Context, message string) {
 
 func (p *ProfilerState) ginJSONErr(c *gin.Context, message string, err error) {
 	c.JSON(http.StatusInternalServerError, map[string]interface{}{
-		"status": "error",
+		"status":  "error",
 		"message": message,
-		"error": err.Error(),
+		"error":   err.Error(),
 	})
 }
 
@@ -202,18 +202,18 @@ func (p *ProfilerState) ginHandleStatus(c *gin.Context) {
 			},
 			"types": map[string]interface{}{
 				"cpu": map[string]interface{}{
-					"enabled": p.enabled,
-					"running": p.cpuRunning.Load(),
+					"enabled":     p.enabled,
+					"running":     p.cpuRunning.Load(),
 					"description": "CPU profiling using Go runtime/pprof",
 				},
 				"heap": map[string]interface{}{
-					"enabled": p.enabled,
-					"running": p.heapRunning.Load(),
+					"enabled":     p.enabled,
+					"running":     p.heapRunning.Load(),
 					"description": "Heap profiling for memory allocation analysis",
 				},
 				"wall": map[string]interface{}{
-					"enabled": p.enabled,
-					"running": p.wallRunning.Load(),
+					"enabled":     p.enabled,
+					"running":     p.wallRunning.Load(),
 					"description": "Wall profiling for goroutine/wall-clock analysis",
 				},
 			},
@@ -227,14 +227,14 @@ func (p *ProfilerState) ginHandleConfig(c *gin.Context) {
 		"status": "ok",
 		"configuration": map[string]interface{}{
 			"profiler": map[string]interface{}{
-				"enabled": p.enabled,
-				"cpuEnabled": p.cpuRunning.Load(),
-				"heapEnabled": p.heapRunning.Load(),
-				"wallEnabled": p.wallRunning.Load(),
-				"memProfileRate": runtime.MemProfileRate,
-				"numGoroutine": runtime.NumGoroutine(),
-				"goVersion": runtime.Version(),
-				"numCPU": runtime.NumCPU(),
+				"enabled":          p.enabled,
+				"cpuEnabled":       p.cpuRunning.Load(),
+				"heapEnabled":      p.heapRunning.Load(),
+				"wallEnabled":      p.wallRunning.Load(),
+				"memProfileRate":   runtime.MemProfileRate,
+				"numGoroutine":     runtime.NumGoroutine(),
+				"goVersion":        runtime.Version(),
+				"numCPU":           runtime.NumCPU(),
 				"blockProfileRate": 0,
 				"mutexProfileFrac": 0,
 			},
@@ -306,8 +306,8 @@ func (p *ProfilerState) jsonOK(w http.ResponseWriter, message string) {
 
 func (p *ProfilerState) jsonErr(w http.ResponseWriter, message string, err error) {
 	JSON(w, http.StatusInternalServerError, map[string]interface{}{
-		"status": "error",
+		"status":  "error",
 		"message": message,
-		"error": err.Error(),
+		"error":   err.Error(),
 	})
 }

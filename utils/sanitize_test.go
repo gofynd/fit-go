@@ -26,7 +26,7 @@ import (
 
 func TestSanitizeString_SQLInjection(t *testing.T) {
 	tests := []struct {
-		name string
+		name  string
 		input string
 		check func(string) bool
 	}{
@@ -88,7 +88,7 @@ func TestSanitizeString_SQLInjection(t *testing.T) {
 
 func TestSanitizeString_XSS(t *testing.T) {
 	tests := []struct {
-		name string
+		name  string
 		input string
 		check func(string) bool
 	}{
@@ -157,8 +157,8 @@ func TestSanitizeString_XSS(t *testing.T) {
 
 func TestSanitizeString_NoSQLInjection(t *testing.T) {
 	tests := []struct {
-		name string
-		input string
+		name     string
+		input    string
 		notFound string
 	}{
 		{"$ne operator", `{"$ne": null}`, "$ne"},
@@ -193,7 +193,7 @@ func TestSanitizeString_NoSQLInjection(t *testing.T) {
 
 func TestSanitizeString_CommandInjection(t *testing.T) {
 	tests := []struct {
-		name string
+		name  string
 		input string
 		check func(string) bool
 	}{
@@ -245,8 +245,8 @@ func TestSanitizeString_CommandInjection(t *testing.T) {
 
 func TestSanitizeString_PathTraversal(t *testing.T) {
 	tests := []struct {
-		name string
-		input string
+		name     string
+		input    string
 		notFound string
 	}{
 		{"dot-dot-slash", "../../../etc/passwd", "../"},
@@ -271,8 +271,8 @@ func TestSanitizeString_PathTraversal(t *testing.T) {
 
 func TestSanitizeString_XXE(t *testing.T) {
 	tests := []struct {
-		name string
-		input string
+		name     string
+		input    string
 		notFound string
 	}{
 		{
@@ -421,7 +421,7 @@ func TestDetectThreats_Comprehensive(t *testing.T) {
 
 func TestContainsHTML_Comprehensive(t *testing.T) {
 	tests := []struct {
-		input string
+		input    string
 		expected bool
 	}{
 		{"<div>test</div>", true},
@@ -451,8 +451,8 @@ func TestContainsHTML_Comprehensive(t *testing.T) {
 
 func TestSanitizeString_CSSInjection(t *testing.T) {
 	tests := []struct {
-		name string
-		input string
+		name     string
+		input    string
 		notFound string
 	}{
 		{"expression()", "color: expression(alert(1))", "expression"},
@@ -472,8 +472,8 @@ func TestSanitizeString_CSSInjection(t *testing.T) {
 
 func TestSanitizeString_TemplateInjection(t *testing.T) {
 	tests := []struct {
-		name string
-		input string
+		name     string
+		input    string
 		notFound string
 	}{
 		{"mustache", "{{7*7}}", "{{"},
@@ -522,8 +522,8 @@ func TestSanitizeString_DisabledOptions(t *testing.T) {
 
 func TestValidateCharactersString(t *testing.T) {
 	tests := []struct {
-		input string
-		pattern string
+		input    string
+		pattern  string
 		expected bool
 	}{
 		{"abc", `^[a-z]+$`, true},

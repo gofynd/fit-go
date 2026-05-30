@@ -54,13 +54,13 @@ import (
 
 // Options configures the tracer.
 type Options struct {
-	ServiceName string
-	Env string
-	Endpoint string // OTLP endpoint
-	SampleRate float64 // Sampling rate (0.0-1.0)
-	BatchTimeout time.Duration // Span batch export timeout
-	MaxExportBatch int // Maximum spans per export batch
-	Attributes map[string]string // Additional resource attributes
+	ServiceName    string
+	Env            string
+	Endpoint       string            // OTLP endpoint
+	SampleRate     float64           // Sampling rate (0.0-1.0)
+	BatchTimeout   time.Duration     // Span batch export timeout
+	MaxExportBatch int               // Maximum spans per export batch
+	Attributes     map[string]string // Additional resource attributes
 	// SpanExporter allows injecting a custom span exporter (useful for testing).
 	SpanExporter sdktrace.SpanExporter `json:"-"`
 	// UseSimpleSpanProcessor uses a synchronous span processor instead of batch.
@@ -71,11 +71,11 @@ type Options struct {
 // DefaultOptions returns default tracer options from environment.
 func DefaultOptions() Options {
 	return Options{
-		ServiceName: envString("OTEL_SERVICE_NAME", envString("SERVICE_NAME", "unknown")),
-		Env: envString("GO_ENV", envString("NODE_ENV", "development")),
-		Endpoint: envString("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
-		SampleRate: 1.0,
-		BatchTimeout: 5 * time.Second,
+		ServiceName:    envString("OTEL_SERVICE_NAME", envString("SERVICE_NAME", "unknown")),
+		Env:            envString("GO_ENV", envString("NODE_ENV", "development")),
+		Endpoint:       envString("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+		SampleRate:     1.0,
+		BatchTimeout:   5 * time.Second,
 		MaxExportBatch: 512,
 	}
 }
@@ -103,18 +103,18 @@ const (
 // Span represents an OpenTelemetry span.
 // Wraps a real trace.Span from the OTel SDK when tracing is enabled.
 type Span struct {
-	name string
-	traceID string
-	spanID string
-	parentID string
-	startTime time.Time
-	endTime time.Time
+	name       string
+	traceID    string
+	spanID     string
+	parentID   string
+	startTime  time.Time
+	endTime    time.Time
 	attributes map[string]any
-	status SpanStatusCode
-	statusMsg string
-	kind SpanKind
-	ended bool
-	mu sync.Mutex
+	status     SpanStatusCode
+	statusMsg  string
+	kind       SpanKind
+	ended      bool
+	mu         sync.Mutex
 	// otelSpan holds the real OTel span when tracing is enabled.
 	otelSpan trace.Span
 }
@@ -189,16 +189,16 @@ func (s *Span) SpanID() string { return s.spanID }
 // Tracer wraps OpenTelemetry tracing functionality.
 type Tracer struct {
 	serviceName string
-	env string
-	enabled bool
-	options Options
-	mu sync.RWMutex
-	provider *sdktrace.TracerProvider
-	otelTracer trace.Tracer
+	env         string
+	enabled     bool
+	options     Options
+	mu          sync.RWMutex
+	provider    *sdktrace.TracerProvider
+	otelTracer  trace.Tracer
 }
 
 var (
-	globalTracer *Tracer
+	globalTracer     *Tracer
 	globalTracerOnce sync.Once
 )
 
@@ -207,9 +207,9 @@ var (
 func New(ctx context.Context, opts Options) (*Tracer, error) {
 	t := &Tracer{
 		serviceName: opts.ServiceName,
-		env: opts.Env,
-		enabled: isTracingEnabled(),
-		options: opts,
+		env:         opts.Env,
+		enabled:     isTracingEnabled(),
+		options:     opts,
 	}
 
 	if t.enabled {
@@ -358,12 +358,12 @@ func toOtelSpanKind(kind SpanKind) trace.SpanKind {
 // a real OTel span; otherwise it creates an in-memory span.
 func (t *Tracer) StartSpan(ctx context.Context, name string, kind SpanKind) (context.Context, *Span) {
 	span := &Span{
-		name: name,
-		traceID: TraceIDFromContext(ctx),
-		spanID: generateID(8),
-		parentID: SpanIDFromContext(ctx),
+		name:      name,
+		traceID:   TraceIDFromContext(ctx),
+		spanID:    generateID(8),
+		parentID:  SpanIDFromContext(ctx),
 		startTime: time.Now(),
-		kind: kind,
+		kind:      kind,
 	}
 
 	// Generate new trace ID if not in existing trace
@@ -508,8 +508,8 @@ func SpanIDFromContext(ctx context.Context) string {
 type contextKey string
 
 const (
-	traceIDKey contextKey = "fit_trace_id"
-	spanIDKey contextKey = "fit_span_id"
+	traceIDKey     contextKey = "fit_trace_id"
+	spanIDKey      contextKey = "fit_span_id"
 	currentSpanKey contextKey = "fit_current_span"
 )
 

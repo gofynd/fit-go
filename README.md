@@ -34,8 +34,8 @@ import (
 	"context"
 	"log"
 
-	"github.com/fynd/commerce/fit"
-	"github.com/fynd/commerce/fit/server"
+	"github.com/gofynd/fit-go"
+	"github.com/gofynd/fit-go/server"
 )
 
 func main() {

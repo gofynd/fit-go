@@ -31,7 +31,7 @@ import (
 // ---------------------------------------------------------------------------
 
 type testLogger struct {
-	mu sync.Mutex
+	mu       sync.Mutex
 	messages []string
 }
 
@@ -59,14 +59,14 @@ func (l *testLogger) Messages() []string {
 }
 
 type testMetrics struct {
-	mu sync.Mutex
+	mu      sync.Mutex
 	records []metricRecord
 }
 
 type metricRecord struct {
-	Method string
-	Host string
-	Status string
+	Method   string
+	Host     string
+	Status   string
 	Duration time.Duration
 }
 
@@ -74,9 +74,9 @@ func (m *testMetrics) RecordHTTPClient(method, host, statusCode string, duration
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.records = append(m.records, metricRecord{
-		Method: method,
-		Host: host,
-		Status: statusCode,
+		Method:   method,
+		Host:     host,
+		Status:   statusCode,
 		Duration: duration,
 	})
 }
@@ -213,7 +213,7 @@ func TestHTTPClient_Logging(t *testing.T) {
 
 	logger := &testLogger{}
 	client := NewHTTPClient(HTTPClientOptions{
-		Logger: logger,
+		Logger:  logger,
 		Timeout: 5 * time.Second,
 	})
 
@@ -250,7 +250,7 @@ func TestHTTPClient_Logging(t *testing.T) {
 func TestHTTPClient_ErrorLogging(t *testing.T) {
 	logger := &testLogger{}
 	client := NewHTTPClient(HTTPClientOptions{
-		Logger: logger,
+		Logger:  logger,
 		Timeout: 100 * time.Millisecond,
 	})
 
@@ -313,7 +313,7 @@ func TestHTTPClient_MetricsRecording(t *testing.T) {
 	metrics := &testMetrics{}
 	client := NewHTTPClient(HTTPClientOptions{
 		MetricsRecorder: metrics,
-		Timeout: 5 * time.Second,
+		Timeout:         5 * time.Second,
 	})
 
 	resp, err := client.Get(ts.URL + "/metrics-test")
@@ -346,7 +346,7 @@ func TestHTTPClient_MetricsOnError(t *testing.T) {
 	metrics := &testMetrics{}
 	client := NewHTTPClient(HTTPClientOptions{
 		MetricsRecorder: metrics,
-		Timeout: 100 * time.Millisecond,
+		Timeout:         100 * time.Millisecond,
 	})
 
 	_, _ = client.Get("http://192.0.2.1:1/unreachable")
@@ -374,7 +374,7 @@ func TestHTTPClient_DefaultHeaders(t *testing.T) {
 
 	client := NewHTTPClient(HTTPClientOptions{
 		Headers: map[string]string{
-			"X-Custom": "header-value",
+			"X-Custom":   "header-value",
 			"X-Override": "from-default",
 		},
 	})
@@ -490,7 +490,7 @@ func TestHTTPClient_DefaultTimeout(t *testing.T) {
 
 func TestExtractHost(t *testing.T) {
 	tests := []struct {
-		url string
+		url      string
 		expected string
 	}{
 		{"https://api.example.com/path", "api.example.com"},

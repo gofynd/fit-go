@@ -30,7 +30,7 @@ import (
 
 func TestParseLevel(t *testing.T) {
 	tests := []struct {
-		input string
+		input    string
 		expected Level
 	}{
 		{"debug", LevelDebug},
@@ -59,7 +59,7 @@ func TestParseLevel(t *testing.T) {
 
 func TestLevel_String(t *testing.T) {
 	tests := []struct {
-		level Level
+		level    Level
 		expected string
 	}{
 		{LevelDebug, "debug"},
@@ -85,7 +85,7 @@ func TestLevel_String(t *testing.T) {
 
 func TestIsHealthCheckPath(t *testing.T) {
 	tests := []struct {
-		path string
+		path     string
 		expected bool
 	}{
 		{"/_healthz", true},
@@ -208,9 +208,9 @@ func TestNew(t *testing.T) {
 
 func TestLogger_LogMethods(t *testing.T) {
 	tests := []struct {
-		name string
-		logMethod func(*Logger, string...interface{})
-		level string
+		name      string
+		logMethod func(*Logger, string, ...interface{})
+		level     string
 	}{
 		{"Debug", (*Logger).Debug, "debug"},
 		{"Info", (*Logger).Info, "info"},
@@ -222,9 +222,9 @@ func TestLogger_LogMethods(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var buf bytes.Buffer
 			logger, _ := New(Options{
-				Level: "debug",
+				Level:  "debug",
 				Output: &buf,
-				Env: "production", // no colors
+				Env:    "production", // no colors
 			})
 
 			tt.logMethod(logger, "test message", "key", "value")
@@ -255,9 +255,9 @@ func TestLogger_LevelFiltering(t *testing.T) {
 	t.Run("debug not logged at info level", func(t *testing.T) {
 		var buf bytes.Buffer
 		logger, _ := New(Options{
-			Level: "info",
+			Level:  "info",
 			Output: &buf,
-			Env: "production",
+			Env:    "production",
 		})
 
 		logger.Debug("this should not appear")
@@ -270,9 +270,9 @@ func TestLogger_LevelFiltering(t *testing.T) {
 	t.Run("info logged at info level", func(t *testing.T) {
 		var buf bytes.Buffer
 		logger, _ := New(Options{
-			Level: "info",
+			Level:  "info",
 			Output: &buf,
-			Env: "production",
+			Env:    "production",
 		})
 
 		logger.Info("this should appear")
@@ -285,9 +285,9 @@ func TestLogger_LevelFiltering(t *testing.T) {
 	t.Run("warn logged at info level", func(t *testing.T) {
 		var buf bytes.Buffer
 		logger, _ := New(Options{
-			Level: "info",
+			Level:  "info",
 			Output: &buf,
-			Env: "production",
+			Env:    "production",
 		})
 
 		logger.Warn("warning message")
@@ -301,9 +301,9 @@ func TestLogger_LevelFiltering(t *testing.T) {
 func TestLogger_SetLevel(t *testing.T) {
 	var buf bytes.Buffer
 	logger, _ := New(Options{
-		Level: "error",
+		Level:  "error",
 		Output: &buf,
-		Env: "production",
+		Env:    "production",
 	})
 
 	logger.Info("should not appear")
@@ -325,9 +325,9 @@ func TestLogger_SetLevel(t *testing.T) {
 func TestLogger_WithContext(t *testing.T) {
 	var buf bytes.Buffer
 	logger, _ := New(Options{
-		Level: "info",
+		Level:  "info",
 		Output: &buf,
-		Env: "production",
+		Env:    "production",
 	})
 
 	ctx := ContextWithTrace(context.Background(), "trace-123", "span-456")
@@ -349,14 +349,14 @@ func TestLogger_WithContext(t *testing.T) {
 func TestLogger_WithFields(t *testing.T) {
 	var buf bytes.Buffer
 	logger, _ := New(Options{
-		Level: "info",
+		Level:  "info",
 		Output: &buf,
-		Env: "production",
+		Env:    "production",
 	})
 
 	fieldLogger := logger.WithFields(map[string]interface{}{
 		"request_id": "req-123",
-		"user_id": "user-456",
+		"user_id":    "user-456",
 	})
 
 	fieldLogger.Info("test with fields")
@@ -379,9 +379,9 @@ func TestLogger_WithFields(t *testing.T) {
 func TestLogger_WithService(t *testing.T) {
 	var buf bytes.Buffer
 	logger, _ := New(Options{
-		Level: "info",
+		Level:  "info",
 		Output: &buf,
-		Env: "production",
+		Env:    "production",
 	})
 
 	serviceLogger := logger.WithService("api-gateway")
@@ -398,9 +398,9 @@ func TestLogger_WithService(t *testing.T) {
 func TestLogger_ChainedDerivation(t *testing.T) {
 	var buf bytes.Buffer
 	logger, _ := New(Options{
-		Level: "info",
+		Level:  "info",
 		Output: &buf,
-		Env: "production",
+		Env:    "production",
 	})
 
 	ctx := ContextWithTrace(context.Background(), "trace-123", "span-456")
@@ -430,9 +430,9 @@ func TestLogger_ChainedDerivation(t *testing.T) {
 func TestLogger_DerivationIndependence(t *testing.T) {
 	var buf bytes.Buffer
 	logger, _ := New(Options{
-		Level: "info",
+		Level:  "info",
 		Output: &buf,
-		Env: "production",
+		Env:    "production",
 	})
 
 	// Create two derived loggers
@@ -473,9 +473,9 @@ func TestLogger_KeyValuePairs(t *testing.T) {
 	t.Run("normal pairs", func(t *testing.T) {
 		var buf bytes.Buffer
 		logger, _ := New(Options{
-			Level: "info",
+			Level:  "info",
 			Output: &buf,
-			Env: "production",
+			Env:    "production",
 		})
 
 		logger.Info("test", "k1", "v1", "k2", 123)
@@ -495,9 +495,9 @@ func TestLogger_KeyValuePairs(t *testing.T) {
 	t.Run("odd number of args", func(t *testing.T) {
 		var buf bytes.Buffer
 		logger, _ := New(Options{
-			Level: "info",
+			Level:  "info",
 			Output: &buf,
-			Env: "production",
+			Env:    "production",
 		})
 
 		logger.Info("test", "k1", "v1", "k2")
@@ -514,9 +514,9 @@ func TestLogger_KeyValuePairs(t *testing.T) {
 	t.Run("non-string key", func(t *testing.T) {
 		var buf bytes.Buffer
 		logger, _ := New(Options{
-			Level: "info",
+			Level:  "info",
 			Output: &buf,
-			Env: "production",
+			Env:    "production",
 		})
 
 		logger.Info("test", 123, "value")
@@ -539,9 +539,9 @@ func TestLogger_KeyValuePairs(t *testing.T) {
 	t.Run("error value", func(t *testing.T) {
 		var buf bytes.Buffer
 		logger, _ := New(Options{
-			Level: "info",
+			Level:  "info",
 			Output: &buf,
-			Env: "production",
+			Env:    "production",
 		})
 
 		logger.Info("test", "error", &testError{msg: "something went wrong"})
@@ -563,9 +563,9 @@ func TestLogger_KeyValuePairs(t *testing.T) {
 func TestLogger_CallerInfo(t *testing.T) {
 	var buf bytes.Buffer
 	logger, _ := New(Options{
-		Level: "debug",
+		Level:  "debug",
 		Output: &buf,
-		Env: "production",
+		Env:    "production",
 	})
 
 	logger.Error("error with caller")
@@ -585,9 +585,9 @@ func TestLogger_CallerInfo(t *testing.T) {
 func TestLogger_NoCallerForInfo(t *testing.T) {
 	var buf bytes.Buffer
 	logger, _ := New(Options{
-		Level: "info",
+		Level:  "info",
 		Output: &buf,
-		Env: "production",
+		Env:    "production",
 	})
 
 	logger.Info("info without caller")
@@ -607,9 +607,9 @@ func TestLogger_NoCallerForInfo(t *testing.T) {
 func TestLogger_ConcurrentAccess(t *testing.T) {
 	var buf bytes.Buffer
 	logger, _ := New(Options{
-		Level: "debug",
+		Level:  "debug",
 		Output: &buf,
-		Env: "production",
+		Env:    "production",
 	})
 
 	var wg sync.WaitGroup
@@ -665,9 +665,9 @@ func TestLogger_Colorization(t *testing.T) {
 	t.Run("development mode colorizes", func(t *testing.T) {
 		var buf bytes.Buffer
 		logger, _ := New(Options{
-			Level: "info",
+			Level:  "info",
 			Output: &buf,
-			Env: "development",
+			Env:    "development",
 		})
 
 		logger.Info("colored message")
@@ -681,9 +681,9 @@ func TestLogger_Colorization(t *testing.T) {
 	t.Run("production mode does not colorize", func(t *testing.T) {
 		var buf bytes.Buffer
 		logger, _ := New(Options{
-			Level: "info",
+			Level:  "info",
 			Output: &buf,
-			Env: "production",
+			Env:    "production",
 		})
 
 		logger.Info("plain message")

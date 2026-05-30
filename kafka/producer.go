@@ -23,12 +23,12 @@ import "time"
 
 // Header is a single Kafka message header (key-value pair).
 type Header struct {
-	Key string
+	Key   string
 	Value []byte
 }
 
 // Message represents a single Kafka message to be produced.
-// Mirrors the kafkajs Message interface used.
+// Mirrors the Message interface used.
 type Message struct {
 	// Key is the optional partition key. When set, messages with the same
 	// key are routed to the same partition.
@@ -51,17 +51,17 @@ type Message struct {
 
 // TopicMessages groups messages destined for a single topic.
 // Used by ProduceBatch to send to multiple topics in one call.
-// Mirrors the kafkajs TopicMessages interface.
+// Mirrors the TopicMessages interface.
 type TopicMessages struct {
-	Topic string
+	Topic    string
 	Messages []Message
 }
 
 // RecordMetadata is returned for each message after a successful produce.
 type RecordMetadata struct {
-	Topic string
+	Topic     string
 	Partition int
-	Offset int64
+	Offset    int64
 }
 
 // ---------------------------------------------------------------------------
@@ -69,7 +69,7 @@ type RecordMetadata struct {
 // ---------------------------------------------------------------------------
 
 // ProducerConfig holds settings for a Kafka producer.
-// Mirrors the kafkajs ProducerConfig options.
+// Mirrors the ProducerConfig options.
 type ProducerConfig struct {
 	// Acks is the default acknowledgement level:
 	// 0 = fire-and-forget, 1 = leader only, -1 = all ISR (default).

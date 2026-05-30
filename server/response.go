@@ -18,8 +18,8 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/fynd/commerce/fit/errors"
 	"github.com/gin-gonic/gin"
+	"github.com/gofynd/fit-go/errors"
 )
 
 // JSON writes a JSON response with the given status code (net/http version).
@@ -66,9 +66,9 @@ func Error(w http.ResponseWriter, err error) {
 		}
 		JSON(w, status, map[string]interface{}{
 			"error": map[string]interface{}{
-				"code": fe.Code,
+				"code":    fe.Code,
 				"message": fe.GetMessage(),
-				"meta": fe.Meta,
+				"meta":    fe.Meta,
 			},
 		})
 		return
@@ -99,9 +99,9 @@ func GinError(c *gin.Context, err error) {
 		}
 		c.JSON(status, map[string]interface{}{
 			"error": map[string]interface{}{
-				"code": fe.Code,
+				"code":    fe.Code,
 				"message": fe.GetMessage(),
-				"meta": fe.Meta,
+				"meta":    fe.Meta,
 			},
 		})
 		return

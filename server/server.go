@@ -86,14 +86,12 @@ type Config struct {
 
 // Server is the fit.go HTTP server. It wraps net/http.Server and uses
 // gin.Engine for routing and middleware chains, plus lifecycle management.
-//
-// This is equivalent to the ServerConfig class.
 type Server struct {
-	mu sync.RWMutex
-	cfg Config
-	engine *gin.Engine
-	server *http.Server
-	logger *slog.Logger
+	mu              sync.RWMutex
+	cfg             Config
+	engine          *gin.Engine
+	server          *http.Server
+	logger          *slog.Logger
 	fallbackHandler http.Handler // used for single-type or internal-type root mounting
 
 	// App is the top-level http.Handler with all middleware applied.
@@ -126,7 +124,7 @@ func New(cfg Config) *Server {
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 	s := &Server{
-		cfg: cfg,
+		cfg:    cfg,
 		engine: engine,
 		Router: engine,
 		logger: cfg.Logger,
@@ -142,8 +140,6 @@ func New(cfg Config) *Server {
 //
 // requestMiddlewares are applied before route handlers.
 // responseMiddlewares are applied after route handlers (e.g. error handler).
-//
-// This is equivalent to ServerConfig.init().
 func (s *Server) Init(
 	routers map[ServerType]http.Handler,
 	requestMiddlewares []Middleware,
@@ -173,8 +169,8 @@ func (s *Server) Init(
 
 	// Request logging
 	root.Use(GinLogRequestResponse(LogRequestResponseConfig{
-		Logger: s.logger,
-		IncludeHeaders: coalesce(s.cfg.IncludeHeadersInLog, os.Getenv("INCLUDE_HEADERS_IN_LOG")),
+		Logger:          s.logger,
+		IncludeHeaders:  coalesce(s.cfg.IncludeHeadersInLog, os.Getenv("INCLUDE_HEADERS_IN_LOG")),
 		MetricsRecorder: s.cfg.MetricsRecorder,
 	}))
 
@@ -237,7 +233,6 @@ func (s *Server) Init(
 }
 
 // Start starts the HTTP server. It blocks until the server is shut down.
-// This is equivalent to ServerConfig.start().
 func (s *Server) Start() error {
 	s.mu.Lock()
 	port := s.cfg.Port
@@ -256,11 +251,11 @@ func (s *Server) Start() error {
 
 	addr := net.JoinHostPort("", port)
 	s.server = &http.Server{
-		Addr: addr,
-		Handler: s.App,
-		ReadTimeout: s.cfg.ReadTimeout,
+		Addr:         addr,
+		Handler:      s.App,
+		ReadTimeout:  s.cfg.ReadTimeout,
 		WriteTimeout: s.cfg.WriteTimeout,
-		IdleTimeout: s.cfg.IdleTimeout,
+		IdleTimeout:  s.cfg.IdleTimeout,
 	}
 	s.mu.Unlock()
 
@@ -272,8 +267,7 @@ func (s *Server) Start() error {
 	return err
 }
 
-// Shutdown gracefully shuts down the server. This is equivalent to
-// ServerConfig.shutdown().
+// Shutdown gracefully shuts down the server.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.RLock()
 	srv := s.server

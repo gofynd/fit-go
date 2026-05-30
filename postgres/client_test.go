@@ -47,10 +47,10 @@ func TestConnectionDiscovery(t *testing.T) {
 
 	t.Run("env regex matches correctly", func(t *testing.T) {
 		tests := []struct {
-			input string
-			shouldMatch bool
+			input           string
+			shouldMatch     bool
 			expectedService string
-			expectedType string
+			expectedType    string
 		}{
 			{"POSTGRES_CATALOG_READ_WRITE", true, "CATALOG", "WRITE"},
 			{"POSTGRES_USERS_READ_ONLY", true, "USERS", "ONLY"},
@@ -126,8 +126,8 @@ func TestApplyPoolSettings(t *testing.T) {
 		perService := map[string]ServicePoolOverrides{
 			"catalog": {
 				Write: &PoolOverrides{
-					MaxOpenConns: 100,
-					MaxIdleConns: 20,
+					MaxOpenConns:    100,
+					MaxIdleConns:    20,
 					ConnMaxIdleTime: 5 * time.Minute,
 					ConnMaxLifetime: 30 * time.Minute,
 				},
@@ -201,30 +201,30 @@ func TestTLSConfig(t *testing.T) {
 
 func TestParseURI(t *testing.T) {
 	tests := []struct {
-		name string
-		uri string
+		name     string
+		uri      string
 		wantHost string
 		wantPort string
-		wantDB string
+		wantDB   string
 		wantUser string
 		wantPass string
-		wantSSL string
+		wantSSL  string
 	}{
 		{
-			name: "postgres URI format",
-			uri: "postgres://user:pass@localhost:5432/mydb?sslmode=require",
+			name:     "postgres URI format",
+			uri:      "postgres://user:pass@localhost:5432/mydb?sslmode=require",
 			wantHost: "localhost",
 			wantPort: "5432",
-			wantDB: "mydb",
+			wantDB:   "mydb",
 			wantUser: "user",
 			wantPass: "pass",
-			wantSSL: "require",
+			wantSSL:  "require",
 		},
 		{
-			name: "postgresql scheme",
-			uri: "postgresql://user:pass@localhost/mydb",
+			name:     "postgresql scheme",
+			uri:      "postgresql://user:pass@localhost/mydb",
 			wantHost: "localhost",
-			wantDB: "mydb",
+			wantDB:   "mydb",
 			wantUser: "user",
 			wantPass: "pass",
 		},
@@ -279,14 +279,14 @@ func TestParseKeyValue(t *testing.T) {
 
 func TestDefaultPostgresDSN(t *testing.T) {
 	parsed := &ParsedURI{
-		Username: "user",
-		Password: "pass",
-		Host: "localhost",
-		Port: "5432",
-		Database: "mydb",
+		Username:        "user",
+		Password:        "pass",
+		Host:            "localhost",
+		Port:            "5432",
+		Database:        "mydb",
 		ApplicationName: "test-app",
-		SSLMode: "require",
-		Options: map[string]string{},
+		SSLMode:         "require",
+		Options:         map[string]string{},
 	}
 
 	dsn := DefaultPostgresDSN(parsed)
@@ -330,7 +330,7 @@ func TestClient_Services(t *testing.T) {
 	c := &Client{
 		services: map[string]*ServiceConnection{
 			"catalog": {Read: &sql.DB{}},
-			"users": {Write: &sql.DB{}},
+			"users":   {Write: &sql.DB{}},
 		},
 	}
 
@@ -424,7 +424,7 @@ func TestGetAppName(t *testing.T) {
 
 func TestGetDeploymentName(t *testing.T) {
 	tests := []struct {
-		podName string
+		podName  string
 		expected string
 	}{
 		{"catalog-service-dply-abc123", "catalog-service-dply"},

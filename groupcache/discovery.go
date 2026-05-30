@@ -36,7 +36,7 @@ type k8sEndpoints struct {
 
 type k8sSubset struct {
 	Addresses []k8sAddress `json:"addresses"`
-	Ports []k8sPort `json:"ports"`
+	Ports     []k8sPort    `json:"ports"`
 }
 
 type k8sAddress struct {
@@ -44,8 +44,8 @@ type k8sAddress struct {
 }
 
 type k8sPort struct {
-	Name string `json:"name"`
-	Port int `json:"port"`
+	Name     string `json:"name"`
+	Port     int    `json:"port"`
 	Protocol string `json:"protocol"`
 }
 

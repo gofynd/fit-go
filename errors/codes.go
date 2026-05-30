@@ -35,9 +35,9 @@ const (
 // builtinMessageCodes maps built-in intCodes to message IDs. Services may
 // extend this via ErrorRegistry.Init.
 var builtinMessageCodes = map[int]int{
-	UNCAUGHT_EXCEPTION: 1,
+	UNCAUGHT_EXCEPTION:                    1,
 	APPLICATION_HEADER_JSON_PARSE_FAILURE: 2,
-	USER_HEADER_JSON_PARSE_FAILURE: 2,
+	USER_HEADER_JSON_PARSE_FAILURE:        2,
 }
 
 // builtinMessagesEN provides default English messages keyed by message ID.

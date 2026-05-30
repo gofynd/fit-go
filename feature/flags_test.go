@@ -144,12 +144,12 @@ func TestInit_ServerError(t *testing.T) {
 func TestClient_IsEnabled(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"bool_true": true,
-			"bool_false": false,
-			"string_true": "true",
+			"bool_true":    true,
+			"bool_false":   false,
+			"string_true":  "true",
 			"string_false": "false",
-			"number_one": float64(1),
-			"number_zero": float64(0),
+			"number_one":   float64(1),
+			"number_zero":  float64(0),
 			"string_value": "some_value",
 		})
 	}))
@@ -171,7 +171,7 @@ func TestClient_IsEnabled(t *testing.T) {
 	defer client.Stop()
 
 	tests := []struct {
-		key string
+		key      string
 		expected bool
 	}{
 		{"bool_true", true},
@@ -207,8 +207,8 @@ func TestClient_IsEnabled_NilClient(t *testing.T) {
 func TestClient_GetValue(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"string": "hello",
-			"number": 42.5,
+			"string":  "hello",
+			"number":  42.5,
 			"boolean": true,
 		})
 	}))

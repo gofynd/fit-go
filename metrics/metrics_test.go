@@ -70,7 +70,7 @@ func TestRegistryNew(t *testing.T) {
 	t.Run("with deployment name", func(t *testing.T) {
 		registry, _ := New(Options{
 			DeploymentName: "test-deployment",
-			ServerEnabled: true,
+			ServerEnabled:  true,
 		})
 		if registry.deploymentName != "test-deployment" {
 			t.Errorf("DeploymentName = %q, want test-deployment", registry.deploymentName)
@@ -95,10 +95,10 @@ func TestRegistryNew(t *testing.T) {
 		// Verify the histogram was created (we can't inspect buckets directly,
 		// but we can verify the histogram works by observing).
 		registry.RecordServerMetrics(ServerMetrics{
-			Method: "GET",
-			Route: "/test",
+			Method:     "GET",
+			Route:      "/test",
 			StatusCode: 200,
-			Duration: 10 * time.Millisecond,
+			Duration:   10 * time.Millisecond,
 		})
 		output := registry.GetMetricsOutput()
 		if !strings.Contains(output, "fit_http_request_duration_ms") {
@@ -109,7 +109,7 @@ func TestRegistryNew(t *testing.T) {
 	t.Run("custom prometheus registry", func(t *testing.T) {
 		promReg := prometheus.NewRegistry()
 		registry, err := New(Options{
-			ServerEnabled: true,
+			ServerEnabled:      true,
 			PrometheusRegistry: promReg,
 		})
 		if err != nil {
@@ -127,15 +127,15 @@ func TestRegistryNew(t *testing.T) {
 
 func TestRecordServerMetrics(t *testing.T) {
 	registry, _ := New(Options{
-		ServerEnabled: true,
+		ServerEnabled:  true,
 		DeploymentName: "test",
 	})
 
 	registry.RecordServerMetrics(ServerMetrics{
-		Method: "GET",
-		Route: "/api/users",
+		Method:     "GET",
+		Route:      "/api/users",
 		StatusCode: 200,
-		Duration: 100 * time.Millisecond,
+		Duration:   100 * time.Millisecond,
 	})
 
 	output := registry.GetMetricsOutput()
@@ -163,10 +163,10 @@ func TestRecordServerMetrics_Disabled(t *testing.T) {
 	registry, _ := New(Options{ServerEnabled: false})
 	// Should not panic when disabled.
 	registry.RecordServerMetrics(ServerMetrics{
-		Method: "GET",
-		Route: "/api/users",
+		Method:     "GET",
+		Route:      "/api/users",
 		StatusCode: 200,
-		Duration: 100 * time.Millisecond,
+		Duration:   100 * time.Millisecond,
 	})
 }
 
@@ -183,14 +183,14 @@ func TestRecordServerMetrics_NilRegistry(t *testing.T) {
 func TestRecordHTTPClientMetrics(t *testing.T) {
 	registry, _ := New(Options{
 		HTTPClientEnabled: true,
-		DeploymentName: "test",
+		DeploymentName:    "test",
 	})
 
 	registry.RecordHTTPClientMetrics(HTTPClientMetrics{
-		Method: "POST",
-		Host: "api.example.com",
+		Method:     "POST",
+		Host:       "api.example.com",
 		StatusCode: 201,
-		Duration: 250 * time.Millisecond,
+		Duration:   250 * time.Millisecond,
 	})
 
 	output := registry.GetMetricsOutput()
@@ -209,10 +209,10 @@ func TestRecordHTTPClientMetrics_Disabled(t *testing.T) {
 	registry, _ := New(Options{HTTPClientEnabled: false})
 	// Should not panic when disabled.
 	registry.RecordHTTPClientMetrics(HTTPClientMetrics{
-		Method: "GET",
-		Host: "api.example.com",
+		Method:     "GET",
+		Host:       "api.example.com",
 		StatusCode: 200,
-		Duration: 100 * time.Millisecond,
+		Duration:   100 * time.Millisecond,
 	})
 }
 
@@ -229,22 +229,22 @@ func TestRecordHTTPClientMetrics_NilRegistry(t *testing.T) {
 func TestMetricsOutput(t *testing.T) {
 	t.Run("both enabled with observations", func(t *testing.T) {
 		registry, _ := New(Options{
-			ServerEnabled: true,
+			ServerEnabled:     true,
 			HTTPClientEnabled: true,
-			DeploymentName: "test",
+			DeploymentName:    "test",
 		})
 
 		registry.RecordServerMetrics(ServerMetrics{
-			Method: "GET",
-			Route: "/api",
+			Method:     "GET",
+			Route:      "/api",
 			StatusCode: 200,
-			Duration: 50 * time.Millisecond,
+			Duration:   50 * time.Millisecond,
 		})
 		registry.RecordHTTPClientMetrics(HTTPClientMetrics{
-			Method: "POST",
-			Host: "example.com",
+			Method:     "POST",
+			Host:       "example.com",
 			StatusCode: 200,
-			Duration: 100 * time.Millisecond,
+			Duration:   100 * time.Millisecond,
 		})
 
 		output := registry.GetMetricsOutput()
@@ -285,15 +285,15 @@ func TestMetricsOutput(t *testing.T) {
 
 func TestHandler(t *testing.T) {
 	registry, _ := New(Options{
-		ServerEnabled: true,
+		ServerEnabled:  true,
 		DeploymentName: "test",
 	})
 
 	registry.RecordServerMetrics(ServerMetrics{
-		Method: "GET",
-		Route: "/health",
+		Method:     "GET",
+		Route:      "/health",
 		StatusCode: 200,
-		Duration: 5 * time.Millisecond,
+		Duration:   5 * time.Millisecond,
 	})
 
 	handler := registry.Handler()
@@ -329,7 +329,7 @@ func TestHandler_NilRegistry(t *testing.T) {
 
 func TestParseBuckets(t *testing.T) {
 	tests := []struct {
-		input string
+		input    string
 		expected []float64
 	}{
 		{"1,5,10", []float64{1, 5, 10}},
@@ -362,7 +362,7 @@ func TestParseBuckets(t *testing.T) {
 
 func TestShutdown(t *testing.T) {
 	registry, _ := New(Options{
-		ServerEnabled: true,
+		ServerEnabled:     true,
 		HTTPClientEnabled: true,
 	})
 
@@ -435,16 +435,16 @@ func TestShouldRecord(t *testing.T) {
 
 func TestMultipleObservations(t *testing.T) {
 	registry, _ := New(Options{
-		ServerEnabled: true,
+		ServerEnabled:  true,
 		DeploymentName: "test",
 	})
 
 	for i := 0; i < 10; i++ {
 		registry.RecordServerMetrics(ServerMetrics{
-			Method: "GET",
-			Route: "/api",
+			Method:     "GET",
+			Route:      "/api",
 			StatusCode: 200,
-			Duration: time.Duration(i*10) * time.Millisecond,
+			Duration:   time.Duration(i*10) * time.Millisecond,
 		})
 	}
 

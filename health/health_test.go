@@ -258,7 +258,7 @@ func TestShouldSkip(t *testing.T) {
 	defer os.Unsetenv(key)
 
 	tests := []struct {
-		value string
+		value    string
 		expected bool
 	}{
 		{"true", true},

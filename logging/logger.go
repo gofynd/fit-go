@@ -61,16 +61,16 @@ const (
 
 var levelNames = map[Level]string{
 	LevelDebug: "debug",
-	LevelInfo: "info",
-	LevelWarn: "warn",
+	LevelInfo:  "info",
+	LevelWarn:  "warn",
 	LevelError: "error",
 	LevelFatal: "fatal",
 }
 
 var levelFromString = map[string]Level{
 	"debug": LevelDebug,
-	"info": LevelInfo,
-	"warn": LevelWarn,
+	"info":  LevelInfo,
+	"warn":  LevelWarn,
 	"error": LevelError,
 	"fatal": LevelFatal,
 }
@@ -133,29 +133,29 @@ type Options struct {
 
 // entry is a single structured log record serialized as JSON.
 type entry struct {
-	Level string `json:"level"`
-	Message string `json:"message"`
-	Timestamp string `json:"timestamp"`
-	Service string `json:"service,omitempty"`
-	TraceID string `json:"trace_id,omitempty"`
-	SpanID string `json:"span_id,omitempty"`
-	Caller string `json:"caller,omitempty"`
-	Extra map[string]interface{} `json:"extra,omitempty"`
+	Level     string                 `json:"level"`
+	Message   string                 `json:"message"`
+	Timestamp string                 `json:"timestamp"`
+	Service   string                 `json:"service,omitempty"`
+	TraceID   string                 `json:"trace_id,omitempty"`
+	SpanID    string                 `json:"span_id,omitempty"`
+	Caller    string                 `json:"caller,omitempty"`
+	Extra     map[string]interface{} `json:"extra,omitempty"`
 }
 
 // Logger is a structured, thread-safe JSON logger. It is the Go equivalent
 // of the Winston logger created tracing/index.ts.
 type Logger struct {
-	mu sync.Mutex
-	level Level
-	loc *time.Location
-	env string
-	service string
-	out io.Writer
+	mu       sync.Mutex
+	level    Level
+	loc      *time.Location
+	env      string
+	service  string
+	out      io.Writer
 	colorize bool
-	fields map[string]interface{} // persistent fields added via WithFields
-	traceID string // bound trace context (via WithContext)
-	spanID string
+	fields   map[string]interface{} // persistent fields added via WithFields
+	traceID  string                 // bound trace context (via WithContext)
+	spanID   string
 }
 
 // New creates a Logger from the given Options. It loads the timezone,
@@ -202,11 +202,11 @@ func New(opts Options) (*Logger, error) {
 	}
 
 	return &Logger{
-		level: ParseLevel(opts.Level),
-		loc: loc,
-		env: opts.Env,
-		service: opts.Service,
-		out: w,
+		level:    ParseLevel(opts.Level),
+		loc:      loc,
+		env:      opts.Env,
+		service:  opts.Service,
+		out:      w,
 		colorize: !isProd,
 	}, nil
 }
@@ -215,14 +215,14 @@ func New(opts Options) (*Logger, error) {
 // deep-copied fields map so that derived loggers are independent.
 func (l *Logger) clone() *Logger {
 	c := &Logger{
-		level: l.level,
-		loc: l.loc,
-		env: l.env,
-		service: l.service,
-		out: l.out,
+		level:    l.level,
+		loc:      l.loc,
+		env:      l.env,
+		service:  l.service,
+		out:      l.out,
 		colorize: l.colorize,
-		traceID: l.traceID,
-		spanID: l.spanID,
+		traceID:  l.traceID,
+		spanID:   l.spanID,
 	}
 	if len(l.fields) > 0 {
 		c.fields = make(map[string]interface{}, len(l.fields))
@@ -310,18 +310,18 @@ func (l *Logger) Fatal(msg string, kvs ...interface{}) {
 
 // ANSI colour codes used only in non-production (development) mode.
 const (
-	colorReset = "\033[0m"
-	colorRed = "\033[31m"
-	colorGreen = "\033[32m"
+	colorReset  = "\033[0m"
+	colorRed    = "\033[31m"
+	colorGreen  = "\033[32m"
 	colorYellow = "\033[33m"
-	colorBlue = "\033[34m"
+	colorBlue   = "\033[34m"
 	colorPurple = "\033[35m"
 )
 
 var levelColor = map[Level]string{
 	LevelDebug: colorBlue,
-	LevelInfo: colorGreen,
-	LevelWarn: colorYellow,
+	LevelInfo:  colorGreen,
+	LevelWarn:  colorYellow,
 	LevelError: colorRed,
 	LevelFatal: colorPurple,
 }
@@ -340,12 +340,12 @@ func (l *Logger) log(lvl Level, msg string, kvs []interface{}) {
 	now := time.Now().In(l.loc)
 
 	e := entry{
-		Level: lvl.String(),
-		Message: msg,
+		Level:     lvl.String(),
+		Message:   msg,
 		Timestamp: now.Format(time.RFC3339Nano),
-		Service: l.service,
-		TraceID: l.traceID,
-		SpanID: l.spanID,
+		Service:   l.service,
+		TraceID:   l.traceID,
+		SpanID:    l.spanID,
 	}
 
 	// Merge persistent fields and per-call key-value pairs into Extra.

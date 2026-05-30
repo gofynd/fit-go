@@ -45,7 +45,7 @@ import (
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
 
-	fithealth "github.com/fynd/commerce/fit/health"
+	fithealth "github.com/gofynd/fit-go/health"
 )
 
 // ---------------------------------------------------------------------------
@@ -107,7 +107,7 @@ type CallInfo struct {
 
 // RPCError represents a gRPC error response.
 type RPCError struct {
-	Code StatusCode
+	Code    StatusCode
 	Message string
 }
 
@@ -255,8 +255,8 @@ type MethodSchema struct {
 
 // Server manages a gRPC server instance.
 type Server struct {
-	mu sync.Mutex
-	cfg Config
+	mu     sync.Mutex
+	cfg    Config
 	logger *slog.Logger
 
 	// grpcServer is the real gRPC server instance.
@@ -290,7 +290,6 @@ type Server struct {
 // Init initializes a new gRPC server with the given configuration.
 // It validates the config, verifies proto file existence, and optionally
 // loads the response type schema.
-//
 func Init(cfg Config) (*Server, error) {
 	if err := cfg.defaults(); err != nil {
 		return nil, err
@@ -308,8 +307,8 @@ func Init(cfg Config) (*Server, error) {
 	grpcServer := grpc.NewServer(
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			MaxConnectionIdle: cfg.IdleTimeout,
-			Time: cfg.KeepaliveInterval,
-			Timeout: cfg.KeepaliveTimeout,
+			Time:              cfg.KeepaliveInterval,
+			Timeout:           cfg.KeepaliveTimeout,
 		}),
 	)
 
@@ -322,14 +321,14 @@ func Init(cfg Config) (*Server, error) {
 	reflection.Register(grpcServer)
 
 	s := &Server{
-		cfg: cfg,
-		logger: cfg.Logger,
-		grpcServer: grpcServer,
-		healthServer: healthServer,
-		services: make(map[string]ServiceImplementation),
-		protoPath: protoPath,
+		cfg:           cfg,
+		logger:        cfg.Logger,
+		grpcServer:    grpcServer,
+		healthServer:  healthServer,
+		services:      make(map[string]ServiceImplementation),
+		protoPath:     protoPath,
 		healthChecker: cfg.HealthChecker,
-		done: make(chan struct{}),
+		done:          make(chan struct{}),
 	}
 
 	// Attempt to load response type schema (optional, used for validation).
@@ -461,7 +460,7 @@ func (s *Server) executeChain(chain []HandlerFunc, call *CallInfo, callback Call
 						"error", fmt.Sprintf("%v", r),
 					)
 					callback(&RPCError{
-						Code: Internal,
+						Code:    Internal,
 						Message: fmt.Sprintf("%v", r),
 					}, nil)
 				}

@@ -38,7 +38,7 @@ func TestNewManager(t *testing.T) {
 func TestManager_Init_InlineKeys(t *testing.T) {
 	// Generate valid test keys
 	dek := make([]byte, 32) // AES-256 requires 32 bytes
-	iv := make([]byte, 12) // GCM nonce is 12 bytes
+	iv := make([]byte, 12)  // GCM nonce is 12 bytes
 	for i := range dek {
 		dek[i] = byte(i)
 	}
@@ -566,9 +566,9 @@ func TestVaultProvider_ValidateEnv_Missing(t *testing.T) {
 
 func TestSplitPath(t *testing.T) {
 	tests := []struct {
-		path string
+		path   string
 		prefix string
-		name string
+		name   string
 	}{
 		{"transit/keys/mykey", "transit/keys", "mykey"},
 		{"simple", "", "simple"},

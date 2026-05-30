@@ -21,7 +21,7 @@ import (
 	"time"
 
 	ckafka "github.com/confluentinc/confluent-kafka-go/v2/kafka"
-	"github.com/fynd/commerce/fit/logging"
+	"github.com/gofynd/fit-go/logging"
 )
 
 // ---------------------------------------------------------------------------
@@ -31,8 +31,8 @@ import (
 func TestNewConfluentClient_Config(t *testing.T) {
 	t.Run("basic config", func(t *testing.T) {
 		cfg := &Config{
-			Brokers: []string{"broker1:9092", "broker2:9092"},
-			ClientID: "test-service-client",
+			Brokers:     []string{"broker1:9092", "broker2:9092"},
+			ClientID:    "test-service-client",
 			Compression: CompressionLZ4,
 		}
 
@@ -95,7 +95,7 @@ func TestNewConfluentClient_Config(t *testing.T) {
 
 	t.Run("closed client rejects producer", func(t *testing.T) {
 		cfg := &Config{
-			Brokers: []string{"broker:9092"},
+			Brokers:  []string{"broker:9092"},
 			ClientID: "test",
 		}
 		client, err := NewConfluentClient(cfg)
@@ -113,7 +113,7 @@ func TestNewConfluentClient_Config(t *testing.T) {
 
 	t.Run("closed client rejects consumer", func(t *testing.T) {
 		cfg := &Config{
-			Brokers: []string{"broker:9092"},
+			Brokers:  []string{"broker:9092"},
 			ClientID: "test",
 		}
 		client, err := NewConfluentClient(cfg)
@@ -233,7 +233,7 @@ func TestConfluentClient_ConfigFromEnv(t *testing.T) {
 func TestConfluentProducer_MessageMapping(t *testing.T) {
 	t.Run("basic message", func(t *testing.T) {
 		msg := Message{
-			Key: []byte("partition-key"),
+			Key:   []byte("partition-key"),
 			Value: []byte(`{"order_id": "12345"}`),
 		}
 
@@ -278,7 +278,7 @@ func TestConfluentProducer_MessageMapping(t *testing.T) {
 	t.Run("message with timestamp", func(t *testing.T) {
 		ts := time.Date(2026, 4, 11, 10, 30, 0, 0, time.UTC)
 		msg := Message{
-			Value: []byte("payload"),
+			Value:     []byte("payload"),
 			Timestamp: ts,
 		}
 
@@ -291,7 +291,7 @@ func TestConfluentProducer_MessageMapping(t *testing.T) {
 
 	t.Run("message with explicit partition", func(t *testing.T) {
 		msg := Message{
-			Value: []byte("payload"),
+			Value:     []byte("payload"),
 			Partition: 3,
 		}
 
@@ -328,7 +328,7 @@ func TestConfluentProducer_MessageMapping(t *testing.T) {
 
 	t.Run("message with default partition is PartitionAny", func(t *testing.T) {
 		msg := Message{
-			Value: []byte("payload"),
+			Value:     []byte("payload"),
 			Partition: -1,
 		}
 
@@ -349,7 +349,7 @@ func TestConfluentProducer_MessageMapping(t *testing.T) {
 func TestConfluentConsumer_TopicConfig(t *testing.T) {
 	t.Run("consumer requires group ID", func(t *testing.T) {
 		cfg := &Config{
-			Brokers: []string{"broker:9092"},
+			Brokers:  []string{"broker:9092"},
 			ClientID: "test",
 		}
 		client, err := NewConfluentClient(cfg)
@@ -365,7 +365,7 @@ func TestConfluentConsumer_TopicConfig(t *testing.T) {
 
 	t.Run("consumer config mapping", func(t *testing.T) {
 		cfg := &Config{
-			Brokers: []string{"broker:9092"},
+			Brokers:  []string{"broker:9092"},
 			ClientID: "test",
 		}
 		client, err := NewConfluentClient(cfg)
@@ -374,16 +374,16 @@ func TestConfluentConsumer_TopicConfig(t *testing.T) {
 		}
 
 		consumerCfg := ConsumerConfig{
-			GroupID: "test-group",
-			SessionTimeout: 45 * time.Second,
-			HeartbeatInterval: 5 * time.Second,
-			RebalanceTimeout: 120 * time.Second,
+			GroupID:              "test-group",
+			SessionTimeout:       45 * time.Second,
+			HeartbeatInterval:    5 * time.Second,
+			RebalanceTimeout:     120 * time.Second,
 			MaxBytesPerPartition: 2 << 20, // 2 MB
-			MinBytes: 512,
-			MaxBytes: 20 << 20, // 20 MB
-			MaxWaitTime: 10 * time.Second,
-			AutoCommit: true,
-			AutoCommitInterval: 10 * time.Second,
+			MinBytes:             512,
+			MaxBytes:             20 << 20, // 20 MB
+			MaxWaitTime:          10 * time.Second,
+			AutoCommit:           true,
+			AutoCommitInterval:   10 * time.Second,
 		}
 
 		consumer, err := client.Consumer(consumerCfg)
@@ -454,8 +454,8 @@ func TestConfluentConsumer_TopicConfig(t *testing.T) {
 
 func TestSASLMechanisms(t *testing.T) {
 	tests := []struct {
-		name string
-		input string
+		name     string
+		input    string
 		expected string
 	}{
 		{"PLAIN", "PLAIN", "PLAIN"},
@@ -478,12 +478,12 @@ func TestSASLMechanisms(t *testing.T) {
 	// Test that SCRAM mechanisms build correct config.
 	t.Run("SCRAM-SHA-256 builds config", func(t *testing.T) {
 		cfg := &Config{
-			Brokers: []string{"broker:9092"},
+			Brokers:  []string{"broker:9092"},
 			ClientID: "test",
 			SASL: &SASLConfig{
 				Mechanism: "SCRAM-SHA-256",
-				Username: "user",
-				Password: "pass",
+				Username:  "user",
+				Password:  "pass",
 			},
 		}
 
@@ -515,12 +515,12 @@ func TestSASLMechanisms(t *testing.T) {
 
 	t.Run("SCRAM-SHA-512 builds config", func(t *testing.T) {
 		cfg := &Config{
-			Brokers: []string{"broker:9092"},
+			Brokers:  []string{"broker:9092"},
 			ClientID: "test",
 			SASL: &SASLConfig{
 				Mechanism: "SCRAM-SHA-512",
-				Username: "user",
-				Password: "pass",
+				Username:  "user",
+				Password:  "pass",
 			},
 		}
 
@@ -537,12 +537,12 @@ func TestSASLMechanisms(t *testing.T) {
 
 	t.Run("PLAIN mechanism", func(t *testing.T) {
 		cfg := &Config{
-			Brokers: []string{"broker:9092"},
+			Brokers:  []string{"broker:9092"},
 			ClientID: "test",
 			SASL: &SASLConfig{
 				Mechanism: "PLAIN",
-				Username: "user",
-				Password: "pass",
+				Username:  "user",
+				Password:  "pass",
 			},
 		}
 
@@ -565,7 +565,7 @@ func TestSASLMechanisms(t *testing.T) {
 func TestTLSConfigBuilding(t *testing.T) {
 	t.Run("no TLS config", func(t *testing.T) {
 		cfg := &Config{
-			Brokers: []string{"broker:9092"},
+			Brokers:  []string{"broker:9092"},
 			ClientID: "test",
 		}
 
@@ -582,9 +582,9 @@ func TestTLSConfigBuilding(t *testing.T) {
 
 	t.Run("TLS config sets SSL protocol", func(t *testing.T) {
 		cfg := &Config{
-			Brokers: []string{"broker:9092"},
+			Brokers:  []string{"broker:9092"},
 			ClientID: "test",
-			TLS: &TLSConfig{},
+			TLS:      &TLSConfig{},
 		}
 
 		cm, err := buildConfluentConfig(cfg)
@@ -605,12 +605,12 @@ func TestTLSConfigBuilding(t *testing.T) {
 
 	t.Run("TLS with cert paths", func(t *testing.T) {
 		cfg := &Config{
-			Brokers: []string{"broker:9092"},
+			Brokers:  []string{"broker:9092"},
 			ClientID: "test",
 			TLS: &TLSConfig{
-				CAFile: "/path/to/ca.pem",
+				CAFile:   "/path/to/ca.pem",
 				CertFile: "/path/to/cert.pem",
-				KeyFile: "/path/to/key.pem",
+				KeyFile:  "/path/to/key.pem",
 			},
 		}
 
@@ -637,12 +637,12 @@ func TestTLSConfigBuilding(t *testing.T) {
 
 	t.Run("SASL + TLS sets SASL_SSL protocol", func(t *testing.T) {
 		cfg := &Config{
-			Brokers: []string{"broker:9092"},
+			Brokers:  []string{"broker:9092"},
 			ClientID: "test",
 			SASL: &SASLConfig{
 				Mechanism: "PLAIN",
-				Username: "user",
-				Password: "pass",
+				Username:  "user",
+				Password:  "pass",
 			},
 			TLS: &TLSConfig{
 				CAFile: "/path/to/ca.pem",
@@ -667,8 +667,8 @@ func TestTLSConfigBuilding(t *testing.T) {
 
 func TestCompressionCodecMapping(t *testing.T) {
 	tests := []struct {
-		name string
-		fit CompressionType
+		name     string
+		fit      CompressionType
 		expected string
 	}{
 		{"None", CompressionNone, "none"},
@@ -698,12 +698,12 @@ func TestConfluentPayloadMapping(t *testing.T) {
 		topic := "orders"
 		msg := &ckafka.Message{
 			TopicPartition: ckafka.TopicPartition{
-				Topic: &topic,
+				Topic:     &topic,
 				Partition: 2,
-				Offset: 42,
+				Offset:    42,
 			},
-			Key: []byte("order-123"),
-			Value: []byte(`{"status":"confirmed"}`),
+			Key:       []byte("order-123"),
+			Value:     []byte(`{"status":"confirmed"}`),
 			Timestamp: ts,
 			Headers: []ckafka.Header{
 				{Key: "trace-id", Value: []byte("abc-123")},
@@ -746,9 +746,9 @@ func TestConfluentPayloadMapping(t *testing.T) {
 		topic := "events"
 		msg := &ckafka.Message{
 			TopicPartition: ckafka.TopicPartition{
-				Topic: &topic,
+				Topic:     &topic,
 				Partition: 0,
-				Offset: 1,
+				Offset:    1,
 			},
 			Value: []byte("data"),
 		}
@@ -763,9 +763,9 @@ func TestConfluentPayloadMapping(t *testing.T) {
 	t.Run("message with nil topic", func(t *testing.T) {
 		msg := &ckafka.Message{
 			TopicPartition: ckafka.TopicPartition{
-				Topic: nil,
+				Topic:     nil,
 				Partition: 0,
-				Offset: 1,
+				Offset:    1,
 			},
 			Value: []byte("data"),
 		}
@@ -784,8 +784,8 @@ func TestConfluentPayloadMapping(t *testing.T) {
 
 func TestProducerConfigOverrides(t *testing.T) {
 	cfg := &Config{
-		Brokers: []string{"broker:9092"},
-		ClientID: "test",
+		Brokers:     []string{"broker:9092"},
+		ClientID:    "test",
 		Compression: CompressionLZ4,
 	}
 	client, err := NewConfluentClient(cfg)
@@ -863,8 +863,8 @@ func TestProducerConfigOverrides(t *testing.T) {
 
 	t.Run("producer with timeout and retry settings", func(t *testing.T) {
 		producer, err := client.Producer(ProducerConfig{
-			Timeout: 15 * time.Second,
-			MaxRetries: 5,
+			Timeout:      15 * time.Second,
+			MaxRetries:   5,
 			RetryBackoff: 500 * time.Millisecond,
 		})
 		if err != nil {
@@ -892,7 +892,7 @@ func TestProducerConfigOverrides(t *testing.T) {
 		// Create a producer with overrides.
 		_, err := client.Producer(ProducerConfig{
 			Compression: CompressionGZIP,
-			Acks: 1,
+			Acks:        1,
 		})
 		if err != nil {
 			t.Fatalf("Producer() error = %v", err)
@@ -925,10 +925,10 @@ func TestResolveAutoCommit(t *testing.T) {
 	boolPtr := func(v bool) *bool { return &v }
 
 	tests := []struct {
-		name string
+		name          string
 		configDefault bool
-		override *bool
-		expected bool
+		override      *bool
+		expected      bool
 	}{
 		{"default true, no override", true, nil, true},
 		{"default false, no override", false, nil, false},
@@ -953,8 +953,8 @@ func TestResolveAutoCommit(t *testing.T) {
 
 func TestSecurityProtocol(t *testing.T) {
 	tests := []struct {
-		name string
-		cfg *Config
+		name     string
+		cfg      *Config
 		expected string
 	}{
 		{
@@ -966,7 +966,7 @@ func TestSecurityProtocol(t *testing.T) {
 			"SASL only",
 			&Config{
 				Brokers: []string{"b:9092"},
-				SASL: &SASLConfig{Mechanism: "PLAIN", Username: "u", Password: "p"},
+				SASL:    &SASLConfig{Mechanism: "PLAIN", Username: "u", Password: "p"},
 			},
 			"SASL_PLAINTEXT",
 		},
@@ -974,7 +974,7 @@ func TestSecurityProtocol(t *testing.T) {
 			"TLS only",
 			&Config{
 				Brokers: []string{"b:9092"},
-				TLS: &TLSConfig{},
+				TLS:     &TLSConfig{},
 			},
 			"SSL",
 		},
@@ -982,8 +982,8 @@ func TestSecurityProtocol(t *testing.T) {
 			"SASL + TLS",
 			&Config{
 				Brokers: []string{"b:9092"},
-				SASL: &SASLConfig{Mechanism: "PLAIN", Username: "u", Password: "p"},
-				TLS: &TLSConfig{},
+				SASL:    &SASLConfig{Mechanism: "PLAIN", Username: "u", Password: "p"},
+				TLS:     &TLSConfig{},
 			},
 			"SASL_SSL",
 		},
@@ -1021,7 +1021,7 @@ func TestInitDefault(t *testing.T) {
 
 	t.Run("valid config creates client with driver", func(t *testing.T) {
 		cfg := &Config{
-			Brokers: []string{"broker:9092"},
+			Brokers:  []string{"broker:9092"},
 			ClientID: "test-init",
 		}
 
@@ -1050,7 +1050,7 @@ func TestInitDefault(t *testing.T) {
 
 func TestConfluentProducer_NotConnected(t *testing.T) {
 	cfg := &Config{
-		Brokers: []string{"broker:9092"},
+		Brokers:  []string{"broker:9092"},
 		ClientID: "test",
 	}
 	client, err := NewConfluentClient(cfg)
@@ -1084,7 +1084,7 @@ func TestConfluentProducer_NotConnected(t *testing.T) {
 
 func TestConfluentConsumer_NotConnected(t *testing.T) {
 	cfg := &Config{
-		Brokers: []string{"broker:9092"},
+		Brokers:  []string{"broker:9092"},
 		ClientID: "test",
 	}
 	client, err := NewConfluentClient(cfg)
@@ -1132,7 +1132,7 @@ func TestConfluentProducer_CloseIdempotent(t *testing.T) {
 func TestConfluentConsumer_CloseIdempotent(t *testing.T) {
 	cc := &ConfluentConsumer{
 		groupID: "test",
-		logger: mustLogger(),
+		logger:  mustLogger(),
 	}
 
 	// Close without connect should be safe.
@@ -1152,7 +1152,7 @@ func TestConfluentConsumer_CloseIdempotent(t *testing.T) {
 
 func TestConfluentClient_CloseIdempotent(t *testing.T) {
 	cfg := &Config{
-		Brokers: []string{"broker:9092"},
+		Brokers:  []string{"broker:9092"},
 		ClientID: "test",
 	}
 	client, err := NewConfluentClient(cfg)
@@ -1175,8 +1175,8 @@ func TestConfluentClient_CloseIdempotent(t *testing.T) {
 func TestCloneConfigMap(t *testing.T) {
 	original := &ckafka.ConfigMap{
 		"bootstrap.servers": "broker:9092",
-		"client.id": "test",
-		"acks": "all",
+		"client.id":         "test",
+		"acks":              "all",
 	}
 
 	clone := cloneConfigMap(original)

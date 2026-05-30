@@ -27,45 +27,45 @@ import (
 // securityPatterns holds compiled regular expressions for detecting security
 // threats in input strings.
 var securityPatterns = struct {
-	InvisibleChars *regexp.Regexp
-	HTMLTags *regexp.Regexp
-	HTMLEntities *regexp.Regexp
-	ScriptTags *regexp.Regexp
-	SQLInjection *regexp.Regexp
-	NoSQLInjection *regexp.Regexp
-	CommandInjection *regexp.Regexp
-	LDAPInjection *regexp.Regexp
-	XXEInjection *regexp.Regexp
-	PathTraversal *regexp.Regexp
-	XSSEvents *regexp.Regexp
+	InvisibleChars      *regexp.Regexp
+	HTMLTags            *regexp.Regexp
+	HTMLEntities        *regexp.Regexp
+	ScriptTags          *regexp.Regexp
+	SQLInjection        *regexp.Regexp
+	NoSQLInjection      *regexp.Regexp
+	CommandInjection    *regexp.Regexp
+	LDAPInjection       *regexp.Regexp
+	XXEInjection        *regexp.Regexp
+	PathTraversal       *regexp.Regexp
+	XSSEvents           *regexp.Regexp
 	JavaScriptExecution *regexp.Regexp
-	ControlChars *regexp.Regexp
-	NullBytes *regexp.Regexp
-	DangerousProtocols *regexp.Regexp
-	XSSVectors *regexp.Regexp
-	CSSInjection *regexp.Regexp
-	TemplateInjection *regexp.Regexp
-	SSIInjection *regexp.Regexp
+	ControlChars        *regexp.Regexp
+	NullBytes           *regexp.Regexp
+	DangerousProtocols  *regexp.Regexp
+	XSSVectors          *regexp.Regexp
+	CSSInjection        *regexp.Regexp
+	TemplateInjection   *regexp.Regexp
+	SSIInjection        *regexp.Regexp
 }{
-	InvisibleChars: regexp.MustCompile("[\u200B\u200C\u200D\u2063\uFEFF\u3164\uFFA0\u115F\u1160\u061C\u180E\u2000-\u200F\u2028-\u202F\u205F-\u206F]"),
-	HTMLTags: regexp.MustCompile(`<[^>]*>`),
-	HTMLEntities: regexp.MustCompile(`(?i)&(?:#(?:\d+|x[0-9a-fA-F]+)|[a-zA-Z0-9]+);`),
-	ScriptTags: regexp.MustCompile(`(?is)<\s*script[^>]*>.*?<\s*/\s*script\s*>`),
-	SQLInjection: regexp.MustCompile(`(?i)(\b(?:SELECT|INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|EXEC|UNION|TRUNCATE|GRANT|REVOKE)\b\s+\w+|--|\'\s*OR\s+|\'\s*UNION\s+|\'\s*;|\|\||\bOR\b\s+\d+\s*=\s*\d+|\bUNION\b\s+(?:ALL\s+)?SELECT|\bINTO\b\s+(?:OUTFILE|DUMPFILE))`),
-	NoSQLInjection: regexp.MustCompile(`(?i)(\$ne|\$gt|\$lt|\$gte|\$lte|\$in|\$nin|\$and|\$or|\$not|\$where|\$regex|\$options|\$elemMatch|\$size|\$exists|\$type|\$mod|\$all)`),
-	CommandInjection: regexp.MustCompile(`(?i)(;\s*(?:rm|cat|ls|pwd|whoami|ps|mv|cp|chmod|chown|curl|wget|netcat|nc)\b|\|\s*(?:rm|cat|ls|pwd|whoami|ps|mv|cp|chmod|chown|curl|wget|netcat|nc)\b|&&\s*(?:rm|cat|ls|pwd|whoami|ps|mv|cp|chmod|chown|curl|wget|netcat|nc)\b|\$\(|` + "`" + `.*` + "`" + `|%0a|%0d)`),
-	LDAPInjection: regexp.MustCompile(`(?i)(\*\)|(\|\()|(\&\()|(\!\()|(\(\|)|(\(\&)|(\(\!)|(objectClass=)|(cn=)|(uid=)|(ou=)|(dc=))`),
-	XXEInjection: regexp.MustCompile(`(?i)(<!ENTITY|<!DOCTYPE|SYSTEM|PUBLIC|CDATA|\[CDATA\[)`),
-	PathTraversal: regexp.MustCompile(`(?i)(\.\.\/|\.\.\\|%2e%2e%2f|%2e%2e%5c|%252e%252e%252f|%252e%252e%255c)`),
-	XSSEvents: regexp.MustCompile(`(?i)\bon\w+\s*=`),
+	InvisibleChars:      regexp.MustCompile("[\u200B\u200C\u200D\u2063\uFEFF\u3164\uFFA0\u115F\u1160\u061C\u180E\u2000-\u200F\u2028-\u202F\u205F-\u206F]"),
+	HTMLTags:            regexp.MustCompile(`<[^>]*>`),
+	HTMLEntities:        regexp.MustCompile(`(?i)&(?:#(?:\d+|x[0-9a-fA-F]+)|[a-zA-Z0-9]+);`),
+	ScriptTags:          regexp.MustCompile(`(?is)<\s*script[^>]*>.*?<\s*/\s*script\s*>`),
+	SQLInjection:        regexp.MustCompile(`(?i)(\b(?:SELECT|INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|EXEC|UNION|TRUNCATE|GRANT|REVOKE)\b\s+\w+|--|\'\s*OR\s+|\'\s*UNION\s+|\'\s*;|\|\||\bOR\b\s+\d+\s*=\s*\d+|\bUNION\b\s+(?:ALL\s+)?SELECT|\bINTO\b\s+(?:OUTFILE|DUMPFILE))`),
+	NoSQLInjection:      regexp.MustCompile(`(?i)(\$ne|\$gt|\$lt|\$gte|\$lte|\$in|\$nin|\$and|\$or|\$not|\$where|\$regex|\$options|\$elemMatch|\$size|\$exists|\$type|\$mod|\$all)`),
+	CommandInjection:    regexp.MustCompile(`(?i)(;\s*(?:rm|cat|ls|pwd|whoami|ps|mv|cp|chmod|chown|curl|wget|netcat|nc)\b|\|\s*(?:rm|cat|ls|pwd|whoami|ps|mv|cp|chmod|chown|curl|wget|netcat|nc)\b|&&\s*(?:rm|cat|ls|pwd|whoami|ps|mv|cp|chmod|chown|curl|wget|netcat|nc)\b|\$\(|` + "`" + `.*` + "`" + `|%0a|%0d)`),
+	LDAPInjection:       regexp.MustCompile(`(?i)(\*\)|(\|\()|(\&\()|(\!\()|(\(\|)|(\(\&)|(\(\!)|(objectClass=)|(cn=)|(uid=)|(ou=)|(dc=))`),
+	XXEInjection:        regexp.MustCompile(`(?i)(<!ENTITY|<!DOCTYPE|SYSTEM|PUBLIC|CDATA|\[CDATA\[)`),
+	PathTraversal:       regexp.MustCompile(`(?i)(\.\.\/|\.\.\\|%2e%2e%2f|%2e%2e%5c|%252e%252e%252f|%252e%252e%255c)`),
+	XSSEvents:           regexp.MustCompile(`(?i)\bon\w+\s*=`),
 	JavaScriptExecution: regexp.MustCompile(`(?i)(javascript:|data:text/html|vbscript:|expression\(|eval\(|setTimeout\(|setInterval\()`),
-	ControlChars: regexp.MustCompile(`[\x00-\x1f\x7f]`),
-	NullBytes: regexp.MustCompile("\x00"),
-	DangerousProtocols: regexp.MustCompile(`(?i)(javascript:|data:|vbscript:|file:|ftp:|gopher:|ldap:|mailto:|news:|telnet:)`),
-	XSSVectors: regexp.MustCompile(`(?i)(<\s*script[^>]*>|<\s*/\s*script\s*>|<\s*iframe[^>]*>|<\s*object[^>]*>|<\s*embed[^>]*>|<\s*link[^>]*>|<\s*meta[^>]*>|<\s*style[^>]*>)`),
-	CSSInjection: regexp.MustCompile(`(?i)(expression\s*\(|javascript\s*:|@import|url\s*\(|behavior\s*:|binding\s*:)`),
-	TemplateInjection: regexp.MustCompile(`(\{\{|\}\}|\$\{|\}|<%|%>|\[\[|\]\])`),
-	SSIInjection: regexp.MustCompile(`(?i)(<!--\s*#\s*(?:include|exec|echo|config|set)\s*)`),
+	ControlChars:        regexp.MustCompile(`[\x00-\x1f\x7f]`),
+	NullBytes:           regexp.MustCompile("\x00"),
+	DangerousProtocols:  regexp.MustCompile(`(?i)(javascript:|data:|vbscript:|file:|ftp:|gopher:|ldap:|mailto:|news:|telnet:)`),
+	XSSVectors:          regexp.MustCompile(`(?i)(<\s*script[^>]*>|<\s*/\s*script\s*>|<\s*iframe[^>]*>|<\s*object[^>]*>|<\s*embed[^>]*>|<\s*link[^>]*>|<\s*meta[^>]*>|<\s*style[^>]*>)`),
+	CSSInjection:        regexp.MustCompile(`(?i)(expression\s*\(|javascript\s*:|@import|url\s*\(|behavior\s*:|binding\s*:)`),
+	TemplateInjection:   regexp.MustCompile(`(\{\{|\}\}|\$\{|\}|<%|%>|\[\[|\]\])`),
+	SSIInjection:        regexp.MustCompile(`(?i)(<!--\s*#\s*(?:include|exec|echo|config|set)\s*)`),
 }
 
 // ---------------------------------------------------------------------------
@@ -75,21 +75,21 @@ var securityPatterns = struct {
 // ThreatReport contains boolean flags indicating which security threats were
 // detected in an input string. Port ThreatReport interface.
 type ThreatReport struct {
-	InvisibleChars bool `json:"invisible_chars,omitempty"`
-	HTMLContent bool `json:"html_content,omitempty"`
-	SQLInjection bool `json:"sql_injection,omitempty"`
-	NoSQLInjection bool `json:"nosql_injection,omitempty"`
-	CommandInjection bool `json:"command_injection,omitempty"`
-	LDAPInjection bool `json:"ldap_injection,omitempty"`
-	XXEInjection bool `json:"xxe_injection,omitempty"`
-	PathTraversal bool `json:"path_traversal,omitempty"`
-	ControlChars bool `json:"control_chars,omitempty"`
-	NullBytes bool `json:"null_bytes,omitempty"`
-	XSSEvents bool `json:"xss_events,omitempty"`
-	CSSInjection bool `json:"css_injection,omitempty"`
-	TemplateInjection bool `json:"template_injection,omitempty"`
-	SSIInjection bool `json:"ssi_injection,omitempty"`
-	MaxLengthExceeded bool `json:"max_length_exceeded,omitempty"`
+	InvisibleChars      bool `json:"invisible_chars,omitempty"`
+	HTMLContent         bool `json:"html_content,omitempty"`
+	SQLInjection        bool `json:"sql_injection,omitempty"`
+	NoSQLInjection      bool `json:"nosql_injection,omitempty"`
+	CommandInjection    bool `json:"command_injection,omitempty"`
+	LDAPInjection       bool `json:"ldap_injection,omitempty"`
+	XXEInjection        bool `json:"xxe_injection,omitempty"`
+	PathTraversal       bool `json:"path_traversal,omitempty"`
+	ControlChars        bool `json:"control_chars,omitempty"`
+	NullBytes           bool `json:"null_bytes,omitempty"`
+	XSSEvents           bool `json:"xss_events,omitempty"`
+	CSSInjection        bool `json:"css_injection,omitempty"`
+	TemplateInjection   bool `json:"template_injection,omitempty"`
+	SSIInjection        bool `json:"ssi_injection,omitempty"`
+	MaxLengthExceeded   bool `json:"max_length_exceeded,omitempty"`
 	ForbiddenCharacters bool `json:"forbidden_characters,omitempty"`
 }
 
@@ -107,26 +107,26 @@ func (t ThreatReport) HasThreats() bool {
 // options default to enabled unless explicitly set to false).
 type SanitizeOptions struct {
 	// Injection protection (all enabled by default).
-	SQLInjection *bool
-	NoSQLInjection *bool
+	SQLInjection     *bool
+	NoSQLInjection   *bool
 	CommandInjection *bool
-	LDAPInjection *bool
-	XXEInjection *bool
-	PathTraversal *bool
+	LDAPInjection    *bool
+	XXEInjection     *bool
+	PathTraversal    *bool
 
 	// Character handling (all enabled by default).
 	RemoveInvisibleChars *bool
-	RemoveControlChars *bool
-	RemoveNullBytes *bool
-	NormalizeUnicode *bool
+	RemoveControlChars   *bool
+	RemoveNullBytes      *bool
+	NormalizeUnicode     *bool
 
 	// HTML handling (enabled by default).
 	SanitizeHTML *bool
 
 	// Validation.
-	MaxLength int
+	MaxLength         int
 	AllowedCharacters *regexp.Regexp
-	CustomPatterns []*regexp.Regexp
+	CustomPatterns    []*regexp.Regexp
 }
 
 // optEnabled returns true if the option pointer is nil (default enabled) or
@@ -142,7 +142,6 @@ func optEnabled(opt *bool) bool {
 // SanitizeString sanitizes a general string by removing HTML content, invisible
 // characters, injection patterns, and other security threats. It does NOT
 // expect HTML in the input - all HTML is stripped.
-//
 func SanitizeString(input string, opts SanitizeOptions) string {
 	sanitized := input
 
@@ -241,7 +240,6 @@ func SanitizeString(input string, opts SanitizeOptions) string {
 
 // DetectThreats analyzes an input string for security threats without modifying
 // it. Returns a ThreatReport with boolean flags for each detected threat type.
-//
 func DetectThreats(input string) ThreatReport {
 	report := ThreatReport{}
 

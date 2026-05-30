@@ -60,28 +60,28 @@ import (
 
 // Config holds the profiler configuration.
 type Config struct {
-	Enabled bool `json:"enabled"`
-	Server string `json:"server"`
-	CPUEnabled bool `json:"cpuEnabled"`
-	HeapEnabled bool `json:"heapEnabled"`
-	WallEnabled bool `json:"cpuWallEnabled"`
-	TagsJSON string `json:"tagsJson"`
-	FlushIntervalMs int `json:"flushIntervalMs"`
-	HeapSamplingIntervalBytes int `json:"heapSamplingIntervalBytes"`
-	HeapStackDepth int `json:"heapStackDepth"`
-	WallSamplingDurationMs int `json:"wallSamplingDurationMs"`
-	WallSamplingIntervalMicros int `json:"wallSamplingIntervalMicros"`
-	WallCollectCPUTime bool `json:"wallCollectCpuTime"`
-	Tags map[string]string `json:"tags,omitempty"`
-	ApplicationName string `json:"applicationName,omitempty"`
+	Enabled                    bool              `json:"enabled"`
+	Server                     string            `json:"server"`
+	CPUEnabled                 bool              `json:"cpuEnabled"`
+	HeapEnabled                bool              `json:"heapEnabled"`
+	WallEnabled                bool              `json:"cpuWallEnabled"`
+	TagsJSON                   string            `json:"tagsJson"`
+	FlushIntervalMs            int               `json:"flushIntervalMs"`
+	HeapSamplingIntervalBytes  int               `json:"heapSamplingIntervalBytes"`
+	HeapStackDepth             int               `json:"heapStackDepth"`
+	WallSamplingDurationMs     int               `json:"wallSamplingDurationMs"`
+	WallSamplingIntervalMicros int               `json:"wallSamplingIntervalMicros"`
+	WallCollectCPUTime         bool              `json:"wallCollectCpuTime"`
+	Tags                       map[string]string `json:"tags,omitempty"`
+	ApplicationName            string            `json:"applicationName,omitempty"`
 }
 
 // DetailedStatus represents the detailed profiling status.
 type DetailedStatus struct {
-	Overall bool `json:"overall"`
-	CPU ProfileType `json:"cpu"`
-	Heap ProfileType `json:"heap"`
-	Wall ProfileType `json:"wall"`
+	Overall bool        `json:"overall"`
+	CPU     ProfileType `json:"cpu"`
+	Heap    ProfileType `json:"heap"`
+	Wall    ProfileType `json:"wall"`
 }
 
 // ProfileType represents the status of a single profile type.
@@ -92,18 +92,18 @@ type ProfileType struct {
 
 // Profiler manages continuous profiling.
 type Profiler struct {
-	mu sync.Mutex
-	config Config
-	cpuRunning atomic.Bool
-	heapRunning atomic.Bool
-	wallRunning atomic.Bool
+	mu             sync.Mutex
+	config         Config
+	cpuRunning     atomic.Bool
+	heapRunning    atomic.Bool
+	wallRunning    atomic.Bool
 	overallRunning atomic.Bool
-	enabled atomic.Bool
+	enabled        atomic.Bool
 
 	// Internal state
-	cpuBuffer *profileBuffer
+	cpuBuffer  *profileBuffer
 	stopWallCh chan struct{}
-	wallDone chan struct{}
+	wallDone   chan struct{}
 
 	// Pyroscope profiler instance (nil when using pprof fallback).
 	pyroscope *pyroscope.Profiler
@@ -122,18 +122,18 @@ func (pb *profileBuffer) Write(p []byte) (int, error) {
 // DefaultConfig returns the default profiler configuration from environment variables.
 func DefaultConfig() Config {
 	return Config{
-		Enabled: envBool("PROFILING_ENABLED", false),
-		Server: envString("PROFILING_DISTRIBUTOR_ADDRESS", "http://utility-pyroscope-distributor.utility.svc.cluster.local:4040"),
-		CPUEnabled: envBool("PROFILING_CPU_ENABLED", true),
-		HeapEnabled: envBool("PROFILING_HEAP_ENABLED", true),
-		WallEnabled: envBool("PROFILING_CPU_WALL_ENABLED", true),
-		TagsJSON: envString("PROFILING_TAGS_JSON", "{}"),
-		FlushIntervalMs: envInt("PROFILING_FLUSH_INTERVAL_MS", 10000),
-		HeapSamplingIntervalBytes: envInt("PROFILING_HEAP_SAMPLING_INTERVAL_BYTES", 524288),
-		HeapStackDepth: envInt("PROFILING_HEAP_STACK_DEPTH", 64),
-		WallSamplingDurationMs: envInt("PROFILING_WALL_SAMPLING_DURATION_MS", 60000),
+		Enabled:                    envBool("PROFILING_ENABLED", false),
+		Server:                     envString("PROFILING_DISTRIBUTOR_ADDRESS", "http://utility-pyroscope-distributor.utility.svc.cluster.local:4040"),
+		CPUEnabled:                 envBool("PROFILING_CPU_ENABLED", true),
+		HeapEnabled:                envBool("PROFILING_HEAP_ENABLED", true),
+		WallEnabled:                envBool("PROFILING_CPU_WALL_ENABLED", true),
+		TagsJSON:                   envString("PROFILING_TAGS_JSON", "{}"),
+		FlushIntervalMs:            envInt("PROFILING_FLUSH_INTERVAL_MS", 10000),
+		HeapSamplingIntervalBytes:  envInt("PROFILING_HEAP_SAMPLING_INTERVAL_BYTES", 524288),
+		HeapStackDepth:             envInt("PROFILING_HEAP_STACK_DEPTH", 64),
+		WallSamplingDurationMs:     envInt("PROFILING_WALL_SAMPLING_DURATION_MS", 60000),
 		WallSamplingIntervalMicros: envInt("PROFILING_WALL_SAMPLING_INTERVAL_MICROS", 10000),
-		WallCollectCPUTime: envBool("PROFILING_WALL_COLLECT_CPU_TIME", false),
+		WallCollectCPUTime:         envBool("PROFILING_WALL_COLLECT_CPU_TIME", false),
 	}
 }
 
@@ -150,7 +150,7 @@ func NewFromEnv() *Profiler {
 }
 
 // buildAppName constructs the application name from environment variables,
-//.
+// .
 func (p *Profiler) buildAppName() string {
 	podName := envString("K8S_POD_NAME", "unknown-pod")
 	projectName := envString("PROJECT_NAME", "DefaultProject")
@@ -179,7 +179,7 @@ func (p *Profiler) buildTags() map[string]string {
 
 	tags := map[string]string{
 		"project_name": projectName,
-		"pod_name": podName,
+		"pod_name":     podName,
 	}
 
 	// Add platform version if available.
@@ -219,7 +219,6 @@ func (p *Profiler) pyroscopeProfileTypes() []pyroscope.ProfileType {
 // Start initializes and starts all enabled profiling types.
 // When PROFILING_ENABLED is true and a server address is configured, Pyroscope
 // push mode is used. Otherwise, local pprof profiling serves as a fallback.
-//
 func (p *Profiler) Start() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -240,10 +239,10 @@ func (p *Profiler) Start() {
 	if p.config.Server != "" {
 		profiler, err := pyroscope.Start(pyroscope.Config{
 			ApplicationName: p.config.ApplicationName,
-			ServerAddress: p.config.Server,
-			Tags: p.config.Tags,
-			ProfileTypes: p.pyroscopeProfileTypes(),
-			UploadRate: time.Duration(p.config.FlushIntervalMs) * time.Millisecond,
+			ServerAddress:   p.config.Server,
+			Tags:            p.config.Tags,
+			ProfileTypes:    p.pyroscopeProfileTypes(),
+			UploadRate:      time.Duration(p.config.FlushIntervalMs) * time.Millisecond,
 		})
 		if err == nil {
 			p.pyroscope = profiler
@@ -478,8 +477,8 @@ func (p *Profiler) GetDetailedStatus() DetailedStatus {
 // serialization in HTTP handlers.
 func (p *Profiler) Status() map[string]interface{} {
 	return map[string]interface{}{
-		"enabled": p.enabled.Load(),
-		"running": p.overallRunning.Load(),
+		"enabled":         p.enabled.Load(),
+		"running":         p.overallRunning.Load(),
 		"applicationName": p.config.ApplicationName,
 		"cpu": map[string]interface{}{
 			"enabled": p.config.CPUEnabled,

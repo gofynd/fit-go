@@ -1,6 +1,6 @@
-module github.com/fynd/commerce/fit
+module github.com/gofynd/fit-go
 
-go 1.25.10 
+go 1.25.10
 
 require (
 	github.com/confluentinc/confluent-kafka-go/v2 v2.14.0
@@ -10,6 +10,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/grafana/pyroscope-go v1.2.8
 	github.com/lib/pq v1.12.3
+	github.com/mailgun/groupcache/v2 v2.6.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/redis/go-redis/v9 v9.18.0
 	github.com/stretchr/testify v1.11.1
@@ -49,7 +50,6 @@ require (
 	github.com/klauspost/compress v1.18.4 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
-	github.com/mailgun/groupcache/v2 v2.6.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect

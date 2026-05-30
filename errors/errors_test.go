@@ -135,7 +135,7 @@ func TestFitError_SetMeta(t *testing.T) {
 	err := New(errors.New("test"), 1)
 
 	meta := map[string]interface{}{
-		"user_id": 123,
+		"user_id":    123,
 		"request_id": "abc-123",
 	}
 
@@ -219,8 +219,8 @@ func TestFitError_SetLang(t *testing.T) {
 func TestFitError_GetStrCode(t *testing.T) {
 	tests := []struct {
 		serviceCode string
-		intCode int
-		expected string
+		intCode     int
+		expected    string
 	}{
 		{"AVS", 1, "AVS0001"},
 		{"AVS", 22, "AVS0022"},
@@ -419,9 +419,9 @@ func TestFitError_HTTPStatusCodes(t *testing.T) {
 	defer func() { DefaultRegistry = oldDefault }()
 
 	tests := []struct {
-		name string
+		name       string
 		statusCode int
-		expected int
+		expected   int
 	}{
 		{"OK", http.StatusOK, http.StatusOK},
 		{"Created", http.StatusCreated, http.StatusCreated},

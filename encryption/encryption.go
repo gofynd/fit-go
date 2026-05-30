@@ -27,7 +27,7 @@ import (
 
 // Default LRU cache settings.
 const (
-	defaultCacheMax = 2000
+	defaultCacheMax     = 2000
 	defaultCacheMaxSize = 100000
 )
 
@@ -41,10 +41,10 @@ const (
 //	encrypted, err := mgr.Encrypt("sensitive data")
 //	decrypted, err := mgr.Decrypt(encrypted)
 type Manager struct {
-	mu sync.RWMutex
-	initialized bool
-	dek []byte
-	iv []byte
+	mu              sync.RWMutex
+	initialized     bool
+	dek             []byte
+	iv              []byte
 	encryptionCache *lruCache
 	decryptionCache *lruCache
 }
@@ -260,28 +260,28 @@ func (m *Manager) IsInitialized() bool {
 // ---------------------------------------------------------------------------
 
 type lruCache struct {
-	mu sync.Mutex
-	max int // max number of entries
+	mu      sync.Mutex
+	max     int // max number of entries
 	maxSize int // max total size in bytes
-	size int // current total size
-	items map[string]*lruNode
-	head *lruNode // most recently used
-	tail *lruNode // least recently used
+	size    int // current total size
+	items   map[string]*lruNode
+	head    *lruNode // most recently used
+	tail    *lruNode // least recently used
 }
 
 type lruNode struct {
-	key string
+	key   string
 	value string
-	size int
-	prev *lruNode
-	next *lruNode
+	size  int
+	prev  *lruNode
+	next  *lruNode
 }
 
 func newLRUCache(max, maxSize int) *lruCache {
 	return &lruCache{
-		max: max,
+		max:     max,
 		maxSize: maxSize,
-		items: make(map[string]*lruNode),
+		items:   make(map[string]*lruNode),
 	}
 }
 
@@ -315,9 +315,9 @@ func (c *lruCache) Set(key, value string) {
 	} else {
 		// Add new entry.
 		node := &lruNode{
-			key: key,
+			key:   key,
 			value: value,
-			size: entrySize,
+			size:  entrySize,
 		}
 		c.items[key] = node
 		c.addToHead(node)

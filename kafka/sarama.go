@@ -16,10 +16,8 @@
 // confluent-kafka-go (librdkafka wrapper). It satisfies the KafkaClient,
 // KafkaProducer, and KafkaConsumer interfaces defined in kafka.go.
 //
-// This is the production driver for fit.go Kafka integration, equivalent to
-// the kafkajs driver used. Originally implemented with IBM/sarama,
-// now rewritten to use confluent-kafka-go for better performance, stability,
-// and feature parity with librdkafka.
+// This is the production driver for the fit Kafka integration, built on
+// confluent-kafka-go (librdkafka) for performance and stability.
 package kafka
 
 import (
@@ -30,7 +28,7 @@ import (
 	"time"
 
 	ckafka "github.com/confluentinc/confluent-kafka-go/v2/kafka"
-	"github.com/fynd/commerce/fit/logging"
+	"github.com/gofynd/fit-go/logging"
 )
 
 // ---------------------------------------------------------------------------
@@ -38,7 +36,7 @@ import (
 // ---------------------------------------------------------------------------
 
 var (
-	_ KafkaClient = (*ConfluentClient)(nil)
+	_ KafkaClient   = (*ConfluentClient)(nil)
 	_ KafkaProducer = (*ConfluentProducer)(nil)
 	_ KafkaConsumer = (*ConfluentConsumer)(nil)
 )
@@ -52,11 +50,11 @@ var (
 // consumers on demand.
 type ConfluentClient struct {
 	brokers []string
-	fitCfg *Config
+	fitCfg  *Config
 	baseCfg *ckafka.ConfigMap
-	logger *logging.Logger
+	logger  *logging.Logger
 
-	mu sync.Mutex
+	mu     sync.Mutex
 	closed bool
 }
 
@@ -95,9 +93,9 @@ func NewConfluentClient(cfg *Config) (*ConfluentClient, error) {
 
 	return &ConfluentClient{
 		brokers: cfg.Brokers,
-		fitCfg: cfg,
+		fitCfg:  cfg,
 		baseCfg: baseCfg,
-		logger: logger,
+		logger:  logger,
 	}, nil
 }
 
@@ -148,8 +146,8 @@ func (cc *ConfluentClient) Producer(config ProducerConfig) (KafkaProducer, error
 
 	return &ConfluentProducer{
 		configMap: pCfg,
-		logger: cc.logger,
-		brokers: cc.brokers,
+		logger:    cc.logger,
+		brokers:   cc.brokers,
 	}, nil
 }
 
@@ -202,9 +200,9 @@ func (cc *ConfluentClient) Consumer(config ConsumerConfig) (KafkaConsumer, error
 
 	return &ConfluentConsumer{
 		configMap: cCfg,
-		groupID: config.GroupID,
-		config: config,
-		logger: cc.logger,
+		groupID:   config.GroupID,
+		config:    config,
+		logger:    cc.logger,
 	}, nil
 }
 
@@ -230,12 +228,12 @@ func (cc *ConfluentClient) Close() error {
 // Producer. It sends messages synchronously by waiting for delivery reports.
 type ConfluentProducer struct {
 	configMap *ckafka.ConfigMap
-	logger *logging.Logger
-	brokers []string
+	logger    *logging.Logger
+	brokers   []string
 
-	mu sync.Mutex
+	mu       sync.Mutex
 	producer *ckafka.Producer
-	closed bool
+	closed   bool
 }
 
 // Connect establishes the confluent Producer connection to the brokers.
@@ -363,15 +361,15 @@ func (cp *ConfluentProducer) Close() error {
 // shutdown.
 type ConfluentConsumer struct {
 	configMap *ckafka.ConfigMap
-	groupID string
-	config ConsumerConfig
-	logger *logging.Logger
+	groupID   string
+	config    ConsumerConfig
+	logger    *logging.Logger
 
-	mu sync.Mutex
+	mu       sync.Mutex
 	consumer *ckafka.Consumer
-	topics []string
+	topics   []string
 	cancelFn context.CancelFunc
-	closed bool
+	closed   bool
 }
 
 // Connect subscribes to the given topics by creating a confluent Consumer.
@@ -549,11 +547,11 @@ func (cc *ConfluentConsumer) ConsumeBatch(handler BatchHandler, opts ConsumerOpt
 		}
 
 		batchPayload := BatchPayload{
-			Topic: batchTopic,
-			Partition: int(batchPartition),
-			Messages: batch,
+			Topic:       batchTopic,
+			Partition:   int(batchPartition),
+			Messages:    batch,
 			FirstOffset: batch[0].Offset,
-			LastOffset: batch[len(batch)-1].Offset,
+			LastOffset:  batch[len(batch)-1].Offset,
 		}
 
 		if err := handler(batchPayload); err != nil {
@@ -734,7 +732,7 @@ func mapSASLMechanismToString(mechanism string) string {
 func buildConfluentMessage(topic string, msg Message) *ckafka.Message {
 	km := &ckafka.Message{
 		TopicPartition: ckafka.TopicPartition{
-			Topic: &topic,
+			Topic:     &topic,
 			Partition: ckafka.PartitionAny,
 		},
 		Value: msg.Value,
@@ -757,7 +755,7 @@ func buildConfluentMessage(topic string, msg Message) *ckafka.Message {
 		headers := make([]ckafka.Header, len(msg.Headers))
 		for i, h := range msg.Headers {
 			headers[i] = ckafka.Header{
-				Key: h.Key,
+				Key:   h.Key,
 				Value: h.Value,
 			}
 		}
@@ -775,11 +773,11 @@ func mapConfluentToPayload(msg *ckafka.Message) MessagePayload {
 	}
 
 	payload := MessagePayload{
-		Topic: topic,
+		Topic:     topic,
 		Partition: int(msg.TopicPartition.Partition),
-		Offset: int64(msg.TopicPartition.Offset),
-		Key: msg.Key,
-		Value: msg.Value,
+		Offset:    int64(msg.TopicPartition.Offset),
+		Key:       msg.Key,
+		Value:     msg.Value,
 		Timestamp: msg.Timestamp,
 	}
 
@@ -787,7 +785,7 @@ func mapConfluentToPayload(msg *ckafka.Message) MessagePayload {
 		headers := make([]Header, len(msg.Headers))
 		for i, h := range msg.Headers {
 			headers[i] = Header{
-				Key: h.Key,
+				Key:   h.Key,
 				Value: h.Value,
 			}
 		}

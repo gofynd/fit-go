@@ -36,13 +36,13 @@ import (
 // - VAULT_DEK_KV_PATH: KV secret path (e.g. "pii/encryption")
 // - VAULT_DEK_KV_MOUNT_PATH: KV mount path (e.g. "secret")
 type VaultProvider struct {
-	endpoint string
-	token string
-	dekName string
+	endpoint     string
+	token        string
+	dekName      string
 	dekMountPath string
-	kvPath string
-	kvMountPath string
-	client *http.Client
+	kvPath       string
+	kvMountPath  string
+	client       *http.Client
 }
 
 // NewVaultProvider creates a VaultProvider configured from environment
@@ -50,7 +50,7 @@ type VaultProvider struct {
 func NewVaultProvider() *VaultProvider {
 	return &VaultProvider{
 		endpoint: os.Getenv("VAULT_API_ENDPOINT"),
-		token: os.Getenv("VAULT_TOKEN"),
+		token:    os.Getenv("VAULT_TOKEN"),
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -205,7 +205,7 @@ func (v *VaultProvider) decryptDEK(ciphertext, context string) ([]byte, error) {
 
 	payload, err := json.Marshal(map[string]string{
 		"ciphertext": ciphertext,
-		"context": context,
+		"context":    context,
 	})
 	if err != nil {
 		return nil, err

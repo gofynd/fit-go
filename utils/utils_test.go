@@ -142,8 +142,8 @@ func TestSanitizeString(t *testing.T) {
 
 func TestDetectThreats(t *testing.T) {
 	tests := []struct {
-		name string
-		input string
+		name     string
+		input    string
 		expected func(ThreatReport) bool
 	}{
 		{"invisible chars", "test\u200Btest", func(r ThreatReport) bool { return r.InvisibleChars }},
@@ -190,7 +190,7 @@ func TestThreatReport_HasThreats(t *testing.T) {
 
 func TestContainsHTML(t *testing.T) {
 	tests := []struct {
-		input string
+		input    string
 		expected bool
 	}{
 		{"<div>test</div>", true},
@@ -211,7 +211,7 @@ func TestContainsHTML(t *testing.T) {
 func TestValidateCharacters(t *testing.T) {
 	pattern := regexp.MustCompile(`^[a-z]+$`)
 	tests := []struct {
-		input string
+		input    string
 		expected bool
 	}{
 		{"abc", true},
@@ -241,7 +241,7 @@ func TestBoolPtr(t *testing.T) {
 
 func TestIsPrintable(t *testing.T) {
 	tests := []struct {
-		input string
+		input    string
 		expected bool
 	}{
 		{"Hello, World!", true},
@@ -266,7 +266,7 @@ func TestIsPrintable(t *testing.T) {
 func TestTruncateString(t *testing.T) {
 	tests := []struct {
 		input, suffix, expected string
-		maxLen int
+		maxLen                  int
 	}{
 		{"hello world", "...", "he...", 5},
 		{"hello", "...", "hello", 10},

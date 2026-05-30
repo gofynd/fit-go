@@ -43,7 +43,7 @@ import (
 // config files. It provides type-safe getters with defaults and is safe for
 // concurrent access.
 type Config struct {
-	mu sync.RWMutex
+	mu     sync.RWMutex
 	values map[string]string
 }
 
@@ -64,7 +64,7 @@ func New() *Config {
 func Load(paths ...string) (*Config, error) {
 	cfg := New()
 
-	// 1. Load .env file if present (like dotenv in Node.js).
+	// 1. Load .env file if present.
 	if err := cfg.loadDotenv(); err != nil {
 		// Non-fatal: .env file is optional.
 		_ = err
@@ -404,8 +404,7 @@ func (c *Config) GetFloat(key string, defaultValue float64) float64 {
 
 // GetDuration returns the config value for the given key as a time.Duration.
 // The value is parsed using time.ParseDuration (e.g., "30s", "5m", "1h").
-// If the value is a plain integer, it is treated as milliseconds to match
-// the Node.js convention used.
+// If the value is a plain integer, it is treated as milliseconds.
 // If the key is not found or cannot be parsed, it returns the default.
 func (c *Config) GetDuration(key string, defaultValue time.Duration) time.Duration {
 	c.mu.RLock()
@@ -416,7 +415,7 @@ func (c *Config) GetDuration(key string, defaultValue time.Duration) time.Durati
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
 		}
-		// Fall back to treating plain integers as milliseconds (Node.js compat).
+		// Fall back to treating plain integers as milliseconds.
 		if ms, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return time.Duration(ms) * time.Millisecond
 		}

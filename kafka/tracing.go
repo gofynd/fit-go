@@ -25,7 +25,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/fynd/commerce/fit/tracing"
+	"github.com/gofynd/fit-go/tracing"
 )
 
 const traceparentHeaderKey = "traceparent"
@@ -58,9 +58,9 @@ func TracedMessageHandler(handler MessageHandler) MessageHandler {
 		defer span.End()
 
 		span.SetAttributes(map[string]any{
-			"messaging.system": "kafka",
-			"messaging.destination": msg.Topic,
-			"messaging.kafka.partition": msg.Partition,
+			"messaging.system":               "kafka",
+			"messaging.destination":          msg.Topic,
+			"messaging.kafka.partition":      msg.Partition,
 			"messaging.kafka.message.offset": msg.Offset,
 		})
 
@@ -96,7 +96,7 @@ func InjectTraceHeaders(ctx context.Context, msg *Message) {
 
 	tp := tracing.FormatTraceparent(traceID, spanID, true)
 	msg.Headers = append(msg.Headers, Header{
-		Key: traceparentHeaderKey,
+		Key:   traceparentHeaderKey,
 		Value: []byte(tp),
 	})
 }

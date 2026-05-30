@@ -59,12 +59,12 @@ func TestApplyDriverOptions_AppName(t *testing.T) {
 
 func TestApplyDriverOptions_PoolSettings(t *testing.T) {
 	opts := &DialOptions{
-		MaxPoolSize: 100,
-		MinPoolSize: 10,
-		MaxIdleTimeMS: 30000,
+		MaxPoolSize:      100,
+		MinPoolSize:      10,
+		MaxIdleTimeMS:    30000,
 		ConnectTimeoutMS: 5000,
-		SocketTimeoutMS: 10000,
-		MaxConnecting: 5,
+		SocketTimeoutMS:  10000,
+		MaxConnecting:    5,
 		WaitQueueTimeout: 15000,
 	}
 
@@ -82,7 +82,7 @@ func TestApplyDriverOptions_TLS(t *testing.T) {
 	opts := &DialOptions{
 		TLSConfig: &tls.Config{
 			InsecureSkipVerify: true,
-			MinVersion: tls.VersionTLS12,
+			MinVersion:         tls.VersionTLS12,
 		},
 	}
 
@@ -121,17 +121,17 @@ func TestApplyDriverOptions_NilOpts(t *testing.T) {
 
 func TestApplyDriverOptions_AllFields(t *testing.T) {
 	opts := &DialOptions{
-		AppName: "full-test",
-		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS13},
-		MaxPoolSize: 200,
-		MinPoolSize: 20,
-		MaxIdleTimeMS: 60000,
+		AppName:          "full-test",
+		TLSConfig:        &tls.Config{MinVersion: tls.VersionTLS13},
+		MaxPoolSize:      200,
+		MinPoolSize:      20,
+		MaxIdleTimeMS:    60000,
 		ConnectTimeoutMS: 10000,
-		SocketTimeoutMS: 15000,
-		MaxConnecting: 10,
+		SocketTimeoutMS:  15000,
+		MaxConnecting:    10,
 		WaitQueueTimeout: 30000,
-		AutoIndex: true,
-		AutoCreate: true,
+		AutoIndex:        true,
+		AutoCreate:       true,
 	}
 
 	defer func() {
@@ -195,13 +195,13 @@ func TestDefaultDialFunc_WithAllOptions(t *testing.T) {
 	defer cancel()
 
 	opts := &DialOptions{
-		AppName: "integration-test",
-		MaxPoolSize: 50,
-		MinPoolSize: 5,
-		MaxIdleTimeMS: 10000,
+		AppName:          "integration-test",
+		MaxPoolSize:      50,
+		MinPoolSize:      5,
+		MaxIdleTimeMS:    10000,
 		ConnectTimeoutMS: 1000,
-		SocketTimeoutMS: 2000,
-		MaxConnecting: 3,
+		SocketTimeoutMS:  2000,
+		MaxConnecting:    3,
 		WaitQueueTimeout: 5000,
 	}
 

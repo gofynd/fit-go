@@ -30,27 +30,27 @@ import (
 
 // Options configures the metrics registry.
 type Options struct {
-	MetricsDir string
-	ServerEnabled bool
+	MetricsDir        string
+	ServerEnabled     bool
 	HTTPClientEnabled bool
-	ServerBuckets string // comma-separated bucket values
+	ServerBuckets     string // comma-separated bucket values
 	HTTPClientBuckets string // comma-separated bucket values
-	DeploymentName string
+	DeploymentName    string
 	// PrometheusRegistry allows injecting a custom prometheus registry (useful for testing).
 	PrometheusRegistry *prometheus.Registry
 }
 
 // Registry holds all metrics collectors.
 type Registry struct {
-	mu sync.RWMutex
-	serverEnabled bool
-	clientEnabled bool
-	serverHist *prometheus.HistogramVec
-	clientHist *prometheus.HistogramVec
+	mu             sync.RWMutex
+	serverEnabled  bool
+	clientEnabled  bool
+	serverHist     *prometheus.HistogramVec
+	clientHist     *prometheus.HistogramVec
 	deploymentName string
-	metricsDir string
-	promRegistry *prometheus.Registry
-	collectors []prometheus.Collector
+	metricsDir     string
+	promRegistry   *prometheus.Registry
+	collectors     []prometheus.Collector
 }
 
 // New creates a new metrics registry.
@@ -61,11 +61,11 @@ func New(opts Options) (*Registry, error) {
 	}
 
 	r := &Registry{
-		serverEnabled: opts.ServerEnabled,
-		clientEnabled: opts.HTTPClientEnabled,
+		serverEnabled:  opts.ServerEnabled,
+		clientEnabled:  opts.HTTPClientEnabled,
 		deploymentName: opts.DeploymentName,
-		metricsDir: opts.MetricsDir,
-		promRegistry: promReg,
+		metricsDir:     opts.MetricsDir,
+		promRegistry:   promReg,
 	}
 
 	if r.deploymentName == "" {
@@ -79,8 +79,8 @@ func New(opts Options) (*Registry, error) {
 			buckets = parseBuckets(opts.ServerBuckets)
 		}
 		r.serverHist = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Name: "fit_http_request_duration_ms",
-			Help: "HTTP server request duration in milliseconds",
+			Name:    "fit_http_request_duration_ms",
+			Help:    "HTTP server request duration in milliseconds",
 			Buckets: buckets,
 		}, []string{"method", "route", "status_code", "deployment_name"})
 		promReg.MustRegister(r.serverHist)
@@ -94,8 +94,8 @@ func New(opts Options) (*Registry, error) {
 			buckets = parseBuckets(opts.HTTPClientBuckets)
 		}
 		r.clientHist = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-			Name: "fit_http_client_request_duration_ms",
-			Help: "HTTP client request duration in milliseconds",
+			Name:    "fit_http_client_request_duration_ms",
+			Help:    "HTTP client request duration in milliseconds",
 			Buckets: buckets,
 		}, []string{"method", "host", "status_code", "deployment_name"})
 		promReg.MustRegister(r.clientHist)
@@ -107,10 +107,10 @@ func New(opts Options) (*Registry, error) {
 
 // ServerMetrics contains data for recording server request metrics.
 type ServerMetrics struct {
-	Method string
-	Route string
+	Method     string
+	Route      string
 	StatusCode int
-	Duration time.Duration
+	Duration   time.Duration
 }
 
 // RecordServerMetrics records an HTTP server request metric.
@@ -119,19 +119,19 @@ func (r *Registry) RecordServerMetrics(m ServerMetrics) {
 		return
 	}
 	r.serverHist.With(prometheus.Labels{
-		"method": m.Method,
-		"route": m.Route,
-		"status_code": strconv.Itoa(m.StatusCode),
+		"method":          m.Method,
+		"route":           m.Route,
+		"status_code":     strconv.Itoa(m.StatusCode),
 		"deployment_name": r.deploymentName,
 	}).Observe(float64(m.Duration.Milliseconds()))
 }
 
 // HTTPClientMetrics contains data for recording HTTP client request metrics.
 type HTTPClientMetrics struct {
-	Method string
-	Host string
+	Method     string
+	Host       string
 	StatusCode int
-	Duration time.Duration
+	Duration   time.Duration
 }
 
 // RecordHTTPClientMetrics records an HTTP client request metric.
@@ -140,9 +140,9 @@ func (r *Registry) RecordHTTPClientMetrics(m HTTPClientMetrics) {
 		return
 	}
 	r.clientHist.With(prometheus.Labels{
-		"method": m.Method,
-		"host": m.Host,
-		"status_code": strconv.Itoa(m.StatusCode),
+		"method":          m.Method,
+		"host":            m.Host,
+		"status_code":     strconv.Itoa(m.StatusCode),
 		"deployment_name": r.deploymentName,
 	}).Observe(float64(m.Duration.Milliseconds()))
 }

@@ -20,7 +20,6 @@ package encryption
 // Provider is the interface for key providers that supply a Data Encryption Key
 // (DEK) and Initialization Vector (IV). Implementations fetch and decrypt these
 // secrets from external systems (e.g. HashiCorp Vault, GCP KMS).
-//
 type Provider interface {
 	// Init fetches and returns the plaintext DEK and IV. The DEK must be
 	// exactly 32 bytes (AES-256) and the IV must be 12 bytes (GCM standard

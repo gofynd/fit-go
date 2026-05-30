@@ -26,7 +26,7 @@ import (
 
 // mockTransport captures events sent to Sentry for test assertions.
 type mockTransport struct {
-	mu sync.Mutex
+	mu     sync.Mutex
 	events []*sentrylib.Event
 }
 
@@ -36,8 +36,8 @@ func (t *mockTransport) SendEvent(event *sentrylib.Event) {
 	defer t.mu.Unlock()
 	t.events = append(t.events, event)
 }
-func (t *mockTransport) Flush(timeout time.Duration) bool { return true }
-func (t *mockTransport) Close() {}
+func (t *mockTransport) Flush(timeout time.Duration) bool          { return true }
+func (t *mockTransport) Close()                                    {}
 func (t *mockTransport) FlushWithContext(ctx context.Context) bool { return true }
 func (t *mockTransport) SendEventWithContext(ctx context.Context, event *sentrylib.Event) {
 	t.SendEvent(event)
@@ -83,12 +83,12 @@ func TestSentryInit_WithDSN(t *testing.T) {
 	transport := &mockTransport{}
 	s := newTestSentry()
 	err := s.InitWithConfig(SentryConfig{
-		DSN: "https://examplePublicKey@o0.ingest.sentry.io/0",
+		DSN:         "https://examplePublicKey@o0.ingest.sentry.io/0",
 		Environment: "test",
-		Debug: true,
-		SampleRate: 1.0,
-		Transport: transport,
-		Tags: map[string]string{"service": "fit-test"},
+		Debug:       true,
+		SampleRate:  1.0,
+		Transport:   transport,
+		Tags:        map[string]string{"service": "fit-test"},
 	})
 	if err != nil {
 		t.Fatalf("InitWithConfig error: %v", err)
@@ -106,7 +106,7 @@ func TestCaptureError_NOP(t *testing.T) {
 	transport := &mockTransport{}
 	s := newTestSentry()
 	_ = s.InitWithConfig(SentryConfig{
-		DSN: "https://examplePublicKey@o0.ingest.sentry.io/0",
+		DSN:       "https://examplePublicKey@o0.ingest.sentry.io/0",
 		Transport: transport,
 	})
 
@@ -129,7 +129,7 @@ func TestCaptureError_Regular(t *testing.T) {
 	transport := &mockTransport{}
 	s := newTestSentry()
 	_ = s.InitWithConfig(SentryConfig{
-		DSN: "https://examplePublicKey@o0.ingest.sentry.io/0",
+		DSN:       "https://examplePublicKey@o0.ingest.sentry.io/0",
 		Transport: transport,
 	})
 
@@ -161,7 +161,7 @@ func TestCaptureErrorWithContext(t *testing.T) {
 	transport := &mockTransport{}
 	s := newTestSentry()
 	_ = s.InitWithConfig(SentryConfig{
-		DSN: "https://examplePublicKey@o0.ingest.sentry.io/0",
+		DSN:       "https://examplePublicKey@o0.ingest.sentry.io/0",
 		Transport: transport,
 	})
 
@@ -182,7 +182,7 @@ func TestCaptureErrorWithContext_NOP(t *testing.T) {
 	transport := &mockTransport{}
 	s := newTestSentry()
 	_ = s.InitWithConfig(SentryConfig{
-		DSN: "https://examplePublicKey@o0.ingest.sentry.io/0",
+		DSN:       "https://examplePublicKey@o0.ingest.sentry.io/0",
 		Transport: transport,
 	})
 
@@ -203,7 +203,7 @@ func TestCaptureMessage(t *testing.T) {
 	transport := &mockTransport{}
 	s := newTestSentry()
 	_ = s.InitWithConfig(SentryConfig{
-		DSN: "https://examplePublicKey@o0.ingest.sentry.io/0",
+		DSN:       "https://examplePublicKey@o0.ingest.sentry.io/0",
 		Transport: transport,
 	})
 
@@ -227,7 +227,7 @@ func TestCaptureMessageWithLevel(t *testing.T) {
 	transport := &mockTransport{}
 	s := newTestSentry()
 	_ = s.InitWithConfig(SentryConfig{
-		DSN: "https://examplePublicKey@o0.ingest.sentry.io/0",
+		DSN:       "https://examplePublicKey@o0.ingest.sentry.io/0",
 		Transport: transport,
 	})
 
@@ -248,7 +248,7 @@ func TestSetUserTagExtra(t *testing.T) {
 	transport := &mockTransport{}
 	s := newTestSentry()
 	_ = s.InitWithConfig(SentryConfig{
-		DSN: "https://examplePublicKey@o0.ingest.sentry.io/0",
+		DSN:       "https://examplePublicKey@o0.ingest.sentry.io/0",
 		Transport: transport,
 	})
 
@@ -272,7 +272,7 @@ func TestFlushWithTimeout(t *testing.T) {
 	transport := &mockTransport{}
 	s2 := newTestSentry()
 	_ = s2.InitWithConfig(SentryConfig{
-		DSN: "https://examplePublicKey@o0.ingest.sentry.io/0",
+		DSN:       "https://examplePublicKey@o0.ingest.sentry.io/0",
 		Transport: transport,
 	})
 	if !s2.FlushWithTimeout(time.Second) {
@@ -297,7 +297,7 @@ func TestCaptureError_Nil(t *testing.T) {
 
 func TestToSentryLevel(t *testing.T) {
 	tests := []struct {
-		input SentryLevel
+		input    SentryLevel
 		expected sentrylib.Level
 	}{
 		{SentryLevelDebug, sentrylib.LevelDebug},
@@ -326,7 +326,7 @@ func TestAddBreadcrumb(t *testing.T) {
 	transport := &mockTransport{}
 	s := newTestSentry()
 	_ = s.InitWithConfig(SentryConfig{
-		DSN: "https://examplePublicKey@o0.ingest.sentry.io/0",
+		DSN:       "https://examplePublicKey@o0.ingest.sentry.io/0",
 		Transport: transport,
 	})
 

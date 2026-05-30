@@ -53,17 +53,17 @@ const (
 
 // serverTypeNames maps ServerType to its string representation.
 var serverTypeNames = map[ServerType]string{
-	ServerTypePlatform: "platform",
-	ServerTypeApplication: "application",
-	ServerTypePartner: "partner",
-	ServerTypeInternal: "internal",
-	ServerTypeWebhook: "webhook",
+	ServerTypePlatform:      "platform",
+	ServerTypeApplication:   "application",
+	ServerTypePartner:       "partner",
+	ServerTypeInternal:      "internal",
+	ServerTypeWebhook:       "webhook",
 	ServerTypeAdministrator: "administrator",
-	ServerTypePublic: "public",
-	ServerTypePortal: "portal",
-	ServerTypePanel: "panel",
-	ServerTypeDev: "dev",
-	ServerTypeCommon: "common",
+	ServerTypePublic:        "public",
+	ServerTypePortal:        "portal",
+	ServerTypePanel:         "panel",
+	ServerTypeDev:           "dev",
+	ServerTypeCommon:        "common",
 }
 
 // serverTypeFromString is the reverse lookup table.

@@ -31,8 +31,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/fynd/commerce/fit/errors"
 	"github.com/gin-gonic/gin"
+	"github.com/gofynd/fit-go/errors"
 )
 
 // Middleware is the standard middleware signature used throughout fit.go.
@@ -62,9 +62,9 @@ const (
 // Gin context key strings for c.Set/c.Get.
 const (
 	ginKeyApplicationData = "fit.applicationData"
-	ginKeyUserData = "fit.userData"
-	ginKeyDecodedToken = "fit.decodedToken"
-	ginKeyRequestID = "fit.requestID"
+	ginKeyUserData        = "fit.userData"
+	ginKeyDecodedToken    = "fit.decodedToken"
+	ginKeyRequestID       = "fit.requestID"
 )
 
 // ---------------------------------------------------------------------------
@@ -132,7 +132,7 @@ func RequestIDFromContext(ctx context.Context) string {
 // ---------------------------------------------------------------------------
 
 var (
-	uuidPattern = regexp.MustCompile(`/[a-fA-F0-9-]{36}`)
+	uuidPattern    = regexp.MustCompile(`/[a-fA-F0-9-]{36}`)
 	numericPattern = regexp.MustCompile(`/\d+`)
 )
 
@@ -152,7 +152,7 @@ func normalizeRoutePath(path string) string {
 type responseRecorder struct {
 	http.ResponseWriter
 	statusCode int
-	written bool
+	written    bool
 }
 
 func newResponseRecorder(w http.ResponseWriter) *responseRecorder {
@@ -281,7 +281,7 @@ func GinParseApplicationData(c *gin.Context) {
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, map[string]interface{}{
 				"error": map[string]interface{}{
-					"code": "APPLICATION_HEADER_JSON_PARSE_FAILURE",
+					"code":    "APPLICATION_HEADER_JSON_PARSE_FAILURE",
 					"message": "failed to parse x-application-data header",
 					"meta": map[string]interface{}{
 						"rawApplicationHeader": header,
@@ -310,7 +310,7 @@ func GinParseUserData(c *gin.Context) {
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, map[string]interface{}{
 				"error": map[string]interface{}{
-					"code": "USER_HEADER_JSON_PARSE_FAILURE",
+					"code":    "USER_HEADER_JSON_PARSE_FAILURE",
 					"message": "failed to parse x-user-data header",
 					"meta": map[string]interface{}{
 						"rawUserHeader": header,
@@ -377,9 +377,9 @@ func ErrorHandler(logger *slog.Logger) gin.HandlerFunc {
 					}
 					c.AbortWithStatusJSON(status, map[string]interface{}{
 						"error": map[string]interface{}{
-							"code": e.Code,
+							"code":    e.Code,
 							"message": e.GetMessage(),
-							"meta": e.Meta,
+							"meta":    e.Meta,
 						},
 					})
 				case error:
@@ -658,7 +658,7 @@ func DecryptionMiddleware(locations []string, decrypt DecryptFunc) gin.HandlerFu
 // bodyWriter intercepts Write calls to capture the response body for gin.
 type bodyWriter struct {
 	gin.ResponseWriter
-	buf *bytes.Buffer
+	buf        *bytes.Buffer
 	statusCode int
 }
 
@@ -719,7 +719,7 @@ type CORSConfig struct {
 	AllowOrigins []string // Defaults to ["*"]
 	AllowMethods []string // Defaults to common methods
 	AllowHeaders []string // Defaults to common headers
-	MaxAge int // Access-Control-Max-Age in seconds
+	MaxAge       int      // Access-Control-Max-Age in seconds
 }
 
 // CORS returns a gin middleware that sets CORS headers and handles preflight
@@ -875,9 +875,9 @@ func ErrorHandlerWithLogger(logger *slog.Logger) gin.HandlerFunc {
 					}
 					c.AbortWithStatusJSON(status, map[string]interface{}{
 						"error": map[string]interface{}{
-							"code": e.Code,
+							"code":    e.Code,
 							"message": e.GetMessage(),
-							"meta": e.Meta,
+							"meta":    e.Meta,
 						},
 					})
 				case error:

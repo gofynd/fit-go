@@ -29,7 +29,7 @@ type CheckFunc func() string
 
 // Checker orchestrates health checks across all connections.
 type Checker struct {
-	mu sync.RWMutex
+	mu     sync.RWMutex
 	checks []CheckFunc
 	// skipCounter is used for adaptive health checking to reduce load
 	skipCounter int

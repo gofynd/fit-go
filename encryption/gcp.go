@@ -39,13 +39,13 @@ import (
 // Credentials (ADC). The provider fetches the project ID from the metadata
 // server and uses ADC access tokens for API calls.
 type GCPProvider struct {
-	location string
-	keyRing string
+	location  string
+	keyRing   string
 	cryptoKey string
-	secretID string
-	ivSecret string
+	secretID  string
+	ivSecret  string
 	projectID string
-	client *http.Client
+	client    *http.Client
 }
 
 // NewGCPProvider creates a GCPProvider configured from environment variables.
@@ -59,11 +59,11 @@ func NewGCPProvider() *GCPProvider {
 	}
 
 	return &GCPProvider{
-		location: location,
-		keyRing: os.Getenv("GCP_PII_KMS_KEY_RING"),
+		location:  location,
+		keyRing:   os.Getenv("GCP_PII_KMS_KEY_RING"),
 		cryptoKey: os.Getenv("GCP_PII_KMS_KEY"),
-		secretID: os.Getenv("GSM_PII_DEK_SECRET_ID"),
-		ivSecret: os.Getenv("GSM_PII_IV_SECRET_ID"),
+		secretID:  os.Getenv("GSM_PII_DEK_SECRET_ID"),
+		ivSecret:  os.Getenv("GSM_PII_IV_SECRET_ID"),
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -132,10 +132,10 @@ func (g *GCPProvider) Init() ([]byte, []byte, error) {
 // validateEnv checks that all required GCP environment variables are set.
 func (g *GCPProvider) validateEnv() error {
 	checks := map[string]string{
-		"GCP_PII_KMS_KEY_RING": g.keyRing,
-		"GCP_PII_KMS_KEY": g.cryptoKey,
+		"GCP_PII_KMS_KEY_RING":  g.keyRing,
+		"GCP_PII_KMS_KEY":       g.cryptoKey,
 		"GSM_PII_DEK_SECRET_ID": g.secretID,
-		"GSM_PII_IV_SECRET_ID": g.ivSecret,
+		"GSM_PII_IV_SECRET_ID":  g.ivSecret,
 	}
 	for name, val := range checks {
 		if val == "" {
@@ -299,7 +299,7 @@ func jsonReader(data []byte) io.Reader {
 
 type bytesReader struct {
 	data []byte
-	pos int
+	pos  int
 }
 
 func readerFromBytes(data []byte) *bytesReader {

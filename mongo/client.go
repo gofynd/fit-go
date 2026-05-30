@@ -110,17 +110,17 @@ type DialFunc func(ctx context.Context, uri string, opts *DialOptions) (Connecti
 // DialOptions carries connection parameters resolved from env vars and user
 // config that the DialFunc should apply to the underlying driver client.
 type DialOptions struct {
-	AppName string
-	TLSConfig *tls.Config
-	MaxPoolSize int
-	MinPoolSize int
-	MaxIdleTimeMS int
+	AppName          string
+	TLSConfig        *tls.Config
+	MaxPoolSize      int
+	MinPoolSize      int
+	MaxIdleTimeMS    int
 	ConnectTimeoutMS int
-	SocketTimeoutMS int
-	MaxConnecting int
+	SocketTimeoutMS  int
+	MaxConnecting    int
 	WaitQueueTimeout int
-	AutoIndex bool
-	AutoCreate bool
+	AutoIndex        bool
+	AutoCreate       bool
 }
 
 // ---------------------------------------------------------------------------
@@ -129,7 +129,7 @@ type DialOptions struct {
 
 // ServiceConnection holds read and write connections for a single service.
 type ServiceConnection struct {
-	Read Connection
+	Read  Connection
 	Write Connection
 }
 
@@ -158,18 +158,18 @@ type ConnectionOptions struct {
 // ServicePoolOverrides allows callers to programmatically override pool settings
 // for a specific service, similar to the connectionOptions parameter.
 type ServicePoolOverrides struct {
-	Read *PoolOverrides
+	Read  *PoolOverrides
 	Write *PoolOverrides
 }
 
 // PoolOverrides holds optional pool tuning values. Zero values are ignored.
 type PoolOverrides struct {
-	MaxPoolSize int
-	MinPoolSize int
-	MaxIdleTimeMS int
+	MaxPoolSize      int
+	MinPoolSize      int
+	MaxIdleTimeMS    int
 	ConnectTimeoutMS int
-	SocketTimeoutMS int
-	MaxConnecting int
+	SocketTimeoutMS  int
+	MaxConnecting    int
 	WaitQueueTimeout int
 }
 
@@ -180,7 +180,7 @@ type PoolOverrides struct {
 // Client manages MongoDB connections for all discovered services. It is the
 // Go equivalent of the MongodbConnections map.
 type Client struct {
-	mu sync.RWMutex
+	mu       sync.RWMutex
 	services map[string]*ServiceConnection
 	initOnce sync.Once
 }
@@ -216,10 +216,10 @@ func Init(opts ConnectionOptions) (*Client, error) {
 	autoCreate := !envBool("DISABLE_DB_AUTO_CREATE_COLLECTION", false)
 
 	type connJob struct {
-		serviceName string
+		serviceName      string
 		serviceNameUpper string
-		connType string // "read" or "write"
-		connStringOrRef string
+		connType         string // "read" or "write"
+		connStringOrRef  string
 	}
 
 	var jobs []connJob
@@ -250,10 +250,10 @@ func Init(opts ConnectionOptions) (*Client, error) {
 		}
 
 		jobs = append(jobs, connJob{
-			serviceName: serviceName,
+			serviceName:      serviceName,
 			serviceNameUpper: serviceNameUpper,
-			connType: connType,
-			connStringOrRef: value,
+			connType:         connType,
+			connStringOrRef:  value,
 		})
 	}
 
@@ -264,9 +264,9 @@ func Init(opts ConnectionOptions) (*Client, error) {
 	// Resolve all connections concurrently.all pattern.
 	type connResult struct {
 		serviceName string
-		connType string
-		conn Connection
-		err error
+		connType    string
+		conn        Connection
+		err         error
 	}
 
 	results := make(chan connResult, len(jobs))
@@ -282,8 +282,8 @@ func Init(opts ConnectionOptions) (*Client, error) {
 			if err != nil {
 				results <- connResult{
 					serviceName: j.serviceName,
-					connType: j.connType,
-					err: fmt.Errorf("mongo: resolve connection for %s_%s: %w", j.serviceName, j.connType, err),
+					connType:    j.connType,
+					err:         fmt.Errorf("mongo: resolve connection for %s_%s: %w", j.serviceName, j.connType, err),
 				}
 				return
 			}
@@ -298,8 +298,8 @@ func Init(opts ConnectionOptions) (*Client, error) {
 			if err != nil {
 				results <- connResult{
 					serviceName: j.serviceName,
-					connType: j.connType,
-					err: fmt.Errorf("mongo: connection failed for %s_%s: %w", j.serviceName, j.connType, err),
+					connType:    j.connType,
+					err:         fmt.Errorf("mongo: connection failed for %s_%s: %w", j.serviceName, j.connType, err),
 				}
 				return
 			}
@@ -311,16 +311,16 @@ func Init(opts ConnectionOptions) (*Client, error) {
 				_ = conn.Close(context.Background())
 				results <- connResult{
 					serviceName: j.serviceName,
-					connType: j.connType,
-					err: fmt.Errorf("mongo: ping failed for %s_%s: %w", j.serviceName, j.connType, err),
+					connType:    j.connType,
+					err:         fmt.Errorf("mongo: ping failed for %s_%s: %w", j.serviceName, j.connType, err),
 				}
 				return
 			}
 
 			results <- connResult{
 				serviceName: j.serviceName,
-				connType: j.connType,
-				conn: conn,
+				connType:    j.connType,
+				conn:        conn,
 			}
 		}(job)
 	}
@@ -461,10 +461,10 @@ func buildDialOptions(
 	prefix := fmt.Sprintf("MONGO_%s_%s_", serviceNameUpper, envConnType)
 
 	d := &DialOptions{
-		AppName: getAppName(),
+		AppName:          getAppName(),
 		ConnectTimeoutMS: int(opts.ConnectTimeout.Milliseconds()),
-		AutoIndex: autoIndex,
-		AutoCreate: autoCreate,
+		AutoIndex:        autoIndex,
+		AutoCreate:       autoCreate,
 	}
 
 	// Read pool settings from env vars.
@@ -575,10 +575,10 @@ func loadTLSConfig(dbType, serviceNameUpper string) *tls.Config {
 	caCertPool.AppendCertsFromPEM(caCert)
 
 	return &tls.Config{
-		RootCAs: caCertPool,
-		Certificates: []tls.Certificate{cert},
+		RootCAs:            caCertPool,
+		Certificates:       []tls.Certificate{cert},
 		InsecureSkipVerify: false,
-		MinVersion: tls.VersionTLS12,
+		MinVersion:         tls.VersionTLS12,
 	}
 }
 
@@ -605,7 +605,7 @@ func fetchGSMSecret(secretName string) (string, error) {
 
 	// Delegate to the config package's GSM implementation.
 	// This avoids duplicating the HTTP-based GSM fetch logic.
-	// Import path: github.com/fynd/commerce/fit/config
+	// Import path: github.com/gofynd/fit-go/config
 	//
 	// We use a pluggable resolver to avoid the import cycle. Callers can set
 	// the resolver via SetGSMResolver before calling Init.
@@ -624,7 +624,7 @@ func fetchGSMSecret(secretName string) (string, error) {
 type GSMResolverFunc func(secretName, version string) (string, error)
 
 var (
-	gsmMu sync.RWMutex
+	gsmMu       sync.RWMutex
 	gsmResolver GSMResolverFunc
 )
 

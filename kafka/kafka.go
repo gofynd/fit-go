@@ -37,7 +37,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/fynd/commerce/fit/logging"
+	"github.com/gofynd/fit-go/logging"
 )
 
 // ---------------------------------------------------------------------------
@@ -80,11 +80,11 @@ func ParseLogLevel(s string) LogLevel {
 type CompressionType int
 
 const (
-	CompressionNone CompressionType = iota
-	CompressionGZIP // 1
-	CompressionSnappy // 2
-	CompressionLZ4 // 3
-	CompressionZSTD // 4
+	CompressionNone   CompressionType = iota
+	CompressionGZIP                   // 1
+	CompressionSnappy                 // 2
+	CompressionLZ4                    // 3
+	CompressionZSTD                   // 4
 )
 
 // CompressionCodec compresses and decompresses message payloads.
@@ -100,13 +100,13 @@ type CompressionCodec interface {
 // ---------------------------------------------------------------------------
 
 // SASLConfig holds SASL authentication credentials.
-// Mirrors the kafkajs SASL options used.
+// Mirrors the SASL options used.
 type SASLConfig struct {
 	// Mechanism is the SASL mechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512).
 	// Defaults to "PLAIN" when not set.
 	Mechanism string
-	Username string
-	Password string
+	Username  string
+	Password  string
 }
 
 // ---------------------------------------------------------------------------
@@ -116,9 +116,9 @@ type SASLConfig struct {
 // TLSConfig holds mutual-TLS file paths for Kafka SSL connections.
 // The paths point to PEM-encoded certificate/key files on disk.
 type TLSConfig struct {
-	CAFile string // Path to the CA certificate file
+	CAFile   string // Path to the CA certificate file
 	CertFile string // Path to the client certificate file
-	KeyFile string // Path to the client private key file
+	KeyFile  string // Path to the client private key file
 }
 
 // BuildTLSConfig reads PEM files and returns a *tls.Config ready for use with
@@ -130,7 +130,7 @@ func (t *TLSConfig) BuildTLSConfig() (*tls.Config, error) {
 	}
 
 	tlsCfg := &tls.Config{
-		MinVersion: tls.VersionTLS12,
+		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: true, // matches rejectUnauthorized: false
 	}
 
@@ -337,13 +337,13 @@ func ConfigFromEnv() (*Config, error) {
 		cfg.Brokers = splitBrokers(os.Getenv("KAFKA_SASL_SSL_BROKER_LIST"))
 		cfg.SASL = &SASLConfig{
 			Mechanism: envOrDefault("KAFKA_SASL_SSL_MECHANISM", "PLAIN"),
-			Username: os.Getenv("KAFKA_SASL_SSL_USR"),
-			Password: os.Getenv("KAFKA_SASL_SSL_PAS"),
+			Username:  os.Getenv("KAFKA_SASL_SSL_USR"),
+			Password:  os.Getenv("KAFKA_SASL_SSL_PAS"),
 		}
 		cfg.TLS = &TLSConfig{
-			CAFile: os.Getenv("KAFKA_SASL_SSL_CA"),
+			CAFile:   os.Getenv("KAFKA_SASL_SSL_CA"),
 			CertFile: os.Getenv("KAFKA_SASL_SSL_CERT"),
-			KeyFile: os.Getenv("KAFKA_SASL_SSL_KEY"),
+			KeyFile:  os.Getenv("KAFKA_SASL_SSL_KEY"),
 		}
 		return cfg, nil
 	}
@@ -352,9 +352,9 @@ func ConfigFromEnv() (*Config, error) {
 	if hasSSLEnv() {
 		cfg.Brokers = splitBrokers(os.Getenv("KAFKA_SSL_BROKER_LIST"))
 		cfg.TLS = &TLSConfig{
-			CAFile: os.Getenv("KAFKA_SSL_CA"),
+			CAFile:   os.Getenv("KAFKA_SSL_CA"),
 			CertFile: os.Getenv("KAFKA_SSL_CERT"),
-			KeyFile: os.Getenv("KAFKA_SSL_KEY"),
+			KeyFile:  os.Getenv("KAFKA_SSL_KEY"),
 		}
 		return cfg, nil
 	}
@@ -364,8 +364,8 @@ func ConfigFromEnv() (*Config, error) {
 		cfg.Brokers = splitBrokers(os.Getenv("KAFKA_SASL_BROKER_LIST"))
 		cfg.SASL = &SASLConfig{
 			Mechanism: envOrDefault("KAFKA_SASL_MECHANISM", "PLAIN"),
-			Username: os.Getenv("KAFKA_SASL_USR"),
-			Password: os.Getenv("KAFKA_SASL_PAS"),
+			Username:  os.Getenv("KAFKA_SASL_USR"),
+			Password:  os.Getenv("KAFKA_SASL_PAS"),
 		}
 		return cfg, nil
 	}

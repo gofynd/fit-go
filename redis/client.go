@@ -248,7 +248,7 @@ type SentinelDialOptions struct {
 
 // ServiceConnection holds read and write connections for a single service.
 type ServiceConnection struct {
-	Read Connection
+	Read  Connection
 	Write Connection
 }
 
@@ -284,7 +284,7 @@ type ConnectionOptions struct {
 // Client manages Redis connections for all discovered services. It is the Go
 // equivalent of the RedisConnections map.
 type Client struct {
-	mu sync.RWMutex
+	mu       sync.RWMutex
 	services map[string]*ServiceConnection
 }
 
@@ -293,7 +293,7 @@ var envPattern = regexp.MustCompile(`^REDIS_(.+)_READ_(WRITE|ONLY)$`)
 
 // Init discovers Redis connection environment variables, resolves connection
 // strings, and establishes connections. It mirrors initRedis() in
-///src/redis/index.ts.
+// /src/redis/index.ts.
 func Init(opts ConnectionOptions) (*Client, error) {
 	if opts.Dial == nil {
 		return nil, fmt.Errorf("redis: DialFunc must be provided")
@@ -342,10 +342,10 @@ func Init(opts ConnectionOptions) (*Client, error) {
 		}
 
 		jobs = append(jobs, connJobEntry{
-			serviceName: serviceName,
+			serviceName:      serviceName,
 			serviceNameUpper: serviceNameUpper,
-			connType: connType,
-			connStringOrRef: value,
+			connType:         connType,
+			connStringOrRef:  value,
 		})
 	}
 
@@ -355,9 +355,9 @@ func Init(opts ConnectionOptions) (*Client, error) {
 
 	type connResult struct {
 		serviceName string
-		connType string
-		conn Connection
-		err error
+		connType    string
+		conn        Connection
+		err         error
 	}
 
 	results := make(chan connResult, len(jobs))
@@ -372,8 +372,8 @@ func Init(opts ConnectionOptions) (*Client, error) {
 			if err != nil {
 				results <- connResult{
 					serviceName: j.serviceName,
-					connType: j.connType,
-					err: fmt.Errorf("redis: resolve connection for %s_%s: %w", j.serviceName, j.connType, err),
+					connType:    j.connType,
+					err:         fmt.Errorf("redis: resolve connection for %s_%s: %w", j.serviceName, j.connType, err),
 				}
 				return
 			}
@@ -390,8 +390,8 @@ func Init(opts ConnectionOptions) (*Client, error) {
 			if err != nil {
 				results <- connResult{
 					serviceName: j.serviceName,
-					connType: j.connType,
-					err: err,
+					connType:    j.connType,
+					err:         err,
 				}
 				return
 			}
@@ -403,16 +403,16 @@ func Init(opts ConnectionOptions) (*Client, error) {
 				_ = conn.Close()
 				results <- connResult{
 					serviceName: j.serviceName,
-					connType: j.connType,
-					err: fmt.Errorf("redis: ping failed for %s_%s: %w", j.serviceName, j.connType, err),
+					connType:    j.connType,
+					err:         fmt.Errorf("redis: ping failed for %s_%s: %w", j.serviceName, j.connType, err),
 				}
 				return
 			}
 
 			results <- connResult{
 				serviceName: j.serviceName,
-				connType: j.connType,
-				conn: conn,
+				connType:    j.connType,
+				conn:        conn,
 			}
 		}(job)
 	}
@@ -534,12 +534,12 @@ func (c *Client) HealthCheck() func() string {
 
 // parsedURI holds the components extracted from a Redis connection URI.
 type parsedURI struct {
-	Scheme string
+	Scheme   string
 	Username string
 	Password string
-	Hosts []hostPort
-	DB int
-	Options map[string]string
+	Hosts    []hostPort
+	DB       int
+	Options  map[string]string
 }
 
 type hostPort struct {
@@ -562,7 +562,7 @@ func parseRedisURI(rawURI string) (*parsedURI, error) {
 	}
 
 	p := &parsedURI{
-		Scheme: strings.ToLower(u.Scheme),
+		Scheme:  strings.ToLower(u.Scheme),
 		Options: make(map[string]string),
 	}
 
@@ -609,17 +609,17 @@ func parseRedisURI(rawURI string) (*parsedURI, error) {
 }
 
 type connJobEntry struct {
-	serviceName string
+	serviceName      string
 	serviceNameUpper string
-	connType string
-	connStringOrRef string
+	connType         string
+	connStringOrRef  string
 }
 
 // envPoolOpts holds pool settings read from environment variables.
 type envPoolOpts struct {
 	ConnectTimeout time.Duration
-	SocketTimeout time.Duration
-	KeepAlive time.Duration
+	SocketTimeout  time.Duration
+	KeepAlive      time.Duration
 }
 
 // dialFromURI parses the connection string and routes to the appropriate dial
@@ -656,17 +656,17 @@ func dialFromURI(
 		}
 
 		sentOpts := &SentinelDialOptions{
-			MasterName: masterName,
-			SentinelAddrs: make([]string, 0, len(parsed.Hosts)),
-			Password: parsed.Password,
-			Username: parsed.Username,
-			ClientName: clientName,
-			TLSConfig: tlsCfg,
+			MasterName:     masterName,
+			SentinelAddrs:  make([]string, 0, len(parsed.Hosts)),
+			Password:       parsed.Password,
+			Username:       parsed.Username,
+			ClientName:     clientName,
+			TLSConfig:      tlsCfg,
 			ConnectTimeout: connectTimeout,
-			SocketTimeout: envOpts.SocketTimeout,
-			KeepAlive: envOpts.KeepAlive,
-			DB: parsed.DB,
-			ReadOnly: isReadOnly,
+			SocketTimeout:  envOpts.SocketTimeout,
+			KeepAlive:      envOpts.KeepAlive,
+			DB:             parsed.DB,
+			ReadOnly:       isReadOnly,
 		}
 
 		for _, h := range parsed.Hosts {
@@ -700,16 +700,16 @@ func dialFromURI(
 		}
 
 		clusterOpts := &ClusterDialOptions{
-			Addrs: make([]string, 0, len(parsed.Hosts)),
-			Password: parsed.Password,
-			Username: parsed.Username,
-			ClientName: clientName,
-			TLSConfig: tlsCfg,
-			ConnectTimeout: connectTimeout,
-			SocketTimeout: envOpts.SocketTimeout,
-			KeepAlive: envOpts.KeepAlive,
+			Addrs:                make([]string, 0, len(parsed.Hosts)),
+			Password:             parsed.Password,
+			Username:             parsed.Username,
+			ClientName:           clientName,
+			TLSConfig:            tlsCfg,
+			ConnectTimeout:       connectTimeout,
+			SocketTimeout:        envOpts.SocketTimeout,
+			KeepAlive:            envOpts.KeepAlive,
 			SlotsRefreshInterval: 5 * time.Second,
-			ReadOnly: isReadOnly,
+			ReadOnly:             isReadOnly,
 		}
 
 		for _, h := range parsed.Hosts {
@@ -726,16 +726,16 @@ func dialFromURI(
 	}
 
 	dialOpts := &DialOptions{
-		Addr: addr,
-		Password: parsed.Password,
-		Username: parsed.Username,
-		DB: parsed.DB,
-		ClientName: clientName,
-		TLSConfig: tlsCfg,
+		Addr:           addr,
+		Password:       parsed.Password,
+		Username:       parsed.Username,
+		DB:             parsed.DB,
+		ClientName:     clientName,
+		TLSConfig:      tlsCfg,
 		ConnectTimeout: connectTimeout,
-		SocketTimeout: envOpts.SocketTimeout,
-		KeepAlive: envOpts.KeepAlive,
-		ReadOnly: isReadOnly,
+		SocketTimeout:  envOpts.SocketTimeout,
+		KeepAlive:      envOpts.KeepAlive,
+		ReadOnly:       isReadOnly,
 	}
 
 	return opts.Dial(ctx, dialOpts)
@@ -807,11 +807,11 @@ func loadTLSConfig(dbType, serviceNameUpper string) *tls.Config {
 	caCertPool.AppendCertsFromPEM(caCert)
 
 	return &tls.Config{
-		RootCAs: caCertPool,
+		RootCAs:      caCertPool,
 		Certificates: []tls.Certificate{cert},
 		// Match: rejectUnauthorized: false
 		InsecureSkipVerify: true,
-		MinVersion: tls.VersionTLS12,
+		MinVersion:         tls.VersionTLS12,
 	}
 }
 
@@ -840,7 +840,7 @@ func resolveConnectionString(value string) (string, error) {
 type GSMResolverFunc func(secretName, version string) (string, error)
 
 var (
-	gsmMu sync.RWMutex
+	gsmMu       sync.RWMutex
 	gsmResolver GSMResolverFunc
 )
 

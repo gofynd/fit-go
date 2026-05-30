@@ -37,7 +37,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
-	"github.com/fynd/commerce/fit/health"
+	"github.com/gofynd/fit-go/health"
 )
 
 // ---------------------------------------------------------------------------
@@ -64,7 +64,7 @@ func newTestServer(t *testing.T) *Server {
 	srv, err := Init(Config{
 		FileName: "test",
 		ProtoDir: tmpDir,
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatalf("Init() error = %v", err)
@@ -115,7 +115,7 @@ func generateRSAKeyPair(t *testing.T) (*rsa.PrivateKey, string) {
 		t.Fatalf("failed to marshal public key: %v", err)
 	}
 	pubPEM := pem.EncodeToMemory(&pem.Block{
-		Type: "PUBLIC KEY",
+		Type:  "PUBLIC KEY",
 		Bytes: pubBytes,
 	})
 	return priv, string(pubPEM)
@@ -212,15 +212,15 @@ func TestConfig_CustomValues(t *testing.T) {
 	checker := health.NewChecker()
 
 	cfg := Config{
-		ServerType: "custom",
-		Port: "8080",
-		FileName: "myservice",
-		ProtoDir: "/custom/proto",
-		IdleTimeout: 30 * time.Second,
+		ServerType:        "custom",
+		Port:              "8080",
+		FileName:          "myservice",
+		ProtoDir:          "/custom/proto",
+		IdleTimeout:       30 * time.Second,
 		KeepaliveInterval: 10 * time.Second,
-		KeepaliveTimeout: 5 * time.Second,
-		Logger: logger,
-		HealthChecker: checker,
+		KeepaliveTimeout:  5 * time.Second,
+		Logger:            logger,
+		HealthChecker:     checker,
 	}
 	err := cfg.defaults()
 	if err != nil {
@@ -267,15 +267,15 @@ func TestInit_CustomConfig(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	srv, err := Init(Config{
-		ServerType: serverType,
-		Port: "0",
-		FileName: "custom",
-		ProtoDir: tmpDir,
-		IdleTimeout: 120 * time.Second,
+		ServerType:        serverType,
+		Port:              "0",
+		FileName:          "custom",
+		ProtoDir:          tmpDir,
+		IdleTimeout:       120 * time.Second,
 		KeepaliveInterval: 30 * time.Second,
-		KeepaliveTimeout: 15 * time.Second,
-		Logger: logger,
-		HealthChecker: checker,
+		KeepaliveTimeout:  15 * time.Second,
+		Logger:            logger,
+		HealthChecker:     checker,
 	})
 	if err != nil {
 		t.Fatalf("Init() error = %v", err)
@@ -675,8 +675,8 @@ func TestJWTAuthorization(t *testing.T) {
 	t.Run("valid HS256 token", func(t *testing.T) {
 		claims := jwt.MapClaims{
 			"company_id": float64(42),
-			"exp": float64(time.Now().Add(1 * time.Hour).Unix()),
-			"iat": float64(time.Now().Unix()),
+			"exp":        float64(time.Now().Add(1 * time.Hour).Unix()),
+			"iat":        float64(time.Now().Unix()),
 		}
 		tokenStr := createHS256Token(t, claims, secret)
 
@@ -687,8 +687,8 @@ func TestJWTAuthorization(t *testing.T) {
 		var nextCalled bool
 		call := &CallInfo{
 			Metadata: Metadata{"authorization": []string{"Bearer " + tokenStr}},
-			Request: map[string]interface{}{"company_id": float64(42)},
-			Context: context.Background(),
+			Request:  map[string]interface{}{"company_id": float64(42)},
+			Context:  context.Background(),
 		}
 
 		handler(call, func(err error, resp map[string]interface{}) {
@@ -716,8 +716,8 @@ func TestJWTAuthorization(t *testing.T) {
 		var gotErr error
 		call := &CallInfo{
 			Metadata: Metadata{},
-			Request: map[string]interface{}{},
-			Context: context.Background(),
+			Request:  map[string]interface{}{},
+			Context:  context.Background(),
 		}
 
 		handler(call, func(err error, resp map[string]interface{}) {
@@ -734,7 +734,7 @@ func TestJWTAuthorization(t *testing.T) {
 	t.Run("invalid token signature", func(t *testing.T) {
 		claims := jwt.MapClaims{
 			"company_id": float64(42),
-			"exp": float64(time.Now().Add(1 * time.Hour).Unix()),
+			"exp":        float64(time.Now().Add(1 * time.Hour).Unix()),
 		}
 		tokenStr := createHS256Token(t, claims, "wrong-secret")
 
@@ -743,8 +743,8 @@ func TestJWTAuthorization(t *testing.T) {
 		var gotErr error
 		call := &CallInfo{
 			Metadata: Metadata{"authorization": []string{"Bearer " + tokenStr}},
-			Request: map[string]interface{}{},
-			Context: context.Background(),
+			Request:  map[string]interface{}{},
+			Context:  context.Background(),
 		}
 
 		handler(call, func(err error, resp map[string]interface{}) {
@@ -761,8 +761,8 @@ func TestJWTAuthorization(t *testing.T) {
 	t.Run("expired token", func(t *testing.T) {
 		claims := jwt.MapClaims{
 			"company_id": float64(42),
-			"exp": float64(time.Now().Add(-1 * time.Hour).Unix()),
-			"iat": float64(time.Now().Add(-2 * time.Hour).Unix()),
+			"exp":        float64(time.Now().Add(-1 * time.Hour).Unix()),
+			"iat":        float64(time.Now().Add(-2 * time.Hour).Unix()),
 		}
 		tokenStr := createHS256Token(t, claims, secret)
 
@@ -771,8 +771,8 @@ func TestJWTAuthorization(t *testing.T) {
 		var gotErr error
 		call := &CallInfo{
 			Metadata: Metadata{"authorization": []string{"Bearer " + tokenStr}},
-			Request: map[string]interface{}{},
-			Context: context.Background(),
+			Request:  map[string]interface{}{},
+			Context:  context.Background(),
 		}
 
 		handler(call, func(err error, resp map[string]interface{}) {
@@ -789,21 +789,21 @@ func TestJWTAuthorization(t *testing.T) {
 	t.Run("expired token with clock skew", func(t *testing.T) {
 		claims := jwt.MapClaims{
 			"company_id": float64(42),
-			"exp": float64(time.Now().Add(-30 * time.Second).Unix()),
-			"iat": float64(time.Now().Add(-2 * time.Hour).Unix()),
+			"exp":        float64(time.Now().Add(-30 * time.Second).Unix()),
+			"iat":        float64(time.Now().Add(-2 * time.Hour).Unix()),
 		}
 		tokenStr := createHS256Token(t, claims, secret)
 
 		handler := AuthorizeJWTToken(JWTConfig{
-			Secret: secret,
+			Secret:           secret,
 			AllowedClockSkew: 1 * time.Minute,
 		})
 
 		var nextCalled bool
 		call := &CallInfo{
 			Metadata: Metadata{"authorization": []string{"Bearer " + tokenStr}},
-			Request: map[string]interface{}{"company_id": float64(42)},
-			Context: context.Background(),
+			Request:  map[string]interface{}{"company_id": float64(42)},
+			Context:  context.Background(),
 		}
 
 		handler(call, func(err error, resp map[string]interface{}) {
@@ -822,20 +822,20 @@ func TestJWTAuthorization(t *testing.T) {
 	t.Run("payload mismatch", func(t *testing.T) {
 		claims := jwt.MapClaims{
 			"company_id": float64(99),
-			"exp": float64(time.Now().Add(1 * time.Hour).Unix()),
+			"exp":        float64(time.Now().Add(1 * time.Hour).Unix()),
 		}
 		tokenStr := createHS256Token(t, claims, secret)
 
 		handler := AuthorizeJWTToken(JWTConfig{
-			Secret: secret,
+			Secret:  secret,
 			Payload: map[string]interface{}{"company_id": float64(42)},
 		})
 
 		var gotErr error
 		call := &CallInfo{
 			Metadata: Metadata{"authorization": []string{"Bearer " + tokenStr}},
-			Request: map[string]interface{}{},
-			Context: context.Background(),
+			Request:  map[string]interface{}{},
+			Context:  context.Background(),
 		}
 
 		handler(call, func(err error, resp map[string]interface{}) {
@@ -852,7 +852,7 @@ func TestJWTAuthorization(t *testing.T) {
 	t.Run("HS384 token", func(t *testing.T) {
 		claims := jwt.MapClaims{
 			"company_id": float64(42),
-			"exp": float64(time.Now().Add(1 * time.Hour).Unix()),
+			"exp":        float64(time.Now().Add(1 * time.Hour).Unix()),
 		}
 		token := jwt.NewWithClaims(jwt.SigningMethodHS384, claims)
 		tokenStr, err := token.SignedString([]byte(secret))
@@ -861,15 +861,15 @@ func TestJWTAuthorization(t *testing.T) {
 		}
 
 		handler := AuthorizeJWTToken(JWTConfig{
-			Secret: secret,
+			Secret:            secret,
 			AllowedAlgorithms: []string{"HS256", "HS384"},
 		})
 
 		var nextCalled bool
 		call := &CallInfo{
 			Metadata: Metadata{"authorization": []string{"Bearer " + tokenStr}},
-			Request: map[string]interface{}{"company_id": float64(42)},
-			Context: context.Background(),
+			Request:  map[string]interface{}{"company_id": float64(42)},
+			Context:  context.Background(),
 		}
 
 		handler(call, func(err error, resp map[string]interface{}) {
@@ -888,7 +888,7 @@ func TestJWTAuthorization(t *testing.T) {
 	t.Run("HS512 token", func(t *testing.T) {
 		claims := jwt.MapClaims{
 			"company_id": float64(42),
-			"exp": float64(time.Now().Add(1 * time.Hour).Unix()),
+			"exp":        float64(time.Now().Add(1 * time.Hour).Unix()),
 		}
 		token := jwt.NewWithClaims(jwt.SigningMethodHS512, claims)
 		tokenStr, err := token.SignedString([]byte(secret))
@@ -897,15 +897,15 @@ func TestJWTAuthorization(t *testing.T) {
 		}
 
 		handler := AuthorizeJWTToken(JWTConfig{
-			Secret: secret,
+			Secret:            secret,
 			AllowedAlgorithms: []string{"HS512"},
 		})
 
 		var nextCalled bool
 		call := &CallInfo{
 			Metadata: Metadata{"authorization": []string{"Bearer " + tokenStr}},
-			Request: map[string]interface{}{"company_id": float64(42)},
-			Context: context.Background(),
+			Request:  map[string]interface{}{"company_id": float64(42)},
+			Context:  context.Background(),
 		}
 
 		handler(call, func(err error, resp map[string]interface{}) {
@@ -926,7 +926,7 @@ func TestJWTAuthorization(t *testing.T) {
 
 		claims := jwt.MapClaims{
 			"company_id": float64(42),
-			"exp": float64(time.Now().Add(1 * time.Hour).Unix()),
+			"exp":        float64(time.Now().Add(1 * time.Hour).Unix()),
 		}
 		token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 		tokenStr, err := token.SignedString(privKey)
@@ -935,15 +935,15 @@ func TestJWTAuthorization(t *testing.T) {
 		}
 
 		handler := AuthorizeJWTToken(JWTConfig{
-			RSAPublicKeyPEM: pubPEM,
+			RSAPublicKeyPEM:   pubPEM,
 			AllowedAlgorithms: []string{"RS256"},
 		})
 
 		var nextCalled bool
 		call := &CallInfo{
 			Metadata: Metadata{"authorization": []string{"Bearer " + tokenStr}},
-			Request: map[string]interface{}{"company_id": float64(42)},
-			Context: context.Background(),
+			Request:  map[string]interface{}{"company_id": float64(42)},
+			Context:  context.Background(),
 		}
 
 		handler(call, func(err error, resp map[string]interface{}) {
@@ -962,7 +962,7 @@ func TestJWTAuthorization(t *testing.T) {
 	t.Run("algorithm not in allowed list", func(t *testing.T) {
 		claims := jwt.MapClaims{
 			"company_id": float64(42),
-			"exp": float64(time.Now().Add(1 * time.Hour).Unix()),
+			"exp":        float64(time.Now().Add(1 * time.Hour).Unix()),
 		}
 		token := jwt.NewWithClaims(jwt.SigningMethodHS384, claims)
 		tokenStr, err := token.SignedString([]byte(secret))
@@ -972,15 +972,15 @@ func TestJWTAuthorization(t *testing.T) {
 
 		// Only allow HS256, but token is HS384.
 		handler := AuthorizeJWTToken(JWTConfig{
-			Secret: secret,
+			Secret:            secret,
 			AllowedAlgorithms: []string{"HS256"},
 		})
 
 		var gotErr error
 		call := &CallInfo{
 			Metadata: Metadata{"authorization": []string{"Bearer " + tokenStr}},
-			Request: map[string]interface{}{},
-			Context: context.Background(),
+			Request:  map[string]interface{}{},
+			Context:  context.Background(),
 		}
 
 		handler(call, func(err error, resp map[string]interface{}) {
@@ -1000,8 +1000,8 @@ func TestJWTAuthorization(t *testing.T) {
 		var gotErr error
 		call := &CallInfo{
 			Metadata: Metadata{"authorization": []string{"Bearer not.a.valid.jwt"}},
-			Request: map[string]interface{}{},
-			Context: context.Background(),
+			Request:  map[string]interface{}{},
+			Context:  context.Background(),
 		}
 
 		handler(call, func(err error, resp map[string]interface{}) {
@@ -1023,8 +1023,8 @@ func TestJWTAuthorization(t *testing.T) {
 		var gotErr error
 		call := &CallInfo{
 			Metadata: Metadata{"authorization": []string{tokenStr}}, // No "Bearer " prefix.
-			Request: map[string]interface{}{},
-			Context: context.Background(),
+			Request:  map[string]interface{}{},
+			Context:  context.Background(),
 		}
 
 		handler(call, func(err error, resp map[string]interface{}) {
@@ -1041,7 +1041,7 @@ func TestJWTAuthorization(t *testing.T) {
 	t.Run("auto extract company_id from request", func(t *testing.T) {
 		claims := jwt.MapClaims{
 			"company_id": float64(77),
-			"exp": float64(time.Now().Add(1 * time.Hour).Unix()),
+			"exp":        float64(time.Now().Add(1 * time.Hour).Unix()),
 		}
 		tokenStr := createHS256Token(t, claims, secret)
 
@@ -1051,8 +1051,8 @@ func TestJWTAuthorization(t *testing.T) {
 		var nextCalled bool
 		call := &CallInfo{
 			Metadata: Metadata{"authorization": []string{"Bearer " + tokenStr}},
-			Request: map[string]interface{}{"company_id": float64(77)},
-			Context: context.Background(),
+			Request:  map[string]interface{}{"company_id": float64(77)},
+			Context:  context.Background(),
 		}
 
 		handler(call, func(err error, resp map[string]interface{}) {
@@ -1077,7 +1077,7 @@ func TestDecodeStructFields(t *testing.T) {
 	t.Run("plain map", func(t *testing.T) {
 		input := map[string]interface{}{
 			"name": "test",
-			"age": 25,
+			"age":  25,
 		}
 		result := decodeStructFields(input)
 		if result["name"] != "test" {
@@ -1170,8 +1170,8 @@ func TestDecodeStructFields(t *testing.T) {
 
 func TestDecodeProtobufValue(t *testing.T) {
 	tests := []struct {
-		name string
-		input interface{}
+		name     string
+		input    interface{}
 		expected interface{}
 	}{
 		{"stringValue", map[string]interface{}{"stringValue": "hello"}, "hello"},
@@ -1198,11 +1198,11 @@ func TestDecodeProtobufValue(t *testing.T) {
 func TestValidateResponse(t *testing.T) {
 	t.Run("valid response", func(t *testing.T) {
 		response := map[string]interface{}{
-			"name": "test",
+			"name":  "test",
 			"count": float64(42),
 		}
 		schema := map[string]string{
-			"name": "string",
+			"name":  "string",
 			"count": "float",
 		}
 		err := validateResponse(response, schema, "", false)
@@ -1287,7 +1287,7 @@ func TestValidateResponse(t *testing.T) {
 
 func TestGoTypeToSchemaType(t *testing.T) {
 	tests := []struct {
-		input interface{}
+		input    interface{}
 		expected string
 	}{
 		{float64(1.5), "float"},
@@ -1312,9 +1312,9 @@ func TestGoTypeToSchemaType(t *testing.T) {
 
 func TestIsCompatibleType(t *testing.T) {
 	tests := []struct {
-		actual string
+		actual   string
 		expected string
-		result bool
+		result   bool
 	}{
 		{"number", "float", true},
 		{"float", "number", true},
@@ -1371,7 +1371,7 @@ func TestMetadata_Set(t *testing.T) {
 
 func TestRPCError_Error(t *testing.T) {
 	err := &RPCError{
-		Code: Internal,
+		Code:    Internal,
 		Message: "something went wrong",
 	}
 
@@ -1387,7 +1387,7 @@ func TestRPCError_Error(t *testing.T) {
 
 func TestCapitalize(t *testing.T) {
 	tests := []struct {
-		input string
+		input    string
 		expected string
 	}{
 		{"hello", "Hello"},
@@ -1427,9 +1427,9 @@ func TestCallInfo_Context(t *testing.T) {
 	ctx := context.WithValue(context.Background(), ctxKey("key"), "value")
 	call := &CallInfo{
 		FullMethod: "/package.Service/Method",
-		Context: ctx,
-		Request: map[string]interface{}{"param": "value"},
-		Metadata: Metadata{"auth": []string{"token"}},
+		Context:    ctx,
+		Request:    map[string]interface{}{"param": "value"},
+		Metadata:   Metadata{"auth": []string{"token"}},
 	}
 
 	if call.Context.Value(ctxKey("key")) != "value" {
@@ -1499,8 +1499,8 @@ func TestComparePayloads(t *testing.T) {
 		expected := map[string]interface{}{"company_id": float64(42)}
 		decoded := map[string]interface{}{
 			"company_id": float64(42),
-			"iat": float64(1234567890),
-			"exp": float64(9999999999),
+			"iat":        float64(1234567890),
+			"exp":        float64(9999999999),
 		}
 		if !comparePayloads(expected, decoded) {
 			t.Error("matching payloads should return true")
@@ -1511,7 +1511,7 @@ func TestComparePayloads(t *testing.T) {
 		expected := map[string]interface{}{"company_id": float64(42)}
 		decoded := map[string]interface{}{
 			"company_id": float64(99),
-			"iat": float64(1234567890),
+			"iat":        float64(1234567890),
 		}
 		if comparePayloads(expected, decoded) {
 			t.Error("mismatched payloads should return false")
@@ -1521,9 +1521,9 @@ func TestComparePayloads(t *testing.T) {
 	t.Run("extra non-standard claims", func(t *testing.T) {
 		expected := map[string]interface{}{"company_id": float64(42)}
 		decoded := map[string]interface{}{
-			"company_id": float64(42),
+			"company_id":  float64(42),
 			"extra_field": "surprise",
-			"iat": float64(1234567890),
+			"iat":         float64(1234567890),
 		}
 		if comparePayloads(expected, decoded) {
 			t.Error("extra non-standard claims should cause mismatch")

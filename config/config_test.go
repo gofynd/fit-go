@@ -36,9 +36,9 @@ func TestGetString(t *testing.T) {
 	cfg.Set("TEST_KEY", "test_value")
 
 	tests := []struct {
-		name string
-		key string
-		defVal string
+		name     string
+		key      string
+		defVal   string
 		expected string
 	}{
 		{"existing key", "TEST_KEY", "default", "test_value"},
@@ -62,9 +62,9 @@ func TestGetInt(t *testing.T) {
 	cfg.Set("INVALID_INT", "not_a_number")
 
 	tests := []struct {
-		name string
-		key string
-		defVal int
+		name     string
+		key      string
+		defVal   int
 		expected int
 	}{
 		{"valid int", "INT_VAL", 0, 42},
@@ -110,9 +110,9 @@ func TestGetBool(t *testing.T) {
 	cfg.Set("BOOL_INVALID", "maybe")
 
 	tests := []struct {
-		name string
-		key string
-		defVal bool
+		name     string
+		key      string
+		defVal   bool
 		expected bool
 	}{
 		{"true", "BOOL_TRUE", false, true},
@@ -161,14 +161,14 @@ func TestGetFloat(t *testing.T) {
 func TestGetDuration(t *testing.T) {
 	cfg := New()
 	cfg.Set("DUR_GO", "30s")
-	cfg.Set("DUR_MS", "5000") // Node.js style milliseconds
+	cfg.Set("DUR_MS", "5000") // plain integer treated as milliseconds
 	cfg.Set("DUR_HOUR", "1h")
 	cfg.Set("DUR_INVALID", "not_a_duration")
 
 	tests := []struct {
-		name string
-		key string
-		defVal time.Duration
+		name     string
+		key      string
+		defVal   time.Duration
 		expected time.Duration
 	}{
 		{"Go duration 30s", "DUR_GO", 0, 30 * time.Second},
@@ -196,9 +196,9 @@ func TestGetStringSlice(t *testing.T) {
 	cfg.Set("EMPTY_SLICE", "")
 
 	tests := []struct {
-		name string
-		key string
-		defVal []string
+		name     string
+		key      string
+		defVal   []string
 		expected []string
 	}{
 		{"comma separated", "SLICE_VAL", nil, []string{"a", "b", "c"}},
@@ -244,7 +244,7 @@ func TestSetAll(t *testing.T) {
 	cfg.Set("EXISTING", "old")
 
 	cfg.SetAll(map[string]string{
-		"NEW_KEY": "new_value",
+		"NEW_KEY":  "new_value",
 		"EXISTING": "overwritten",
 	})
 
@@ -425,10 +425,10 @@ func TestLoadEnvPrecedence(t *testing.T) {
 
 func TestParseDotenvLine(t *testing.T) {
 	tests := []struct {
-		line string
-		wantKey string
+		line      string
+		wantKey   string
 		wantValue string
-		wantOk bool
+		wantOk    bool
 	}{
 		{"KEY=value", "KEY", "value", true},
 		{"KEY=\"quoted value\"", "KEY", "quoted value", true},
@@ -475,9 +475,9 @@ func TestFlattenMap(t *testing.T) {
 	result := flattenMap("", input)
 
 	expected := map[string]string{
-		"SIMPLE": "value",
-		"NUMBER": "42",
-		"NESTED_INNER": "nested_value",
+		"SIMPLE":           "value",
+		"NUMBER":           "42",
+		"NESTED_INNER":     "nested_value",
 		"NESTED_DEEP_LEAF": "deep_value",
 	}
 

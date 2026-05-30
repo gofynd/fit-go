@@ -21,8 +21,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/fynd/commerce/fit/health"
-	"github.com/fynd/commerce/fit/logging"
+	"github.com/gofynd/fit-go/health"
+	"github.com/gofynd/fit-go/logging"
 )
 
 const (

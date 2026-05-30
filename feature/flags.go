@@ -39,16 +39,15 @@ import (
 // Client is a feature flag client that communicates with a feature flag server
 // (e.g. FeatureHub). It maintains a local cache of feature flags that is
 // refreshed periodically.
-//
 type Client struct {
-	mu sync.RWMutex
-	url string
-	apiKey string
-	flags map[string]interface{}
+	mu      sync.RWMutex
+	url     string
+	apiKey  string
+	flags   map[string]interface{}
 	userKey string
 	session string
-	client *http.Client
-	stopCh chan struct{}
+	client  *http.Client
+	stopCh  chan struct{}
 	stopped bool
 }
 
@@ -77,9 +76,9 @@ func Init() (*Client, error) {
 	}
 
 	c := &Client{
-		url: strings.TrimRight(url, "/"),
+		url:    strings.TrimRight(url, "/"),
 		apiKey: apiKey,
-		flags: make(map[string]interface{}),
+		flags:  make(map[string]interface{}),
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},

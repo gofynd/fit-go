@@ -29,7 +29,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
-	"github.com/fynd/commerce/fit/health"
+	"github.com/gofynd/fit-go/health"
 )
 
 // ---------------------------------------------------------------------------

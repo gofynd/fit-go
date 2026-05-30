@@ -100,16 +100,16 @@ type HTTPResponse struct {
 //	req, _ := http.NewRequest("GET", "https://api.example.com/data", nil)
 //	resp, err := client.Do(req)
 type HTTPClient struct {
-	mu sync.RWMutex
-	client *http.Client
-	baseURL string
-	defaultHeaders map[string]string
-	logger HTTPLogger
-	metricsRecorder HTTPMetricsRecorder
-	proxyURL string
-	forceProxyList []string
-	noProxyList []string
-	requestInterceptors []RequestInterceptor
+	mu                   sync.RWMutex
+	client               *http.Client
+	baseURL              string
+	defaultHeaders       map[string]string
+	logger               HTTPLogger
+	metricsRecorder      HTTPMetricsRecorder
+	proxyURL             string
+	forceProxyList       []string
+	noProxyList          []string
+	requestInterceptors  []RequestInterceptor
 	responseInterceptors []ResponseInterceptor
 }
 
@@ -189,17 +189,17 @@ func NewHTTPClient(opts HTTPClientOptions) *HTTPClient {
 
 	return &HTTPClient{
 		client: &http.Client{
-			Timeout: opts.Timeout,
+			Timeout:   opts.Timeout,
 			Transport: transport,
 		},
-		baseURL: strings.TrimRight(opts.BaseURL, "/"),
-		defaultHeaders: opts.Headers,
-		logger: opts.Logger,
-		metricsRecorder: opts.MetricsRecorder,
-		proxyURL: proxyURL,
-		forceProxyList: forceProxy,
-		noProxyList: noProxy,
-		requestInterceptors: opts.RequestInterceptors,
+		baseURL:              strings.TrimRight(opts.BaseURL, "/"),
+		defaultHeaders:       opts.Headers,
+		logger:               opts.Logger,
+		metricsRecorder:      opts.MetricsRecorder,
+		proxyURL:             proxyURL,
+		forceProxyList:       forceProxy,
+		noProxyList:          noProxy,
+		requestInterceptors:  opts.RequestInterceptors,
 		responseInterceptors: opts.ResponseInterceptors,
 	}
 }

@@ -35,7 +35,7 @@ const (
 // ErrorRegistry holds the service-level configuration that maps integer error
 // codes to formatted string codes and human-readable messages.
 type ErrorRegistry struct {
-	mu sync.RWMutex
+	mu              sync.RWMutex
 	serviceNameCode string
 	// messages maps ISO language code -> message ID -> message string.
 	// Example: {"EN": {1: "Uncaught Exception", 2: "Invalid request"}}
@@ -131,12 +131,12 @@ type FitError struct {
 // If err is nil, the ErrorMessage is left empty.
 func New(err error, intCode int) *FitError {
 	fe := &FitError{
-		IntCode: intCode,
-		Meta: make(map[string]interface{}),
-		NOP: false,
+		IntCode:        intCode,
+		Meta:           make(map[string]interface{}),
+		NOP:            false,
 		HTTPStatusCode: http.StatusInternalServerError,
-		ISOLangCode: DefaultLanguageCode,
-		registry: DefaultRegistry,
+		ISOLangCode:    DefaultLanguageCode,
+		registry:       DefaultRegistry,
 	}
 
 	if err != nil {

@@ -54,8 +54,8 @@ import (
 
 	gc "github.com/mailgun/groupcache/v2"
 
-	"github.com/fynd/commerce/fit/health"
-	"github.com/fynd/commerce/fit/logging"
+	"github.com/gofynd/fit-go/health"
+	"github.com/gofynd/fit-go/logging"
 )
 
 // ---------------------------------------------------------------------------
@@ -111,16 +111,16 @@ type K8sDiscoveryConfig struct {
 // Kubernetes peer discovery. It is the primary entry point for the groupcache
 // package.
 type Client struct {
-	mu sync.RWMutex
-	pool *gc.HTTPPool
-	groups map[string]*gc.Group
-	self string
-	port string
-	logger *logging.Logger
-	metrics *Metrics
-	mux *http.ServeMux
-	server *http.Server
-	stopCh chan struct{}
+	mu       sync.RWMutex
+	pool     *gc.HTTPPool
+	groups   map[string]*gc.Group
+	self     string
+	port     string
+	logger   *logging.Logger
+	metrics  *Metrics
+	mux      *http.ServeMux
+	server   *http.Server
+	stopCh   chan struct{}
 	stopOnce sync.Once
 }
 
@@ -159,14 +159,14 @@ func Init(cfg Config) (*Client, error) {
 	mux.Handle("/_groupcache/", pool)
 
 	c := &Client{
-		pool: pool,
-		groups: make(map[string]*gc.Group),
-		self: self,
-		port: port,
-		logger: logger,
+		pool:    pool,
+		groups:  make(map[string]*gc.Group),
+		self:    self,
+		port:    port,
+		logger:  logger,
 		metrics: NewMetrics(),
-		mux: mux,
-		stopCh: make(chan struct{}),
+		mux:     mux,
+		stopCh:  make(chan struct{}),
 	}
 
 	logger.Info("groupcache: initialized",
@@ -184,7 +184,7 @@ func Init(cfg Config) (*Client, error) {
 func (c *Client) StartServer() error {
 	addr := ":" + c.port
 	c.server = &http.Server{
-		Addr: addr,
+		Addr:    addr,
 		Handler: c.mux,
 	}
 

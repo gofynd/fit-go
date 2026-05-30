@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package fit is the core framework for Fynd Commerce Go monolith (metroplex).
-// It provides configuration, server, database,
-// messaging, observability, and utility modules for building scalable services.
+// Package fit is a batteries-included framework for building scalable Go
+// microservices. It provides configuration, server, database, messaging,
+// observability, and utility modules with sensible, environment-driven defaults.
 package fit
 
 import (
@@ -22,43 +22,42 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/fynd/commerce/fit/config"
-	"github.com/fynd/commerce/fit/errors"
-	"github.com/fynd/commerce/fit/health"
-	"github.com/fynd/commerce/fit/logging"
-	"github.com/fynd/commerce/fit/metrics"
-	"github.com/fynd/commerce/fit/tracing"
+	"github.com/gofynd/fit-go/config"
+	"github.com/gofynd/fit-go/errors"
+	"github.com/gofynd/fit-go/health"
+	"github.com/gofynd/fit-go/logging"
+	"github.com/gofynd/fit-go/metrics"
+	"github.com/gofynd/fit-go/tracing"
 )
 
 // Connections holds all initialized database and service connections.
 // interface.
 type Connections struct {
-	Mongo interface{} // MongoDB connections (read/write per service)
-	MySQL interface{} // MySQL connections via database/sql
-	Postgres interface{} // PostgreSQL connections via database/sql
-	Redis interface{} // Redis connections (standalone or cluster)
+	Mongo       interface{} // MongoDB connections (read/write per service)
+	MySQL       interface{} // MySQL connections via database/sql
+	Postgres    interface{} // PostgreSQL connections via database/sql
+	Redis       interface{} // Redis connections (standalone or cluster)
 	FeatureFlag interface{} // Feature flag client
-	Kafka interface{} // Kafka client
-	GroupCache interface{} // GroupCache distributed in-process cache
+	Kafka       interface{} // Kafka client
+	GroupCache  interface{} // GroupCache distributed in-process cache
 }
 
 // Fit is the main framework singleton that holds global state.
-// Equivalent to the Fit class.
 type Fit struct {
-	mu sync.RWMutex
-	Config *config.Config
+	mu          sync.RWMutex
+	Config      *config.Config
 	Connections Connections
-	Logger *logging.Logger
-	Tracer *tracing.Tracer
-	Metrics *metrics.Registry
-	Health *health.Checker
-	Errors *errors.ErrorRegistry
+	Logger      *logging.Logger
+	Tracer      *tracing.Tracer
+	Metrics     *metrics.Registry
+	Health      *health.Checker
+	Errors      *errors.ErrorRegistry
 }
 
 // instance is the global Fit singleton.
 var (
 	instance *Fit
-	once sync.Once
+	once     sync.Once
 )
 
 // Instance returns the global Fit instance, initializing it if needed.
@@ -93,9 +92,9 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 
 	// 2. Initialize logging
 	logger, err := logging.New(logging.Options{
-		Level: cfg.GetString("LOG_LEVEL", "info"),
+		Level:    cfg.GetString("LOG_LEVEL", "info"),
 		Timezone: cfg.GetString("LOG_TIMEZONE", "UTC"),
-		Env: cfg.GetString("NODE_ENV", "development"),
+		Env:      cfg.GetString("NODE_ENV", "development"),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("fit: failed to init logger: %w", err)
@@ -112,7 +111,7 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 	if cfg.GetBool("TRACING_ENABLED", false) {
 		tracer, err := tracing.New(ctx, tracing.Options{
 			ServiceName: cfg.GetString("SERVICE_NAME", "unknown"),
-			Env: cfg.GetString("NODE_ENV", "development"),
+			Env:         cfg.GetString("NODE_ENV", "development"),
 		})
 		if err != nil {
 			logger.Warn("fit: tracing init failed, continuing without tracing", "error", err)
@@ -124,12 +123,12 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 	// 5. Initialize metrics if enabled
 	if cfg.GetBool("FIT_PROMETHEUS_ENABLED", false) {
 		registry, err := metrics.New(metrics.Options{
-			MetricsDir: cfg.GetString("METRICS_DIR", ""),
-			ServerEnabled: cfg.GetBool("FIT_PROMETHEUS_SERVER_ENABLED", true),
+			MetricsDir:        cfg.GetString("METRICS_DIR", ""),
+			ServerEnabled:     cfg.GetBool("FIT_PROMETHEUS_SERVER_ENABLED", true),
 			HTTPClientEnabled: cfg.GetBool("FIT_PROMETHEUS_AXIOS_ENABLED", true),
-			ServerBuckets: cfg.GetString("FIT_PROMETHEUS_SERVER_BUCKETS", ""),
+			ServerBuckets:     cfg.GetString("FIT_PROMETHEUS_SERVER_BUCKETS", ""),
 			HTTPClientBuckets: cfg.GetString("FIT_PROMETHEUS_AXIOS_BUCKETS", ""),
-			DeploymentName: cfg.GetString("DEPLOYMENT_NAME", ""),
+			DeploymentName:    cfg.GetString("DEPLOYMENT_NAME", ""),
 		})
 		if err != nil {
 			logger.Warn("fit: metrics init failed, continuing without metrics", "error", err)

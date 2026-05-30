@@ -106,8 +106,8 @@ func TestProfilerConfig(t *testing.T) {
 		t.Setenv("DEPLOYMENT_TYPE", "worker")
 
 		p := New(Config{
-			Enabled: true,
-			CPUEnabled: true,
+			Enabled:                    true,
+			CPUEnabled:                 true,
 			WallSamplingIntervalMicros: 100000,
 		})
 		p.Start()
@@ -128,7 +128,7 @@ func TestProfilerConfig(t *testing.T) {
 		t.Setenv("DEPLOYMENT_TYPE", "server")
 
 		p := New(Config{
-			Enabled: true,
+			Enabled:                    true,
 			WallSamplingIntervalMicros: 100000,
 		})
 		p.Start()
@@ -145,8 +145,8 @@ func TestProfilerConfig(t *testing.T) {
 		t.Setenv("PROJECT_NAME", "fynd")
 
 		p := New(Config{
-			Enabled: true,
-			TagsJSON: `{"custom_tag":"value","env":"staging"}`,
+			Enabled:                    true,
+			TagsJSON:                   `{"custom_tag":"value","env":"staging"}`,
 			WallSamplingIntervalMicros: 100000,
 		})
 		p.Start()
@@ -172,10 +172,10 @@ func TestProfilerConfig(t *testing.T) {
 
 	t.Run("GetConfig returns current config", func(t *testing.T) {
 		cfg := Config{
-			Enabled: true,
-			Server: "http://test:4040",
+			Enabled:    true,
+			Server:     "http://test:4040",
 			CPUEnabled: true,
-			TagsJSON: `{"env":"test"}`,
+			TagsJSON:   `{"env":"test"}`,
 		}
 		p := New(cfg)
 		result := p.GetConfig()
@@ -208,12 +208,12 @@ func TestProfilerStartStop(t *testing.T) {
 
 	t.Run("start and stop all", func(t *testing.T) {
 		p := New(Config{
-			Enabled: true,
-			CPUEnabled: true,
-			HeapEnabled: true,
-			WallEnabled: true,
+			Enabled:                    true,
+			CPUEnabled:                 true,
+			HeapEnabled:                true,
+			WallEnabled:                true,
 			WallSamplingIntervalMicros: 100000,
-			HeapSamplingIntervalBytes: 524288,
+			HeapSamplingIntervalBytes:  524288,
 		})
 
 		p.Start()
@@ -268,8 +268,8 @@ func TestProfilerStartStop(t *testing.T) {
 		defer func() { runtime.MemProfileRate = oldRate }()
 
 		p := New(Config{
-			Enabled: true,
-			HeapEnabled: true,
+			Enabled:                   true,
+			HeapEnabled:               true,
 			HeapSamplingIntervalBytes: 262144,
 		})
 		p.enabled.Store(true)
@@ -290,8 +290,8 @@ func TestProfilerStartStop(t *testing.T) {
 
 	t.Run("wall profiling start/stop", func(t *testing.T) {
 		p := New(Config{
-			Enabled: true,
-			WallEnabled: true,
+			Enabled:                    true,
+			WallEnabled:                true,
 			WallSamplingIntervalMicros: 100000,
 		})
 		p.enabled.Store(true)
@@ -311,8 +311,8 @@ func TestProfilerStartStop(t *testing.T) {
 
 	t.Run("idempotent start/stop", func(t *testing.T) {
 		p := New(Config{
-			Enabled: true,
-			CPUEnabled: true,
+			Enabled:                    true,
+			CPUEnabled:                 true,
 			WallSamplingIntervalMicros: 100000,
 		})
 
@@ -375,10 +375,10 @@ func TestProfilerStartStop(t *testing.T) {
 func TestProfilerStatus(t *testing.T) {
 	t.Run("GetDetailedStatus reflects running state", func(t *testing.T) {
 		p := New(Config{
-			Enabled: true,
-			CPUEnabled: true,
-			HeapEnabled: false,
-			WallEnabled: true,
+			Enabled:                    true,
+			CPUEnabled:                 true,
+			HeapEnabled:                false,
+			WallEnabled:                true,
 			WallSamplingIntervalMicros: 100000,
 		})
 		p.Start()
@@ -401,8 +401,8 @@ func TestProfilerStatus(t *testing.T) {
 
 	t.Run("Status returns map", func(t *testing.T) {
 		p := New(Config{
-			Enabled: true,
-			CPUEnabled: true,
+			Enabled:                    true,
+			CPUEnabled:                 true,
 			WallSamplingIntervalMicros: 100000,
 		})
 		p.Start()
@@ -435,12 +435,12 @@ func TestProfilerStatus(t *testing.T) {
 
 func TestProfilerRoutes(t *testing.T) {
 	p := New(Config{
-		Enabled: true,
-		CPUEnabled: false,
-		HeapEnabled: true,
-		WallEnabled: false,
+		Enabled:                    true,
+		CPUEnabled:                 false,
+		HeapEnabled:                true,
+		WallEnabled:                false,
 		WallSamplingIntervalMicros: 100000,
-		HeapSamplingIntervalBytes: 524288,
+		HeapSamplingIntervalBytes:  524288,
 	})
 
 	handler := p.Routes()
@@ -567,9 +567,9 @@ func TestProfilerRoutes(t *testing.T) {
 func TestEnvHelpers(t *testing.T) {
 	t.Run("envBool", func(t *testing.T) {
 		tests := []struct {
-			key string
+			key      string
 			setValue string
-			def bool
+			def      bool
 			expected bool
 		}{
 			{"TEST_BOOL_TRUE", "true", false, true},

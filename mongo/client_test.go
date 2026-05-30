@@ -27,10 +27,10 @@ import (
 // ---------------------------------------------------------------------------
 
 type mockConnection struct {
-	pingCalled bool
+	pingCalled  bool
 	closeCalled bool
-	pingErr error
-	closeErr error
+	pingErr     error
+	closeErr    error
 }
 
 func (m *mockConnection) Ping(ctx context.Context) error {
@@ -58,19 +58,19 @@ func mockDial(ctx context.Context, uri string, opts *DialOptions) (Connection, e
 
 func TestEnvRegex(t *testing.T) {
 	tests := []struct {
-		input string
-		shouldMatch bool
+		input           string
+		shouldMatch     bool
 		expectedService string
-		expectedType string
+		expectedType    string
 	}{
 		{"MONGO_USERS_READ_WRITE", true, "USERS", "WRITE"},
 		{"MONGO_ORDERS_READ_ONLY", true, "ORDERS", "ONLY"},
 		{"MONGO_FOO_BAR_READ_WRITE", true, "FOO_BAR", "WRITE"},
 		{"MONGO_X_READ_ONLY", true, "X", "ONLY"},
-		{"MONGO__READ_WRITE", false, "", ""}, // empty service
+		{"MONGO__READ_WRITE", false, "", ""},      // empty service
 		{"REDIS_USERS_READ_WRITE", false, "", ""}, // wrong prefix
-		{"MONGO_USERS_WRITE", false, "", ""}, // missing READ_
-		{"MONGO_USERS_READ_", false, "", ""}, // missing type
+		{"MONGO_USERS_WRITE", false, "", ""},      // missing READ_
+		{"MONGO_USERS_READ_", false, "", ""},      // missing type
 		{"mongo_users_read_write", false, "", ""}, // lowercase
 	}
 
@@ -103,7 +103,7 @@ func TestEnvRegex(t *testing.T) {
 
 func TestGetDeploymentName(t *testing.T) {
 	tests := []struct {
-		podName string
+		podName  string
 		expected string
 	}{
 		{"order-service-dply-abc123-xyz", "order-service-dply"},
@@ -135,60 +135,60 @@ func TestGetAppName(t *testing.T) {
 	}()
 
 	tests := []struct {
-		name string
-		podName string
-		namespace string
+		name        string
+		podName     string
+		namespace   string
 		serviceName string
-		expected string
+		expected    string
 	}{
 		{
-			name: "full deployment name with namespace",
-			podName: "order-service-dply-abc123",
-			namespace: "production",
+			name:        "full deployment name with namespace",
+			podName:     "order-service-dply-abc123",
+			namespace:   "production",
 			serviceName: "order-service",
-			expected: "production-order-service-dply",
+			expected:    "production-order-service-dply",
 		},
 		{
-			name: "cron job with namespace",
-			podName: "payment-cron-12345",
-			namespace: "staging",
+			name:        "cron job with namespace",
+			podName:     "payment-cron-12345",
+			namespace:   "staging",
 			serviceName: "payment-processor",
-			expected: "staging-payment-cron",
+			expected:    "staging-payment-cron",
 		},
 		{
-			name: "no deployment pattern, use service name",
-			podName: "random-pod-name",
-			namespace: "production",
+			name:        "no deployment pattern, use service name",
+			podName:     "random-pod-name",
+			namespace:   "production",
 			serviceName: "my-service",
-			expected: "production-my-service",
+			expected:    "production-my-service",
 		},
 		{
-			name: "default namespace ignored",
-			podName: "order-dply-abc",
-			namespace: "default",
+			name:        "default namespace ignored",
+			podName:     "order-dply-abc",
+			namespace:   "default",
 			serviceName: "order",
-			expected: "order-dply",
+			expected:    "order-dply",
 		},
 		{
-			name: "empty namespace",
-			podName: "service-dply-xyz",
-			namespace: "",
+			name:        "empty namespace",
+			podName:     "service-dply-xyz",
+			namespace:   "",
 			serviceName: "service",
-			expected: "service-dply",
+			expected:    "service-dply",
 		},
 		{
-			name: "no pod name, use service name",
-			podName: "",
-			namespace: "",
+			name:        "no pod name, use service name",
+			podName:     "",
+			namespace:   "",
 			serviceName: "standalone-service",
-			expected: "standalone-service",
+			expected:    "standalone-service",
 		},
 		{
-			name: "only namespace",
-			podName: "",
-			namespace: "test-ns",
+			name:        "only namespace",
+			podName:     "",
+			namespace:   "test-ns",
 			serviceName: "",
-			expected: "test-ns",
+			expected:    "test-ns",
 		},
 	}
 
@@ -214,16 +214,16 @@ func TestEnvBool(t *testing.T) {
 	defer os.Unsetenv(key)
 
 	tests := []struct {
-		value string
+		value      string
 		defaultVal bool
-		expected bool
+		expected   bool
 	}{
 		{"true", false, true},
 		{"TRUE", false, true},
 		{" true ", false, true},
 		{"false", true, false},
 		{"FALSE", true, false},
-		{"", true, true}, // use default
+		{"", true, true},   // use default
 		{"", false, false}, // use default
 		{"yes", false, false},
 		{"1", false, false},
@@ -385,7 +385,7 @@ func TestApplyPoolOverrides(t *testing.T) {
 	}
 
 	po := &PoolOverrides{
-		MaxPoolSize: 100,
+		MaxPoolSize:   100,
 		MaxIdleTimeMS: 60000,
 		// MinPoolSize intentionally 0 - should not override
 	}
@@ -411,7 +411,7 @@ func TestClient_Service(t *testing.T) {
 	c := &Client{
 		services: map[string]*ServiceConnection{
 			"users": {
-				Read: &mockConnection{},
+				Read:  &mockConnection{},
 				Write: &mockConnection{},
 			},
 			"orders": {
@@ -448,7 +448,7 @@ func TestClient_Service(t *testing.T) {
 func TestClient_Services(t *testing.T) {
 	c := &Client{
 		services: map[string]*ServiceConnection{
-			"users": {Read: &mockConnection{}},
+			"users":  {Read: &mockConnection{}},
 			"orders": {Write: &mockConnection{}},
 		},
 	}
@@ -471,7 +471,7 @@ func TestClient_Ping(t *testing.T) {
 		c := &Client{
 			services: map[string]*ServiceConnection{
 				"users": {
-					Read: &mockConnection{},
+					Read:  &mockConnection{},
 					Write: &mockConnection{},
 				},
 			},
@@ -487,7 +487,7 @@ func TestClient_Ping(t *testing.T) {
 		c := &Client{
 			services: map[string]*ServiceConnection{
 				"users": {
-					Read: &mockConnection{pingErr: context.DeadlineExceeded},
+					Read:  &mockConnection{pingErr: context.DeadlineExceeded},
 					Write: &mockConnection{},
 				},
 			},
@@ -511,7 +511,7 @@ func TestClient_Close(t *testing.T) {
 	c := &Client{
 		services: map[string]*ServiceConnection{
 			"users": {
-				Read: read,
+				Read:  read,
 				Write: write,
 			},
 		},
@@ -620,7 +620,7 @@ func TestInit(t *testing.T) {
 		}()
 
 		c, err := Init(ConnectionOptions{
-			Dial: mockDial,
+			Dial:           mockDial,
 			ConnectTimeout: 5 * time.Second,
 		})
 		if err != nil {

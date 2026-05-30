@@ -128,8 +128,8 @@ func TestApplyPoolSettings(t *testing.T) {
 		perService := map[string]ServicePoolOverrides{
 			"catalog": {
 				Write: &PoolOverrides{
-					MaxOpenConns: 100,
-					MaxIdleConns: 20,
+					MaxOpenConns:    100,
+					MaxIdleConns:    20,
 					ConnMaxIdleTime: 5 * time.Minute,
 					ConnMaxLifetime: 30 * time.Minute,
 				},
@@ -231,53 +231,53 @@ func TestTLSConfig(t *testing.T) {
 
 func TestParseURI(t *testing.T) {
 	tests := []struct {
-		name string
-		uri string
+		name     string
+		uri      string
 		wantHost string
 		wantPort string
-		wantDB string
+		wantDB   string
 		wantUser string
 		wantPass string
 		wantOpts map[string]string
-		wantErr bool
+		wantErr  bool
 	}{
 		{
-			name: "mysql URI format",
-			uri: "mysql://user:pass@localhost:3306/mydb",
+			name:     "mysql URI format",
+			uri:      "mysql://user:pass@localhost:3306/mydb",
 			wantHost: "localhost",
 			wantPort: "3306",
-			wantDB: "mydb",
+			wantDB:   "mydb",
 			wantUser: "user",
 			wantPass: "pass",
 		},
 		{
-			name: "without port",
-			uri: "mysql://user:pass@localhost/mydb",
+			name:     "without port",
+			uri:      "mysql://user:pass@localhost/mydb",
 			wantHost: "localhost",
-			wantDB: "mydb",
+			wantDB:   "mydb",
 			wantUser: "user",
 			wantPass: "pass",
 		},
 		{
-			name: "with query params",
-			uri: "mysql://localhost:3306/mydb?charset=utf8mb4&parseTime=true",
+			name:     "with query params",
+			uri:      "mysql://localhost:3306/mydb?charset=utf8mb4&parseTime=true",
 			wantHost: "localhost",
 			wantPort: "3306",
-			wantDB: "mydb",
+			wantDB:   "mydb",
 			wantOpts: map[string]string{"charset": "utf8mb4", "parseTime": "true"},
 		},
 		{
-			name: "password with special chars",
-			uri: "mysql://user:p%40ss%3Aword@localhost:3306/mydb",
+			name:     "password with special chars",
+			uri:      "mysql://user:p%40ss%3Aword@localhost:3306/mydb",
 			wantHost: "localhost",
 			wantPort: "3306",
-			wantDB: "mydb",
+			wantDB:   "mydb",
 			wantUser: "user",
 			wantPass: "p@ss:word",
 		},
 		{
-			name: "DSN format (no scheme)",
-			uri: "user:password@tcp(localhost:3306)/mydb",
+			name:     "DSN format (no scheme)",
+			uri:      "user:password@tcp(localhost:3306)/mydb",
 			wantOpts: map[string]string{"_raw_dsn": "user:password@tcp(localhost:3306)/mydb"},
 		},
 	}
@@ -317,8 +317,8 @@ func TestParseURI(t *testing.T) {
 
 func TestDefaultMySQLDSN(t *testing.T) {
 	tests := []struct {
-		name string
-		parsed *ParsedURI
+		name     string
+		parsed   *ParsedURI
 		contains []string
 	}{
 		{
@@ -326,8 +326,8 @@ func TestDefaultMySQLDSN(t *testing.T) {
 			parsed: &ParsedURI{
 				Username: "user",
 				Password: "pass",
-				Host: "localhost",
-				Port: "3306",
+				Host:     "localhost",
+				Port:     "3306",
 				Database: "mydb",
 			},
 			contains: []string{"user:pass@", "tcp(localhost:3306)", "/mydb"},
@@ -336,20 +336,20 @@ func TestDefaultMySQLDSN(t *testing.T) {
 			name: "with TLS name",
 			parsed: &ParsedURI{
 				Username: "user",
-				Host: "localhost",
-				Port: "3306",
+				Host:     "localhost",
+				Port:     "3306",
 				Database: "mydb",
-				TLSName: "custom-tls",
+				TLSName:  "custom-tls",
 			},
 			contains: []string{"tls=custom-tls"},
 		},
 		{
 			name: "with options",
 			parsed: &ParsedURI{
-				Host: "localhost",
-				Port: "3306",
+				Host:     "localhost",
+				Port:     "3306",
 				Database: "mydb",
-				Options: map[string]string{"charset": "utf8mb4"},
+				Options:  map[string]string{"charset": "utf8mb4"},
 			},
 			contains: []string{"charset=utf8mb4"},
 		},
@@ -408,7 +408,7 @@ func TestClient_Services(t *testing.T) {
 	c := &Client{
 		services: map[string]*ServiceConnection{
 			"catalog": {Read: &sql.DB{}},
-			"users": {Write: &sql.DB{}},
+			"users":   {Write: &sql.DB{}},
 		},
 	}
 
@@ -513,7 +513,7 @@ func TestResolveConnectionString(t *testing.T) {
 
 func TestGetDeploymentName(t *testing.T) {
 	tests := []struct {
-		podName string
+		podName  string
 		expected string
 	}{
 		{"catalog-service-dply-abc123", "catalog-service-dply"},

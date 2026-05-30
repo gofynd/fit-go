@@ -30,8 +30,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fynd/commerce/fit/errors"
 	"github.com/gin-gonic/gin"
+	"github.com/gofynd/fit-go/errors"
 )
 
 // ---------------------------------------------------------------------------
@@ -190,7 +190,7 @@ func TestAuthorizeJWT_ValidToken(t *testing.T) {
 	secret := "test-jwt-secret"
 	claims := map[string]interface{}{
 		"company_id": "abc123",
-		"exp": float64(time.Now().Add(time.Hour).Unix()),
+		"exp":        float64(time.Now().Add(time.Hour).Unix()),
 	}
 	token := createTestJWT(claims, secret)
 
@@ -248,7 +248,7 @@ func TestAuthorizeJWT_ExpiredToken(t *testing.T) {
 	secret := "test-jwt-secret"
 	claims := map[string]interface{}{
 		"company_id": "123",
-		"exp": float64(time.Now().Add(-time.Hour).Unix()),
+		"exp":        float64(time.Now().Add(-time.Hour).Unix()),
 	}
 	token := createTestJWT(claims, secret)
 
@@ -295,7 +295,7 @@ func TestAuthorizeJWT_EnvSecret(t *testing.T) {
 
 	claims := map[string]interface{}{
 		"company_id": "123",
-		"exp": float64(time.Now().Add(time.Hour).Unix()),
+		"exp":        float64(time.Now().Add(time.Hour).Unix()),
 	}
 	token := createTestJWT(claims, secret)
 
@@ -321,13 +321,13 @@ func TestAuthorizeJWT_PayloadMismatch(t *testing.T) {
 	secret := "test-secret"
 	claims := map[string]interface{}{
 		"company_id": "123",
-		"exp": float64(time.Now().Add(time.Hour).Unix()),
+		"exp":        float64(time.Now().Add(time.Hour).Unix()),
 	}
 	token := createTestJWT(claims, secret)
 
 	engine := gin.New()
 	opts := JWTOptions{
-		Secret: secret,
+		Secret:          secret,
 		ExpectedPayload: map[string]interface{}{"company_id": "999"},
 	}
 	engine.Use(AuthorizeJWTToken(opts))
@@ -459,7 +459,7 @@ func TestLogRequestResponse_Middleware(t *testing.T) {
 
 		engine := gin.New()
 		cfg := LogRequestResponseConfig{
-			Logger: logger,
+			Logger:         logger,
 			IncludeHeaders: "X-Trace-Id",
 		}
 		engine.Use(LogRequestResponse(cfg))
@@ -760,13 +760,13 @@ func TestSecureHeaders_GinMiddleware(t *testing.T) {
 	engine.ServeHTTP(rec, req)
 
 	expectedHeaders := map[string]string{
-		"X-Content-Type-Options": "nosniff",
-		"X-DNS-Prefetch-Control": "off",
-		"X-Download-Options": "noopen",
-		"X-Frame-Options": "SAMEORIGIN",
-		"X-XSS-Protection": "0",
+		"X-Content-Type-Options":    "nosniff",
+		"X-DNS-Prefetch-Control":    "off",
+		"X-Download-Options":        "noopen",
+		"X-Frame-Options":           "SAMEORIGIN",
+		"X-XSS-Protection":          "0",
 		"Strict-Transport-Security": "max-age=15552000; includeSubDomains",
-		"Referrer-Policy": "no-referrer",
+		"Referrer-Policy":           "no-referrer",
 	}
 
 	for header, expected := range expectedHeaders {

@@ -255,7 +255,7 @@ func TestExtractPeers_FallbackToFirstPort(t *testing.T) {
 		Subsets: []k8sSubset{
 			{
 				Addresses: []k8sAddress{{IP: "10.0.0.1"}},
-				Ports: []k8sPort{{Name: "http", Port: 8080}},
+				Ports:     []k8sPort{{Name: "http", Port: 8080}},
 			},
 		},
 	}
@@ -282,7 +282,7 @@ func TestExtractPeers_PortByNumber(t *testing.T) {
 		Subsets: []k8sSubset{
 			{
 				Addresses: []k8sAddress{{IP: "10.0.0.1"}},
-				Ports: []k8sPort{{Name: "cache", Port: 9090}},
+				Ports:     []k8sPort{{Name: "cache", Port: 9090}},
 			},
 		},
 	}

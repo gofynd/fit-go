@@ -27,11 +27,11 @@ import (
 // ---------------------------------------------------------------------------
 
 type mockConnection struct {
-	pingCalled bool
+	pingCalled  bool
 	closeCalled bool
-	pingErr error
-	closeErr error
-	isCluster bool
+	pingErr     error
+	closeErr    error
+	isCluster   bool
 }
 
 func (m *mockConnection) Ping(ctx context.Context) error {
@@ -73,18 +73,18 @@ func mockSentinelDial(ctx context.Context, opts *SentinelDialOptions) (Connectio
 
 func TestEnvPattern(t *testing.T) {
 	tests := []struct {
-		input string
-		shouldMatch bool
+		input           string
+		shouldMatch     bool
 		expectedService string
-		expectedType string
+		expectedType    string
 	}{
 		{"REDIS_CACHE_READ_WRITE", true, "CACHE", "WRITE"},
 		{"REDIS_SESSIONS_READ_ONLY", true, "SESSIONS", "ONLY"},
 		{"REDIS_FOO_BAR_READ_WRITE", true, "FOO_BAR", "WRITE"},
 		{"REDIS_X_READ_ONLY", true, "X", "ONLY"},
-		{"REDIS__READ_WRITE", false, "", ""}, // empty service
+		{"REDIS__READ_WRITE", false, "", ""},      // empty service
 		{"MONGO_CACHE_READ_WRITE", false, "", ""}, // wrong prefix
-		{"REDIS_CACHE_WRITE", false, "", ""}, // missing READ_
+		{"REDIS_CACHE_WRITE", false, "", ""},      // missing READ_
 		{"redis_cache_read_write", false, "", ""}, // lowercase
 	}
 
@@ -117,62 +117,62 @@ func TestEnvPattern(t *testing.T) {
 
 func TestParseRedisURI(t *testing.T) {
 	tests := []struct {
-		name string
-		uri string
+		name      string
+		uri       string
 		wantHosts []string
-		wantDB int
-		wantUser string
-		wantPass string
-		wantOpts map[string]string
-		wantErr bool
+		wantDB    int
+		wantUser  string
+		wantPass  string
+		wantOpts  map[string]string
+		wantErr   bool
 	}{
 		{
-			name: "simple standalone",
-			uri: "redis://localhost:6379/0",
+			name:      "simple standalone",
+			uri:       "redis://localhost:6379/0",
 			wantHosts: []string{"localhost:6379"},
-			wantDB: 0,
+			wantDB:    0,
 		},
 		{
-			name: "with auth",
-			uri: "redis://user:pass@localhost:6379/1",
+			name:      "with auth",
+			uri:       "redis://user:pass@localhost:6379/1",
 			wantHosts: []string{"localhost:6379"},
-			wantDB: 1,
-			wantUser: "user",
-			wantPass: "pass",
+			wantDB:    1,
+			wantUser:  "user",
+			wantPass:  "pass",
 		},
 		{
-			name: "cluster multiple hosts",
-			uri: "redis://host1:6379,host2:6380,host3:6381",
+			name:      "cluster multiple hosts",
+			uri:       "redis://host1:6379,host2:6380,host3:6381",
 			wantHosts: []string{"host1:6379", "host2:6380", "host3:6381"},
-			wantDB: 0,
+			wantDB:    0,
 		},
 		{
-			name: "with query params",
-			uri: "redis://localhost:6379/0?sharded_db=true",
+			name:      "with query params",
+			uri:       "redis://localhost:6379/0?sharded_db=true",
 			wantHosts: []string{"localhost:6379"},
-			wantOpts: map[string]string{"sharded_db": "true"},
+			wantOpts:  map[string]string{"sharded_db": "true"},
 		},
 		{
-			name: "sentinel",
-			uri: "redis-sentinel://sentinel1:26379,sentinel2:26379?master=mymaster",
+			name:      "sentinel",
+			uri:       "redis-sentinel://sentinel1:26379,sentinel2:26379?master=mymaster",
 			wantHosts: []string{"sentinel1:26379", "sentinel2:26379"},
-			wantOpts: map[string]string{"master": "mymaster"},
+			wantOpts:  map[string]string{"master": "mymaster"},
 		},
 		{
-			name: "default host",
-			uri: "redis://",
+			name:      "default host",
+			uri:       "redis://",
 			wantHosts: []string{"localhost:6379"},
 		},
 		{
-			name: "no scheme",
-			uri: "localhost:6379",
+			name:      "no scheme",
+			uri:       "localhost:6379",
 			wantHosts: []string{"localhost:6379"},
 		},
 		{
-			name: "host without port",
-			uri: "redis://myhost/2",
+			name:      "host without port",
+			uri:       "redis://myhost/2",
 			wantHosts: []string{"myhost:6379"},
-			wantDB: 2,
+			wantDB:    2,
 		},
 	}
 
@@ -219,8 +219,8 @@ func TestParseRedisURI(t *testing.T) {
 
 func TestHostPort_Addr(t *testing.T) {
 	tests := []struct {
-		host string
-		port string
+		host     string
+		port     string
 		expected string
 	}{
 		{"localhost", "6379", "localhost:6379"},
@@ -311,7 +311,7 @@ func TestGetRedisEnvOptions(t *testing.T) {
 
 func TestGetDeploymentName(t *testing.T) {
 	tests := []struct {
-		podName string
+		podName  string
 		expected string
 	}{
 		{"cache-service-dply-abc123", "cache-service-dply"},
@@ -341,32 +341,32 @@ func TestGetAppName(t *testing.T) {
 	}()
 
 	tests := []struct {
-		name string
-		podName string
-		namespace string
+		name        string
+		podName     string
+		namespace   string
 		serviceName string
-		expected string
+		expected    string
 	}{
 		{
-			name: "full deployment",
-			podName: "redis-svc-dply-xyz",
-			namespace: "production",
+			name:        "full deployment",
+			podName:     "redis-svc-dply-xyz",
+			namespace:   "production",
 			serviceName: "redis-svc",
-			expected: "production-redis-svc-dply",
+			expected:    "production-redis-svc-dply",
 		},
 		{
-			name: "service name fallback",
-			podName: "random-pod",
-			namespace: "",
+			name:        "service name fallback",
+			podName:     "random-pod",
+			namespace:   "",
 			serviceName: "my-service",
-			expected: "my-service",
+			expected:    "my-service",
 		},
 		{
-			name: "namespace only",
-			podName: "",
-			namespace: "staging",
+			name:        "namespace only",
+			podName:     "",
+			namespace:   "staging",
 			serviceName: "",
-			expected: "staging",
+			expected:    "staging",
 		},
 	}
 
@@ -391,7 +391,7 @@ func TestClient_Service(t *testing.T) {
 	c := &Client{
 		services: map[string]*ServiceConnection{
 			"cache": {
-				Read: &mockConnection{},
+				Read:  &mockConnection{},
 				Write: &mockConnection{},
 			},
 		},
@@ -422,7 +422,7 @@ func TestClient_Service(t *testing.T) {
 func TestClient_Services(t *testing.T) {
 	c := &Client{
 		services: map[string]*ServiceConnection{
-			"cache": {Read: &mockConnection{}},
+			"cache":    {Read: &mockConnection{}},
 			"sessions": {Write: &mockConnection{}},
 		},
 	}
@@ -445,7 +445,7 @@ func TestClient_Ping(t *testing.T) {
 		c := &Client{
 			services: map[string]*ServiceConnection{
 				"cache": {
-					Read: &mockConnection{},
+					Read:  &mockConnection{},
 					Write: &mockConnection{},
 				},
 			},
@@ -584,7 +584,7 @@ func TestInit(t *testing.T) {
 		}()
 
 		c, err := Init(ConnectionOptions{
-			Dial: mockDial,
+			Dial:                  mockDial,
 			DefaultConnectTimeout: 5 * time.Second,
 		})
 		if err != nil {
@@ -614,7 +614,7 @@ func TestInit(t *testing.T) {
 		}
 
 		_, err := Init(ConnectionOptions{
-			Dial: mockDial,
+			Dial:        mockDial,
 			ClusterDial: clusterDial,
 		})
 		if err != nil {
@@ -640,7 +640,7 @@ func TestInit(t *testing.T) {
 		}
 
 		_, err := Init(ConnectionOptions{
-			Dial: mockDial,
+			Dial:         mockDial,
 			SentinelDial: sentinelDial,
 		})
 		if err != nil {
@@ -853,9 +853,9 @@ func TestDialFromURI_Routing(t *testing.T) {
 	ctx := context.Background()
 	job := connJobEntry{serviceName: "test", connType: "write"}
 	opts := ConnectionOptions{
-		Dial: mockDial,
-		ClusterDial: mockClusterDial,
-		SentinelDial: mockSentinelDial,
+		Dial:                  mockDial,
+		ClusterDial:           mockClusterDial,
+		SentinelDial:          mockSentinelDial,
 		DefaultConnectTimeout: 5 * time.Second,
 	}
 
@@ -915,7 +915,7 @@ func TestDialFromURI_Routing(t *testing.T) {
 
 		readJob := connJobEntry{serviceName: "test", connType: "read"}
 		readOpts := ConnectionOptions{
-			Dial: captureDial,
+			Dial:                  captureDial,
 			DefaultConnectTimeout: 5 * time.Second,
 		}
 

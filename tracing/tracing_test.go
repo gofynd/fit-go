@@ -84,10 +84,10 @@ func TestTracerInit_Enabled(t *testing.T) {
 	exporter := tracetest.NewInMemoryExporter()
 
 	tracer, err := New(context.Background(), Options{
-		ServiceName: "test-enabled",
-		Env: "test",
-		SampleRate: 1.0,
-		SpanExporter: exporter,
+		ServiceName:            "test-enabled",
+		Env:                    "test",
+		SampleRate:             1.0,
+		SpanExporter:           exporter,
 		UseSimpleSpanProcessor: true,
 	})
 	if err != nil {
@@ -131,9 +131,9 @@ func TestStartSpan_ContextPropagation(t *testing.T) {
 
 	exporter := tracetest.NewInMemoryExporter()
 	tracer, _ := New(context.Background(), Options{
-		ServiceName: "test-ctx",
-		SpanExporter: exporter,
-		SampleRate: 1.0,
+		ServiceName:            "test-ctx",
+		SpanExporter:           exporter,
+		SampleRate:             1.0,
 		UseSimpleSpanProcessor: true,
 	})
 
@@ -183,9 +183,9 @@ func TestSpanAttributes(t *testing.T) {
 
 	exporter := tracetest.NewInMemoryExporter()
 	tracer, _ := New(context.Background(), Options{
-		ServiceName: "test-attrs",
-		SpanExporter: exporter,
-		SampleRate: 1.0,
+		ServiceName:            "test-attrs",
+		SpanExporter:           exporter,
+		SampleRate:             1.0,
 		UseSimpleSpanProcessor: true,
 	})
 
@@ -250,38 +250,38 @@ func TestSpanAttributes(t *testing.T) {
 
 func TestW3CTraceContext(t *testing.T) {
 	tests := []struct {
-		name string
+		name        string
 		traceparent string
-		wantTrace string
-		wantSpan string
+		wantTrace   string
+		wantSpan    string
 		wantSampled bool
 	}{
 		{
-			name: "valid sampled",
+			name:        "valid sampled",
 			traceparent: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
-			wantTrace: "0af7651916cd43dd8448eb211c80319c",
-			wantSpan: "b7ad6b7169203331",
+			wantTrace:   "0af7651916cd43dd8448eb211c80319c",
+			wantSpan:    "b7ad6b7169203331",
 			wantSampled: true,
 		},
 		{
-			name: "valid not sampled",
+			name:        "valid not sampled",
 			traceparent: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00",
-			wantTrace: "0af7651916cd43dd8448eb211c80319c",
-			wantSpan: "b7ad6b7169203331",
+			wantTrace:   "0af7651916cd43dd8448eb211c80319c",
+			wantSpan:    "b7ad6b7169203331",
 			wantSampled: false,
 		},
 		{
-			name: "invalid format",
+			name:        "invalid format",
 			traceparent: "invalid",
-			wantTrace: "",
-			wantSpan: "",
+			wantTrace:   "",
+			wantSpan:    "",
 			wantSampled: false,
 		},
 		{
-			name: "empty",
+			name:        "empty",
 			traceparent: "",
-			wantTrace: "",
-			wantSpan: "",
+			wantTrace:   "",
+			wantSpan:    "",
 			wantSampled: false,
 		},
 	}
@@ -323,9 +323,9 @@ func TestDecorators(t *testing.T) {
 
 	exporter := tracetest.NewInMemoryExporter()
 	tracer, _ := New(context.Background(), Options{
-		ServiceName: "test-decorators",
-		SpanExporter: exporter,
-		SampleRate: 1.0,
+		ServiceName:            "test-decorators",
+		SpanExporter:           exporter,
+		SampleRate:             1.0,
 		UseSimpleSpanProcessor: true,
 	})
 	// Set as global tracer.
@@ -406,7 +406,7 @@ func TestDecorators(t *testing.T) {
 
 func TestShouldTrace(t *testing.T) {
 	tests := []struct {
-		path string
+		path     string
 		expected bool
 	}{
 		{"/api/users", true},
@@ -471,9 +471,9 @@ func TestSpanFromContext(t *testing.T) {
 
 func TestFormatTraceContext(t *testing.T) {
 	tests := []struct {
-		name string
-		traceID string
-		spanID string
+		name     string
+		traceID  string
+		spanID   string
 		expected string
 	}{
 		{"both present", "trace-123", "span-456", "trace_id=trace-123 span_id=span-456"},
@@ -548,7 +548,7 @@ func TestSamplerConfigurations(t *testing.T) {
 	defer os.Unsetenv("TRACING_ENABLED")
 
 	tests := []struct {
-		name string
+		name       string
 		sampleRate float64
 	}{
 		{"always sample", 1.0},
@@ -562,9 +562,9 @@ func TestSamplerConfigurations(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			exporter := tracetest.NewInMemoryExporter()
 			tracer, err := New(context.Background(), Options{
-				ServiceName: "test-sampler",
+				ServiceName:  "test-sampler",
 				SpanExporter: exporter,
-				SampleRate: tt.sampleRate,
+				SampleRate:   tt.sampleRate,
 			})
 			if err != nil {
 				t.Fatalf("New() error = %v", err)
@@ -608,9 +608,9 @@ func TestOTelSpanKindMapping(t *testing.T) {
 
 	exporter := tracetest.NewInMemoryExporter()
 	tracer, _ := New(context.Background(), Options{
-		ServiceName: "test-kinds",
-		SpanExporter: exporter,
-		SampleRate: 1.0,
+		ServiceName:            "test-kinds",
+		SpanExporter:           exporter,
+		SampleRate:             1.0,
 		UseSimpleSpanProcessor: true,
 	})
 
@@ -648,7 +648,7 @@ func TestOTelSpanKindMapping(t *testing.T) {
 
 func TestIgnoreIncomingRequestHook(t *testing.T) {
 	tests := []struct {
-		path string
+		path     string
 		expected bool
 	}{
 		{"/api/users", false},

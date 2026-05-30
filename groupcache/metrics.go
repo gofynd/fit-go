@@ -27,22 +27,22 @@ import (
 // maintained by groupcache itself, providing application-level counters
 // across all groups.
 type Metrics struct {
-	hits atomic.Int64
-	misses atomic.Int64
-	loads atomic.Int64
+	hits      atomic.Int64
+	misses    atomic.Int64
+	loads     atomic.Int64
 	peerLoads atomic.Int64
-	errors atomic.Int64
+	errors    atomic.Int64
 }
 
 // MetricsSnapshot is a point-in-time snapshot of cache metrics, suitable for
 // JSON serialization and health check reporting.
 type MetricsSnapshot struct {
-	Hits int64 `json:"hits"`
-	Misses int64 `json:"misses"`
-	Loads int64 `json:"loads"`
-	PeerLoads int64 `json:"peerLoads"`
-	Errors int64 `json:"errors"`
-	HitRate float64 `json:"hitRate"`
+	Hits      int64   `json:"hits"`
+	Misses    int64   `json:"misses"`
+	Loads     int64   `json:"loads"`
+	PeerLoads int64   `json:"peerLoads"`
+	Errors    int64   `json:"errors"`
+	HitRate   float64 `json:"hitRate"`
 }
 
 // NewMetrics creates a new Metrics instance with all counters at zero.
@@ -89,12 +89,12 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 	}
 
 	return MetricsSnapshot{
-		Hits: hits,
-		Misses: misses,
-		Loads: m.loads.Load(),
+		Hits:      hits,
+		Misses:    misses,
+		Loads:     m.loads.Load(),
 		PeerLoads: m.peerLoads.Load(),
-		Errors: m.errors.Load(),
-		HitRate: hitRate,
+		Errors:    m.errors.Load(),
+		HitRate:   hitRate,
 	}
 }
 

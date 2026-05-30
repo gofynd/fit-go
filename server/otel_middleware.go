@@ -26,8 +26,8 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/fynd/commerce/fit/tracing"
 	"github.com/gin-gonic/gin"
+	"github.com/gofynd/fit-go/tracing"
 )
 
 // OTelMiddleware returns a Gin middleware that instruments each request
@@ -63,15 +63,15 @@ func OTelMiddleware() gin.HandlerFunc {
 
 		// Set HTTP semantic convention attributes.
 		span.SetAttributes(map[string]any{
-			"http.method": c.Request.Method,
-			"http.url": c.Request.URL.String(),
-			"http.target": path,
-			"http.host": c.Request.Host,
-			"http.scheme": httpScheme(c.Request),
+			"http.method":     c.Request.Method,
+			"http.url":        c.Request.URL.String(),
+			"http.target":     path,
+			"http.host":       c.Request.Host,
+			"http.scheme":     httpScheme(c.Request),
 			"http.user_agent": c.Request.UserAgent(),
 			"http.request_id": c.GetHeader("x-request-id"),
-			"net.peer.ip": c.ClientIP(),
-			"http.route": normalizeRoutePath(path),
+			"net.peer.ip":     c.ClientIP(),
+			"http.route":      normalizeRoutePath(path),
 		})
 
 		// Propagate trace context into the request for downstream handlers.
