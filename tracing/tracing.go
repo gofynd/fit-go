@@ -322,8 +322,20 @@ func Global() *Tracer {
 	return globalTracer
 }
 
-// Shutdown gracefully shuts down the tracer, flushing any remaining spans.
+// Shutdown gracefully shuts down the global tracer, flushing any remaining spans.
+func Shutdown(ctx context.Context) error {
+	if globalTracer != nil {
+		return globalTracer.shutdown(ctx)
+	}
+	return nil
+}
+
+// Shutdown gracefully shuts down this tracer, flushing any remaining spans.
 func (t *Tracer) Shutdown(ctx context.Context) error {
+	return t.shutdown(ctx)
+}
+
+func (t *Tracer) shutdown(ctx context.Context) error {
 	if !t.enabled {
 		return nil
 	}
