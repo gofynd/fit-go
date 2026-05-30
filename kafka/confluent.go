@@ -1,4 +1,4 @@
-// Copyright 2026 Fynd (Shopsense Retail Technologies Pvt. Ltd.)
+// Copyright 2026 Fynd (Shopsense Retail Technologies Limited)
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package kafka - sarama.go provides a real Kafka driver implementation using
+// Package kafka - confluent.go provides a real Kafka driver implementation using
 // confluent-kafka-go (librdkafka wrapper). It satisfies the KafkaClient,
 // KafkaProducer, and KafkaConsumer interfaces defined in kafka.go.
 //

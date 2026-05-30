@@ -33,7 +33,9 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
 
+	"github.com/gin-gonic/gin"
 	"github.com/gofynd/fit-go"
 	"github.com/gofynd/fit-go/server"
 )
@@ -48,26 +50,60 @@ func main() {
 	}
 	defer f.Shutdown(ctx)
 
-	// Create an HTTP server
-	srv, err := server.New(server.Config{
-		Port:   "8080",
-		Logger: f.Logger.Slog(),
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Register routes
-	srv.GET("/ping", func(c *gin.Context) {
+	// Build your routes on a gin engine
+	engine := gin.New()
+	engine.GET("/ping", func(c *gin.Context) {
 		c.JSON(200, gin.H{"message": "pong"})
 	})
 
-	// Start serving
-	if err := srv.Start(ctx); err != nil {
+	// Create the HTTP server and mount the engine as the default route handler
+	srv := server.New(server.Config{Port: "8080"})
+	if err := srv.Init(
+		map[server.ServerType]http.Handler{server.ServerTypeDefault: engine},
+		nil, // request middlewares
+		nil, // response middlewares
+	); err != nil {
+		log.Fatal(err)
+	}
+
+	// Start serving (blocks until the server stops)
+	if err := srv.Start(); err != nil {
 		log.Fatal(err)
 	}
 }
 ```
+
+See [`examples/`](examples) for complete, runnable programs covering each module.
+
+## Examples
+
+The [`examples/`](examples) directory contains standalone, runnable programs —
+each demonstrates one part of the framework. Run any of them from the repo root:
+
+```sh
+go run ./examples/01-quickstart
+```
+
+Most are configured through environment variables (the header comment in each
+`main.go` lists the relevant ones). Examples that talk to external systems
+(databases, Kafka, Pyroscope) need those services reachable to do real work,
+but all of them compile and start without extra setup.
+
+| Example | Module(s) | What it shows |
+|---|---|---|
+| [01-quickstart](examples/01-quickstart) | `fit` | Initialize the framework and shut down gracefully on a signal |
+| [02-config](examples/02-config) | `config` | Load config, typed getters, validation rules |
+| [03-logging](examples/03-logging) | `logging` | Structured JSON logging, derived loggers, trace context |
+| [04-http-server](examples/04-http-server) | `server` | Gin-based HTTP server, routing by ServerType, health routes |
+| [05-databases](examples/05-databases) | `mongo`, `postgres`, `redis`, `health` | Connect with read/write split and aggregate health checks |
+| [06-kafka](examples/06-kafka) | `kafka` | Produce and consume messages with the confluent driver |
+| [07-caching](examples/07-caching) | `groupcache` | Read-through distributed cache with a single-flight loader |
+| [08-encryption](examples/08-encryption) | `encryption` | AES-256-GCM encrypt/decrypt with pluggable key providers |
+| [09-errors](examples/09-errors) | `errors` | Structured error codes with localized messages |
+| [10-observability](examples/10-observability) | `tracing`, `metrics`, `profiling` | Spans, a Prometheus endpoint, and continuous profiling |
+
+See [`examples/README.md`](examples/README.md) for more detail, including the
+smaller modules (`feature`, `utils`, `grpc`) that don't have their own example.
 
 ## Configuration
 
@@ -85,7 +121,7 @@ cfg, err := config.Load("config.json")
 port := cfg.GetInt("PORT", 8080)
 debug := cfg.GetBool("DEBUG", false)
 name := cfg.GetString("SERVICE_NAME", "my-service")
-hosts := cfg.GetStringSlice("ALLOWED_HOSTS", ",", []string{"localhost"})
+hosts := cfg.GetStringSlice("ALLOWED_HOSTS", []string{"localhost"})
 ttl := cfg.GetDuration("CACHE_TTL", 5 * time.Minute)
 ```
 
@@ -101,9 +137,10 @@ MONGO_CATALOG_READ_ONLY=mongodb://localhost:27017/catalog?readPreference=seconda
 ```
 
 ```go
-client, err := mongo.Init(cfg)
-rwConn := client.GetReadWrite("catalog")
-roConn := client.GetReadOnly("catalog")
+client, err := mongo.InitDefault(ctx)
+conn := client.Service("catalog")
+write := conn.Write // Connection for writes
+read := conn.Read   // Connection for reads
 ```
 
 ### PostgreSQL
@@ -115,8 +152,9 @@ POSTGRES_ORDERS_READ_ONLY=postgres://reader:secret@localhost:5432/orders?sslmode
 
 ```go
 client, err := postgres.InitDefault()
-rwConn := client.GetReadWrite("orders")
-roConn := client.GetReadOnly("orders")
+conn := client.Service("orders")
+write := conn.Write // *sql.DB for writes
+read := conn.Read   // *sql.DB for reads
 ```
 
 ### Redis
@@ -129,23 +167,27 @@ REDIS_CACHE_READ_ONLY=redis://localhost:6379/0
 ```
 
 ```go
-client, err := redis.Init(cfg)
-rwConn := client.GetReadWrite("cache")
+client, err := redis.InitDefault(ctx)
+conn := client.Service("cache")
+write := conn.Write // Connection for writes
 ```
 
 ## Kafka
 
-```bash
-KAFKA_BROKER_LIST=localhost:9092
-```
-
 ```go
-producer, err := kafka.NewProducer(kafka.ProducerConfig{
-    Brokers: cfg.GetString("KAFKA_BROKER_LIST", ""),
+client, err := kafka.NewConfluentClient(&kafka.Config{
+    Brokers:  []string{"localhost:9092"},
+    ClientID: "my-service",
 })
+defer client.Close()
+
+producer, err := client.Producer(kafka.ProducerConfig{})
 defer producer.Close()
 
-err = producer.Produce(ctx, "my-topic", key, value)
+// acks: -1 = all in-sync replicas, 1 = leader only, 0 = fire-and-forget.
+err = producer.Produce("my-topic", []kafka.Message{
+    {Key: []byte("k"), Value: []byte(`{"hello":"world"}`)},
+}, -1)
 ```
 
 ## Observability
@@ -179,7 +221,8 @@ tracer, _ := tracing.New(ctx, tracing.Options{
 })
 defer tracer.Shutdown(ctx)
 
-ctx, span := tracer.Start(ctx, "process-order")
+ctx, span := tracer.StartSpan(ctx, "process-order", tracing.SpanKindInternal)
+span.SetAttribute("order.id", "o-123")
 defer span.End()
 ```
 
