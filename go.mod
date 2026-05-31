@@ -9,7 +9,6 @@ require (
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/grafana/pyroscope-go v1.2.8
-	github.com/lib/pq v1.12.3
 	github.com/mailgun/groupcache/v2 v2.6.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/redis/go-redis/v9 v9.18.0
@@ -21,6 +20,8 @@ require (
 	go.opentelemetry.io/otel/trace v1.43.0
 	google.golang.org/grpc v1.80.0
 )
+
+require github.com/jackc/pgx/v5 v5.7.2
 
 require (
 	filippo.io/edwards25519 v1.1.0 // indirect
@@ -46,6 +47,9 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/grafana/pyroscope-go/godeltaprof v0.1.9 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.28.0 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/compress v1.18.4 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect

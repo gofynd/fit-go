@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package postgres provides PostgreSQL connection management for the fit.go framework.
-// Go implementation of modules/postgres/index.ts and sql/index.ts.
+// Package postgres provides PostgreSQL connection management for the fit.go framework
+// using pgx/v5 native connection pools.
 //
-// The package manages read/write PostgreSQL connections per service using the
-// database/sql interface. Connections are auto-discovered from environment
-// variables matching the pattern:
+// The package manages read/write PostgreSQL connections per service using pgxpool.Pool.
+// Connections are auto-discovered from environment variables matching the pattern:
 //
 //	POSTGRES_{SERVICE}_READ_WRITE - connection string for read-write operations
 //	POSTGRES_{SERVICE}_READ_ONLY - connection string for read-only operations
@@ -32,11 +31,11 @@
 //
 // # Pool tuning environment variables
 //
-//	POSTGRES_{SERVICE}_{TYPE}_MAX_POOL_SIZE - max open connections (SetMaxOpenConns)
-//	POSTGRES_{SERVICE}_{TYPE}_MIN_POOL_SIZE - max idle connections (SetMaxIdleConns)
-//	POSTGRES_{SERVICE}_{TYPE}_MAX_IDLE_TIME - max idle time in ms (SetConnMaxIdleTime)
-//	POSTGRES_{SERVICE}_{TYPE}_CONNECTION_TIMEOUT - max connection lifetime in ms (SetConnMaxLifetime)
-//	POSTGRES_{SERVICE}_{TYPE}_POOL_EVICT - eviction check interval in ms
+//	POSTGRES_{SERVICE}_{TYPE}_MAX_POOL_SIZE - max connections in the pool
+//	POSTGRES_{SERVICE}_{TYPE}_MIN_POOL_SIZE - min idle connections maintained
+//	POSTGRES_{SERVICE}_{TYPE}_MAX_IDLE_TIME - max idle time in ms
+//	POSTGRES_{SERVICE}_{TYPE}_CONNECTION_TIMEOUT - max connection lifetime in ms
+//	POSTGRES_{SERVICE}_{TYPE}_HEALTH_CHECK_PERIOD - health check interval in ms
 //
 // Where {TYPE} is READ_WRITE or READ_ONLY.
 //
@@ -57,7 +56,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"database/sql"
 	"fmt"
 	"net/url"
 	"os"
@@ -67,46 +65,31 @@ import (
 	"sync"
 	"time"
 
-	// Side-effect import: registers the "postgres" driver with database/sql.
-	_ "github.com/lib/pq"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// ---------------------------------------------------------------------------
-// Service connections
-// ---------------------------------------------------------------------------
-
-// ServiceConnection holds read and write *sql.DB connections for a single service.
+// ServiceConnection holds read and write *pgxpool.Pool connections for a single service.
 type ServiceConnection struct {
-	Read  *sql.DB
-	Write *sql.DB
+	Read  *pgxpool.Pool
+	Write *pgxpool.Pool
 }
-
-// ---------------------------------------------------------------------------
-// Options
-// ---------------------------------------------------------------------------
 
 // ConnectionOptions configures the PostgreSQL client initialization.
 type ConnectionOptions struct {
-	// DriverName is the registered database/sql driver name (e.g., "postgres", "pgx").
-	// The caller must import and register the driver before calling Init.
-	// Defaults to "postgres" if empty.
-	DriverName string
-
-	// DSNTransform is an optional hook that converts a parsed connection URI
-	// into a driver-specific DSN string. If nil, the framework constructs a
-	// standard PostgreSQL URI: postgres://user:password@host:port/dbname.
-	DSNTransform func(parsed *ParsedURI) string
-
-	// PerService allows callers to set pool overrides per service.
-	PerService map[string]ServicePoolOverrides
-
-	// Context for connection establishment.
+	// MaxConns is the maximum number of connections per pool. Defaults to 20.
+	MaxConns int32
+	// MinConns is the minimum number of idle connections per pool. Defaults to 5.
+	MinConns int32
+	// MaxConnLifetime is the maximum lifetime of a connection. Defaults to 1 hour.
+	MaxConnLifetime time.Duration
+	// MaxConnIdleTime is the maximum idle time of a connection. Defaults to 30 minutes.
+	MaxConnIdleTime time.Duration
+	// HealthCheckPeriod is the interval between health checks. Defaults to 1 minute.
+	HealthCheckPeriod time.Duration
+	// Context for connection establishment and initial pings.
 	Context context.Context
-
-	// ConnectorFunc is an optional function that creates a driver.Connector
-	// with custom TLS config. This is useful for pgx or lib/pq which support
-	// TLS configuration through the connector rather than DSN parameters.
-	ConnectorFunc func(dsn string, tlsCfg *tls.Config) (interface{}, error)
+	// PerService allows per-service pool overrides.
+	PerService map[string]ServicePoolOverrides
 }
 
 // ServicePoolOverrides allows programmatic pool configuration per service.
@@ -117,75 +100,12 @@ type ServicePoolOverrides struct {
 
 // PoolOverrides holds optional pool tuning values. Zero values are ignored.
 type PoolOverrides struct {
-	MaxOpenConns    int
-	MaxIdleConns    int
-	ConnMaxIdleTime time.Duration
-	ConnMaxLifetime time.Duration
+	MaxConns          int32
+	MinConns          int32
+	MaxConnLifetime   time.Duration
+	MaxConnIdleTime   time.Duration
+	HealthCheckPeriod time.Duration
 }
-
-// ---------------------------------------------------------------------------
-// ParsedURI
-// ---------------------------------------------------------------------------
-
-// ParsedURI holds components extracted from a database connection URI.
-type ParsedURI struct {
-	Username string
-	Password string
-	Host     string
-	Port     string
-	Database string
-	Options  map[string]string
-	// SSLMode for PostgreSQL connections.
-	SSLMode string
-	// ApplicationName to set on the connection.
-	ApplicationName string
-}
-
-// Addr returns the host:port string.
-func (p *ParsedURI) Addr() string {
-	if p.Port != "" {
-		return p.Host + ":" + p.Port
-	}
-	return p.Host + ":5432"
-}
-
-// DefaultPostgresDSN returns a standard PostgreSQL connection URI.
-func DefaultPostgresDSN(p *ParsedURI) string {
-	u := &url.URL{
-		Scheme: "postgres",
-		Host:   p.Addr(),
-	}
-
-	if p.Username != "" {
-		if p.Password != "" {
-			u.User = url.UserPassword(p.Username, p.Password)
-		} else {
-			u.User = url.User(p.Username)
-		}
-	}
-
-	if p.Database != "" {
-		u.Path = "/" + p.Database
-	}
-
-	q := u.Query()
-	if p.ApplicationName != "" {
-		q.Set("application_name", p.ApplicationName)
-	}
-	if p.SSLMode != "" {
-		q.Set("sslmode", p.SSLMode)
-	}
-	for k, v := range p.Options {
-		q.Set(k, v)
-	}
-	u.RawQuery = q.Encode()
-
-	return u.String()
-}
-
-// ---------------------------------------------------------------------------
-// Client
-// ---------------------------------------------------------------------------
 
 // Client manages PostgreSQL connections for all discovered services.
 type Client struct {
@@ -196,49 +116,28 @@ type Client struct {
 var envRegex = regexp.MustCompile(`^POSTGRES_(.+)_READ_(WRITE|ONLY)$`)
 
 // InitDefault discovers PostgreSQL connections from environment variables and
-// establishes connections using the lib/pq driver with sensible defaults.
-// It is the simplest way to initialize the PostgreSQL client:
-//
-//	client, err := postgres.InitDefault()
+// establishes pgxpool.Pool connections with sensible defaults.
 func InitDefault() (*Client, error) {
-	return InitDefaultWithContext(context.Background())
+	return InitWithContext(context.Background(), ConnectionOptions{})
 }
 
-// InitDefaultWithContext is like InitDefault but accepts a context for
-// connection establishment and initial pings.
-func InitDefaultWithContext(ctx context.Context) (*Client, error) {
-	return Init(ConnectionOptions{
-		DriverName: "postgres",
-		Context:    ctx,
-	})
-}
-
-// Init discovers PostgreSQL connection environment variables, resolves connection
-// strings, and establishes connections.
-func Init(opts ConnectionOptions) (*Client, error) {
-	if opts.DriverName == "" {
-		opts.DriverName = "postgres"
-	}
-	if opts.DSNTransform == nil {
-		opts.DSNTransform = DefaultPostgresDSN
-	}
-
-	ctx := opts.Context
+// InitWithContext discovers connections and creates pools with the given context and options.
+func InitWithContext(ctx context.Context, opts ConnectionOptions) (*Client, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	opts = applyOptionDefaults(opts)
 
 	c := &Client{
 		services: make(map[string]*ServiceConnection),
 	}
 
-	// Phase 1: Collect all env vars into a connection mapping.
 	type connEntry struct {
 		readRef  string
 		writeRef string
 	}
-	connMap := make(map[string]*connEntry) // keyed by lowercase service name
-	upperNames := make(map[string]string)  // lowercase -> UPPER
+	connMap := make(map[string]*connEntry)
+	upperNames := make(map[string]string)
 
 	for _, env := range os.Environ() {
 		idx := strings.IndexByte(env, '=')
@@ -277,85 +176,64 @@ func Init(opts ConnectionOptions) (*Client, error) {
 		return c, nil
 	}
 
-	// Phase 2: Establish connections.
 	appName := getAppName()
 
 	for serviceName, entry := range connMap {
 		serviceNameUpper := upperNames[serviceName]
-
-		// Load TLS config if present.
-		tlsCfg, serverName := loadPostgresTLSConfig(serviceNameUpper)
+		tlsCfg := loadPostgresTLSConfig(serviceNameUpper)
 
 		sc := &ServiceConnection{}
 
-		if entry.readRef != "" && entry.writeRef != "" {
-			// Both read and write connections.
+		if entry.writeRef != "" {
 			writeConnStr, err := resolveConnectionString(entry.writeRef)
 			if err != nil {
 				return nil, fmt.Errorf("postgres: resolve write connection for %s: %w", serviceName, err)
 			}
+			writePool, err := createPool(ctx, writeConnStr, appName, tlsCfg, poolSettingsFromEnv(serviceNameUpper, "WRITE", opts, serviceName, "write"))
+			if err != nil {
+				return nil, fmt.Errorf("postgres: create write pool for %s: %w", serviceName, err)
+			}
+			sc.Write = writePool
+		}
+
+		if entry.readRef != "" {
 			readConnStr, err := resolveConnectionString(entry.readRef)
 			if err != nil {
+				if sc.Write != nil {
+					sc.Write.Close()
+				}
 				return nil, fmt.Errorf("postgres: resolve read connection for %s: %w", serviceName, err)
 			}
-
-			writeDB, err := openDB(ctx, opts, writeConnStr, serviceName, serviceNameUpper, "write", appName, tlsCfg, serverName)
+			readPool, err := createPool(ctx, readConnStr, appName, tlsCfg, poolSettingsFromEnv(serviceNameUpper, "ONLY", opts, serviceName, "read"))
 			if err != nil {
-				return nil, err
+				if sc.Write != nil {
+					sc.Write.Close()
+				}
+				return nil, fmt.Errorf("postgres: create read pool for %s: %w", serviceName, err)
 			}
-			applyPoolSettings(writeDB, serviceNameUpper, "WRITE", opts.PerService, serviceName, "write")
+			sc.Read = readPool
+		}
 
-			readDB, err := openDB(ctx, opts, readConnStr, serviceName, serviceNameUpper, "read", appName, tlsCfg, serverName)
-			if err != nil {
-				_ = writeDB.Close()
-				return nil, err
-			}
-			applyPoolSettings(readDB, serviceNameUpper, "ONLY", opts.PerService, serviceName, "read")
-
-			sc.Write = writeDB
-			sc.Read = readDB
-		} else {
-			// Single connection type.
-			connType := "write"
-			connTypeEnv := "WRITE"
-			ref := entry.writeRef
-			if ref == "" {
-				connType = "read"
-				connTypeEnv = "ONLY"
-				ref = entry.readRef
-			}
-
-			connStr, err := resolveConnectionString(ref)
-			if err != nil {
-				return nil, fmt.Errorf("postgres: resolve connection for %s_%s: %w", serviceName, connType, err)
-			}
-
-			db, err := openDB(ctx, opts, connStr, serviceName, serviceNameUpper, connType, appName, tlsCfg, serverName)
-			if err != nil {
-				return nil, err
-			}
-			applyPoolSettings(db, serviceNameUpper, connTypeEnv, opts.PerService, serviceName, connType)
-
-			if connType == "read" {
-				sc.Read = db
-			} else {
-				sc.Write = db
-			}
+		// If only one connection is provided, use it for both.
+		if sc.Write == nil && sc.Read != nil {
+			sc.Write = sc.Read
+		} else if sc.Read == nil && sc.Write != nil {
+			sc.Read = sc.Write
 		}
 
 		c.services[serviceName] = sc
 	}
 
-	// Phase 3: Verify all connections.
+	// Verify all connections.
 	for name, sc := range c.services {
 		if sc.Read != nil {
-			if err := sc.Read.PingContext(ctx); err != nil {
+			if err := sc.Read.Ping(ctx); err != nil {
 				_ = c.Close()
 				return nil, fmt.Errorf("postgres: ping failed for %s_read: %w", name, err)
 			}
 		}
-		if sc.Write != nil {
-			if err := sc.Write.PingContext(ctx); err != nil {
+		if sc.Write != nil && sc.Write != sc.Read {
+			if err := sc.Write.Ping(ctx); err != nil {
 				_ = c.Close()
 				return nil, fmt.Errorf("postgres: ping failed for %s_write: %w", name, err)
 			}
@@ -365,7 +243,7 @@ func Init(opts ConnectionOptions) (*Client, error) {
 	return c, nil
 }
 
-// Service returns the connections for the given service name.
+// Service returns the connections for the given service name (case-insensitive).
 func (c *Client) Service(name string) *ServiceConnection {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -376,7 +254,6 @@ func (c *Client) Service(name string) *ServiceConnection {
 func (c *Client) Services() map[string]*ServiceConnection {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-
 	result := make(map[string]*ServiceConnection, len(c.services))
 	for k, v := range c.services {
 		result[k] = v
@@ -391,12 +268,12 @@ func (c *Client) Ping(ctx context.Context) error {
 
 	for name, sc := range c.services {
 		if sc.Read != nil {
-			if err := sc.Read.PingContext(ctx); err != nil {
+			if err := sc.Read.Ping(ctx); err != nil {
 				return fmt.Errorf("postgres: ping failed for %s_read: %w", name, err)
 			}
 		}
-		if sc.Write != nil {
-			if err := sc.Write.PingContext(ctx); err != nil {
+		if sc.Write != nil && sc.Write != sc.Read {
+			if err := sc.Write.Ping(ctx); err != nil {
 				return fmt.Errorf("postgres: ping failed for %s_write: %w", name, err)
 			}
 		}
@@ -404,30 +281,20 @@ func (c *Client) Ping(ctx context.Context) error {
 	return nil
 }
 
-// Close terminates all connections gracefully.
+// Close terminates all connection pools gracefully.
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	var errs []error
-	for name, sc := range c.services {
+	for _, sc := range c.services {
 		if sc.Read != nil {
-			if err := sc.Read.Close(); err != nil {
-				errs = append(errs, fmt.Errorf("postgres: close %s_read: %w", name, err))
-			}
+			sc.Read.Close()
 		}
 		if sc.Write != nil && sc.Write != sc.Read {
-			if err := sc.Write.Close(); err != nil {
-				errs = append(errs, fmt.Errorf("postgres: close %s_write: %w", name, err))
-			}
+			sc.Write.Close()
 		}
 	}
-
 	c.services = make(map[string]*ServiceConnection)
-
-	if len(errs) > 0 {
-		return fmt.Errorf("postgres: close errors: %v", errs)
-	}
 	return nil
 }
 
@@ -444,84 +311,90 @@ func (c *Client) HealthCheck() func() string {
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers
+// Pool creation
 // ---------------------------------------------------------------------------
 
-// openDB parses a connection string, creates a *sql.DB, and configures it.
-func openDB(
-	ctx context.Context,
-	opts ConnectionOptions,
-	connStr, serviceName, serviceNameUpper, connType, appName string,
-	tlsCfg *tls.Config,
-	serverName string,
-) (*sql.DB, error) {
-	parsed, err := parseURI(connStr)
-	if err != nil {
-		return nil, fmt.Errorf("postgres: parse URI for %s_%s: %w", serviceName, connType, err)
-	}
-
-	// Set application_name.application_name.
-	parsed.ApplicationName = appName
-
-	// Configure SSL via DSN parameters.
-	if tlsCfg != nil {
-		parsed.SSLMode = "verify-full"
-		if serverName != "" {
-			parsed.Options["sslrootcert"] = envWithFallback(
-				fmt.Sprintf("POSTGRES_%s_SSL_CA", serviceNameUpper),
-				"POSTGRES_SSL_CA",
-			)
-			parsed.Options["sslcert"] = envWithFallback(
-				fmt.Sprintf("POSTGRES_%s_SSL_CERT", serviceNameUpper),
-				"POSTGRES_SSL_CERT",
-			)
-			parsed.Options["sslkey"] = envWithFallback(
-				fmt.Sprintf("POSTGRES_%s_SSL_KEY", serviceNameUpper),
-				"POSTGRES_SSL_KEY",
-			)
-		}
-	}
-
-	dsn := opts.DSNTransform(parsed)
-
-	db, err := sql.Open(opts.DriverName, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("postgres: open %s_%s: %w", serviceName, connType, err)
-	}
-
-	return db, nil
+type poolSettings struct {
+	MaxConns          int32
+	MinConns          int32
+	MaxConnLifetime   time.Duration
+	MaxConnIdleTime   time.Duration
+	HealthCheckPeriod time.Duration
 }
 
-// applyPoolSettings configures pool sizes from env vars and caller overrides.
-func applyPoolSettings(
-	db *sql.DB,
-	serviceNameUpper, connTypeEnv string,
-	perService map[string]ServicePoolOverrides,
-	serviceName, connType string,
-) {
-	prefix := fmt.Sprintf("POSTGRES_%s_READ_%s_", serviceNameUpper, connTypeEnv)
-
-	envMapping := []struct {
-		suffix string
-		apply  func(int)
-	}{
-		{"MAX_POOL_SIZE", func(v int) { db.SetMaxOpenConns(v) }},
-		{"MIN_POOL_SIZE", func(v int) { db.SetMaxIdleConns(v) }},
-		{"MAX_IDLE_TIME", func(v int) { db.SetConnMaxIdleTime(time.Duration(v) * time.Millisecond) }},
-		{"CONNECTION_TIMEOUT", func(v int) { db.SetConnMaxLifetime(time.Duration(v) * time.Millisecond) }},
+func createPool(ctx context.Context, connStr, appName string, tlsCfg *tls.Config, settings poolSettings) (*pgxpool.Pool, error) {
+	// Append application_name to connection string if not present.
+	if appName != "" && !strings.Contains(connStr, "application_name") {
+		sep := "?"
+		if strings.Contains(connStr, "?") {
+			sep = "&"
+		}
+		connStr += sep + "application_name=" + url.QueryEscape(appName)
 	}
 
-	for _, m := range envMapping {
-		if v := os.Getenv(prefix + m.suffix); v != "" {
-			if parsed, err := strconv.Atoi(v); err == nil {
-				m.apply(parsed)
-			}
+	poolCfg, err := pgxpool.ParseConfig(connStr)
+	if err != nil {
+		return nil, fmt.Errorf("parse connection string: %w", err)
+	}
+
+	poolCfg.MaxConns = settings.MaxConns
+	poolCfg.MinConns = settings.MinConns
+	poolCfg.MaxConnLifetime = settings.MaxConnLifetime
+	poolCfg.MaxConnIdleTime = settings.MaxConnIdleTime
+	poolCfg.HealthCheckPeriod = settings.HealthCheckPeriod
+
+	if tlsCfg != nil {
+		poolCfg.ConnConfig.TLSConfig = tlsCfg
+	}
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		return nil, fmt.Errorf("create pool: %w", err)
+	}
+
+	return pool, nil
+}
+
+func poolSettingsFromEnv(serviceNameUpper, connTypeEnv string, opts ConnectionOptions, serviceName, connType string) poolSettings {
+	ps := poolSettings{
+		MaxConns:          opts.MaxConns,
+		MinConns:          opts.MinConns,
+		MaxConnLifetime:   opts.MaxConnLifetime,
+		MaxConnIdleTime:   opts.MaxConnIdleTime,
+		HealthCheckPeriod: opts.HealthCheckPeriod,
+	}
+
+	prefix := fmt.Sprintf("POSTGRES_%s_READ_%s_", serviceNameUpper, connTypeEnv)
+
+	if v := os.Getenv(prefix + "MAX_POOL_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			ps.MaxConns = int32(n)
+		}
+	}
+	if v := os.Getenv(prefix + "MIN_POOL_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			ps.MinConns = int32(n)
+		}
+	}
+	if v := os.Getenv(prefix + "MAX_IDLE_TIME"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			ps.MaxConnIdleTime = time.Duration(n) * time.Millisecond
+		}
+	}
+	if v := os.Getenv(prefix + "CONNECTION_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			ps.MaxConnLifetime = time.Duration(n) * time.Millisecond
+		}
+	}
+	if v := os.Getenv(prefix + "HEALTH_CHECK_PERIOD"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			ps.HealthCheckPeriod = time.Duration(n) * time.Millisecond
 		}
 	}
 
 	// Apply caller overrides.
-	if perService != nil {
-		if svcOverrides, ok := perService[serviceName]; ok {
+	if opts.PerService != nil {
+		if svcOverrides, ok := opts.PerService[serviceName]; ok {
 			var po *PoolOverrides
 			if connType == "read" {
 				po = svcOverrides.Read
@@ -529,103 +402,33 @@ func applyPoolSettings(
 				po = svcOverrides.Write
 			}
 			if po != nil {
-				if po.MaxOpenConns > 0 {
-					db.SetMaxOpenConns(po.MaxOpenConns)
+				if po.MaxConns > 0 {
+					ps.MaxConns = po.MaxConns
 				}
-				if po.MaxIdleConns > 0 {
-					db.SetMaxIdleConns(po.MaxIdleConns)
+				if po.MinConns > 0 {
+					ps.MinConns = po.MinConns
 				}
-				if po.ConnMaxIdleTime > 0 {
-					db.SetConnMaxIdleTime(po.ConnMaxIdleTime)
+				if po.MaxConnLifetime > 0 {
+					ps.MaxConnLifetime = po.MaxConnLifetime
 				}
-				if po.ConnMaxLifetime > 0 {
-					db.SetConnMaxLifetime(po.ConnMaxLifetime)
+				if po.MaxConnIdleTime > 0 {
+					ps.MaxConnIdleTime = po.MaxConnIdleTime
+				}
+				if po.HealthCheckPeriod > 0 {
+					ps.HealthCheckPeriod = po.HealthCheckPeriod
 				}
 			}
 		}
 	}
+
+	return ps
 }
 
-// parseURI parses a PostgreSQL connection URI.
-func parseURI(rawURI string) (*ParsedURI, error) {
-	// Handle both URI-style and keyword=value style.
-	if !strings.Contains(rawURI, "://") {
-		// Assume it's keyword=value format (e.g., "host=localhost port=5432 dbname=mydb").
-		return parseKeyValue(rawURI), nil
-	}
+// ---------------------------------------------------------------------------
+// TLS
+// ---------------------------------------------------------------------------
 
-	u, err := url.Parse(rawURI)
-	if err != nil {
-		return nil, fmt.Errorf("postgres: invalid URI: %w", err)
-	}
-
-	p := &ParsedURI{
-		Host:     u.Hostname(),
-		Port:     u.Port(),
-		Database: strings.TrimPrefix(u.Path, "/"),
-		Options:  make(map[string]string),
-	}
-
-	if u.User != nil {
-		p.Username = u.User.Username()
-		p.Password, _ = u.User.Password()
-	}
-
-	for k, v := range u.Query() {
-		if len(v) > 0 {
-			switch k {
-			case "sslmode":
-				p.SSLMode = v[0]
-			case "application_name":
-				p.ApplicationName = v[0]
-			default:
-				p.Options[k] = v[0]
-			}
-		}
-	}
-
-	return p, nil
-}
-
-// parseKeyValue parses a PostgreSQL keyword=value connection string.
-func parseKeyValue(s string) *ParsedURI {
-	p := &ParsedURI{
-		Options: make(map[string]string),
-	}
-
-	for _, part := range strings.Fields(s) {
-		idx := strings.IndexByte(part, '=')
-		if idx < 0 {
-			continue
-		}
-		key := part[:idx]
-		value := part[idx+1:]
-
-		switch key {
-		case "host":
-			p.Host = value
-		case "port":
-			p.Port = value
-		case "dbname":
-			p.Database = value
-		case "user":
-			p.Username = value
-		case "password":
-			p.Password = value
-		case "sslmode":
-			p.SSLMode = value
-		case "application_name":
-			p.ApplicationName = value
-		default:
-			p.Options[key] = value
-		}
-	}
-
-	return p
-}
-
-// loadPostgresTLSConfig builds a *tls.Config from SSL environment variables.
-func loadPostgresTLSConfig(serviceNameUpper string) (*tls.Config, string) {
+func loadPostgresTLSConfig(serviceNameUpper string) *tls.Config {
 	serverName := os.Getenv(fmt.Sprintf("POSTGRES_%s_SSL_SERVER_NAME", serviceNameUpper))
 	caPath := envWithFallback(
 		fmt.Sprintf("POSTGRES_%s_SSL_CA", serviceNameUpper),
@@ -640,19 +443,18 @@ func loadPostgresTLSConfig(serviceNameUpper string) (*tls.Config, string) {
 		"POSTGRES_SSL_KEY",
 	)
 
-	// SSL requires all four: CA, cert, key, and server name (.
 	if caPath == "" || certPath == "" || keyPath == "" || serverName == "" {
-		return nil, ""
+		return nil
 	}
 
 	caCert, err := os.ReadFile(caPath)
 	if err != nil {
-		return nil, ""
+		return nil
 	}
 
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		return nil, ""
+		return nil
 	}
 
 	caCertPool := x509.NewCertPool()
@@ -663,11 +465,13 @@ func loadPostgresTLSConfig(serviceNameUpper string) (*tls.Config, string) {
 		RootCAs:      caCertPool,
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
-	}, serverName
+	}
 }
 
-// resolveConnectionString resolves a value as either a direct connection string
-// or a GSM secret reference.
+// ---------------------------------------------------------------------------
+// Connection string resolution
+// ---------------------------------------------------------------------------
+
 func resolveConnectionString(value string) (string, error) {
 	if strings.EqualFold(os.Getenv("DB_CONNECTION_PROVIDER"), "GSM") {
 		gsmMu.RLock()
@@ -675,7 +479,7 @@ func resolveConnectionString(value string) (string, error) {
 		gsmMu.RUnlock()
 
 		if resolver == nil {
-			return "", fmt.Errorf("postgres: GSM resolver not configured; call postgres.SetGSMResolver() before Init")
+			return "", fmt.Errorf("postgres: GSM resolver not configured; call SetGSMResolver() before Init")
 		}
 
 		version := os.Getenv("DB_CONNECTION_SECRET_VERSION")
@@ -696,14 +500,35 @@ var (
 )
 
 // SetGSMResolver configures the function used to fetch secrets from GSM.
-// Must be called before Init when DB_CONNECTION_PROVIDER=GSM.
 func SetGSMResolver(fn GSMResolverFunc) {
 	gsmMu.Lock()
 	defer gsmMu.Unlock()
 	gsmResolver = fn
 }
 
-// getAppName derives an application name for connection identification.
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+
+func applyOptionDefaults(opts ConnectionOptions) ConnectionOptions {
+	if opts.MaxConns == 0 {
+		opts.MaxConns = 20
+	}
+	if opts.MinConns == 0 {
+		opts.MinConns = 5
+	}
+	if opts.MaxConnLifetime == 0 {
+		opts.MaxConnLifetime = 1 * time.Hour
+	}
+	if opts.MaxConnIdleTime == 0 {
+		opts.MaxConnIdleTime = 30 * time.Minute
+	}
+	if opts.HealthCheckPeriod == 0 {
+		opts.HealthCheckPeriod = 1 * time.Minute
+	}
+	return opts
+}
+
 func getAppName() string {
 	podName := os.Getenv("K8S_POD_NAME")
 	namespace := os.Getenv("K8S_POD_NAMESPACE")

@@ -1,34 +1,13 @@
-// Copyright 2026 Fynd (Shopsense Retail Technologies Limited)
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package postgres
 
 import (
 	"context"
-	"database/sql"
 	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
-
-// The real "postgres" driver is registered via the side-effect import in client.go.
-
-// ---------------------------------------------------------------------------
-// InitDefault / Connection Discovery tests
-// ---------------------------------------------------------------------------
 
 func TestInitDefault_NoEnv(t *testing.T) {
 	clearPostgresEnv(t)
@@ -79,90 +58,86 @@ func TestConnectionDiscovery(t *testing.T) {
 		}
 	})
 
-	t.Run("default driver name", func(t *testing.T) {
+	t.Run("empty client on no env", func(t *testing.T) {
 		clearPostgresEnv(t)
-		c, err := Init(ConnectionOptions{})
+		c, err := InitWithContext(context.Background(), ConnectionOptions{})
 		if err != nil {
-			t.Fatalf("Init() error = %v", err)
+			t.Fatalf("InitWithContext() error = %v", err)
 		}
 		if c == nil {
 			t.Fatal("Expected non-nil client")
 		}
+		if len(c.services) != 0 {
+			t.Errorf("Expected 0 services, got %d", len(c.services))
+		}
 	})
 }
 
-// ---------------------------------------------------------------------------
-// Pool settings tests
-// ---------------------------------------------------------------------------
-
-func TestApplyPoolSettings(t *testing.T) {
+func TestPoolSettingsFromEnv(t *testing.T) {
 	t.Run("reads env vars", func(t *testing.T) {
 		t.Setenv("POSTGRES_CATALOG_READ_WRITE_MAX_POOL_SIZE", "50")
 		t.Setenv("POSTGRES_CATALOG_READ_WRITE_MIN_POOL_SIZE", "10")
 		t.Setenv("POSTGRES_CATALOG_READ_WRITE_MAX_IDLE_TIME", "60000")
 		t.Setenv("POSTGRES_CATALOG_READ_WRITE_CONNECTION_TIMEOUT", "30000")
+		t.Setenv("POSTGRES_CATALOG_READ_WRITE_HEALTH_CHECK_PERIOD", "5000")
 
-		db, err := sql.Open("postgres", "postgres://localhost:5432/test?sslmode=disable")
-		if err != nil {
-			t.Fatalf("sql.Open error: %v", err)
+		opts := applyOptionDefaults(ConnectionOptions{})
+		ps := poolSettingsFromEnv("CATALOG", "WRITE", opts, "catalog", "write")
+
+		if ps.MaxConns != 50 {
+			t.Errorf("MaxConns = %d, want 50", ps.MaxConns)
 		}
-		defer db.Close()
-
-		applyPoolSettings(db, "CATALOG", "WRITE", nil, "catalog", "write")
-
-		stats := db.Stats()
-		if stats.MaxOpenConnections != 50 {
-			t.Errorf("Expected MaxOpenConns=50, got %d", stats.MaxOpenConnections)
+		if ps.MinConns != 10 {
+			t.Errorf("MinConns = %d, want 10", ps.MinConns)
+		}
+		if ps.MaxConnIdleTime != 60*time.Second {
+			t.Errorf("MaxConnIdleTime = %v, want 60s", ps.MaxConnIdleTime)
+		}
+		if ps.MaxConnLifetime != 30*time.Second {
+			t.Errorf("MaxConnLifetime = %v, want 30s", ps.MaxConnLifetime)
+		}
+		if ps.HealthCheckPeriod != 5*time.Second {
+			t.Errorf("HealthCheckPeriod = %v, want 5s", ps.HealthCheckPeriod)
 		}
 	})
 
 	t.Run("applies caller overrides", func(t *testing.T) {
-		db, err := sql.Open("postgres", "postgres://localhost:5432/test?sslmode=disable")
-		if err != nil {
-			t.Fatalf("sql.Open error: %v", err)
-		}
-		defer db.Close()
-
-		perService := map[string]ServicePoolOverrides{
-			"catalog": {
-				Write: &PoolOverrides{
-					MaxOpenConns:    100,
-					MaxIdleConns:    20,
-					ConnMaxIdleTime: 5 * time.Minute,
-					ConnMaxLifetime: 30 * time.Minute,
+		opts := applyOptionDefaults(ConnectionOptions{
+			PerService: map[string]ServicePoolOverrides{
+				"catalog": {
+					Write: &PoolOverrides{
+						MaxConns:          100,
+						MinConns:          20,
+						MaxConnIdleTime:   5 * time.Minute,
+						MaxConnLifetime:   30 * time.Minute,
+						HealthCheckPeriod: 2 * time.Minute,
+					},
 				},
 			},
+		})
+
+		ps := poolSettingsFromEnv("CATALOG", "WRITE", opts, "catalog", "write")
+		if ps.MaxConns != 100 {
+			t.Errorf("MaxConns = %d, want 100", ps.MaxConns)
 		}
-
-		applyPoolSettings(db, "CATALOG", "WRITE", perService, "catalog", "write")
-
-		stats := db.Stats()
-		if stats.MaxOpenConnections != 100 {
-			t.Errorf("Expected MaxOpenConns=100, got %d", stats.MaxOpenConnections)
+		if ps.MinConns != 20 {
+			t.Errorf("MinConns = %d, want 20", ps.MinConns)
 		}
 	})
 
-	t.Run("read type uses ONLY prefix", func(t *testing.T) {
-		t.Setenv("POSTGRES_USERS_READ_ONLY_MAX_POOL_SIZE", "25")
+	t.Run("uses defaults when no env or overrides", func(t *testing.T) {
+		clearPostgresEnv(t)
+		opts := applyOptionDefaults(ConnectionOptions{})
+		ps := poolSettingsFromEnv("MYSERVICE", "WRITE", opts, "myservice", "write")
 
-		db, err := sql.Open("postgres", "postgres://localhost:5432/test?sslmode=disable")
-		if err != nil {
-			t.Fatalf("sql.Open error: %v", err)
+		if ps.MaxConns != 20 {
+			t.Errorf("MaxConns = %d, want default 20", ps.MaxConns)
 		}
-		defer db.Close()
-
-		applyPoolSettings(db, "USERS", "ONLY", nil, "users", "read")
-
-		stats := db.Stats()
-		if stats.MaxOpenConnections != 25 {
-			t.Errorf("Expected MaxOpenConns=25, got %d", stats.MaxOpenConnections)
+		if ps.MinConns != 5 {
+			t.Errorf("MinConns = %d, want default 5", ps.MinConns)
 		}
 	})
 }
-
-// ---------------------------------------------------------------------------
-// TLS config tests
-// ---------------------------------------------------------------------------
 
 func TestTLSConfig(t *testing.T) {
 	t.Run("returns nil when no certs configured", func(t *testing.T) {
@@ -173,12 +148,9 @@ func TestTLSConfig(t *testing.T) {
 			os.Unsetenv(k)
 		}
 
-		cfg, serverName := loadPostgresTLSConfig("TEST")
+		cfg := loadPostgresTLSConfig("TEST")
 		if cfg != nil {
 			t.Error("Expected nil TLS config without certs")
-		}
-		if serverName != "" {
-			t.Error("Expected empty server name")
 		}
 	})
 
@@ -188,130 +160,17 @@ func TestTLSConfig(t *testing.T) {
 		t.Setenv("POSTGRES_TEST_SSL_KEY", "/tmp/key.pem")
 		os.Unsetenv("POSTGRES_TEST_SSL_SERVER_NAME")
 
-		cfg, _ := loadPostgresTLSConfig("TEST")
+		cfg := loadPostgresTLSConfig("TEST")
 		if cfg != nil {
 			t.Error("Expected nil TLS config without server name")
 		}
 	})
 }
 
-// ---------------------------------------------------------------------------
-// URI parsing tests
-// ---------------------------------------------------------------------------
-
-func TestParseURI(t *testing.T) {
-	tests := []struct {
-		name     string
-		uri      string
-		wantHost string
-		wantPort string
-		wantDB   string
-		wantUser string
-		wantPass string
-		wantSSL  string
-	}{
-		{
-			name:     "postgres URI format",
-			uri:      "postgres://user:pass@localhost:5432/mydb?sslmode=require",
-			wantHost: "localhost",
-			wantPort: "5432",
-			wantDB:   "mydb",
-			wantUser: "user",
-			wantPass: "pass",
-			wantSSL:  "require",
-		},
-		{
-			name:     "postgresql scheme",
-			uri:      "postgresql://user:pass@localhost/mydb",
-			wantHost: "localhost",
-			wantDB:   "mydb",
-			wantUser: "user",
-			wantPass: "pass",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			parsed, err := parseURI(tt.uri)
-			if err != nil {
-				t.Fatalf("parseURI() error: %v", err)
-			}
-			if parsed.Host != tt.wantHost {
-				t.Errorf("Host = %q, want %q", parsed.Host, tt.wantHost)
-			}
-			if parsed.Port != tt.wantPort {
-				t.Errorf("Port = %q, want %q", parsed.Port, tt.wantPort)
-			}
-			if parsed.Database != tt.wantDB {
-				t.Errorf("Database = %q, want %q", parsed.Database, tt.wantDB)
-			}
-			if parsed.Username != tt.wantUser {
-				t.Errorf("Username = %q, want %q", parsed.Username, tt.wantUser)
-			}
-			if parsed.Password != tt.wantPass {
-				t.Errorf("Password = %q, want %q", parsed.Password, tt.wantPass)
-			}
-			if tt.wantSSL != "" && parsed.SSLMode != tt.wantSSL {
-				t.Errorf("SSLMode = %q, want %q", parsed.SSLMode, tt.wantSSL)
-			}
-		})
-	}
-}
-
-func TestParseKeyValue(t *testing.T) {
-	p := parseKeyValue("host=localhost port=5432 dbname=mydb user=testuser sslmode=disable")
-	if p.Host != "localhost" {
-		t.Errorf("Host = %q", p.Host)
-	}
-	if p.Port != "5432" {
-		t.Errorf("Port = %q", p.Port)
-	}
-	if p.Database != "mydb" {
-		t.Errorf("Database = %q", p.Database)
-	}
-	if p.Username != "testuser" {
-		t.Errorf("Username = %q", p.Username)
-	}
-	if p.SSLMode != "disable" {
-		t.Errorf("SSLMode = %q", p.SSLMode)
-	}
-}
-
-func TestDefaultPostgresDSN(t *testing.T) {
-	parsed := &ParsedURI{
-		Username:        "user",
-		Password:        "pass",
-		Host:            "localhost",
-		Port:            "5432",
-		Database:        "mydb",
-		ApplicationName: "test-app",
-		SSLMode:         "require",
-		Options:         map[string]string{},
-	}
-
-	dsn := DefaultPostgresDSN(parsed)
-	if !strings.Contains(dsn, "postgres://") {
-		t.Errorf("Expected postgres:// scheme, got: %s", dsn)
-	}
-	if !strings.Contains(dsn, "localhost:5432") {
-		t.Errorf("Expected host:port, got: %s", dsn)
-	}
-	if !strings.Contains(dsn, "sslmode=require") {
-		t.Errorf("Expected sslmode param, got: %s", dsn)
-	}
-	if !strings.Contains(dsn, "application_name=test-app") {
-		t.Errorf("Expected application_name param, got: %s", dsn)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Client tests
-// ---------------------------------------------------------------------------
-
 func TestClient_Service(t *testing.T) {
 	c := &Client{
 		services: map[string]*ServiceConnection{
-			"catalog": {Read: &sql.DB{}, Write: &sql.DB{}},
+			"catalog": {},
 		},
 	}
 
@@ -329,8 +188,8 @@ func TestClient_Service(t *testing.T) {
 func TestClient_Services(t *testing.T) {
 	c := &Client{
 		services: map[string]*ServiceConnection{
-			"catalog": {Read: &sql.DB{}},
-			"users":   {Write: &sql.DB{}},
+			"catalog": {},
+			"users":   {},
 		},
 	}
 
@@ -363,7 +222,7 @@ func TestClient_HealthCheck_Empty(t *testing.T) {
 func TestClientConcurrentAccess(t *testing.T) {
 	c := &Client{
 		services: map[string]*ServiceConnection{
-			"catalog": {Read: &sql.DB{}, Write: &sql.DB{}},
+			"catalog": {},
 		},
 	}
 
@@ -378,10 +237,6 @@ func TestClientConcurrentAccess(t *testing.T) {
 	}
 	wg.Wait()
 }
-
-// ---------------------------------------------------------------------------
-// GSM resolver tests
-// ---------------------------------------------------------------------------
 
 func TestResolveConnectionString(t *testing.T) {
 	t.Run("direct connection string", func(t *testing.T) {
@@ -407,10 +262,6 @@ func TestResolveConnectionString(t *testing.T) {
 		}
 	})
 }
-
-// ---------------------------------------------------------------------------
-// App name tests
-// ---------------------------------------------------------------------------
 
 func TestGetAppName(t *testing.T) {
 	t.Setenv("K8S_POD_NAME", "catalog-svc-dply-xyz")
@@ -440,21 +291,22 @@ func TestGetDeploymentName(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// InitDefaultWithContext test
-// ---------------------------------------------------------------------------
-
-func TestInitDefaultWithContext(t *testing.T) {
-	clearPostgresEnv(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	c, err := InitDefaultWithContext(ctx)
-	if err != nil {
-		t.Fatalf("InitDefaultWithContext() error = %v", err)
+func TestApplyOptionDefaults(t *testing.T) {
+	opts := applyOptionDefaults(ConnectionOptions{})
+	if opts.MaxConns != 20 {
+		t.Errorf("MaxConns = %d, want 20", opts.MaxConns)
 	}
-	if c == nil {
-		t.Fatal("Expected non-nil client")
+	if opts.MinConns != 5 {
+		t.Errorf("MinConns = %d, want 5", opts.MinConns)
+	}
+	if opts.MaxConnLifetime != time.Hour {
+		t.Errorf("MaxConnLifetime = %v, want 1h", opts.MaxConnLifetime)
+	}
+	if opts.MaxConnIdleTime != 30*time.Minute {
+		t.Errorf("MaxConnIdleTime = %v, want 30m", opts.MaxConnIdleTime)
+	}
+	if opts.HealthCheckPeriod != time.Minute {
+		t.Errorf("HealthCheckPeriod = %v, want 1m", opts.HealthCheckPeriod)
 	}
 }
 
