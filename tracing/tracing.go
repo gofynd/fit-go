@@ -369,6 +369,10 @@ func toOtelSpanKind(kind SpanKind) trace.SpanKind {
 // StartSpan starts a new span. When the OTel SDK is initialized, this creates
 // a real OTel span; otherwise it creates an in-memory span.
 func (t *Tracer) StartSpan(ctx context.Context, name string, kind SpanKind) (context.Context, *Span) {
+	// A nil context must never panic the caller (e.g. tests that pass nil).
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	span := &Span{
 		name:      name,
 		traceID:   TraceIDFromContext(ctx),
@@ -503,6 +507,9 @@ func ContextWithTrace(ctx context.Context, traceID, spanID string) context.Conte
 
 // TraceIDFromContext extracts the trace ID from context.
 func TraceIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
 	if v, ok := ctx.Value(traceIDKey).(string); ok {
 		return v
 	}
@@ -511,6 +518,9 @@ func TraceIDFromContext(ctx context.Context) string {
 
 // SpanIDFromContext extracts the span ID from context.
 func SpanIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
 	if v, ok := ctx.Value(spanIDKey).(string); ok {
 		return v
 	}
