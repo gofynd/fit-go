@@ -333,6 +333,22 @@ func (cp *ConfluentProducer) ProduceBatch(topicMessages []TopicMessages, acks in
 	return nil
 }
 
+// ProduceCtx injects the active span's traceparent into each message's headers
+// (when tracing is enabled and ctx carries a span), then delegates to Produce.
+// Existing Produce callers are unaffected; this is the trace-propagating variant.
+func (cp *ConfluentProducer) ProduceCtx(ctx context.Context, topic string, messages []Message, acks int) error {
+	InjectTraceHeadersToMessages(ctx, messages)
+	return cp.Produce(topic, messages, acks)
+}
+
+// ProduceBatchCtx is ProduceBatch with per-message traceparent injection.
+func (cp *ConfluentProducer) ProduceBatchCtx(ctx context.Context, topicMessages []TopicMessages, acks int) error {
+	for i := range topicMessages {
+		InjectTraceHeadersToMessages(ctx, topicMessages[i].Messages)
+	}
+	return cp.ProduceBatch(topicMessages, acks)
+}
+
 // Close disconnects the producer gracefully by flushing pending messages.
 func (cp *ConfluentProducer) Close() error {
 	cp.mu.Lock()
@@ -476,6 +492,14 @@ func (cc *ConfluentConsumer) Consume(handler MessageHandler, opts ConsumerOption
 			}
 		}
 	}
+}
+
+// ConsumeCtx is Consume with a context-aware handler. It reuses the exact same
+// consume loop, wrapping the handler so each message opens a Consumer span
+// (parented to the producer's traceparent header) and the span context is threaded
+// into the handler. Transparent passthrough when tracing is disabled.
+func (cc *ConfluentConsumer) ConsumeCtx(handler MessageHandlerCtx, opts ConsumerOptions) error {
+	return cc.Consume(TracedMessageHandlerCtx(handler), opts)
 }
 
 // ConsumeBatch processes messages in batches via the handler. It collects

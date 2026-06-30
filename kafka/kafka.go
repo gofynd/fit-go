@@ -31,6 +31,7 @@
 package kafka
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -227,6 +228,15 @@ type KafkaProducer interface {
 	// ProduceBatch sends messages to multiple topics in one call.
 	ProduceBatch(topicMessages []TopicMessages, acks int) error
 
+	// ProduceCtx is Produce with a context: when tracing is enabled it injects the
+	// active span's W3C traceparent into each message's headers (so downstream
+	// consumers continue the trace), then delegates to Produce. A no-op-injection
+	// passthrough when tracing is off or ctx has no span.
+	ProduceCtx(ctx context.Context, topic string, messages []Message, acks int) error
+
+	// ProduceBatchCtx is ProduceBatch with traceparent injection (see ProduceCtx).
+	ProduceBatchCtx(ctx context.Context, topicMessages []TopicMessages, acks int) error
+
 	// Close disconnects the producer gracefully.
 	Close() error
 }
@@ -238,6 +248,12 @@ type KafkaConsumer interface {
 
 	// Consume processes messages one at a time via the handler.
 	Consume(handler MessageHandler, opts ConsumerOptions) error
+
+	// ConsumeCtx is Consume with a context-aware handler: it opens a consumer span
+	// per message (parented to the producer's traceparent header) and threads the
+	// span context into the handler, so consumer-side logs and downstream spans
+	// join the trace. A transparent passthrough when tracing is off.
+	ConsumeCtx(handler MessageHandlerCtx, opts ConsumerOptions) error
 
 	// ConsumeBatch processes messages in batches via the handler.
 	ConsumeBatch(handler BatchHandler, opts ConsumerOptions) error

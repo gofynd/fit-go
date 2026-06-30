@@ -167,6 +167,24 @@ func (s *Server) Init(
 		root.Use(SecureHeaders())
 	}
 
+	// Request ID: forward an inbound X-Request-ID or mint one, expose it on the
+	// response header and request context. Installed before OTel/logging so the
+	// id is attached to the server span and every access-log line, and pairs with
+	// the outbound x-request-id the httpclient sets for end-to-end correlation.
+	// NOTE: this is an ENHANCEMENT beyond legacy fit.js — the Node fit server had
+	// no request-id middleware, and fit/axios only logged a per-call UUID (it did
+	// not propagate an x-request-id header). Additive and harmless.
+	root.Use(RequestID())
+
+	// Per-request OpenTelemetry server span. Self-gated: a no-op passthrough when
+	// TRACING_ENABLED is off (default), so there is no added latency unless tracing
+	// is enabled. Installed before request logging and the user/parse middlewares so
+	// the entire request — including the access-log line and every handler — runs
+	// within the span. This restores the auto-instrumentation Node got from the
+	// OTel express plugin, with no per-service wiring. (/_healthz and /_readyz are
+	// skipped inside the middleware via tracing.ShouldTrace.)
+	root.Use(OTelMiddleware())
+
 	// Request logging
 	root.Use(GinLogRequestResponse(LogRequestResponseConfig{
 		Logger:          s.logger,

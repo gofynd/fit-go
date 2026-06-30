@@ -51,9 +51,9 @@ func OTelMiddleware() gin.HandlerFunc {
 		traceparent := c.GetHeader("traceparent")
 		ctx := c.Request.Context()
 		if traceparent != "" {
-			traceID, spanID, _ := tracing.ExtractTraceContext(traceparent)
+			traceID, spanID, sampled := tracing.ExtractTraceContext(traceparent)
 			if traceID != "" {
-				ctx = tracing.ContextWithTrace(ctx, traceID, spanID)
+				ctx = tracing.ContextWithTrace(ctx, traceID, spanID, sampled)
 			}
 		}
 
@@ -61,10 +61,12 @@ func OTelMiddleware() gin.HandlerFunc {
 		ctx, span := tracer.StartSpan(ctx, spanName, tracing.SpanKindServer)
 		defer span.End()
 
-		// Set HTTP semantic convention attributes.
+		// Set HTTP semantic convention attributes. http.url is scheme+host+path
+		// only — never URL.String(), which would capture the query string (PII:
+		// emails/tokens routinely ride in query params) into the span.
 		span.SetAttributes(map[string]any{
 			"http.method":     c.Request.Method,
-			"http.url":        c.Request.URL.String(),
+			"http.url":        httpScheme(c.Request) + "://" + c.Request.Host + path,
 			"http.target":     path,
 			"http.host":       c.Request.Host,
 			"http.scheme":     httpScheme(c.Request),
@@ -79,7 +81,7 @@ func OTelMiddleware() gin.HandlerFunc {
 
 		// Inject traceparent into response headers for client correlation.
 		if span.TraceID() != "" && span.SpanID() != "" {
-			c.Header("traceparent", tracing.FormatTraceparent(span.TraceID(), span.SpanID(), true))
+			c.Header("traceparent", tracing.FormatTraceparent(span.TraceID(), span.SpanID(), span.IsSampled()))
 		}
 
 		c.Next()

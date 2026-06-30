@@ -772,6 +772,10 @@ func RequestID() gin.HandlerFunc {
 		id := c.GetHeader("X-Request-ID")
 		if id == "" {
 			id = generateRequestID()
+			// Also set it on the REQUEST header so later middleware that reads
+			// c.GetHeader("x-request-id") (e.g. OTelMiddleware's span attribute)
+			// sees the minted id, not just the response header.
+			c.Request.Header.Set("X-Request-ID", id)
 		}
 		c.Header("X-Request-ID", id)
 		c.Set(ginKeyRequestID, id)

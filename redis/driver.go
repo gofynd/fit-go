@@ -24,6 +24,8 @@ package redis
 import (
 	"context"
 	"fmt"
+	"strings"
+	"time"
 
 	goredis "github.com/redis/go-redis/v9"
 )
@@ -195,8 +197,55 @@ func DefaultDialFunc() DialFunc {
 
 		client := goredis.NewClient(redisOpts)
 
+		// Some managed/proxied Redis deployments reject the CLIENT command, so
+		// go-redis's CLIENT SETNAME (from ClientName) / SETINFO (identity) handshake
+		// fails the very first command — surfacing as "ERR unknown command 'client'
+		// ... 'setname'". Legacy ioredis set no client name and disabled the lib
+		// handshake, so it never hit this.
+		//
+		// We probe whenever go-redis WOULD send a CLIENT command — i.e. a client
+		// name is set, or identity (SETINFO) is enabled, which is the default. So
+		// this synchronous one-shot PING runs on essentially every standalone dial,
+		// not only against proxies: that is the cost of detecting the rejection
+		// up-front (the alternative is the handshake failing on the first real
+		// command in production). On that specific rejection we transparently
+		// rebuild without the client name and with identity disabled; any other
+		// ping error is ignored here and left for the caller's health check.
+		if redisOpts.ClientName != "" || !redisOpts.DisableIdentity {
+			probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			pingErr := client.Ping(probeCtx).Err()
+			cancel()
+			if isClientCommandUnsupported(pingErr) {
+				_ = client.Close()
+				redisOpts.ClientName = ""
+				redisOpts.DisableIdentity = true
+				client = goredis.NewClient(redisOpts)
+			}
+		}
+
+		attachTracingHook(client)
 		return &standaloneConnection{client: client}, nil
 	}
+}
+
+// isClientCommandUnsupported reports whether err is the server rejecting go-redis's
+// CLIENT SETNAME/SETINFO handshake because it does not support the CLIENT command
+// (e.g. a restricted Redis-compatible proxy). Matched on the redis-server error
+// text "ERR unknown command 'client' ...". Returns false for nil and for any
+// other error (network, auth, a different unknown command), so the fallback only
+// triggers for this specific, recoverable case.
+func isClientCommandUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Anchor on "client" being the REJECTED command (quoted right after "unknown
+	// command"), not merely present somewhere — otherwise a different unknown
+	// command whose args happen to include "client" would false-positive and
+	// wrongly strip the client name. Redis quotes with backticks or single quotes
+	// depending on version; the message is lower-cased above.
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unknown command `client`") ||
+		strings.Contains(msg, "unknown command 'client'")
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +255,14 @@ func DefaultDialFunc() DialFunc {
 // DefaultClusterDialFunc returns a ClusterDialFunc for Redis Cluster connections
 // using go-redis/v9. It maps the framework's ClusterDialOptions to go-redis
 // ClusterOptions.
+//
+// KNOWN LIMITATION: unlike DefaultDialFunc (standalone), this path does NOT
+// probe for / recover from a proxy that rejects the CLIENT SETNAME / SETINFO
+// handshake (see the standalone fallback above). A cluster behind a
+// CLIENT-rejecting proxy would still fail on first command. The observed
+// regression was standalone-only; extending the probe+rebuild to the multi-node
+// cluster topology needs its own design + cluster integration tests. Tracked as
+// a deferred follow-up (see OBSERVABILITY_TRACING_SENTRY_PLAN.md §3d).
 func DefaultClusterDialFunc() ClusterDialFunc {
 	return func(ctx context.Context, opts *ClusterDialOptions) (Connection, error) {
 		clusterOpts := &goredis.ClusterOptions{
@@ -252,6 +309,7 @@ func DefaultClusterDialFunc() ClusterDialFunc {
 
 		client := goredis.NewClusterClient(clusterOpts)
 
+		attachTracingHook(client)
 		return &clusterConnection{client: client}, nil
 	}
 }
@@ -263,6 +321,12 @@ func DefaultClusterDialFunc() ClusterDialFunc {
 // DefaultSentinelDialFunc returns a SentinelDialFunc for Redis Sentinel
 // connections using go-redis/v9. It maps the framework's SentinelDialOptions
 // to go-redis FailoverOptions.
+//
+// KNOWN LIMITATION: like the cluster path and unlike DefaultDialFunc
+// (standalone), this does NOT probe for / recover from a proxy that rejects the
+// CLIENT SETNAME / SETINFO handshake. A sentinel/failover deployment behind a
+// CLIENT-rejecting proxy would still fail on first command. Deferred follow-up
+// (see OBSERVABILITY_TRACING_SENTRY_PLAN.md §3d).
 func DefaultSentinelDialFunc() SentinelDialFunc {
 	return func(ctx context.Context, opts *SentinelDialOptions) (Connection, error) {
 		failoverOpts := &goredis.FailoverOptions{
@@ -323,6 +387,7 @@ func DefaultSentinelDialFunc() SentinelDialFunc {
 			client = goredis.NewFailoverClient(failoverOpts)
 		}
 
+		attachTracingHook(client)
 		return &sentinelConnection{client: client}, nil
 	}
 }

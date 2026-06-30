@@ -50,6 +50,8 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/gofynd/fit-go/logging"
 )
 
 // Options configures the tracer.
@@ -185,6 +187,22 @@ func (s *Span) TraceID() string { return s.traceID }
 
 // SpanID returns the span's ID.
 func (s *Span) SpanID() string { return s.spanID }
+
+// IsSampled reports whether this span's trace is sampled (recorded/exported).
+// It reflects the real sampling decision (e.g. ParentBased / TraceIDRatio), so
+// propagators can set the W3C traceparent sampled flag correctly instead of
+// hard-coding it. Returns false when tracing is disabled (no OTel span).
+func (s *Span) IsSampled() bool {
+	return s.otelSpan != nil && s.otelSpan.SpanContext().IsSampled()
+}
+
+// Status returns the span's completion status (StatusUnset until SetStatus is
+// called). Primarily useful for asserting span outcome in tests.
+func (s *Span) Status() SpanStatusCode {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.status
+}
 
 // Tracer wraps OpenTelemetry tracing functionality.
 type Tracer struct {
@@ -322,6 +340,17 @@ func Global() *Tracer {
 	return globalTracer
 }
 
+// SetGlobal replaces the global tracer and returns a function that restores the
+// previous one. It bypasses the sync.Once init, so it is the way to install a
+// specific tracer (e.g. an enabled tracer built with New) regardless of whether
+// Init has already run — primarily for tests and advanced wiring. Restore with
+// the returned func (typically `defer SetGlobal(tr)()`).
+func SetGlobal(t *Tracer) (restore func()) {
+	prev := globalTracer
+	globalTracer = t
+	return func() { globalTracer = prev }
+}
+
 // Shutdown gracefully shuts down the global tracer, flushing any remaining spans.
 func Shutdown(ctx context.Context) error {
 	if globalTracer != nil {
@@ -413,6 +442,11 @@ func (t *Tracer) StartSpan(ctx context.Context, name string, kind SpanKind) (con
 	ctx = context.WithValue(ctx, spanIDKey, span.spanID)
 	ctx = context.WithValue(ctx, currentSpanKey, span)
 
+	// Bridge the IDs to the logging package so logger.WithContext(ctx) auto-stamps
+	// trace_id/span_id on every log line within this span — the Go equivalent of
+	// Node's OTel log-format enrichment, with no per-call wiring.
+	ctx = logging.ContextWithTrace(ctx, span.traceID, span.spanID)
+
 	return ctx, span
 }
 
@@ -498,10 +532,40 @@ func isTracingEnabled() bool {
 	return strings.EqualFold(val, "true") || val == "1"
 }
 
-// ContextWithTrace adds trace and span IDs to the context.
-func ContextWithTrace(ctx context.Context, traceID, spanID string) context.Context {
+// ContextWithTrace adds trace and span IDs to the context. It records them under
+// fit-go's own keys AND, critically, installs an OpenTelemetry *remote* span
+// context built from those IDs — so that a subsequent StartSpan (which delegates
+// to otelTracer.Start) parents the new span to this extracted trace instead of
+// beginning a fresh root trace. Without the remote span context, OTel ignores the
+// custom keys and trace continuation (inbound HTTP traceparent, Kafka
+// producer→consumer linkage) silently breaks.
+//
+// sampled is the upstream W3C sampled decision (from the inbound traceparent);
+// it is carried on the remote span context so a ParentBased sampler honours the
+// caller's decision instead of forcing every continued trace to record.
+func ContextWithTrace(ctx context.Context, traceID, spanID string, sampled bool) context.Context {
 	ctx = context.WithValue(ctx, traceIDKey, traceID)
 	ctx = context.WithValue(ctx, spanIDKey, spanID)
+
+	tid, err := trace.TraceIDFromHex(traceID)
+	if err != nil {
+		return ctx // invalid trace id — keep custom keys, skip OTel parenting
+	}
+	var flags trace.TraceFlags
+	if sampled {
+		flags = trace.FlagsSampled
+	}
+	scc := trace.SpanContextConfig{
+		TraceID:    tid,
+		Remote:     true,
+		TraceFlags: flags, // honour the upstream sampled decision
+	}
+	if sid, err := trace.SpanIDFromHex(spanID); err == nil {
+		scc.SpanID = sid
+	}
+	if sc := trace.NewSpanContext(scc); sc.IsValid() {
+		ctx = trace.ContextWithRemoteSpanContext(ctx, sc)
+	}
 	return ctx
 }
 

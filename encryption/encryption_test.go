@@ -109,18 +109,21 @@ func TestManager_Init_WrongDEKSize(t *testing.T) {
 	}
 }
 
-func TestManager_Init_WrongIVSize(t *testing.T) {
+func TestManager_Init_AcceptsNonStandardIV(t *testing.T) {
+	// A non-12-byte (but non-empty) IV is now accepted: the platform's canonical
+	// fit encryption (Node `fit/encryption`, `pyfit`) uses a fixed Vault IV of
+	// non-standard length (9 bytes in prod), and fit-go must Init with it via
+	// cipher.NewGCMWithNonceSize. Previously this hard-failed ("IV must be 12 bytes").
 	os.Setenv("PII_DEK_BASE64", base64.StdEncoding.EncodeToString(make([]byte, 32)))
-	os.Setenv("PII_IV_BASE64", base64.StdEncoding.EncodeToString(make([]byte, 16))) // wrong size
+	os.Setenv("PII_IV_BASE64", base64.StdEncoding.EncodeToString(make([]byte, 16)))
 	defer func() {
 		os.Unsetenv("PII_DEK_BASE64")
 		os.Unsetenv("PII_IV_BASE64")
 	}()
 
 	mgr := NewManager()
-	err := mgr.Init()
-	if err == nil {
-		t.Error("Init() should fail with wrong IV size")
+	if err := mgr.Init(); err != nil {
+		t.Errorf("Init() should accept a non-standard (16-byte) IV, got: %v", err)
 	}
 }
 

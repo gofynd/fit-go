@@ -347,6 +347,13 @@ func createPool(ctx context.Context, connStr, appName string, tlsCfg *tls.Config
 		poolCfg.ConnConfig.TLSConfig = tlsCfg
 	}
 
+	// Attach the OTel query tracer when tracing is enabled (nil otherwise → no
+	// per-query overhead). Go equivalent of the @opentelemetry/instrumentation-pg
+	// auto-instrumentation fit.js had.
+	if qt := newQueryTracer(); qt != nil {
+		poolCfg.ConnConfig.Tracer = qt
+	}
+
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("create pool: %w", err)

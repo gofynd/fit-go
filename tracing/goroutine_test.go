@@ -22,7 +22,7 @@ import (
 )
 
 func TestInjectContextIntoGoroutine(t *testing.T) {
-	ctx := ContextWithTrace(context.Background(), "trace-abc", "span-def")
+	ctx := ContextWithTrace(context.Background(), "trace-abc", "span-def", true)
 
 	cleanup := InjectContextIntoGoroutine(ctx)
 	defer cleanup()
@@ -40,7 +40,7 @@ func TestInjectContextIntoGoroutine(t *testing.T) {
 }
 
 func TestInjectContextIntoGoroutine_Cleanup(t *testing.T) {
-	ctx := ContextWithTrace(context.Background(), "trace-123", "span-456")
+	ctx := ContextWithTrace(context.Background(), "trace-123", "span-456", true)
 
 	cleanup := InjectContextIntoGoroutine(ctx)
 	cleanup()
@@ -59,7 +59,7 @@ func TestContextFromGoroutine_NoInjection(t *testing.T) {
 }
 
 func TestInjectContextIntoGoroutine_CrossGoroutine(t *testing.T) {
-	ctx := ContextWithTrace(context.Background(), "trace-parent", "span-parent")
+	ctx := ContextWithTrace(context.Background(), "trace-parent", "span-parent", true)
 
 	cleanup := InjectContextIntoGoroutine(ctx)
 	defer cleanup()
@@ -81,7 +81,7 @@ func TestInjectContextIntoGoroutine_Concurrent(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			ctx := ContextWithTrace(context.Background(), "trace-"+string(rune('A'+idx%26)), "span")
+			ctx := ContextWithTrace(context.Background(), "trace-"+string(rune('A'+idx%26)), "span", true)
 			cleanup := InjectContextIntoGoroutine(ctx)
 			defer cleanup()
 

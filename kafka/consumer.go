@@ -15,7 +15,10 @@
 // Package kafka provides Kafka consumer types and configuration.
 package kafka
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 // ---------------------------------------------------------------------------
 // Handler types
@@ -50,6 +53,14 @@ type BatchPayload struct {
 // Return an error to signal processing failure (the consumer will handle
 // retry/dead-letter based on its configuration).
 type MessageHandler func(payload MessagePayload) error
+
+// MessageHandlerCtx is like MessageHandler but receives a context.Context that
+// carries the per-message consumer trace span. ConsumeCtx extracts the W3C
+// traceparent from the message headers, opens the consumer span, and passes the
+// span-bearing context here — so handler logs and any downstream DB/HTTP spans
+// join the producer's trace. Use this instead of MessageHandler when you want
+// consumer-side trace correlation.
+type MessageHandlerCtx func(ctx context.Context, payload MessagePayload) error
 
 // BatchHandler processes a batch of consumed messages.
 // Return an error to signal processing failure.

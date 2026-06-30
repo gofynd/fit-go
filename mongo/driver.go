@@ -75,6 +75,13 @@ func DefaultDialFunc() DialFunc {
 			applyDriverOptions(clientOpts, opts)
 		}
 
+		// Attach the OTel command monitor when tracing is enabled (nil otherwise,
+		// leaving the hot path untouched). This is the Go equivalent of the
+		// @opentelemetry/instrumentation-mongodb auto-instrumentation fit.js had.
+		if monitor := newCommandMonitor(); monitor != nil {
+			clientOpts.SetMonitor(monitor)
+		}
+
 		client, err := mongo.Connect(clientOpts)
 		if err != nil {
 			return nil, fmt.Errorf("mongo driver: connect failed: %w", err)
