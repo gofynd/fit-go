@@ -134,6 +134,21 @@ type ConsumerConfig struct {
 	// it dead and triggers a rebalance. Default: 5m (300s).
 	// Mirrors Kafka's max.poll.interval.ms.
 	MaxPollInterval time.Duration
+
+	// OnPartitionsAssigned, if set, is invoked after partitions are assigned to
+	// this consumer during a group rebalance (visibility / app hook). Optional.
+	OnPartitionsAssigned func([]PartitionAssignment)
+
+	// OnPartitionsRevoked, if set, is invoked before partitions are revoked from
+	// this consumer during a group rebalance. Optional.
+	OnPartitionsRevoked func([]PartitionAssignment)
+}
+
+// PartitionAssignment identifies a single topic-partition assigned to or revoked
+// from a consumer during a rebalance.
+type PartitionAssignment struct {
+	Topic     string
+	Partition int32
 }
 
 // DefaultConsumerConfig returns a ConsumerConfig with sensible defaults that

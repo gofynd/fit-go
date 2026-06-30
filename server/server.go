@@ -185,6 +185,10 @@ func (s *Server) Init(
 	// skipped inside the middleware via tracing.ShouldTrace.)
 	root.Use(OTelMiddleware())
 
+	// Make the server span the goroutine-local active context so handler logs
+	// carry the trace without explicit threading (implicit propagation).
+	root.Use(GoroutineContextMiddleware())
+
 	// Request logging
 	root.Use(GinLogRequestResponse(LogRequestResponseConfig{
 		Logger:          s.logger,

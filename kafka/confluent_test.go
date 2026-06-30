@@ -1207,3 +1207,29 @@ func mustLogger() *logging.Logger {
 	}
 	return l
 }
+
+// TestFormatAndConvertPartitions covers the rebalance helper functions.
+func TestFormatAndConvertPartitions(t *testing.T) {
+	tA, tB := "orders", "clicks"
+	parts := []ckafka.TopicPartition{
+		{Topic: &tA, Partition: 0},
+		{Topic: &tB, Partition: 3},
+		{Topic: nil, Partition: 7}, // nil topic must not panic
+	}
+
+	got := formatPartitions(parts)
+	want := []string{"orders[0]", "clicks[3]", "[7]"}
+	if len(got) != len(want) {
+		t.Fatalf("formatPartitions len = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("formatPartitions[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	pa := toPartitionAssignments(parts)
+	if len(pa) != 3 || pa[0].Topic != "orders" || pa[0].Partition != 0 || pa[1].Topic != "clicks" || pa[1].Partition != 3 || pa[2].Topic != "" {
+		t.Fatalf("toPartitionAssignments = %+v", pa)
+	}
+}

@@ -242,3 +242,34 @@ func addLeBucket(labels string, bound float64) string {
 	// Insert le before closing brace
 	return labels[:len(labels)-1] + ",le=\"" + le + "\"}"
 }
+
+// ServerRecorderFunc returns a callback suitable for server.Config.MetricsRecorder
+// that forwards inbound HTTP request metrics to this registry. Wire it with:
+//
+//	srvCfg.MetricsRecorder = reg.ServerRecorderFunc()
+func (r *Registry) ServerRecorderFunc() func(method, route, status string, durationMs float64) {
+	return func(method, route, status string, durationMs float64) {
+		code, _ := strconv.Atoi(status)
+		r.RecordServerMetrics(ServerMetrics{
+			Method:     method,
+			Route:      route,
+			StatusCode: code,
+			Duration:   time.Duration(durationMs * float64(time.Millisecond)),
+		})
+	}
+}
+
+// HTTPClientRecorderFunc returns a callback suitable for httpclient.WithMetrics
+// that forwards outbound HTTP call metrics to this registry. Wire it with:
+//
+//	httpclient.NewHTTPClient(httpclient.WithMetrics(reg.HTTPClientRecorderFunc()))
+func (r *Registry) HTTPClientRecorderFunc() func(method, host string, status int, d time.Duration) {
+	return func(method, host string, status int, d time.Duration) {
+		r.RecordHTTPClientMetrics(HTTPClientMetrics{
+			Method:     method,
+			Host:       host,
+			StatusCode: status,
+			Duration:   d,
+		})
+	}
+}

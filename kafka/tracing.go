@@ -98,6 +98,11 @@ func TracedMessageHandlerCtx(handler MessageHandlerCtx) MessageHandler {
 			return handler(context.Background(), msg)
 		}
 		defer span.End()
+		// Make the consumer span the goroutine-local active context so plain
+		// logging.* calls in the handler (and its same-goroutine callees) carry
+		// the trace without explicit threading.
+		cleanup := tracing.InjectContextIntoGoroutine(ctx)
+		defer cleanup()
 		err := handler(ctx, msg)
 		recordSpanResult(span, err)
 		return err

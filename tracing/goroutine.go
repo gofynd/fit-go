@@ -15,48 +15,24 @@
 package tracing
 
 import (
-	"bytes"
 	"context"
-	"runtime"
-	"strconv"
-	"sync"
+
+	"github.com/gofynd/fit-go/internal/goroutinectx"
 )
 
-var goroutineContexts sync.Map
-
-// InjectContextIntoGoroutine stores the trace context from ctx in
-// goroutine-scoped storage so that loggers and other infrastructure can
-// retrieve trace/span IDs without explicit context threading.
-// Returns a cleanup function that must be deferred.
+// InjectContextIntoGoroutine stores ctx in goroutine-scoped storage so that
+// loggers and other infrastructure can retrieve trace/span IDs without explicit
+// context threading. Returns a cleanup function that must be deferred; nested
+// calls on the same goroutine compose correctly.
 //
 //	cleanup := tracing.InjectContextIntoGoroutine(ctx)
 //	defer cleanup()
 func InjectContextIntoGoroutine(ctx context.Context) func() {
-	gid := goroutineID()
-	goroutineContexts.Store(gid, ctx)
-	return func() {
-		goroutineContexts.Delete(gid)
-	}
+	return goroutinectx.Inject(ctx)
 }
 
 // ContextFromGoroutine retrieves the context previously stored by
-// InjectContextIntoGoroutine for the current goroutine.
-// Returns nil if no context was injected.
+// InjectContextIntoGoroutine for the current goroutine. Returns nil if none.
 func ContextFromGoroutine() context.Context {
-	gid := goroutineID()
-	if v, ok := goroutineContexts.Load(gid); ok {
-		return v.(context.Context)
-	}
-	return nil
-}
-
-func goroutineID() uint64 {
-	var buf [64]byte
-	n := runtime.Stack(buf[:], false)
-	fields := bytes.Fields(buf[:n])
-	if len(fields) < 2 {
-		return 0
-	}
-	id, _ := strconv.ParseUint(string(fields[1]), 10, 64)
-	return id
+	return goroutinectx.Load()
 }

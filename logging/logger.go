@@ -28,6 +28,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	oteltrace "go.opentelemetry.io/otel/trace"
+
+	"github.com/gofynd/fit-go/internal/goroutinectx"
 )
 
 // Context keys for trace propagation. These match the OpenTelemetry context
@@ -346,6 +350,27 @@ func (l *Logger) log(lvl Level, msg string, kvs []interface{}) {
 		Service:   l.service,
 		TraceID:   l.traceID,
 		SpanID:    l.spanID,
+	}
+
+	// Implicit trace propagation: when no trace context was explicitly bound
+	// (WithContext), fall back to the goroutine-local active context so logs
+	// still carry trace/span ids without explicit threading. The OTel span
+	// context is the source of truth (covers otelgin/our spans uniformly); the
+	// fit-go logging keys are a secondary fallback.
+	if e.TraceID == "" {
+		if gctx := goroutinectx.Active(); gctx != nil {
+			if sc := oteltrace.SpanContextFromContext(gctx); sc.IsValid() {
+				e.TraceID = sc.TraceID().String()
+				e.SpanID = sc.SpanID().String()
+			} else {
+				if v, ok := gctx.Value(ctxKeyTraceID).(string); ok && v != "" {
+					e.TraceID = v
+				}
+				if v, ok := gctx.Value(ctxKeySpanID).(string); ok && v != "" {
+					e.SpanID = v
+				}
+			}
+		}
 	}
 
 	// Merge persistent fields and per-call key-value pairs into Extra.

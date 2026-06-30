@@ -22,6 +22,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	oteltrace "go.opentelemetry.io/otel/trace"
+
+	"github.com/gofynd/fit-go/internal/goroutinectx"
 )
 
 // ---------------------------------------------------------------------------
@@ -724,4 +728,45 @@ type testError struct {
 
 func (e *testError) Error() string {
 	return e.msg
+}
+
+// When no trace context is explicitly bound, a plain log call must pick up the
+// goroutine-local active context's OTel span (implicit trace propagation).
+func TestLog_ImplicitTraceFromGoroutineLocal(t *testing.T) {
+	var buf bytes.Buffer
+	lg, err := New(Options{Level: "info", Env: "production", Output: &buf})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	tid, _ := oteltrace.TraceIDFromHex("0123456789abcdef0123456789abcdef")
+	sid, _ := oteltrace.SpanIDFromHex("0123456789abcdef")
+	sc := oteltrace.NewSpanContext(oteltrace.SpanContextConfig{TraceID: tid, SpanID: sid})
+	ctx := oteltrace.ContextWithSpanContext(context.Background(), sc)
+
+	cleanup := goroutinectx.Inject(ctx)
+	defer cleanup()
+
+	lg.Info("hello") // no WithContext — must still carry the trace
+
+	out := buf.String()
+	if !strings.Contains(out, "0123456789abcdef0123456789abcdef") {
+		t.Fatalf("log line missing implicit trace_id; got: %s", out)
+	}
+	if !strings.Contains(out, "0123456789abcdef") {
+		t.Fatalf("log line missing implicit span_id; got: %s", out)
+	}
+}
+
+// Without any goroutine-local context, logs carry no trace id (no false data).
+func TestLog_NoImplicitTraceWhenNoneInjected(t *testing.T) {
+	var buf bytes.Buffer
+	lg, err := New(Options{Level: "info", Env: "production", Output: &buf})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	lg.Info("plain")
+	if strings.Contains(buf.String(), "trace_id") {
+		t.Fatalf("unexpected trace_id in log without injected context: %s", buf.String())
+	}
 }

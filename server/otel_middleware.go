@@ -48,3 +48,19 @@ func OTelMiddleware() gin.HandlerFunc {
 		}),
 	)
 }
+
+// GoroutineContextMiddleware stores the request context (carrying the otelgin
+// server span set by OTelMiddleware) in goroutine-local storage for the duration
+// of the handler, so plain logging.* calls in handlers carry the trace without
+// explicit context threading. Installed right after OTelMiddleware. Passthrough
+// (zero cost) when tracing is disabled.
+func GoroutineContextMiddleware() gin.HandlerFunc {
+	if t := tracing.Global(); t == nil || !t.IsEnabled() {
+		return func(c *gin.Context) { c.Next() }
+	}
+	return func(c *gin.Context) {
+		cleanup := tracing.InjectContextIntoGoroutine(c.Request.Context())
+		defer cleanup()
+		c.Next()
+	}
+}

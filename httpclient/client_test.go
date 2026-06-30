@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gofynd/fit-go/internal/tracingtest"
 	"github.com/gofynd/fit-go/tracing"
@@ -158,5 +159,24 @@ func TestProxyFromEnvWithForce(t *testing.T) {
 	}
 	if u2 != nil && u2.Host == "proxy.local:3128" {
 		t.Fatalf("http forced host must NOT be force-proxied (HTTPS-only), got %v", u2)
+	}
+}
+
+// WithMetrics records method/host/status/duration for each outbound call.
+func TestRoundTrip_RecordsMetrics(t *testing.T) {
+	f := &fakeRT{status: 503}
+	var gotMethod, gotHost string
+	var gotStatus int
+	called := false
+	rt := WrapTransport(f, WithMetrics(func(m, h string, s int, _ time.Duration) {
+		gotMethod, gotHost, gotStatus, called = m, h, s, true
+	}))
+	do(t, rt, httptest.NewRequest(http.MethodGet, "http://svc.internal:8080/x", nil))
+
+	if !called {
+		t.Fatal("metrics recorder was not called")
+	}
+	if gotMethod != "GET" || gotHost != "svc.internal:8080" || gotStatus != 503 {
+		t.Fatalf("metrics = %q %q %d, want GET svc.internal:8080 503", gotMethod, gotHost, gotStatus)
 	}
 }

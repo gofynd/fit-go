@@ -49,6 +49,16 @@ type Option func(*transport)
 // (safe fields only). When nil (default) no request logging is emitted.
 func WithLogger(l *slog.Logger) Option { return func(t *transport) { t.logger = l } }
 
+// MetricsRecorder records one outbound HTTP call's metrics. status is the
+// numeric HTTP status (0 on transport error). Fields match
+// metrics.HTTPClientMetrics so callers can forward directly to the metrics
+// registry without this package importing it.
+type MetricsRecorder func(method, host string, status int, duration time.Duration)
+
+// WithMetrics records per-request outbound metrics (method/host/status/duration).
+// When nil (default) no metrics are recorded.
+func WithMetrics(rec MetricsRecorder) Option { return func(t *transport) { t.metrics = rec } }
+
 // WrapTransport wraps base with trace propagation, request-id forwarding and
 // optional logging. A nil base uses http.DefaultTransport. Use this to instrument
 // an existing/custom transport; use NewHTTPClient for a ready-to-use client.
@@ -80,8 +90,9 @@ func NewHTTPClientWithTimeout(timeout time.Duration, opts ...Option) *http.Clien
 }
 
 type transport struct {
-	base   http.RoundTripper
-	logger *slog.Logger
+	base    http.RoundTripper
+	logger  *slog.Logger
+	metrics MetricsRecorder
 }
 
 // RoundTrip clones the request (per the RoundTripper contract — must not mutate
@@ -159,6 +170,10 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 				"method", req.Method, "url", safeURL, "status", status,
 				"request_id", reqID, "duration_ms", duration.Milliseconds())
 		}
+	}
+
+	if t.metrics != nil {
+		t.metrics(req.Method, req.URL.Host, status, duration)
 	}
 
 	return resp, err

@@ -416,7 +416,15 @@ func (cc *ConfluentConsumer) Connect(topics []TopicConfig) error {
 		names[i] = t.Topic
 	}
 
-	if err := consumer.SubscribeTopics(names, nil); err != nil {
+	// Best-effort create any missing topics before subscribing, so a consumer
+	// does not fail to start just because its topic does not exist yet. Never
+	// blocks startup — failures are logged and we fall through to subscribe.
+	cc.ensureTopics(names)
+
+	// Subscribe with a rebalance callback for partition-assignment visibility and
+	// optional app hooks. Once a RebalanceCb is supplied we own assign/unassign
+	// (eager protocol), which the callback handles.
+	if err := consumer.SubscribeTopics(names, cc.rebalanceCb); err != nil {
 		consumer.Close()
 		return fmt.Errorf("kafka/confluent: subscribe failed: %w", err)
 	}
@@ -429,6 +437,96 @@ func (cc *ConfluentConsumer) Connect(topics []TopicConfig) error {
 		"topics", strings.Join(names, ","),
 	)
 	return nil
+}
+
+// ensureTopics best-effort creates any of the given topics that don't yet exist,
+// using the broker's default partitions/replication. All failures are logged and
+// swallowed — topic creation must never block consumer startup.
+func (cc *ConfluentConsumer) ensureTopics(names []string) {
+	admin, err := ckafka.NewAdminClient(cloneConfigMap(cc.configMap))
+	if err != nil {
+		cc.logger.Warn("kafka/confluent: topic auto-create skipped (admin client)", "error", err.Error())
+		return
+	}
+	defer admin.Close()
+
+	specs := make([]ckafka.TopicSpecification, len(names))
+	for i, n := range names {
+		// -1 => use the broker's default num.partitions / replication factor.
+		specs[i] = ckafka.TopicSpecification{Topic: n, NumPartitions: -1, ReplicationFactor: -1}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	results, err := admin.CreateTopics(ctx, specs)
+	if err != nil {
+		cc.logger.Warn("kafka/confluent: topic auto-create failed", "error", err.Error())
+		return
+	}
+	for _, r := range results {
+		switch r.Error.Code() {
+		case ckafka.ErrNoError:
+			cc.logger.Info("kafka/confluent: topic created", "topic", r.Topic)
+		case ckafka.ErrTopicAlreadyExists:
+			// already present — nothing to do
+		default:
+			cc.logger.Warn("kafka/confluent: topic create result", "topic", r.Topic, "error", r.Error.String())
+		}
+	}
+}
+
+// rebalanceCb drives partition assignment/revocation for the subscription.
+// Supplying a RebalanceCb means we own assign/unassign (eager protocol). It logs
+// the partition set and invokes the optional ConsumerConfig hooks.
+func (cc *ConfluentConsumer) rebalanceCb(consumer *ckafka.Consumer, event ckafka.Event) error {
+	switch e := event.(type) {
+	case ckafka.AssignedPartitions:
+		if err := consumer.Assign(e.Partitions); err != nil {
+			cc.logger.Error("kafka/confluent: partition assign failed", "groupId", cc.groupID, "error", err.Error())
+			return nil
+		}
+		cc.logger.Info("kafka/confluent: partitions assigned",
+			"groupId", cc.groupID, "partitions", formatPartitions(e.Partitions))
+		if cc.config.OnPartitionsAssigned != nil {
+			cc.config.OnPartitionsAssigned(toPartitionAssignments(e.Partitions))
+		}
+	case ckafka.RevokedPartitions:
+		cc.logger.Info("kafka/confluent: partitions revoked",
+			"groupId", cc.groupID, "partitions", formatPartitions(e.Partitions))
+		if cc.config.OnPartitionsRevoked != nil {
+			cc.config.OnPartitionsRevoked(toPartitionAssignments(e.Partitions))
+		}
+		if err := consumer.Unassign(); err != nil {
+			cc.logger.Error("kafka/confluent: partition unassign failed", "groupId", cc.groupID, "error", err.Error())
+		}
+	}
+	return nil
+}
+
+// formatPartitions renders partitions as "topic[partition]" for logs.
+func formatPartitions(parts []ckafka.TopicPartition) []string {
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		t := ""
+		if p.Topic != nil {
+			t = *p.Topic
+		}
+		out = append(out, fmt.Sprintf("%s[%d]", t, p.Partition))
+	}
+	return out
+}
+
+// toPartitionAssignments maps confluent partitions to the public type.
+func toPartitionAssignments(parts []ckafka.TopicPartition) []PartitionAssignment {
+	out := make([]PartitionAssignment, 0, len(parts))
+	for _, p := range parts {
+		t := ""
+		if p.Topic != nil {
+			t = *p.Topic
+		}
+		out = append(out, PartitionAssignment{Topic: t, Partition: p.Partition})
+	}
+	return out
 }
 
 // Consume processes messages one at a time via the handler. It blocks until

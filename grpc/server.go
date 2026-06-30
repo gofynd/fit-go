@@ -37,6 +37,7 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health"
@@ -46,6 +47,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	fithealth "github.com/gofynd/fit-go/health"
+	"github.com/gofynd/fit-go/tracing"
 )
 
 // ---------------------------------------------------------------------------
@@ -304,13 +306,20 @@ func Init(cfg Config) (*Server, error) {
 	}
 
 	// Create the real gRPC server with keepalive parameters.
-	grpcServer := grpc.NewServer(
+	serverOpts := []grpc.ServerOption{
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			MaxConnectionIdle: cfg.IdleTimeout,
 			Time:              cfg.KeepaliveInterval,
 			Timeout:           cfg.KeepaliveTimeout,
 		}),
-	)
+	}
+	// Per-RPC OpenTelemetry server spans via the official otelgrpc StatsHandler,
+	// using the global TracerProvider/propagator fit-go's tracing init installs.
+	// Added only when tracing is enabled, so there is zero overhead when off.
+	if t := tracing.Global(); t != nil && t.IsEnabled() {
+		serverOpts = append(serverOpts, grpc.StatsHandler(otelgrpc.NewServerHandler()))
+	}
+	grpcServer := grpc.NewServer(serverOpts...)
 
 	// Register gRPC health check service.
 	healthServer := health.NewServer()
