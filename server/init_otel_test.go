@@ -22,14 +22,16 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/gofynd/fit-go/internal/tracingtest"
 )
 
-// Init must install OTelMiddleware in the default chain so every fit-go service
-// gets per-request server spans with no per-service wiring (the Node OTel-express
-// equivalent). A normal request must serve cleanly; when tracing is enabled the
-// response carries a `traceparent` header (the middleware's observable signal),
-// proving the middleware is in the chain.
+// Init must install OTelMiddleware (otelgin) in the default chain so every
+// fit-go service gets per-request server spans with no per-service wiring (the
+// Node OTel-express equivalent). The handler echoes the trace id from its
+// request context, so a single request proves the middleware is in the chain AND
+// that otelgin extracted + continued the inbound W3C traceparent.
 func TestInit_InstallsOTelMiddlewareInDefaultChain(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	tracingtest.EnabledGlobal(t)
@@ -37,25 +39,28 @@ func TestInit_InstallsOTelMiddlewareInDefaultChain(t *testing.T) {
 	t.Setenv("SERVICE_NAME", "fit-test")
 
 	inner := gin.New()
-	inner.GET("/ping", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
+	inner.GET("/ping", func(c *gin.Context) {
+		c.String(http.StatusOK, trace.SpanContextFromContext(c.Request.Context()).TraceID().String())
+	})
 
 	s := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	if err := s.Init(map[ServerType]http.Handler{ServerTypeInternal: inner}, nil, nil); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 
+	const inboundTrace = "11111111111111111111111111111111"
+	req := httptest.NewRequest(http.MethodGet, "/ping", nil)
+	req.Header.Set("traceparent", "00-"+inboundTrace+"-2222222222222222-01")
 	rec := httptest.NewRecorder()
-	s.engine.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ping", nil))
+	s.engine.ServeHTTP(rec, req)
 
-	// The full default chain (incl. the new OTel middleware) must serve normally.
-	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
-		t.Fatalf("request through default chain: got %d %q, want 200 \"ok\"", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("request through default chain: got %d, want 200", rec.Code)
 	}
-
-	// OTelMiddleware sets a traceparent response header when tracing is enabled —
-	// its proof-of-presence in the default chain. The enabled tracer is installed
-	// for this test (enabledGlobalTracer), so this strong assertion always runs.
-	if rec.Header().Get("traceparent") == "" {
-		t.Fatal("tracing enabled but no traceparent header — OTelMiddleware not in the default chain")
+	// The handler's context must carry the inbound trace id — proving otelgin is
+	// in the chain (server span created) and continued the upstream trace.
+	if rec.Body.String() != inboundTrace {
+		t.Fatalf("handler context trace id = %q, want %q — otelgin not wired or not extracting traceparent",
+			rec.Body.String(), inboundTrace)
 	}
 }

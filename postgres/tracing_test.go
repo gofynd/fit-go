@@ -15,11 +15,7 @@
 package postgres
 
 import (
-	"context"
-	"errors"
 	"testing"
-
-	"github.com/jackc/pgx/v5"
 
 	"github.com/gofynd/fit-go/internal/tracingtest"
 	"github.com/gofynd/fit-go/tracing"
@@ -54,23 +50,11 @@ func TestNewQueryTracer_DisabledReturnsNil(t *testing.T) {
 	}
 }
 
-// TraceQueryStart opens a span (stashed in the returned context) and TraceQueryEnd
-// closes it without panic, on both success and error.
-func TestQueryTracer_Lifecycle(t *testing.T) {
+// When tracing is enabled, an otelpgx QueryTracer is installed (its span
+// lifecycle is tested upstream in otelpgx; here we assert fit-go's wiring).
+func TestNewQueryTracer_EnabledReturnsTracer(t *testing.T) {
 	tracingtest.EnabledGlobal(t)
-	qt := queryTracer{}
-
-	// Success path.
-	ctx := qt.TraceQueryStart(context.Background(), nil, pgx.TraceQueryStartData{SQL: "SELECT 1"})
-	if _, ok := ctx.Value(pgSpanKey{}).(*tracing.Span); !ok {
-		t.Fatal("TraceQueryStart must stash a span in the context")
+	if newQueryTracer() == nil {
+		t.Fatal("expected a query tracer when tracing enabled")
 	}
-	qt.TraceQueryEnd(ctx, nil, pgx.TraceQueryEndData{}) // no panic
-
-	// Error path.
-	ctx2 := qt.TraceQueryStart(context.Background(), nil, pgx.TraceQueryStartData{SQL: "INSERT INTO t VALUES ($1)"})
-	qt.TraceQueryEnd(ctx2, nil, pgx.TraceQueryEndData{Err: errors.New("constraint violation")})
-
-	// End with no span in context is a safe no-op.
-	qt.TraceQueryEnd(context.Background(), nil, pgx.TraceQueryEndData{})
 }

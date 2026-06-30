@@ -205,17 +205,14 @@ func DefaultDialFunc() DialFunc {
 		//
 		// We probe whenever go-redis WOULD send a CLIENT command — i.e. a client
 		// name is set, or identity (SETINFO) is enabled, which is the default. So
-		// this synchronous one-shot PING runs on essentially every standalone dial,
-		// not only against proxies: that is the cost of detecting the rejection
-		// up-front (the alternative is the handshake failing on the first real
-		// command in production). On that specific rejection we transparently
-		// rebuild without the client name and with identity disabled; any other
-		// ping error is ignored here and left for the caller's health check.
+		// this synchronous one-shot PING runs on essentially every dial, not only
+		// against proxies: that is the cost of detecting the rejection up-front (the
+		// alternative is the handshake failing on the first real command in
+		// production). On that specific rejection we transparently rebuild without
+		// the client name and with identity disabled. The cluster and sentinel dial
+		// funcs below apply the same fallback.
 		if redisOpts.ClientName != "" || !redisOpts.DisableIdentity {
-			probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			pingErr := client.Ping(probeCtx).Err()
-			cancel()
-			if isClientCommandUnsupported(pingErr) {
+			if clientHandshakeRejected(ctx, client) {
 				_ = client.Close()
 				redisOpts.ClientName = ""
 				redisOpts.DisableIdentity = true
@@ -248,21 +245,32 @@ func isClientCommandUnsupported(err error) bool {
 		strings.Contains(msg, "unknown command 'client'")
 }
 
+// pinger is the subset of a go-redis client (standalone, cluster, failover) used
+// to probe the CLIENT handshake.
+type pinger interface {
+	Ping(context.Context) *goredis.StatusCmd
+}
+
+// clientHandshakeRejected probes c with a short one-shot PING and reports whether
+// the server rejected go-redis's CLIENT SETNAME/SETINFO handshake — i.e. the
+// caller should rebuild the client without the client name and with identity
+// disabled. Call only when a CLIENT command would actually be sent (ClientName
+// set or identity enabled). Any non-rejection ping error (network, auth, …) is
+// treated as "not rejected" and left for the caller's health check to surface.
+func clientHandshakeRejected(ctx context.Context, c pinger) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return isClientCommandUnsupported(c.Ping(probeCtx).Err())
+}
+
 // ---------------------------------------------------------------------------
 // DefaultClusterDialFunc - cluster
 // ---------------------------------------------------------------------------
 
 // DefaultClusterDialFunc returns a ClusterDialFunc for Redis Cluster connections
 // using go-redis/v9. It maps the framework's ClusterDialOptions to go-redis
-// ClusterOptions.
-//
-// KNOWN LIMITATION: unlike DefaultDialFunc (standalone), this path does NOT
-// probe for / recover from a proxy that rejects the CLIENT SETNAME / SETINFO
-// handshake (see the standalone fallback above). A cluster behind a
-// CLIENT-rejecting proxy would still fail on first command. The observed
-// regression was standalone-only; extending the probe+rebuild to the multi-node
-// cluster topology needs its own design + cluster integration tests. Tracked as
-// a deferred follow-up (see OBSERVABILITY_TRACING_SENTRY_PLAN.md §3d).
+// ClusterOptions. Like the standalone path, it probes for and recovers from a
+// proxy that rejects the CLIENT SETNAME/SETINFO handshake.
 func DefaultClusterDialFunc() ClusterDialFunc {
 	return func(ctx context.Context, opts *ClusterDialOptions) (Connection, error) {
 		clusterOpts := &goredis.ClusterOptions{
@@ -309,6 +317,17 @@ func DefaultClusterDialFunc() ClusterDialFunc {
 
 		client := goredis.NewClusterClient(clusterOpts)
 
+		// Recover from a proxy that rejects the CLIENT handshake (see the
+		// standalone path for the rationale).
+		if clusterOpts.ClientName != "" || !clusterOpts.DisableIdentity {
+			if clientHandshakeRejected(ctx, client) {
+				_ = client.Close()
+				clusterOpts.ClientName = ""
+				clusterOpts.DisableIdentity = true
+				client = goredis.NewClusterClient(clusterOpts)
+			}
+		}
+
 		attachTracingHook(client)
 		return &clusterConnection{client: client}, nil
 	}
@@ -319,14 +338,9 @@ func DefaultClusterDialFunc() ClusterDialFunc {
 // ---------------------------------------------------------------------------
 
 // DefaultSentinelDialFunc returns a SentinelDialFunc for Redis Sentinel
-// connections using go-redis/v9. It maps the framework's SentinelDialOptions
-// to go-redis FailoverOptions.
-//
-// KNOWN LIMITATION: like the cluster path and unlike DefaultDialFunc
-// (standalone), this does NOT probe for / recover from a proxy that rejects the
-// CLIENT SETNAME / SETINFO handshake. A sentinel/failover deployment behind a
-// CLIENT-rejecting proxy would still fail on first command. Deferred follow-up
-// (see OBSERVABILITY_TRACING_SENTRY_PLAN.md §3d).
+// connections using go-redis/v9. It maps the framework's SentinelDialOptions to
+// go-redis FailoverOptions. Like the standalone path, it probes for and recovers
+// from a proxy that rejects the CLIENT SETNAME/SETINFO handshake.
 func DefaultSentinelDialFunc() SentinelDialFunc {
 	return func(ctx context.Context, opts *SentinelDialOptions) (Connection, error) {
 		failoverOpts := &goredis.FailoverOptions{
@@ -375,16 +389,20 @@ func DefaultSentinelDialFunc() SentinelDialFunc {
 			failoverOpts.MinIdleConns = opts.MinIdleConns
 		}
 
-		var client *goredis.Client
-		if opts.ReadOnly {
-			// Use NewFailoverClusterClient for read-only routing to replicas,
-			// but wrap it in a regular Client for interface compatibility.
-			// Actually, go-redis's FailoverOptions does not support ReadOnly
-			// directly. For read replicas, we create a standard failover client
-			// and rely on the application to route reads appropriately.
-			client = goredis.NewFailoverClient(failoverOpts)
-		} else {
-			client = goredis.NewFailoverClient(failoverOpts)
+		// Note: go-redis FailoverOptions does not support ReadOnly directly; reads
+		// to replicas are left to the application to route. Both modes use a
+		// standard failover client.
+		client := goredis.NewFailoverClient(failoverOpts)
+
+		// Recover from a proxy that rejects the CLIENT handshake (see the
+		// standalone path for the rationale).
+		if failoverOpts.ClientName != "" || !failoverOpts.DisableIdentity {
+			if clientHandshakeRejected(ctx, client) {
+				_ = client.Close()
+				failoverOpts.ClientName = ""
+				failoverOpts.DisableIdentity = true
+				client = goredis.NewFailoverClient(failoverOpts)
+			}
 		}
 
 		attachTracingHook(client)

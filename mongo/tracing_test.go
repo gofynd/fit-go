@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/event"
 
@@ -55,7 +56,7 @@ func TestCommandMonitorFor_EnabledReturnsMonitor(t *testing.T) {
 // A command span is opened on Started and closed on Succeeded/Failed, leaving no
 // in-flight spans (guards against span leaks). The failed path records the error.
 func TestCommandTracer_Lifecycle(t *testing.T) {
-	ct := &commandTracer{tracer: tracingtest.Enabled(t), inflight: map[int64]*tracing.Span{}}
+	ct := &commandTracer{tracer: tracingtest.Enabled(t), inflight: make(map[int64]inflightSpan)}
 
 	// Success path.
 	ct.started(context.Background(), &event.CommandStartedEvent{
@@ -84,4 +85,28 @@ func TestCommandTracer_Lifecycle(t *testing.T) {
 
 	// Unknown completion is a safe no-op.
 	ct.finished(999, nil)
+}
+
+// An in-flight span whose completion event never arrives (connection torn down
+// mid-command) must not leak: the stale sweep ends and removes it, while a fresh
+// in-flight span is left untouched.
+func TestCommandTracer_SweepsStaleSpans(t *testing.T) {
+	tr := tracingtest.Enabled(t)
+	ct := &commandTracer{tracer: tr, inflight: make(map[int64]inflightSpan)}
+
+	_, staleSpan := tr.StartSpan(context.Background(), "mongodb.find", tracing.SpanKindClient)
+	_, freshSpan := tr.StartSpan(context.Background(), "mongodb.find", tracing.SpanKindClient)
+	ct.inflight[1] = inflightSpan{span: staleSpan, start: time.Now().Add(-2 * maxInflightAge)}
+	ct.inflight[2] = inflightSpan{span: freshSpan, start: time.Now()}
+
+	ct.mu.Lock()
+	ct.sweepStaleLocked()
+	ct.mu.Unlock()
+
+	if _, ok := ct.inflight[1]; ok {
+		t.Fatal("stale in-flight span should have been swept (ended + removed)")
+	}
+	if _, ok := ct.inflight[2]; !ok {
+		t.Fatal("fresh in-flight span must NOT be swept")
+	}
 }

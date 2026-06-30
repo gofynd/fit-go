@@ -23,6 +23,17 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 )
 
+// fastDialCtx returns a short-deadline context for the dial-option tests so they
+// do not pay the full CLIENT-handshake probe timeout against unreachable fake
+// servers. The probe correctly respects the caller's context deadline; its
+// rejection logic is unit-tested separately (TestClientHandshakeRejected).
+func fastDialCtx(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	t.Cleanup(cancel)
+	return ctx
+}
+
 // ---------------------------------------------------------------------------
 // Interface compliance checks
 // ---------------------------------------------------------------------------
@@ -64,7 +75,7 @@ func TestDefaultDialFunc_CreatesStandaloneConnection(t *testing.T) {
 		DB:       2,
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultDialFunc() error = %v", err)
 	}
@@ -126,7 +137,7 @@ func TestDefaultDialFunc_AppliesAllOptions(t *testing.T) {
 		ReadOnly:       false,
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultDialFunc() error = %v", err)
 	}
@@ -176,7 +187,7 @@ func TestDefaultDialFunc_ZeroValues(t *testing.T) {
 		Addr: "localhost:6379",
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultDialFunc() error = %v", err)
 	}
@@ -217,7 +228,7 @@ func TestDefaultClusterDialFunc_CreatesClusterConnection(t *testing.T) {
 		Username: "cluster-user",
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultClusterDialFunc() error = %v", err)
 	}
@@ -259,7 +270,7 @@ func TestDefaultClusterDialFunc_AppliesOptions(t *testing.T) {
 		MinIdleConns:   20,
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultClusterDialFunc() error = %v", err)
 	}
@@ -299,7 +310,7 @@ func TestDefaultSentinelDialFunc_CreatesSentinelConnection(t *testing.T) {
 		Password:      "master-pass",
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultSentinelDialFunc() error = %v", err)
 	}
@@ -345,7 +356,7 @@ func TestDefaultSentinelDialFunc_AppliesAllOptions(t *testing.T) {
 		MinIdleConns:         5,
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultSentinelDialFunc() error = %v", err)
 	}
@@ -373,7 +384,7 @@ func TestDefaultSentinelDialFunc_ReadOnly(t *testing.T) {
 		ReadOnly:      true,
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultSentinelDialFunc() error = %v", err)
 	}
@@ -410,7 +421,7 @@ func TestDefaultDialFunc_DB0NotSkipped(t *testing.T) {
 		DB:   0,
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultDialFunc() error = %v", err)
 	}
@@ -431,7 +442,7 @@ func TestDefaultClusterDialFunc_ReadOnlyRouting(t *testing.T) {
 		ReadOnly: true,
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultClusterDialFunc() error = %v", err)
 	}
@@ -454,7 +465,7 @@ func TestDefaultDialFunc_TLSOnly(t *testing.T) {
 		},
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultDialFunc() error = %v", err)
 	}

@@ -46,6 +46,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
@@ -309,6 +310,13 @@ func (t *Tracer) initOTel(ctx context.Context, opts Options) error {
 	t.provider = tp
 	t.otelTracer = tp.Tracer("fit.go/" + opts.ServiceName)
 	otel.SetTracerProvider(tp)
+
+	// Install the W3C trace-context propagator globally so the OTel
+	// instrumentation libraries (otelgin, otelhttp, redisotel, otelpgx) extract
+	// inbound traceparent and inject it on outbound calls. Only set here, on the
+	// enabled path — when tracing is off the global stays the no-op propagator,
+	// so those libraries are inert (zero overhead).
+	otel.SetTextMapPropagator(propagation.TraceContext{})
 
 	return nil
 }

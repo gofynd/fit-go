@@ -15,8 +15,11 @@
 package redis
 
 import (
+	"context"
 	"errors"
 	"testing"
+
+	goredis "github.com/redis/go-redis/v9"
 )
 
 // isClientCommandUnsupported must match ONLY the server rejecting the CLIENT
@@ -52,6 +55,36 @@ func TestIsClientCommandUnsupported(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := isClientCommandUnsupported(tc.err); got != tc.want {
 				t.Fatalf("isClientCommandUnsupported(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// fakePinger lets us drive clientHandshakeRejected without a real server.
+type fakePinger struct{ err error }
+
+func (f fakePinger) Ping(ctx context.Context) *goredis.StatusCmd {
+	cmd := goredis.NewStatusCmd(ctx, "ping")
+	cmd.SetErr(f.err)
+	return cmd
+}
+
+// clientHandshakeRejected (used by all three dial paths — standalone, cluster,
+// sentinel) returns true ONLY for the CLIENT-rejection error.
+func TestClientHandshakeRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"rejected", errors.New("ERR unknown command `client`, with args beginning with: `setname`"), true},
+		{"nil/healthy", nil, false},
+		{"other error", errors.New("dial tcp: connection refused"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := clientHandshakeRejected(context.Background(), fakePinger{err: tc.err}); got != tc.want {
+				t.Fatalf("clientHandshakeRejected(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
 	}

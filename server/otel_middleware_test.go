@@ -21,64 +21,55 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/gofynd/fit-go/internal/tracingtest"
 )
+
+// zeroTraceID is the string of an invalid/absent span context — i.e. no span.
+const zeroTraceID = "00000000000000000000000000000000"
 
 func TestOTelMiddleware_TracingDisabled_Passthrough(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
-	engine.Use(OTelMiddleware())
+	engine.Use(OTelMiddleware()) // tracing disabled → passthrough, zero overhead
 	engine.GET("/test", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
 
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/test", nil)
-	engine.ServeHTTP(w, req)
+	engine.ServeHTTP(w, httptest.NewRequest("GET", "/test", nil))
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, "ok", w.Body.String())
 }
 
-func TestOTelMiddleware_HealthCheckSkipped(t *testing.T) {
+// With tracing enabled, otelgin opens a span for normal routes but the
+// ShouldTrace filter skips /_healthz and /_readyz (legacy fit.js parity). The
+// handler echoes its context trace id, so "no span" shows up as the zero id.
+func TestOTelMiddleware_EnabledSkipsHealthPaths(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	tracingtest.EnabledGlobal(t)
+	t.Setenv("SERVICE_NAME", "fit-test")
+
 	engine := gin.New()
 	engine.Use(OTelMiddleware())
-	engine.GET("/_healthz", func(c *gin.Context) {
-		c.String(http.StatusOK, "healthy")
-	})
+	echo := func(c *gin.Context) {
+		c.String(http.StatusOK, trace.SpanContextFromContext(c.Request.Context()).TraceID().String())
+	}
+	engine.GET("/api/thing", echo)
+	engine.GET("/_healthz", echo)
+	engine.GET("/_readyz", echo)
 
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/_healthz", nil)
-	engine.ServeHTTP(w, req)
+	traced := httptest.NewRecorder()
+	engine.ServeHTTP(traced, httptest.NewRequest("GET", "/api/thing", nil))
+	assert.Equal(t, http.StatusOK, traced.Code)
+	assert.NotEqual(t, zeroTraceID, traced.Body.String(), "normal route must get a server span")
 
-	assert.Equal(t, http.StatusOK, w.Code)
-	// No traceparent header should be set for health checks.
-	assert.Empty(t, w.Header().Get("traceparent"))
-}
-
-func TestOTelMiddleware_ReadyzSkipped(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	engine := gin.New()
-	engine.Use(OTelMiddleware())
-	engine.GET("/_readyz", func(c *gin.Context) {
-		c.String(http.StatusOK, "ready")
-	})
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/_readyz", nil)
-	engine.ServeHTTP(w, req)
-
-	assert.Equal(t, http.StatusOK, w.Code)
-	assert.Empty(t, w.Header().Get("traceparent"))
-}
-
-func TestHttpScheme_HTTP(t *testing.T) {
-	req := httptest.NewRequest("GET", "http://localhost/test", nil)
-	assert.Equal(t, "http", httpScheme(req))
-}
-
-func TestHttpScheme_XForwardedProto(t *testing.T) {
-	req := httptest.NewRequest("GET", "http://localhost/test", nil)
-	req.Header.Set("X-Forwarded-Proto", "https")
-	assert.Equal(t, "https", httpScheme(req))
+	for _, p := range []string{"/_healthz", "/_readyz"} {
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, httptest.NewRequest("GET", p, nil))
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, zeroTraceID, w.Body.String(), p+" must be filtered (no span)")
+	}
 }

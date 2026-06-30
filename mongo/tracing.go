@@ -20,35 +20,52 @@
 // no monitor installed when off) and NEVER records command bodies or arguments,
 // honoring the platform "no PII in logs/traces" rule — only db.system,
 // db.operation (command name) and db.name are attached.
+//
+// (mongo-driver v2 has no official OTel contrib instrumentation — otelmongo
+// targets driver v1 — so this hand-rolled monitor is the only option here.)
 package mongo
 
 import (
 	"context"
 	"sync"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/event"
 
 	"github.com/gofynd/fit-go/tracing"
 )
 
+const (
+	// maxInflight bounds the in-flight span map. Reaching it triggers a sweep of
+	// stale entries; normal operation never approaches it.
+	maxInflight = 8192
+	// maxInflightAge is how long an in-flight span may live without a completion
+	// event before the sweep treats it as abandoned and ends it.
+	maxInflightAge = 5 * time.Minute
+)
+
+// inflightSpan is an open command span plus when it started (for the stale sweep).
+type inflightSpan struct {
+	span  *tracing.Span
+	start time.Time
+}
+
 // commandTracer correlates a MongoDB CommandStarted event with its matching
 // Succeeded/Failed event (keyed by RequestID, which is unique per in-flight
 // command) so it can open the span on start and close it on completion.
 //
-// KNOWN LIMITATION (low severity): an inflight entry is removed only by a
-// matching completion event. The driver's CommandMonitor pairs Started with
-// Succeeded/Failed for every command in normal operation, but if a Started ever
-// has no completion (connection torn down mid-command, client closed/cancelled
-// in flight), that entry and its *Span are never deleted/ended. There is no TTL
-// or size cap, so the map is unbounded in principle. Bounded in practice (only
-// the error/teardown edge path, only when tracing is enabled). If span/heap
-// growth is ever observed, add a size cap or stale-entry sweep. Mirrors the
-// requestId-keyed-map design of @opentelemetry/instrumentation-mongodb. Tracked
-// in OBSERVABILITY_TRACING_SENTRY_PLAN.md §3d.
+// The driver pairs Started with Succeeded/Failed for every command in normal
+// operation. If a Started ever has no completion (connection torn down
+// mid-command, client closed/cancelled in flight), its entry would otherwise
+// linger forever — so the map is bounded: when it reaches maxInflight, started()
+// sweeps entries older than maxInflightAge, ending those orphaned spans with an
+// error status. This caps memory at the cost of an O(n) sweep only on the (rare)
+// leak path. Mirrors the requestId-keyed-map design of
+// @opentelemetry/instrumentation-mongodb, with the leak bounded.
 type commandTracer struct {
 	tracer   *tracing.Tracer
 	mu       sync.Mutex
-	inflight map[int64]*tracing.Span
+	inflight map[int64]inflightSpan
 }
 
 // newCommandMonitor returns the command monitor for the global tracer, or nil
@@ -65,7 +82,7 @@ func commandMonitorFor(tracer *tracing.Tracer) *event.CommandMonitor {
 	if tracer == nil || !tracer.IsEnabled() {
 		return nil
 	}
-	ct := &commandTracer{tracer: tracer, inflight: make(map[int64]*tracing.Span)}
+	ct := &commandTracer{tracer: tracer, inflight: make(map[int64]inflightSpan)}
 	return &event.CommandMonitor{
 		Started: ct.started,
 		Succeeded: func(_ context.Context, e *event.CommandSucceededEvent) {
@@ -87,7 +104,10 @@ func (ct *commandTracer) started(ctx context.Context, e *event.CommandStartedEve
 		"db.name":      e.DatabaseName,
 	})
 	ct.mu.Lock()
-	ct.inflight[e.RequestID] = span
+	if len(ct.inflight) >= maxInflight {
+		ct.sweepStaleLocked()
+	}
+	ct.inflight[e.RequestID] = inflightSpan{span: span, start: time.Now()}
 	ct.mu.Unlock()
 }
 
@@ -96,16 +116,29 @@ func (ct *commandTracer) started(ctx context.Context, e *event.CommandStartedEve
 // tracing was disabled, or a duplicate completion event).
 func (ct *commandTracer) finished(reqID int64, cmdErr error) {
 	ct.mu.Lock()
-	span := ct.inflight[reqID]
+	e, ok := ct.inflight[reqID]
 	delete(ct.inflight, reqID)
 	ct.mu.Unlock()
-	if span == nil {
+	if !ok {
 		return
 	}
 	if cmdErr != nil {
-		span.SetStatus(tracing.StatusError, cmdErr.Error())
+		e.span.SetStatus(tracing.StatusError, cmdErr.Error())
 	} else {
-		span.SetStatus(tracing.StatusOK, "")
+		e.span.SetStatus(tracing.StatusOK, "")
 	}
-	span.End()
+	e.span.End()
+}
+
+// sweepStaleLocked ends and removes in-flight spans older than maxInflightAge —
+// orphans whose completion event never arrived. The caller must hold ct.mu.
+func (ct *commandTracer) sweepStaleLocked() {
+	cutoff := time.Now().Add(-maxInflightAge)
+	for id, e := range ct.inflight {
+		if e.start.Before(cutoff) {
+			e.span.SetStatus(tracing.StatusError, "command span abandoned: no completion event")
+			e.span.End()
+			delete(ct.inflight, id)
+		}
+	}
 }

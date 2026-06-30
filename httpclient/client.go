@@ -102,6 +102,14 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Safe URL for spans/logs: scheme+host+path only (no query string / userinfo).
 	safeURL := req.URL.Scheme + "://" + req.URL.Host + req.URL.Path
 
+	// NOTE: this client span is intentionally hand-rolled rather than delegated to
+	// otelhttp (unlike redis/postgres/gin, which use redisotel/otelpgx/otelgin).
+	// otelhttp records url.full = req.URL.String() — the FULL URL including the
+	// query string (it strips only userinfo) — and exposes no option to redact it.
+	// Query params in this platform routinely carry PII (emails/tokens), so
+	// otelhttp would violate the "no PII in traces" rule. We keep this PII-safe
+	// scheme+host+path span; the wrapper exists for the fit/axios parity behaviours
+	// (proxy, x-request-id, safe logging) regardless. Do not swap to otelhttp.
 	var span *tracing.Span
 	if tracer := tracing.Global(); tracer != nil && tracer.IsEnabled() {
 		ctx, s := tracer.StartSpan(req.Context(), "HTTP "+req.Method, tracing.SpanKindClient)
