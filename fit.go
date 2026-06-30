@@ -101,6 +101,12 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 	}
 	f.Logger = logger
 
+	// Route the standard library log/slog through the fit logger, so plain
+	// slog.* calls (service code AND third-party libraries) land in the single
+	// OTel-shaped JSON stream with implicit trace context. (Node fit patches
+	// Winston's default similarly.)
+	logging.SetAsDefaultSlog(logger)
+
 	// 3. Initialize error registry if service name code is set
 	if code := cfg.GetString("SERVICE_NAME_CODE", ""); code != "" {
 		f.Errors = errors.DefaultRegistry

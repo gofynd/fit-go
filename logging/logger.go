@@ -248,7 +248,22 @@ func (l *Logger) WithContext(ctx context.Context) *Logger {
 	if v, ok := ctx.Value(ctxKeySpanID).(string); ok && v != "" {
 		c.spanID = v
 	}
+	// Fall back to the OTel span context so WithContext works for otelgin/our
+	// spans uniformly, not just contexts carrying the fit-go logging keys.
+	if c.traceID == "" {
+		if sc := oteltrace.SpanContextFromContext(ctx); sc.IsValid() {
+			c.traceID = sc.TraceID().String()
+			c.spanID = sc.SpanID().String()
+		}
+	}
 	return c
+}
+
+// levelEnabled reports whether a log at lvl would be emitted (>= threshold).
+func (l *Logger) levelEnabled(lvl Level) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return lvl >= l.level
 }
 
 // WithFields returns a child Logger that includes the given key-value pairs

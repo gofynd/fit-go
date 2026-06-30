@@ -11,6 +11,14 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **slog compatibility / unified log stream**: `logging.NewSlogHandler` + an
+  `slog.Handler` that routes all `log/slog` output (service code AND third-party
+  libraries) through the fit logger — same OTel-JSON, same sink, same implicit
+  trace context. `fit.Init` now patches `slog.SetDefault` automatically; or call
+  `logging.SetAsDefaultSlog(logger)`. `Logger.WithContext` also reads the OTel
+  span context now (not just the fit-go logging keys).
+
+### Added (earlier)
 - **OpenTelemetry tracing** restored across the platform surface, gated on
   `TRACING_ENABLED` (zero overhead when off):
   - `server`: `OTelMiddleware` via official **otelgin** (PII-safe: `http.route`,
