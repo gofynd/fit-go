@@ -106,6 +106,12 @@ func (ct *commandTracer) started(ctx context.Context, e *event.CommandStartedEve
 	ct.mu.Lock()
 	if len(ct.inflight) >= maxInflight {
 		ct.sweepStaleLocked()
+		// Hard cap: if the stale sweep freed nothing (a burst of >maxInflight
+		// commands whose completion never arrived), evict the oldest so the map
+		// stays bounded instead of growing while started() rescans it every call.
+		for len(ct.inflight) >= maxInflight {
+			ct.evictOldestLocked()
+		}
 	}
 	ct.inflight[e.RequestID] = inflightSpan{span: span, start: time.Now()}
 	ct.mu.Unlock()
@@ -128,6 +134,27 @@ func (ct *commandTracer) finished(reqID int64, cmdErr error) {
 		e.span.SetStatus(tracing.StatusOK, "")
 	}
 	e.span.End()
+}
+
+// evictOldestLocked ends and removes the single oldest in-flight span, to enforce
+// the hard size cap when the stale sweep can't free room. The caller must hold
+// ct.mu. A no-op on an empty map.
+func (ct *commandTracer) evictOldestLocked() {
+	var oldestID int64
+	var oldest time.Time
+	found := false
+	for id, e := range ct.inflight {
+		if !found || e.start.Before(oldest) {
+			oldestID, oldest, found = id, e.start, true
+		}
+	}
+	if !found {
+		return
+	}
+	e := ct.inflight[oldestID]
+	e.span.SetStatus(tracing.StatusError, "command span evicted: in-flight cap exceeded")
+	e.span.End()
+	delete(ct.inflight, oldestID)
 }
 
 // sweepStaleLocked ends and removes in-flight spans older than maxInflightAge —

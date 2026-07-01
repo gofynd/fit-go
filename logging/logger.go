@@ -27,12 +27,22 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/gofynd/fit-go/internal/goroutinectx"
 )
+
+// implicitTraceEnabled gates the goroutine-local trace fallback in (*Logger).log,
+// so the runtime.Stack-based goroutine-id lookup only runs when tracing is on.
+// tracing.New keeps it in sync with the tracer's enabled state. Default false.
+var implicitTraceEnabled atomic.Bool
+
+// SetImplicitTraceEnabled toggles the implicit trace-in-logs fallback. Called by
+// tracing.New.
+func SetImplicitTraceEnabled(b bool) { implicitTraceEnabled.Store(b) }
 
 // Context keys for trace propagation. These match the OpenTelemetry context
 // keys that the tracing module injects.
@@ -150,7 +160,7 @@ type entry struct {
 // Logger is a structured, thread-safe JSON logger. It is the Go equivalent
 // of the Winston logger created tracing/index.ts.
 type Logger struct {
-	mu       sync.Mutex
+	mu       *sync.Mutex // shared across clones (see clone); guards out + level
 	level    Level
 	loc      *time.Location
 	env      string
@@ -206,6 +216,7 @@ func New(opts Options) (*Logger, error) {
 	}
 
 	return &Logger{
+		mu:       &sync.Mutex{},
 		level:    ParseLevel(opts.Level),
 		loc:      loc,
 		env:      opts.Env,
@@ -215,10 +226,17 @@ func New(opts Options) (*Logger, error) {
 	}, nil
 }
 
-// clone returns a shallow copy of the logger with its own mutex and a
-// deep-copied fields map so that derived loggers are independent.
+// clone returns a shallow copy of the logger with a deep-copied fields map so
+// that derived loggers are independent. The write mutex is SHARED (pointer) with
+// the parent because clones share the same underlying out writer — an independent
+// mutex per clone would let a logger and its derived child race on that writer.
 func (l *Logger) clone() *Logger {
+	// Snapshot the parent under the shared lock: level is mutable via SetLevel, so
+	// an unlocked read here would race with a concurrent SetLevel.
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	c := &Logger{
+		mu:       l.mu,
 		level:    l.level,
 		loc:      l.loc,
 		env:      l.env,
@@ -371,8 +389,9 @@ func (l *Logger) log(lvl Level, msg string, kvs []interface{}) {
 	// (WithContext), fall back to the goroutine-local active context so logs
 	// still carry trace/span ids without explicit threading. The OTel span
 	// context is the source of truth (covers otelgin/our spans uniformly); the
-	// fit-go logging keys are a secondary fallback.
-	if e.TraceID == "" {
+	// fit-go logging keys are a secondary fallback. Gated so the goroutine-id
+	// lookup (runtime.Stack) is skipped entirely when tracing is off.
+	if e.TraceID == "" && implicitTraceEnabled.Load() {
 		if gctx := goroutinectx.Active(); gctx != nil {
 			if sc := oteltrace.SpanContextFromContext(gctx); sc.IsValid() {
 				e.TraceID = sc.TraceID().String()

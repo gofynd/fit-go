@@ -28,7 +28,7 @@ import (
 
 // resetGlobalTracer resets the global tracer for test isolation.
 func resetGlobalTracer() {
-	globalTracer = nil
+	globalTracer.Store(nil)
 	globalTracerOnce = sync.Once{}
 }
 
@@ -329,7 +329,7 @@ func TestDecorators(t *testing.T) {
 		UseSimpleSpanProcessor: true,
 	})
 	// Set as global tracer.
-	globalTracer = tracer
+	globalTracer.Store(tracer)
 
 	t.Run("Trace decorator success", func(t *testing.T) {
 		called := false

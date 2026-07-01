@@ -733,6 +733,11 @@ func (e *testError) Error() string {
 // When no trace context is explicitly bound, a plain log call must pick up the
 // goroutine-local active context's OTel span (implicit trace propagation).
 func TestLog_ImplicitTraceFromGoroutineLocal(t *testing.T) {
+	// The goroutine-local fallback is gated on the implicit-trace flag that
+	// tracing.New sets to the tracer's enabled state; enable it for this test.
+	SetImplicitTraceEnabled(true)
+	defer SetImplicitTraceEnabled(false)
+
 	var buf bytes.Buffer
 	lg, err := New(Options{Level: "info", Env: "production", Output: &buf})
 	if err != nil {

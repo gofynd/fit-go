@@ -40,6 +40,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -64,6 +65,10 @@ type Options struct {
 	BatchTimeout   time.Duration     // Span batch export timeout
 	MaxExportBatch int               // Maximum spans per export batch
 	Attributes     map[string]string // Additional resource attributes
+	// Enabled, when non-nil, overrides the TRACING_ENABLED env var. Set it from a
+	// merged config so tracing enabled via a config FILE (which doesn't populate
+	// the process env) isn't silently a no-op. nil = use the env var.
+	Enabled *bool `json:"-"`
 	// SpanExporter allows injecting a custom span exporter (useful for testing).
 	SpanExporter sdktrace.SpanExporter `json:"-"`
 	// UseSimpleSpanProcessor uses a synchronous span processor instead of batch.
@@ -217,7 +222,7 @@ type Tracer struct {
 }
 
 var (
-	globalTracer     *Tracer
+	globalTracer     atomic.Pointer[Tracer]
 	globalTracerOnce sync.Once
 )
 
@@ -227,9 +232,14 @@ func New(ctx context.Context, opts Options) (*Tracer, error) {
 	t := &Tracer{
 		serviceName: opts.ServiceName,
 		env:         opts.Env,
-		enabled:     isTracingEnabled(),
+		enabled:     tracingEnabled(opts),
 		options:     opts,
 	}
+
+	// Keep the logger's implicit trace-in-logs fallback in lock-step with the
+	// tracer's enabled state, so the goroutine-local lookup (runtime.Stack) only
+	// runs when tracing is actually on.
+	logging.SetImplicitTraceEnabled(t.enabled)
 
 	if t.enabled {
 		if err := t.initOTel(ctx, opts); err != nil {
@@ -238,6 +248,15 @@ func New(ctx context.Context, opts Options) (*Tracer, error) {
 	}
 
 	return t, nil
+}
+
+// tracingEnabled resolves the enable-gate: the explicit Options.Enabled override
+// when set, else the TRACING_ENABLED env var.
+func tracingEnabled(opts Options) bool {
+	if opts.Enabled != nil {
+		return *opts.Enabled
+	}
+	return isTracingEnabled()
 }
 
 // initOTel sets up the real OTel TracerProvider with OTLP exporter.
@@ -291,15 +310,18 @@ func (t *Tracer) initOTel(ctx context.Context, opts Options) error {
 		sp = sdktrace.NewBatchSpanProcessor(exporter, bspOpts...)
 	}
 
-	// Configure sampler.
-	var sampler sdktrace.Sampler
+	// Wrap the root sampler in ParentBased so an upstream sampling decision (the
+	// W3C traceparent sampled flag, installed by ContextWithTrace) is honoured: a
+	// trace sampled OUT upstream isn't re-recorded here, which would orphan it.
+	var root sdktrace.Sampler
 	if opts.SampleRate >= 1.0 {
-		sampler = sdktrace.AlwaysSample()
+		root = sdktrace.AlwaysSample()
 	} else if opts.SampleRate <= 0.0 {
-		sampler = sdktrace.NeverSample()
+		root = sdktrace.NeverSample()
 	} else {
-		sampler = sdktrace.TraceIDRatioBased(opts.SampleRate)
+		root = sdktrace.TraceIDRatioBased(opts.SampleRate)
 	}
+	sampler := sdktrace.ParentBased(root)
 
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithResource(res),
@@ -331,21 +353,21 @@ func Init() error {
 func InitWithOptions(opts Options) (*Tracer, error) {
 	var initErr error
 	globalTracerOnce.Do(func() {
-		var err error
-		globalTracer, err = New(context.Background(), opts)
+		t, err := New(context.Background(), opts)
 		if err != nil {
 			initErr = err
 		}
+		globalTracer.Store(t)
 	})
-	return globalTracer, initErr
+	return globalTracer.Load(), initErr
 }
 
 // Global returns the global tracer instance.
 func Global() *Tracer {
-	if globalTracer == nil {
+	if globalTracer.Load() == nil {
 		Init()
 	}
-	return globalTracer
+	return globalTracer.Load()
 }
 
 // SetGlobal replaces the global tracer and returns a function that restores the
@@ -354,15 +376,14 @@ func Global() *Tracer {
 // Init has already run — primarily for tests and advanced wiring. Restore with
 // the returned func (typically `defer SetGlobal(tr)()`).
 func SetGlobal(t *Tracer) (restore func()) {
-	prev := globalTracer
-	globalTracer = t
-	return func() { globalTracer = prev }
+	prev := globalTracer.Swap(t)
+	return func() { globalTracer.Store(prev) }
 }
 
 // Shutdown gracefully shuts down the global tracer, flushing any remaining spans.
 func Shutdown(ctx context.Context) error {
-	if globalTracer != nil {
-		return globalTracer.shutdown(ctx)
+	if g := globalTracer.Load(); g != nil {
+		return g.shutdown(ctx)
 	}
 	return nil
 }

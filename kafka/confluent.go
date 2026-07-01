@@ -482,11 +482,25 @@ func (cc *ConfluentConsumer) ensureTopics(names []string) {
 // Supplying a RebalanceCb means we own assign/unassign (eager protocol). It logs
 // the partition set and invokes the optional ConsumerConfig hooks.
 func (cc *ConfluentConsumer) rebalanceCb(consumer *ckafka.Consumer, event ckafka.Event) error {
+	// Use incremental (un)assign under the cooperative-sticky protocol and the
+	// wholesale variants under the eager protocol (librdkafka default). Mixing
+	// them corrupts the assignment, so branch on the negotiated protocol rather
+	// than assuming eager.
+	cooperative := consumer.GetRebalanceProtocol() == "COOPERATIVE"
 	switch e := event.(type) {
 	case ckafka.AssignedPartitions:
-		if err := consumer.Assign(e.Partitions); err != nil {
+		var err error
+		if cooperative {
+			err = consumer.IncrementalAssign(e.Partitions)
+		} else {
+			err = consumer.Assign(e.Partitions)
+		}
+		if err != nil {
+			// Surface it, don't swallow: returning nil tells librdkafka the rebalance
+			// succeeded with no partitions assigned — a silent zombie consumer that
+			// polls forever and reads nothing.
 			cc.logger.Error("kafka/confluent: partition assign failed", "groupId", cc.groupID, "error", err.Error())
-			return nil
+			return err
 		}
 		cc.logger.Info("kafka/confluent: partitions assigned",
 			"groupId", cc.groupID, "partitions", formatPartitions(e.Partitions))
@@ -499,8 +513,15 @@ func (cc *ConfluentConsumer) rebalanceCb(consumer *ckafka.Consumer, event ckafka
 		if cc.config.OnPartitionsRevoked != nil {
 			cc.config.OnPartitionsRevoked(toPartitionAssignments(e.Partitions))
 		}
-		if err := consumer.Unassign(); err != nil {
+		var err error
+		if cooperative {
+			err = consumer.IncrementalUnassign(e.Partitions)
+		} else {
+			err = consumer.Unassign()
+		}
+		if err != nil {
 			cc.logger.Error("kafka/confluent: partition unassign failed", "groupId", cc.groupID, "error", err.Error())
+			return err
 		}
 	}
 	return nil

@@ -115,9 +115,13 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 
 	// 4. Initialize tracing if enabled
 	if cfg.GetBool("TRACING_ENABLED", false) {
+		enabled := true
 		tracer, err := tracing.New(ctx, tracing.Options{
 			ServiceName: cfg.GetString("SERVICE_NAME", "unknown"),
 			Env:         cfg.GetString("NODE_ENV", "development"),
+			// Set explicitly: tracing.New's own gate reads only the env var, which is
+			// empty when TRACING_ENABLED came from a config file.
+			Enabled: &enabled,
 		})
 		if err != nil {
 			logger.Warn("fit: tracing init failed, continuing without tracing", "error", err)

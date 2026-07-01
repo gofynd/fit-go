@@ -44,6 +44,24 @@ func TestIsClientCommandUnsupported(t *testing.T) {
 			errors.New("ERR unknown command 'CLIENT', with args beginning with: 'SETINFO'"),
 			true,
 		},
+		{
+			// Redis < 7.2 supports CLIENT but not the SETINFO SUBCOMMAND that go-redis
+			// sends for lib identity — rejected as "unknown subcommand ... setinfo".
+			"setinfo subcommand rejected (redis < 7.2)",
+			errors.New("ERR Unknown subcommand or wrong number of arguments for 'SETINFO'. Try CLIENT HELP."),
+			true,
+		},
+		{
+			"setname subcommand rejected",
+			errors.New("ERR Unknown subcommand or wrong number of arguments for 'SETNAME'."),
+			true,
+		},
+		{
+			// A different subcommand rejected (not setinfo/setname) must NOT match.
+			"different subcommand rejected",
+			errors.New("ERR Unknown subcommand or wrong number of arguments for 'GETNAME'. Try CLIENT HELP."),
+			false,
+		},
 		{"connection refused", errors.New("dial tcp 10.0.0.1:6379: connect: connection refused"), false},
 		{"auth required", errors.New("NOAUTH Authentication required."), false},
 		{"different unknown command", errors.New("ERR unknown command `subscribe`"), false},
@@ -78,6 +96,7 @@ func TestClientHandshakeRejected(t *testing.T) {
 		want bool
 	}{
 		{"rejected", errors.New("ERR unknown command `client`, with args beginning with: `setname`"), true},
+		{"setinfo subcommand rejected", errors.New("ERR Unknown subcommand or wrong number of arguments for 'SETINFO'. Try CLIENT HELP."), true},
 		{"nil/healthy", nil, false},
 		{"other error", errors.New("dial tcp: connection refused"), false},
 	}

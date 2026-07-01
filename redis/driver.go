@@ -241,8 +241,19 @@ func isClientCommandUnsupported(err error) bool {
 	// wrongly strip the client name. Redis quotes with backticks or single quotes
 	// depending on version; the message is lower-cased above.
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "unknown command `client`") ||
-		strings.Contains(msg, "unknown command 'client'")
+	if strings.Contains(msg, "unknown command `client`") ||
+		strings.Contains(msg, "unknown command 'client'") {
+		return true
+	}
+	// Redis < 7.2 supports CLIENT but not the SETINFO subcommand go-redis sends for
+	// lib identity; it rejects with "unknown subcommand ... 'setinfo'" (SETNAME is
+	// also subcommand-gated on some proxies). Same recoverable case — rebuild
+	// without the identity handshake — so match it too.
+	if strings.Contains(msg, "unknown subcommand") &&
+		(strings.Contains(msg, "setinfo") || strings.Contains(msg, "setname")) {
+		return true
+	}
+	return false
 }
 
 // pinger is the subset of a go-redis client (standalone, cluster, failover) used
