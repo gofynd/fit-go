@@ -416,10 +416,13 @@ func (cc *ConfluentConsumer) Connect(topics []TopicConfig) error {
 		names[i] = t.Topic
 	}
 
-	// Best-effort create any missing topics before subscribing, so a consumer
-	// does not fail to start just because its topic does not exist yet. Never
-	// blocks startup — failures are logged and we fall through to subscribe.
-	cc.ensureTopics(names)
+	// Opt-in only (default off = legacy fit.js subscribe-only behaviour): when
+	// AutoCreateTopics is set, best-effort create any missing topics before
+	// subscribing. Never blocks startup — failures are logged and we fall through
+	// to subscribe.
+	if cc.config.AutoCreateTopics {
+		cc.ensureTopics(names)
+	}
 
 	// Subscribe with a rebalance callback for partition-assignment visibility and
 	// optional app hooks. Once a RebalanceCb is supplied we own assign/unassign

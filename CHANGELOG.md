@@ -39,7 +39,8 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Kafka consumers carry the trace without explicit context threading.
 - **Encryption** (`encryption`): AES-256-GCM variable-length nonce, byte-compatible
   with Node `fit/encryption` and `pyfit`; cross-language known-answer test.
-- **Kafka** consumer: best-effort topic auto-create before subscribe; rebalance
+- **Kafka** consumer: **opt-in** topic auto-create (`ConsumerConfig.AutoCreateTopics`,
+  default **false** = legacy fit.js subscribe-only) before subscribe; rebalance
   callback with partition-assignment visibility + optional `OnPartitionsAssigned`
   / `OnPartitionsRevoked` hooks.
 - **Redis** standalone/cluster/sentinel: `CLIENT SETNAME`/`SETINFO` probe +

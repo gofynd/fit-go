@@ -135,6 +135,13 @@ type ConsumerConfig struct {
 	// Mirrors Kafka's max.poll.interval.ms.
 	MaxPollInterval time.Duration
 
+	// AutoCreateTopics, when true, best-effort creates any subscribed topics that
+	// don't yet exist (broker defaults) before subscribing. Default false to match
+	// legacy fit.js (subscribe-only) and avoid silently creating mistyped topics —
+	// opt in only where the broker's auto-create is off and topics aren't
+	// provisioned out of band.
+	AutoCreateTopics bool
+
 	// OnPartitionsAssigned, if set, is invoked after partitions are assigned to
 	// this consumer during a group rebalance (visibility / app hook). Optional.
 	OnPartitionsAssigned func([]PartitionAssignment)

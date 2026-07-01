@@ -123,6 +123,10 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 			logger.Warn("fit: tracing init failed, continuing without tracing", "error", err)
 		} else {
 			f.Tracer = tracer
+			// Install as the process-global tracer so tracing.Global() (used by the
+			// server/kafka/db instrumentation) resolves to THIS tracer rather than a
+			// separately lazy-initialized one. Makes fit.Init a complete boot path.
+			tracing.SetGlobal(tracer)
 		}
 	}
 
