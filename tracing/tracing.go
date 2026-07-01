@@ -46,6 +46,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -60,7 +61,8 @@ import (
 type Options struct {
 	ServiceName    string
 	Env            string
-	Endpoint       string            // OTLP endpoint
+	Endpoint       string            // OTLP endpoint (URL: scheme+host+port)
+	Protocol       string            // OTLP protocol: "grpc" | "http/protobuf" (default http/protobuf)
 	SampleRate     float64           // Sampling rate (0.0-1.0)
 	BatchTimeout   time.Duration     // Span batch export timeout
 	MaxExportBatch int               // Maximum spans per export batch
@@ -82,6 +84,7 @@ func DefaultOptions() Options {
 		ServiceName:    envString("OTEL_SERVICE_NAME", envString("SERVICE_NAME", "unknown")),
 		Env:            envString("GO_ENV", envString("NODE_ENV", "development")),
 		Endpoint:       envString("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+		Protocol:       envString("OTEL_EXPORTER_OTLP_PROTOCOL", ""),
 		SampleRate:     1.0,
 		BatchTimeout:   5 * time.Second,
 		MaxExportBatch: 512,
@@ -259,6 +262,30 @@ func tracingEnabled(opts Options) bool {
 	return isTracingEnabled()
 }
 
+// newOTLPExporter builds the OTLP span exporter, selecting gRPC vs HTTP by
+// OTEL_EXPORTER_OTLP_PROTOCOL ("grpc" | "http/protobuf", the OTel-spec values;
+// default http/protobuf). The endpoint may be a full URL with scheme+host+port —
+// WithEndpointURL parses it correctly, whereas WithEndpoint expects bare host:port
+// and mangles a scheme into "http://http://...".
+func newOTLPExporter(ctx context.Context, opts Options) (sdktrace.SpanExporter, error) {
+	protocol := opts.Protocol
+	if protocol == "" {
+		protocol = os.Getenv("OTEL_EXPORTER_OTLP_PROTOCOL")
+	}
+	if strings.EqualFold(protocol, "grpc") {
+		var grpcOpts []otlptracegrpc.Option
+		if opts.Endpoint != "" {
+			grpcOpts = append(grpcOpts, otlptracegrpc.WithEndpointURL(opts.Endpoint))
+		}
+		return otlptracegrpc.New(ctx, grpcOpts...)
+	}
+	var httpOpts []otlptracehttp.Option
+	if opts.Endpoint != "" {
+		httpOpts = append(httpOpts, otlptracehttp.WithEndpointURL(opts.Endpoint))
+	}
+	return otlptracehttp.New(ctx, httpOpts...)
+}
+
 // initOTel sets up the real OTel TracerProvider with OTLP exporter.
 func (t *Tracer) initOTel(ctx context.Context, opts Options) error {
 	// Build resource attributes.
@@ -283,11 +310,7 @@ func (t *Tracer) initOTel(ctx context.Context, opts Options) error {
 	if opts.SpanExporter != nil {
 		exporter = opts.SpanExporter
 	} else {
-		exporterOpts := []otlptracehttp.Option{}
-		if opts.Endpoint != "" {
-			exporterOpts = append(exporterOpts, otlptracehttp.WithEndpoint(opts.Endpoint))
-		}
-		exp, err := otlptracehttp.New(ctx, exporterOpts...)
+		exp, err := newOTLPExporter(ctx, opts)
 		if err != nil {
 			return fmt.Errorf("creating OTLP exporter: %w", err)
 		}

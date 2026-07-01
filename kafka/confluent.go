@@ -168,6 +168,12 @@ func (cc *ConfluentClient) Consumer(config ConsumerConfig) (KafkaConsumer, error
 	// Clone the base config for consumer-specific overrides.
 	cCfg := cloneConfigMap(cc.baseCfg)
 
+	// The base config carries producer-only defaults (acks, compression) shared
+	// with the producer path; drop them here so librdkafka doesn't log CONFWARN
+	// about producer properties being ignored on a consumer instance.
+	delete(*cCfg, "acks")
+	delete(*cCfg, "compression.type")
+
 	_ = cCfg.SetKey("group.id", config.GroupID)
 
 	if config.SessionTimeout > 0 {
