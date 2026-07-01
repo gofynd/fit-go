@@ -11,6 +11,13 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Secure-by-default request logging** (`redact` package): a reusable primitive for
+  keeping PII/secrets out of logs (`SafeURL`, `QueryMap`/`Query`, `HeaderValue`).
+  The server access logger now logs `request_url` as **path-only** and emits query
+  params in a **redacted, structured `query_params`** field (operational keys like
+  `limit`/`page`/`sort` kept, all other values masked; keys always retained), and
+  masks sensitive header values (`Authorization`/`Cookie`/api keys). The `[EXT]`
+  outbound client (`utils`) and the tracing `httpclient` log the same path-only URL.
 - **Sampling honors the OTel env**: `tracing` now reads `OTEL_TRACES_SAMPLER` and
   `OTEL_TRACES_SAMPLER_ARG` (via `Options.Sampler` / `Options.SampleRate`) instead
   of hardcoding sample-all — so a configured `parentbased_traceidratio` at `0.25`

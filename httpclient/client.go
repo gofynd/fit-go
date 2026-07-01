@@ -34,6 +34,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gofynd/fit-go/redact"
 	"github.com/gofynd/fit-go/tracing"
 )
 
@@ -111,7 +112,7 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	// Safe URL for spans/logs: scheme+host+path only (no query string / userinfo).
-	safeURL := req.URL.Scheme + "://" + req.URL.Host + req.URL.Path
+	safeURL := redact.SafeURL(req.URL)
 
 	// NOTE: this client span is intentionally hand-rolled rather than delegated to
 	// otelhttp (unlike redis/postgres/gin, which use redisotel/otelpgx/otelgin).

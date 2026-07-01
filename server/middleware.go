@@ -33,6 +33,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gofynd/fit-go/errors"
+	"github.com/gofynd/fit-go/redact"
 )
 
 // Middleware is the standard middleware signature used throughout fit.go.
@@ -215,17 +216,23 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 
 		start := time.Now()
 
-		// Collect optional headers
+		// request_url is the PATH ONLY — the query string is logged separately and
+		// redacted, so PII carried in query params (e.g. an email/phone filter on a
+		// search endpoint) never lands verbatim in the access log.
 		attrs := []slog.Attr{
-			slog.String("request_url", c.Request.URL.RequestURI()),
+			slog.String("request_url", path),
 			slog.String("request_method", c.Request.Method),
 			slog.String("step", "REQ"),
+		}
+		if q := redact.QueryMap(c.Request.URL.Query(), nil); q != nil {
+			attrs = append(attrs, slog.Any("query_params", q))
 		}
 		if cfg.IncludeHeaders != "" {
 			for _, h := range strings.Split(cfg.IncludeHeaders, ",") {
 				h = strings.TrimSpace(h)
 				if h != "" {
-					attrs = append(attrs, slog.String(h, c.Request.Header.Get(h)))
+					// Mask sensitive header values (Authorization/Cookie/api keys).
+					attrs = append(attrs, slog.String(h, redact.HeaderValue(h, c.Request.Header.Get(h))))
 				}
 			}
 		}
@@ -255,7 +262,7 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 
 		l.LogAttrs(c.Request.Context(), level,
 			fmt.Sprintf("[RES] Outgoing %s response from %s", c.Request.Method, path),
-			slog.String("request_url", c.Request.URL.RequestURI()),
+			slog.String("request_url", path), // path only; query is on the correlated REQ line
 			slog.String("request_method", c.Request.Method),
 			slog.String("step", "RES"),
 			slog.Int("response_status", statusCode),

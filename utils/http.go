@@ -27,6 +27,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gofynd/fit-go/redact"
 )
 
 // RequestInterceptor is a function that can modify an HTTP request before it is
@@ -238,10 +240,13 @@ func (c *HTTPClient) Do(req *http.Request) (*http.Response, error) {
 	requestID := generateRequestID()
 	action := strings.ToUpper(req.Method)
 	externalURL := req.URL.String()
+	// logURL is what we LOG: scheme://host/path, never the query string (outbound
+	// URLs to third parties routinely carry secrets/PII, e.g. ?api_key=/?token=).
+	logURL := redact.SafeURL(req.URL)
 
 	// Log request.
 	if c.logger != nil {
-		c.logger.Debug(fmt.Sprintf("[EXT] Request %s to %s with Request ID: %s", action, externalURL, requestID))
+		c.logger.Debug(fmt.Sprintf("[EXT] Request %s to %s with Request ID: %s", action, logURL, requestID))
 	}
 
 	startTime := time.Now()
@@ -258,8 +263,8 @@ func (c *HTTPClient) Do(req *http.Request) (*http.Response, error) {
 			c.metricsRecorder.RecordHTTPClient(action, host, "0", duration)
 		}
 		if c.logger != nil {
-			c.logger.Error(fmt.Sprintf("[EXT] Failed %s to %s with %s", action, externalURL, requestID),
-				"request_url", externalURL,
+			c.logger.Error(fmt.Sprintf("[EXT] Failed %s to %s with %s", action, logURL, requestID),
+				"request_url", logURL,
 				"request_method", action,
 				"error", err.Error(),
 			)
@@ -276,8 +281,8 @@ func (c *HTTPClient) Do(req *http.Request) (*http.Response, error) {
 
 	// Log response.
 	if c.logger != nil {
-		c.logger.Info(fmt.Sprintf("[EXT] Successful %s to %s with Request ID: %s", action, externalURL, requestID),
-			"request_url", externalURL,
+		c.logger.Info(fmt.Sprintf("[EXT] Successful %s to %s with Request ID: %s", action, logURL, requestID),
+			"request_url", logURL,
 			"request_method", action,
 			"response_status", resp.StatusCode,
 		)
