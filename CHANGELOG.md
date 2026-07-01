@@ -11,6 +11,10 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Sampling honors the OTel env**: `tracing` now reads `OTEL_TRACES_SAMPLER` and
+  `OTEL_TRACES_SAMPLER_ARG` (via `Options.Sampler` / `Options.SampleRate`) instead
+  of hardcoding sample-all — so a configured `parentbased_traceidratio` at `0.25`
+  actually samples 25% rather than 100%.
 - **slog compatibility / unified log stream**: `logging.NewSlogHandler` + an
   `slog.Handler` that routes all `log/slog` output (service code AND third-party
   libraries) through the fit logger — same OTel-JSON, same sink, same implicit

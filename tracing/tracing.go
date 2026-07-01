@@ -38,6 +38,7 @@ import (
 	"maps"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -63,7 +64,8 @@ type Options struct {
 	Env            string
 	Endpoint       string            // OTLP endpoint (URL: scheme+host+port)
 	Protocol       string            // OTLP protocol: "grpc" | "http/protobuf" (default http/protobuf)
-	SampleRate     float64           // Sampling rate (0.0-1.0)
+	Sampler        string            // OTEL_TRACES_SAMPLER (e.g. "parentbased_traceidratio"); empty = parentbased over SampleRate
+	SampleRate     float64           // Sampling ratio (0.0-1.0); from OTEL_TRACES_SAMPLER_ARG
 	BatchTimeout   time.Duration     // Span batch export timeout
 	MaxExportBatch int               // Maximum spans per export batch
 	Attributes     map[string]string // Additional resource attributes
@@ -85,10 +87,23 @@ func DefaultOptions() Options {
 		Env:            envString("GO_ENV", envString("NODE_ENV", "development")),
 		Endpoint:       envString("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
 		Protocol:       envString("OTEL_EXPORTER_OTLP_PROTOCOL", ""),
-		SampleRate:     1.0,
+		Sampler:        envString("OTEL_TRACES_SAMPLER", ""),
+		SampleRate:     sampleRateFromEnv(),
 		BatchTimeout:   5 * time.Second,
 		MaxExportBatch: 512,
 	}
+}
+
+// sampleRateFromEnv reads the OTel-standard OTEL_TRACES_SAMPLER_ARG (the ratio for
+// the *ratio samplers) and defaults to 1.0 (sample all) when unset/unparseable —
+// matching the SDK's default and the prior fit-go behaviour.
+func sampleRateFromEnv() float64 {
+	if v := os.Getenv("OTEL_TRACES_SAMPLER_ARG"); v != "" {
+		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+			return f
+		}
+	}
+	return 1.0
 }
 
 // SpanKind represents the role of the span.
@@ -286,6 +301,44 @@ func newOTLPExporter(ctx context.Context, opts Options) (sdktrace.SpanExporter, 
 	return otlptracehttp.New(ctx, httpOpts...)
 }
 
+// buildSampler resolves the OTel-standard OTEL_TRACES_SAMPLER value (opts.Sampler)
+// into a sampler, using opts.SampleRate as the ratio for the *ratio variants. When
+// unset it defaults to parentbased-over-ratio (the platform default), so an
+// upstream sampling decision on the W3C traceparent is honoured — a trace sampled
+// OUT upstream isn't re-recorded here, and the configured ratio is respected for
+// locally-rooted traces (previously ignored, which sampled everything).
+func buildSampler(opts Options) sdktrace.Sampler {
+	switch strings.ToLower(strings.TrimSpace(opts.Sampler)) {
+	case "always_on":
+		return sdktrace.AlwaysSample()
+	case "always_off":
+		return sdktrace.NeverSample()
+	case "traceidratio":
+		return ratioSampler(opts.SampleRate)
+	case "parentbased_always_on":
+		return sdktrace.ParentBased(sdktrace.AlwaysSample())
+	case "parentbased_always_off":
+		return sdktrace.ParentBased(sdktrace.NeverSample())
+	case "parentbased_traceidratio", "":
+		return sdktrace.ParentBased(ratioSampler(opts.SampleRate))
+	default:
+		// Unknown value — fall back to the safe default rather than failing init.
+		return sdktrace.ParentBased(ratioSampler(opts.SampleRate))
+	}
+}
+
+// ratioSampler maps a ratio to a sampler, collapsing the >=1 / <=0 edges to
+// Always/Never so TraceIDRatioBased only sees a genuine fraction.
+func ratioSampler(ratio float64) sdktrace.Sampler {
+	if ratio >= 1.0 {
+		return sdktrace.AlwaysSample()
+	}
+	if ratio <= 0.0 {
+		return sdktrace.NeverSample()
+	}
+	return sdktrace.TraceIDRatioBased(ratio)
+}
+
 // initOTel sets up the real OTel TracerProvider with OTLP exporter.
 func (t *Tracer) initOTel(ctx context.Context, opts Options) error {
 	// Build resource attributes.
@@ -333,18 +386,7 @@ func (t *Tracer) initOTel(ctx context.Context, opts Options) error {
 		sp = sdktrace.NewBatchSpanProcessor(exporter, bspOpts...)
 	}
 
-	// Wrap the root sampler in ParentBased so an upstream sampling decision (the
-	// W3C traceparent sampled flag, installed by ContextWithTrace) is honoured: a
-	// trace sampled OUT upstream isn't re-recorded here, which would orphan it.
-	var root sdktrace.Sampler
-	if opts.SampleRate >= 1.0 {
-		root = sdktrace.AlwaysSample()
-	} else if opts.SampleRate <= 0.0 {
-		root = sdktrace.NeverSample()
-	} else {
-		root = sdktrace.TraceIDRatioBased(opts.SampleRate)
-	}
-	sampler := sdktrace.ParentBased(root)
+	sampler := buildSampler(opts)
 
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithResource(res),
