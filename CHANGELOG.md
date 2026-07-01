@@ -11,6 +11,10 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`international`** package: `AddressFormParser` / `AddressDisplayParser`, the
+  byte-compatible Go port of Node `fit/international`, so services with
+  country-specific address layouts can migrate unchanged. (Closes the last module
+  breadth gap vs fit.js.)
 - **Secure-by-default request logging** (`redact` package): a reusable primitive for
   keeping PII/secrets out of logs (`SafeURL`, `QueryMap`/`Query`, `HeaderValue`).
   The server access logger now logs `request_url` as **path-only** and emits query
