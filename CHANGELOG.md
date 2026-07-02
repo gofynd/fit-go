@@ -30,7 +30,9 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `request_url` (path), `query_params` (**full values**), `path_params`, and
   opted-in header values **verbatim**, at a single **info** level — matching the
   Node/Python request-log contract byte-for-byte (fit.js `log-request-response-details`
-  / pyfit tracing middleware). No redaction on the inbound access log.
+  / pyfit tracing middleware). No redaction on the inbound access log. `path_params`
+  skips gin catch-all (`/*wildcard`) params, which only duplicate `request_url`
+  (e.g. a wildcard-mount + internal-dispatch service), keeping named params.
 - **`redact` package** (reusable primitive): `SafeURL`, `QueryMap`/`Query`,
   `HeaderValue`. Used by the outbound `httpclient`/`utils` clients, which log
   `scheme://host/path` only (outbound URLs routinely carry `?api_key=`/`?token=`),

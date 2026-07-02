@@ -287,14 +287,24 @@ func queryParams(v map[string][]string) map[string]string {
 }
 
 // pathParams renders gin route params (fit.js request_params / pyfit path_params)
-// as a key->value map. nil when there are none.
+// as a key->value map, skipping catch-all (/*wildcard) params. A catch-all
+// captures the whole remaining path — always leading-"/" — which just duplicates
+// request_url (e.g. a service that mounts a wildcard route + internal dispatch has
+// a single catch-all param, adding only noise). Named params (:id) capture one
+// segment and never start with "/". Returns nil when nothing meaningful remains.
 func pathParams(ps gin.Params) map[string]string {
 	if len(ps) == 0 {
 		return nil
 	}
 	out := make(map[string]string, len(ps))
 	for _, p := range ps {
+		if strings.HasPrefix(p.Value, "/") {
+			continue // catch-all wildcard — redundant with request_url
+		}
 		out[p.Key] = p.Value
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

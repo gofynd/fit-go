@@ -78,3 +78,27 @@ func TestLogRequestResponse_InfoLevelParity(t *testing.T) {
 		t.Fatalf("response_status should be logged: %s", out)
 	}
 }
+
+// A catch-all (/*wildcard) route param just duplicates request_url, so it must be
+// suppressed — no path_params field for a service that mounts a wildcard + does
+// internal dispatch (the metroplex case). Named params are still logged.
+func TestLogRequestResponse_CatchAllPathParamSuppressed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	engine := gin.New()
+	engine.Use(LogRequestResponse(LogRequestResponseConfig{Logger: logger}))
+	engine.GET("/platform/*path", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
+
+	engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/platform/v1.0/company/42/ticket", nil))
+	out := buf.String()
+
+	if strings.Contains(out, "path_params") {
+		t.Fatalf("catch-all path param must be suppressed (redundant with request_url): %s", out)
+	}
+	// request_url still carries the full path.
+	if !strings.Contains(out, "/platform/v1.0/company/42/ticket") {
+		t.Fatalf("request_url should still be logged: %s", out)
+	}
+}
