@@ -11,6 +11,17 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`server.DynamicCORS` + `Config.CORS`**: a callback-based, credentialed CORS
+  middleware installed **engine-level** in `Server.Init` (after logging, before the
+  payload/user-data parse middlewares), so it answers a preflight `OPTIONS` on gin's
+  no-route path — a preflight to a GET/POST-only route is handled, not 404/405'd. The
+  caller supplies the per-Origin allow decision (`CORSOptions.AllowOrigin`) — e.g. a
+  dynamic allowlist of `*.fynd.com` / `*.addsale.com` + registered app domains — while
+  fit-go owns the mechanism (reflect Origin + `Allow-Credentials` + `Vary`, preflight
+  204 with headers/methods/max-age, and a configurable skip header such as
+  `X-Skip-Cors`). Coexists with the pre-existing static `CORS(CORSConfig)`; `nil`
+  `Config.CORS` mounts nothing. Replaces the app-layer CORS workaround metroplex
+  shortlinks used.
 - **`international`** package: `AddressFormParser` / `AddressDisplayParser`, the
   byte-compatible Go port of Node `fit/international`, so services with
   country-specific address layouts can migrate unchanged. (Closes the last module

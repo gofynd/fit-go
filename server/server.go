@@ -82,6 +82,11 @@ type Config struct {
 	// HealthChecker is the health checker used by /_healthz and /_readyz routes.
 	// If nil, the package-level globalHealthChecker is used.
 	HealthChecker HealthChecker
+
+	// CORS, when non-nil, installs the dynamic CORS middleware (see DynamicCORS/CORSOptions)
+	// engine-level so it also answers preflights on the no-route path. Nil disables
+	// CORS entirely (a service whose config.enable_cors is off simply leaves this nil).
+	CORS *CORSOptions
 }
 
 // Server is the fit.go HTTP server. It wraps net/http.Server and uses
@@ -195,6 +200,15 @@ func (s *Server) Init(
 		IncludeHeaders:  coalesce(s.cfg.IncludeHeadersInLog, os.Getenv("INCLUDE_HEADERS_IN_LOG")),
 		MetricsRecorder: s.cfg.MetricsRecorder,
 	}))
+
+	// CORS (dynamic, callback-based). Installed engine-level AFTER logging but BEFORE
+	// the payload/user-data parse middlewares so a preflight OPTIONS is answered without
+	// parsing a body/user header, and — being engine-level — it runs on gin's no-route
+	// path too, so a preflight to a GET/POST-only path is handled rather than 404/405'd.
+	// nil = disabled (no middleware mounted).
+	if s.cfg.CORS != nil {
+		root.Use(DynamicCORS(*s.cfg.CORS))
+	}
 
 	// Request middlewares provided by user (pre-parse)
 	for _, mw := range requestMiddlewares {
