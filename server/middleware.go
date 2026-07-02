@@ -33,7 +33,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gofynd/fit-go/errors"
-	"github.com/gofynd/fit-go/redact"
 )
 
 // Middleware is the standard middleware signature used throughout fit.go.
@@ -216,29 +215,35 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 
 		start := time.Now()
 
-		// request_url is the PATH ONLY — the query string is logged separately and
-		// redacted, so PII carried in query params (e.g. an email/phone filter on a
-		// search endpoint) never lands verbatim in the access log.
-		attrs := []slog.Attr{
+		// Legacy parity (fit.js log-request-response-details / pyfit tracing
+		// middleware): request_url = path; query params (full values) and route
+		// params are structured fields; opted-in header values are logged verbatim.
+		// The same base fields are repeated on the RES line, mirroring how Node/pyfit
+		// reuse a single logDetails object. Values are NOT redacted here — this is
+		// deliberate parity with the platform's Node/Python request logging.
+		base := []slog.Attr{
 			slog.String("request_url", path),
 			slog.String("request_method", c.Request.Method),
-			slog.String("step", "REQ"),
 		}
-		if q := redact.QueryMap(c.Request.URL.Query(), nil); q != nil {
-			attrs = append(attrs, slog.Any("query_params", q))
+		if q := queryParams(c.Request.URL.Query()); q != nil {
+			base = append(base, slog.Any("query_params", q))
+		}
+		if p := pathParams(c.Params); p != nil {
+			base = append(base, slog.Any("path_params", p))
 		}
 		if cfg.IncludeHeaders != "" {
 			for _, h := range strings.Split(cfg.IncludeHeaders, ",") {
-				h = strings.TrimSpace(h)
-				if h != "" {
-					// Mask sensitive header values (Authorization/Cookie/api keys).
-					attrs = append(attrs, slog.String(h, redact.HeaderValue(h, c.Request.Header.Get(h))))
+				if h = strings.TrimSpace(h); h != "" {
+					base = append(base, slog.String(h, c.Request.Header.Get(h)))
 				}
 			}
 		}
+
+		// Full-slice cap so REQ/RES appends each allocate — no shared-backing aliasing.
+		reqAttrs := append(base[:len(base):len(base)], slog.String("step", "REQ"))
 		l.LogAttrs(c.Request.Context(), slog.LevelInfo,
 			fmt.Sprintf("[REQ] Incoming %s request for %s", c.Request.Method, path),
-			attrs...,
+			reqAttrs...,
 		)
 
 		c.Next()
@@ -252,27 +257,47 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 			cfg.MetricsRecorder(c.Request.Method, route, strconv.Itoa(statusCode), float64(duration.Milliseconds()))
 		}
 
-		// Log response
-		level := slog.LevelInfo
-		if statusCode >= 500 {
-			level = slog.LevelError
-		} else if statusCode >= 400 {
-			level = slog.LevelWarn
-		}
-
-		l.LogAttrs(c.Request.Context(), level,
-			fmt.Sprintf("[RES] Outgoing %s response from %s", c.Request.Method, path),
-			slog.String("request_url", path), // path only; query is on the correlated REQ line
-			slog.String("request_method", c.Request.Method),
+		// Legacy parity: single info level (no level-by-status).
+		resAttrs := append(base[:len(base):len(base)],
 			slog.String("step", "RES"),
 			slog.Int("response_status", statusCode),
 			slog.Duration("duration", duration),
+		)
+		l.LogAttrs(c.Request.Context(), slog.LevelInfo,
+			fmt.Sprintf("[RES] Outgoing %s response from %s", c.Request.Method, path),
+			resAttrs...,
 		)
 	}
 }
 
 // GinLogRequestResponse is an alias for LogRequestResponse for use in server.go.
 var GinLogRequestResponse = LogRequestResponse
+
+// queryParams flattens query values into a key->value map (multi-valued joined
+// with ",") for structured logging. Full values, legacy parity. nil when empty.
+func queryParams(v map[string][]string) map[string]string {
+	if len(v) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(v))
+	for k, vs := range v {
+		out[k] = strings.Join(vs, ",")
+	}
+	return out
+}
+
+// pathParams renders gin route params (fit.js request_params / pyfit path_params)
+// as a key->value map. nil when there are none.
+func pathParams(ps gin.Params) map[string]string {
+	if len(ps) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(ps))
+	for _, p := range ps {
+		out[p.Key] = p.Value
+	}
+	return out
+}
 
 // ---------------------------------------------------------------------------
 // ParseApplicationData middleware (gin.HandlerFunc)

@@ -26,13 +26,15 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   byte-compatible Go port of Node `fit/international`, so services with
   country-specific address layouts can migrate unchanged. (Closes the last module
   breadth gap vs fit.js.)
-- **Secure-by-default request logging** (`redact` package): a reusable primitive for
-  keeping PII/secrets out of logs (`SafeURL`, `QueryMap`/`Query`, `HeaderValue`).
-  The server access logger now logs `request_url` as **path-only** and emits query
-  params in a **redacted, structured `query_params`** field (operational keys like
-  `limit`/`page`/`sort` kept, all other values masked; keys always retained), and
-  masks sensitive header values (`Authorization`/`Cookie`/api keys). The `[EXT]`
-  outbound client (`utils`) and the tracing `httpclient` log the same path-only URL.
+- **Request logging — full fit.js/pyfit parity**: the server access logger logs
+  `request_url` (path), `query_params` (**full values**), `path_params`, and
+  opted-in header values **verbatim**, at a single **info** level — matching the
+  Node/Python request-log contract byte-for-byte (fit.js `log-request-response-details`
+  / pyfit tracing middleware). No redaction on the inbound access log.
+- **`redact` package** (reusable primitive): `SafeURL`, `QueryMap`/`Query`,
+  `HeaderValue`. Used by the outbound `httpclient`/`utils` clients, which log
+  `scheme://host/path` only (outbound URLs routinely carry `?api_key=`/`?token=`),
+  and available for any service that wants opt-in inbound redaction.
 - **Sampling honors the OTel env**: `tracing` now reads `OTEL_TRACES_SAMPLER` and
   `OTEL_TRACES_SAMPLER_ARG` (via `Options.Sampler` / `Options.SampleRate`) instead
   of hardcoding sample-all — so a configured `parentbased_traceidratio` at `0.25`

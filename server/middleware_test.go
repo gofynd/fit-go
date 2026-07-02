@@ -413,7 +413,9 @@ func TestLogRequestResponse_Middleware(t *testing.T) {
 		}
 	})
 
-	t.Run("error level for 5xx", func(t *testing.T) {
+	// Legacy parity (fit.js/pyfit): every access-log line is INFO, regardless of
+	// status — there is no level-by-status.
+	t.Run("info level for 5xx (parity)", func(t *testing.T) {
 		var logBuf bytes.Buffer
 		logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
 
@@ -428,12 +430,12 @@ func TestLogRequestResponse_Middleware(t *testing.T) {
 		engine.ServeHTTP(rec, req)
 
 		logStr := logBuf.String()
-		if !strings.Contains(logStr, "ERROR") {
-			t.Error("5xx responses should be logged at ERROR level")
+		if strings.Contains(logStr, `"level":"ERROR"`) {
+			t.Error("parity: 5xx must be logged at INFO, not ERROR")
 		}
 	})
 
-	t.Run("warn level for 4xx", func(t *testing.T) {
+	t.Run("info level for 4xx (parity)", func(t *testing.T) {
 		var logBuf bytes.Buffer
 		logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
 
@@ -448,8 +450,8 @@ func TestLogRequestResponse_Middleware(t *testing.T) {
 		engine.ServeHTTP(rec, req)
 
 		logStr := logBuf.String()
-		if !strings.Contains(logStr, "WARN") {
-			t.Error("4xx responses should be logged at WARN level")
+		if strings.Contains(logStr, `"level":"WARN"`) {
+			t.Error("parity: 4xx must be logged at INFO, not WARN")
 		}
 	})
 
