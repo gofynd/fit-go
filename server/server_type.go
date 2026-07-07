@@ -49,7 +49,7 @@ const (
 	ServerTypeDev
 	// ServerTypeCommon serves routes shared across all types.
 	ServerTypeCommon
-	// ServerTypeCentral serves legacy central/admin routes used by some Commerce services.
+	// ServerTypeCentral serves legacy central/admin routes used by Commerce services.
 	ServerTypeCentral
 )
 

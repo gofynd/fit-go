@@ -15,6 +15,7 @@
 package kafka
 
 import (
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -340,6 +341,43 @@ func TestConfluentProducer_MessageMapping(t *testing.T) {
 			t.Errorf("Partition = %d, want PartitionAny (%d)", km.TopicPartition.Partition, ckafka.PartitionAny)
 		}
 	})
+}
+
+func TestConfluentProducer_RecordMetadataMapping(t *testing.T) {
+	topic := "events"
+	km := &ckafka.Message{
+		TopicPartition: ckafka.TopicPartition{
+			Topic:     &topic,
+			Partition: 3,
+			Offset:    42,
+		},
+	}
+
+	metadata := mapConfluentToRecordMetadata(km)
+
+	if metadata.Topic != topic {
+		t.Errorf("Topic = %q, want %q", metadata.Topic, topic)
+	}
+	if metadata.TopicName != topic {
+		t.Errorf("TopicName = %q, want %q", metadata.TopicName, topic)
+	}
+	if metadata.Partition != 3 {
+		t.Errorf("Partition = %d, want 3", metadata.Partition)
+	}
+	if metadata.Offset != 42 {
+		t.Errorf("Offset = %d, want 42", metadata.Offset)
+	}
+	if metadata.BaseOffset != "42" {
+		t.Errorf("BaseOffset = %q, want 42", metadata.BaseOffset)
+	}
+
+	blob, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if string(blob) != `{"topicName":"events","partition":3,"errorCode":0,"baseOffset":"42"}` {
+		t.Fatalf("json = %s", string(blob))
+	}
 }
 
 // ---------------------------------------------------------------------------

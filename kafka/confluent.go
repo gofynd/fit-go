@@ -270,12 +270,22 @@ func (cp *ConfluentProducer) Connect() error {
 // Produce sends messages to a single topic. The acks parameter is configured
 // at the producer level in confluent-kafka-go via the ConfigMap.
 func (cp *ConfluentProducer) Produce(topic string, messages []Message, acks int) error {
+	_, err := cp.ProduceWithMetadata(topic, messages, acks)
+	return err
+}
+
+// ProduceWithMetadata sends messages to a single topic and returns KafkaJS-style
+// broker delivery metadata grouped by topic/partition. It is intentionally a
+// concrete ConfluentProducer capability rather than a KafkaProducer interface
+// requirement, so existing drivers and callers that only need Produce remain
+// unchanged.
+func (cp *ConfluentProducer) ProduceWithMetadata(topic string, messages []Message, acks int) ([]RecordMetadata, error) {
 	cp.mu.Lock()
 	producer := cp.producer
 	cp.mu.Unlock()
 
 	if producer == nil {
-		return fmt.Errorf("kafka/confluent: producer not connected")
+		return nil, fmt.Errorf("kafka/confluent: producer not connected")
 	}
 
 	deliveryChan := make(chan ckafka.Event, len(messages))
@@ -284,20 +294,37 @@ func (cp *ConfluentProducer) Produce(topic string, messages []Message, acks int)
 	for _, msg := range messages {
 		km := buildConfluentMessage(topic, msg)
 		if err := producer.Produce(km, deliveryChan); err != nil {
-			return fmt.Errorf("kafka/confluent: produce to %s failed: %w", topic, err)
+			return nil, fmt.Errorf("kafka/confluent: produce to %s failed: %w", topic, err)
 		}
 	}
+
+	metadata := make([]RecordMetadata, 0, len(messages))
+	metadataByPartition := make(map[string]int, len(messages))
 
 	// Wait for all delivery reports.
 	for i := 0; i < len(messages); i++ {
 		e := <-deliveryChan
-		m := e.(*ckafka.Message)
-		if m.TopicPartition.Error != nil {
-			return fmt.Errorf("kafka/confluent: produce to %s failed: %w", topic, m.TopicPartition.Error)
+		m, ok := e.(*ckafka.Message)
+		if !ok {
+			return nil, fmt.Errorf("kafka/confluent: produce to %s failed: unexpected delivery event %T", topic, e)
 		}
+		if m.TopicPartition.Error != nil {
+			return nil, fmt.Errorf("kafka/confluent: produce to %s failed: %w", topic, m.TopicPartition.Error)
+		}
+		md := mapConfluentToRecordMetadata(m)
+		key := fmt.Sprintf("%s:%d", md.TopicName, md.Partition)
+		if idx, ok := metadataByPartition[key]; ok {
+			if md.Offset < metadata[idx].Offset {
+				metadata[idx].Offset = md.Offset
+				metadata[idx].BaseOffset = md.BaseOffset
+			}
+			continue
+		}
+		metadataByPartition[key] = len(metadata)
+		metadata = append(metadata, md)
 	}
 
-	return nil
+	return metadata, nil
 }
 
 // ProduceBatch sends messages to multiple topics in one call.
@@ -349,6 +376,13 @@ func (cp *ConfluentProducer) ProduceBatch(topicMessages []TopicMessages, acks in
 func (cp *ConfluentProducer) ProduceCtx(ctx context.Context, topic string, messages []Message, acks int) error {
 	InjectTraceHeadersToMessages(ctx, messages)
 	return cp.Produce(topic, messages, acks)
+}
+
+// ProduceCtxWithMetadata is ProduceWithMetadata with per-message traceparent
+// injection.
+func (cp *ConfluentProducer) ProduceCtxWithMetadata(ctx context.Context, topic string, messages []Message, acks int) ([]RecordMetadata, error) {
+	InjectTraceHeadersToMessages(ctx, messages)
+	return cp.ProduceWithMetadata(topic, messages, acks)
 }
 
 // ProduceBatchCtx is ProduceBatch with per-message traceparent injection.
@@ -974,6 +1008,24 @@ func mapConfluentToPayload(msg *ckafka.Message) MessagePayload {
 	}
 
 	return payload
+}
+
+// mapConfluentToRecordMetadata converts a delivery report into the same
+// metadata shape legacy fit.js exposes for router produce responses.
+func mapConfluentToRecordMetadata(msg *ckafka.Message) RecordMetadata {
+	topic := ""
+	if msg.TopicPartition.Topic != nil {
+		topic = *msg.TopicPartition.Topic
+	}
+
+	return RecordMetadata{
+		Topic:      topic,
+		Offset:     int64(msg.TopicPartition.Offset),
+		TopicName:  topic,
+		Partition:  int(msg.TopicPartition.Partition),
+		ErrorCode:  0,
+		BaseOffset: fmt.Sprintf("%d", msg.TopicPartition.Offset),
+	}
 }
 
 // cloneConfigMap creates a copy of a ckafka.ConfigMap. Since ConfigMap is a

@@ -57,11 +57,21 @@ type TopicMessages struct {
 	Messages []Message
 }
 
-// RecordMetadata is returned for each message after a successful produce.
+// RecordMetadata is returned once per topic/partition acknowledged by a produce
+// request, matching KafkaJS-style grouped delivery metadata.
 type RecordMetadata struct {
-	Topic     string
-	Partition int
-	Offset    int64
+	// Topic and Offset are kept for Go callers that want typed access. They are
+	// not serialized because legacy fit.js/KafkaJS exposes topicName/baseOffset
+	// in HTTP responses.
+	Topic  string `json:"-"`
+	Offset int64  `json:"-"`
+
+	TopicName      string `json:"topicName"`
+	Partition      int    `json:"partition"`
+	ErrorCode      int    `json:"errorCode"`
+	BaseOffset     string `json:"baseOffset,omitempty"`
+	LogAppendTime  string `json:"logAppendTime,omitempty"`
+	LogStartOffset string `json:"logStartOffset,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
