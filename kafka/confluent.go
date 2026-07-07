@@ -599,6 +599,18 @@ func (cc *ConfluentConsumer) Consume(handler MessageHandler, opts ConsumerOption
 
 		payload := mapConfluentToPayload(msg)
 
+		if !isAutoCommit && opts.CommitBeforeHandler {
+			if _, err := consumer.CommitMessage(msg); err != nil {
+				cc.logger.Error("kafka/confluent: pre-handler commit failed",
+					"topic", *msg.TopicPartition.Topic,
+					"partition", msg.TopicPartition.Partition,
+					"offset", msg.TopicPartition.Offset,
+					"error", err,
+				)
+				return fmt.Errorf("kafka/confluent: pre-handler commit failed: %w", err)
+			}
+		}
+
 		if err := handler(payload); err != nil {
 			cc.logger.Error("kafka/confluent: message handler error",
 				"topic", *msg.TopicPartition.Topic,
@@ -609,7 +621,7 @@ func (cc *ConfluentConsumer) Consume(handler MessageHandler, opts ConsumerOption
 			continue
 		}
 
-		if !isAutoCommit {
+		if !isAutoCommit && !opts.CommitBeforeHandler {
 			if _, err := consumer.CommitMessage(msg); err != nil {
 				cc.logger.Error("kafka/confluent: commit failed",
 					"topic", *msg.TopicPartition.Topic,
@@ -706,6 +718,19 @@ func (cc *ConfluentConsumer) ConsumeBatch(handler BatchHandler, opts ConsumerOpt
 			LastOffset:  batch[len(batch)-1].Offset,
 		}
 
+		if !isAutoCommit && opts.CommitBeforeHandler && lastMsg != nil {
+			if _, err := consumer.CommitMessage(lastMsg); err != nil {
+				cc.logger.Error("kafka/confluent: pre-handler batch commit failed",
+					"topic", batchTopic,
+					"partition", batchPartition,
+					"firstOffset", batchPayload.FirstOffset,
+					"lastOffset", batchPayload.LastOffset,
+					"error", err,
+				)
+				return fmt.Errorf("kafka/confluent: pre-handler batch commit failed: %w", err)
+			}
+		}
+
 		if err := handler(batchPayload); err != nil {
 			cc.logger.Error("kafka/confluent: batch handler error",
 				"topic", batchTopic,
@@ -717,7 +742,7 @@ func (cc *ConfluentConsumer) ConsumeBatch(handler BatchHandler, opts ConsumerOpt
 			return err
 		}
 
-		if !isAutoCommit && lastMsg != nil {
+		if !isAutoCommit && !opts.CommitBeforeHandler && lastMsg != nil {
 			if _, err := consumer.CommitMessage(lastMsg); err != nil {
 				cc.logger.Error("kafka/confluent: batch commit failed",
 					"error", err,

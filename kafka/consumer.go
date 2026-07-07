@@ -184,6 +184,12 @@ type ConsumerOptions struct {
 	// nil means use the ConsumerConfig default.
 	AutoCommit *bool
 
+	// CommitBeforeHandler commits the consumed offset before invoking the message
+	// handler when manual commits are enabled. This is an explicit opt-in for
+	// legacy at-most-once consumers whose handlers perform non-idempotent external
+	// side effects. It is ignored when auto-commit is enabled.
+	CommitBeforeHandler bool
+
 	// PartitionsConsumedConcurrently is the number of partitions processed
 	// concurrently. Default: 1 (sequential).
 	PartitionsConsumedConcurrently int
