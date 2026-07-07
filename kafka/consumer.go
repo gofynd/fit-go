@@ -122,7 +122,9 @@ type ConsumerConfig struct {
 	// RetryBackoff is the delay before retrying a failed fetch. Default: 100ms.
 	RetryBackoff time.Duration
 
-	// AutoCommit controls automatic offset committing. Default: true.
+	// AutoCommit controls automatic offset committing. DefaultConsumerConfig sets
+	// this to true; a literal ConsumerConfig{} leaves it false, so callers that build
+	// configs manually should set this explicitly when matching legacy behavior.
 	AutoCommit bool
 
 	// AutoCommitInterval is the interval between automatic offset commits.

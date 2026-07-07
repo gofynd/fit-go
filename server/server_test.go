@@ -60,6 +60,7 @@ func TestParseServerType(t *testing.T) {
 		{"panel", ServerTypePanel, false},
 		{"dev", ServerTypeDev, false},
 		{"common", ServerTypeCommon, false},
+		{"central", ServerTypeCentral, false},
 		{" Platform ", ServerTypePlatform, false},
 		{"APPLICATION", ServerTypeApplication, false},
 		{"", ServerTypeDefault, true},
@@ -132,6 +133,7 @@ func TestServerType_String(t *testing.T) {
 		{ServerTypePanel, "panel"},
 		{ServerTypeDev, "dev"},
 		{ServerTypeCommon, "common"},
+		{ServerTypeCentral, "central"},
 		{ServerTypeDefault, "default"},
 		{ServerType(999), "default"},
 	}
@@ -147,8 +149,8 @@ func TestServerType_String(t *testing.T) {
 
 func TestAllServerTypes(t *testing.T) {
 	types := AllServerTypes()
-	if len(types) != 11 {
-		t.Errorf("AllServerTypes() returned %d types, want 11", len(types))
+	if len(types) != 12 {
+		t.Errorf("AllServerTypes() returned %d types, want 12", len(types))
 	}
 
 	for _, st := range types {

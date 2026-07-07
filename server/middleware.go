@@ -191,10 +191,29 @@ type LogRequestResponseConfig struct {
 	// IncludeHeaders is a comma-separated list of header names to include in logs.
 	// Mirrors the INCLUDE_HEADERS_IN_LOG env var.
 	IncludeHeaders string
+	// ResponseLogSeverity controls the response log level. The default is all-info
+	// for fit.js/pyfit parity. Use ResponseLogSeverityStatusBased for services that
+	// intentionally want 4xx=WARN and 5xx=ERROR.
+	ResponseLogSeverity ResponseLogSeverityMode
+	// LegacyOriginalURL logs request_url as the original request URI, including the
+	// query string. The default is path-only, with query params logged separately.
+	LegacyOriginalURL bool
 	// MetricsRecorder is an optional callback invoked with method, route, status, and
 	// duration so that the caller can record Prometheus histograms.
 	MetricsRecorder func(method, route, status string, durationMs float64)
 }
+
+// ResponseLogSeverityMode controls response log levels for LogRequestResponse.
+type ResponseLogSeverityMode string
+
+const (
+	// ResponseLogSeverityAllInfo logs every response line at INFO. This is the
+	// legacy fit.js/pyfit default and remains the zero-value behaviour.
+	ResponseLogSeverityAllInfo ResponseLogSeverityMode = "all_info"
+	// ResponseLogSeverityStatusBased logs 5xx at ERROR, 4xx at WARN, and everything
+	// else at INFO. This preserves the optimized fit-go behavior as an opt-in.
+	ResponseLogSeverityStatusBased ResponseLogSeverityMode = "status_based"
+)
 
 // LogRequestResponse returns a gin middleware that logs incoming requests and outgoing
 // responses. Health-check paths (/_healthz, /_readyz) are skipped.
@@ -206,6 +225,7 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 
 	return func(c *gin.Context) {
 		path := c.Request.URL.Path
+		requestURL := requestURLForLog(c, cfg)
 
 		// Skip health/readiness probes
 		if strings.Contains(path, "/_healthz") || strings.Contains(path, "/_readyz") {
@@ -222,7 +242,7 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 		// reuse a single logDetails object. Values are NOT redacted here — this is
 		// deliberate parity with the platform's Node/Python request logging.
 		base := []slog.Attr{
-			slog.String("request_url", path),
+			slog.String("request_url", requestURL),
 			slog.String("request_method", c.Request.Method),
 		}
 		if q := queryParams(c.Request.URL.Query()); q != nil {
@@ -242,7 +262,7 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 		// Full-slice cap so REQ/RES appends each allocate — no shared-backing aliasing.
 		reqAttrs := append(base[:len(base):len(base)], slog.String("step", "REQ"))
 		l.LogAttrs(c.Request.Context(), slog.LevelInfo,
-			fmt.Sprintf("[REQ] Incoming %s request for %s", c.Request.Method, path),
+			fmt.Sprintf("[REQ] Incoming %s request for %s", c.Request.Method, requestURL),
 			reqAttrs...,
 		)
 
@@ -257,14 +277,16 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 			cfg.MetricsRecorder(c.Request.Method, route, strconv.Itoa(statusCode), float64(duration.Milliseconds()))
 		}
 
-		// Legacy parity: single info level (no level-by-status).
+		// Legacy default: single info level. Services that migrated from fit.js v2.9
+		// status-based logging can opt in with ResponseLogSeverityStatusBased.
+		responseLevel := responseLogLevel(statusCode, cfg)
 		resAttrs := append(base[:len(base):len(base)],
 			slog.String("step", "RES"),
 			slog.Int("response_status", statusCode),
 			slog.Duration("duration", duration),
 		)
-		l.LogAttrs(c.Request.Context(), slog.LevelInfo,
-			fmt.Sprintf("[RES] Outgoing %s response from %s", c.Request.Method, path),
+		l.LogAttrs(c.Request.Context(), responseLevel,
+			fmt.Sprintf("[RES] Outgoing %s response from %s", c.Request.Method, requestURL),
 			resAttrs...,
 		)
 	}
@@ -272,6 +294,32 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 
 // GinLogRequestResponse is an alias for LogRequestResponse for use in server.go.
 var GinLogRequestResponse = LogRequestResponse
+
+func requestURLForLog(c *gin.Context, cfg LogRequestResponseConfig) string {
+	if cfg.LegacyOriginalURL || strings.EqualFold(strings.TrimSpace(envGet("FIT_LOG_REQUEST_URL", "")), "original") {
+		if uri := c.Request.URL.RequestURI(); uri != "" {
+			return uri
+		}
+	}
+	return c.Request.URL.Path
+}
+
+func responseLogLevel(statusCode int, cfg LogRequestResponseConfig) slog.Level {
+	mode := cfg.ResponseLogSeverity
+	if mode == "" {
+		mode = ResponseLogSeverityMode(envGet("FIT_RESPONSE_LOG_SEVERITY", ""))
+	}
+	switch strings.ToLower(strings.TrimSpace(string(mode))) {
+	case string(ResponseLogSeverityStatusBased), "status", "status-based":
+		if statusCode >= http.StatusInternalServerError {
+			return slog.LevelError
+		}
+		if statusCode >= http.StatusBadRequest {
+			return slog.LevelWarn
+		}
+	}
+	return slog.LevelInfo
+}
 
 // queryParams flattens query values into a key->value map (multi-valued joined
 // with ",") for structured logging. Full values, legacy parity. nil when empty.

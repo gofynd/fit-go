@@ -79,6 +79,48 @@ func TestLogRequestResponse_InfoLevelParity(t *testing.T) {
 	}
 }
 
+func TestLogRequestResponse_StatusBasedOptIn(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	engine := gin.New()
+	engine.Use(LogRequestResponse(LogRequestResponseConfig{
+		Logger:              logger,
+		ResponseLogSeverity: ResponseLogSeverityStatusBased,
+	}))
+	engine.GET("/missing", func(c *gin.Context) { c.String(http.StatusNotFound, "missing") })
+	engine.GET("/boom", func(c *gin.Context) { c.String(http.StatusInternalServerError, "boom") })
+
+	engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/missing", nil))
+	engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/boom", nil))
+	out := buf.String()
+
+	if !strings.Contains(out, `"level":"WARN"`) {
+		t.Fatalf("status-based mode should log 4xx response as WARN: %s", out)
+	}
+	if !strings.Contains(out, `"level":"ERROR"`) {
+		t.Fatalf("status-based mode should log 5xx response as ERROR: %s", out)
+	}
+}
+
+func TestLogRequestResponse_OriginalURLOptIn(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	engine := gin.New()
+	engine.Use(LogRequestResponse(LogRequestResponseConfig{Logger: logger, LegacyOriginalURL: true}))
+	engine.GET("/v1/items", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
+
+	engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/v1/items?limit=10", nil))
+	out := buf.String()
+
+	if !strings.Contains(out, `/v1/items?limit=10`) {
+		t.Fatalf("original URL mode should include query string in request_url: %s", out)
+	}
+}
+
 // A catch-all (/*wildcard) route param just duplicates request_url, so it must be
 // suppressed — no path_params field for a service that mounts a wildcard + does
 // internal dispatch (the metroplex case). Named params are still logged.
