@@ -182,8 +182,12 @@ func (cc *ConfluentClient) Consumer(config ConsumerConfig) (KafkaConsumer, error
 	if config.HeartbeatInterval > 0 {
 		_ = cCfg.SetKey("heartbeat.interval.ms", int(config.HeartbeatInterval.Milliseconds()))
 	}
-	if config.RebalanceTimeout > 0 {
-		_ = cCfg.SetKey("max.poll.interval.ms", int(config.RebalanceTimeout.Milliseconds()))
+	maxPollInterval := config.MaxPollInterval
+	if maxPollInterval == 0 {
+		maxPollInterval = config.RebalanceTimeout
+	}
+	if maxPollInterval > 0 {
+		_ = cCfg.SetKey("max.poll.interval.ms", int(maxPollInterval.Milliseconds()))
 	}
 	if config.MaxBytesPerPartition > 0 {
 		_ = cCfg.SetKey("max.partition.fetch.bytes", config.MaxBytesPerPartition)

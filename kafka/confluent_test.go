@@ -378,6 +378,7 @@ func TestConfluentConsumer_TopicConfig(t *testing.T) {
 			SessionTimeout:       45 * time.Second,
 			HeartbeatInterval:    5 * time.Second,
 			RebalanceTimeout:     120 * time.Second,
+			MaxPollInterval:      3 * time.Minute,
 			MaxBytesPerPartition: 2 << 20, // 2 MB
 			MinBytes:             512,
 			MaxBytes:             20 << 20, // 20 MB
@@ -412,8 +413,8 @@ func TestConfluentConsumer_TopicConfig(t *testing.T) {
 		}
 
 		rebalance, _ := cc.configMap.Get("max.poll.interval.ms", 0)
-		if rebalance != 120000 {
-			t.Errorf("max.poll.interval.ms = %v, want 120000", rebalance)
+		if rebalance != 180000 {
+			t.Errorf("max.poll.interval.ms = %v, want 180000", rebalance)
 		}
 
 		maxPartFetch, _ := cc.configMap.Get("max.partition.fetch.bytes", 0)
