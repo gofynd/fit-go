@@ -40,16 +40,11 @@ func startConsumerSpan(msg MessagePayload) (context.Context, *tracing.Span) {
 		return context.Background(), nil
 	}
 
-	ctx := context.Background()
-	for _, h := range msg.Headers {
-		if h.Key == traceparentHeaderKey {
-			traceID, spanID, sampled := tracing.ExtractTraceContext(string(h.Value))
-			if traceID != "" {
-				ctx = tracing.ContextWithTrace(ctx, traceID, spanID, sampled)
-			}
-			break
-		}
-	}
+	// Extract via the GLOBAL propagator: this parses traceparent/tracestate/baggage
+	// and — crucially — marks the parent span context as REMOTE. The traceclue
+	// ServiceEntryPointSampler keys on exactly that to identify this service's entry
+	// point, so a hand-rolled parent would defeat entry-point sampling for consumers.
+	ctx := propagator().Extract(context.Background(), payloadCarrier{headers: msg.Headers})
 
 	ctx, span := tracer.StartSpan(ctx, fmt.Sprintf("kafka.consume %s", msg.Topic), tracing.SpanKindConsumer)
 	span.SetAttributes(map[string]any{
@@ -120,29 +115,21 @@ func InjectTraceHeaders(ctx context.Context, msg *Message) {
 	if tracer == nil || !tracer.IsEnabled() {
 		return
 	}
-
-	span := tracing.SpanFromContext(ctx)
-	if span == nil {
+	if msg == nil {
 		return
 	}
-
-	traceID := span.TraceID()
-	spanID := span.SpanID()
-	if traceID == "" || spanID == "" {
+	// Inject via the GLOBAL propagator (W3C TraceContext + Baggage) rather than
+	// hand-formatting traceparent: it also carries tracestate and baggage, and the
+	// carrier's Set REPLACES a stale header on a re-produced message.
+	//
+	// The context must carry a span for the propagator to write anything. Adopt the
+	// native OTel span when present (otelgin/otelgrpc put a span in the native context
+	// only) — tracing.SpanFromContext handles that, and it is why a produce from an
+	// HTTP handler now propagates at all.
+	if tracing.SpanFromContext(ctx) == nil {
 		return
 	}
-
-	tp := tracing.FormatTraceparent(traceID, spanID, span.IsSampled())
-	for i := range msg.Headers {
-		if msg.Headers[i].Key == traceparentHeaderKey {
-			msg.Headers[i].Value = []byte(tp)
-			return
-		}
-	}
-	msg.Headers = append(msg.Headers, Header{
-		Key:   traceparentHeaderKey,
-		Value: []byte(tp),
-	})
+	propagator().Inject(ctx, messageCarrier{msg: msg})
 }
 
 // InjectTraceHeadersToMessages adds traceparent headers to all messages in the
@@ -151,4 +138,37 @@ func InjectTraceHeadersToMessages(ctx context.Context, messages []Message) {
 	for i := range messages {
 		InjectTraceHeaders(ctx, &messages[i])
 	}
+}
+
+// StartProducerSpan opens a SpanKindProducer span for an outbound produce and returns
+// the span-bearing context (inject traceparent FROM this context, so the consumer
+// parents to the PRODUCER span, not to whatever span happened to be active).
+//
+// Legacy traceclue's Kafka instrumentation records a producer span with messaging
+// attributes and latency; fit-go's ProduceCtx previously only injected a header, so
+// produce latency and failures were invisible in traces.
+//
+// Returns (ctx, nil) when tracing is disabled — callers must nil-check the span.
+func StartProducerSpan(ctx context.Context, topic string, messageCount int) (context.Context, *tracing.Span) {
+	tracer := tracing.Global()
+	if tracer == nil || !tracer.IsEnabled() {
+		return ctx, nil
+	}
+	ctx, span := tracer.StartSpan(ctx, fmt.Sprintf("kafka.produce %s", topic), tracing.SpanKindProducer)
+	span.SetAttributes(map[string]any{
+		"messaging.system":           "kafka",
+		"messaging.destination":      topic,
+		"messaging.destination_kind": "topic",
+		"messaging.batch.size":       messageCount,
+	})
+	return ctx, span
+}
+
+// EndProducerSpan records the produce outcome and ends the span. Safe on a nil span.
+func EndProducerSpan(span *tracing.Span, err error) {
+	if span == nil {
+		return
+	}
+	recordSpanResult(span, err)
+	span.End()
 }

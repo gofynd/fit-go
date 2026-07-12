@@ -426,7 +426,15 @@ func (t *Tracer) initOTel(ctx context.Context, opts Options) error {
 	// inbound traceparent and inject it on outbound calls. Only set here, on the
 	// enabled path — when tracing is off the global stays the no-op propagator,
 	// so those libraries are inert (zero overhead).
-	otel.SetTextMapPropagator(propagation.TraceContext{})
+	// W3C TraceContext (traceparent/tracestate) + Baggage. traceclue/OTel install both
+	// by default; fit-go previously registered TraceContext only, so W3C `baggage`
+	// propagated by an upstream Node/Python service was silently dropped at the Go
+	// boundary. Baggage.Inject writes nothing when the context carries no baggage, so
+	// this adds no header to existing traffic.
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
 
 	return nil
 }

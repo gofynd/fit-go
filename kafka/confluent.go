@@ -373,24 +373,45 @@ func (cp *ConfluentProducer) ProduceBatch(topicMessages []TopicMessages, acks in
 // ProduceCtx injects the active span's traceparent into each message's headers
 // (when tracing is enabled and ctx carries a span), then delegates to Produce.
 // Existing Produce callers are unaffected; this is the trace-propagating variant.
+// It opens a SpanKindProducer span around the produce (latency + messaging attributes
+// + failure status) and injects the traceparent FROM that span, so the consumer parents
+// to the producer span rather than to whatever span was merely active at the call site.
 func (cp *ConfluentProducer) ProduceCtx(ctx context.Context, topic string, messages []Message, acks int) error {
+	ctx, span := StartProducerSpan(ctx, topic, len(messages))
 	InjectTraceHeadersToMessages(ctx, messages)
-	return cp.Produce(topic, messages, acks)
+	err := cp.Produce(topic, messages, acks)
+	EndProducerSpan(span, err)
+	return err
 }
 
-// ProduceCtxWithMetadata is ProduceWithMetadata with per-message traceparent
-// injection.
+// ProduceCtxWithMetadata is ProduceWithMetadata with a producer span + per-message
+// traceparent injection.
 func (cp *ConfluentProducer) ProduceCtxWithMetadata(ctx context.Context, topic string, messages []Message, acks int) ([]RecordMetadata, error) {
+	ctx, span := StartProducerSpan(ctx, topic, len(messages))
 	InjectTraceHeadersToMessages(ctx, messages)
-	return cp.ProduceWithMetadata(topic, messages, acks)
+	md, err := cp.ProduceWithMetadata(topic, messages, acks)
+	EndProducerSpan(span, err)
+	return md, err
 }
 
-// ProduceBatchCtx is ProduceBatch with per-message traceparent injection.
+// ProduceBatchCtx is ProduceBatch with a producer span + per-message traceparent
+// injection across every topic in the batch.
 func (cp *ConfluentProducer) ProduceBatchCtx(ctx context.Context, topicMessages []TopicMessages, acks int) error {
+	total := 0
+	topic := ""
+	for i := range topicMessages {
+		total += len(topicMessages[i].Messages)
+		if topic == "" {
+			topic = topicMessages[i].Topic
+		}
+	}
+	ctx, span := StartProducerSpan(ctx, topic, total)
 	for i := range topicMessages {
 		InjectTraceHeadersToMessages(ctx, topicMessages[i].Messages)
 	}
-	return cp.ProduceBatch(topicMessages, acks)
+	err := cp.ProduceBatch(topicMessages, acks)
+	EndProducerSpan(span, err)
+	return err
 }
 
 // Close disconnects the producer gracefully by flushing pending messages.
