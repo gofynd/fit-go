@@ -330,6 +330,27 @@ func TestErrorRegistry_Init(t *testing.T) {
 	}
 }
 
+func TestErrorRegistry_InitServiceCodeAndReset(t *testing.T) {
+	reg := &ErrorRegistry{}
+	if err := reg.InitServiceCode("ONE"); err != nil {
+		t.Fatalf("InitServiceCode: %v", err)
+	}
+	if got := NewWithRegistry(nil, 7, reg).Code; got != "ONE0007" {
+		t.Fatalf("code = %q, want ONE0007", got)
+	}
+
+	reg.Reset()
+	if got := NewWithRegistry(nil, 7, reg).Code; got != "0007" {
+		t.Fatalf("code after Reset = %q, want 0007", got)
+	}
+	if err := reg.InitServiceCode("TWO"); err != nil {
+		t.Fatalf("second InitServiceCode: %v", err)
+	}
+	if got := NewWithRegistry(nil, 7, reg).Code; got != "TWO0007" {
+		t.Fatalf("code after reinit = %q, want TWO0007", got)
+	}
+}
+
 func TestIsFitError(t *testing.T) {
 	reg := &ErrorRegistry{messageCodes: map[int]int{1: 1}}
 	reg.Init("TST", map[string]int{"TEST": 1}, nil, nil)

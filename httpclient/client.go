@@ -31,9 +31,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+
+	"github.com/gofynd/fit-go/metrics"
 	"github.com/gofynd/fit-go/redact"
 	"github.com/gofynd/fit-go/tracing"
 )
@@ -52,13 +57,19 @@ func WithLogger(l *slog.Logger) Option { return func(t *transport) { t.logger = 
 
 // MetricsRecorder records one outbound HTTP call's metrics. status is the
 // numeric HTTP status (0 on transport error). Fields match
-// metrics.HTTPClientMetrics so callers can forward directly to the metrics
-// registry without this package importing it.
+// metrics.HTTPClientMetrics so callers can forward directly to a registry.
 type MetricsRecorder func(method, host string, status int, duration time.Duration)
 
 // WithMetrics records per-request outbound metrics (method/host/status/duration).
-// When nil (default) no metrics are recorded.
-func WithMetrics(rec MetricsRecorder) Option { return func(t *transport) { t.metrics = rec } }
+// Passing nil explicitly disables metrics for this transport. When the option is
+// omitted, the process-default metrics registry installed by fit.Init is used
+// when available.
+func WithMetrics(rec MetricsRecorder) Option {
+	return func(t *transport) {
+		t.metrics = rec
+		t.metricsConfigured = true
+	}
+}
 
 // WrapTransport wraps base with trace propagation, request-id forwarding and
 // optional logging. A nil base uses http.DefaultTransport. Use this to instrument
@@ -67,7 +78,21 @@ func WrapTransport(base http.RoundTripper, opts ...Option) http.RoundTripper {
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	t := &transport{base: base}
+	if existing, ok := base.(*transport); ok {
+		// Re-wrapping is common when a shared client and service helper both opt in.
+		// Clone the FIT layer so new options override only what they configure while
+		// prior logger/metrics choices remain intact and concurrent callers are not
+		// mutated in place.
+		cloned := *existing
+		for _, o := range opts {
+			o(&cloned)
+		}
+		return &cloned
+	}
+	t := &transport{
+		base:          base,
+		traceRequests: !isOTelHTTPTransport(base),
+	}
 	for _, o := range opts {
 		o(t)
 	}
@@ -78,7 +103,7 @@ func WrapTransport(base http.RoundTripper, opts ...Option) http.RoundTripper {
 // request-id, optional logging, and fit's proxy behaviour (FORCE_PROXY_DOMAINS
 // then HTTP(S)_PROXY/NO_PROXY).
 func NewHTTPClient(opts ...Option) *http.Client {
-	base := &http.Transport{Proxy: ProxyFromEnvWithForce}
+	base := defaultTransportWithFitProxy()
 	return &http.Client{Transport: WrapTransport(base, opts...)}
 }
 
@@ -91,17 +116,22 @@ func NewHTTPClientWithTimeout(timeout time.Duration, opts ...Option) *http.Clien
 }
 
 type transport struct {
-	base    http.RoundTripper
-	logger  *slog.Logger
-	metrics MetricsRecorder
+	base              http.RoundTripper
+	logger            *slog.Logger
+	metrics           MetricsRecorder
+	metricsConfigured bool
+	traceRequests     bool
 }
 
 // RoundTrip clones the request (per the RoundTripper contract — must not mutate
 // the caller's request), ensures a request id, starts a client span + injects
-// traceparent when tracing is enabled, performs the call, then records span
-// status and an optional safe log line.
+// the process-global OTel propagator when tracing is enabled, performs the call,
+// then records span status and an optional safe log line.
 func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	req = req.Clone(req.Context())
+	if req.Header == nil {
+		req.Header = make(http.Header)
+	}
 
 	reqID := req.Header.Get(requestIDHeader)
 	if reqID == "" {
@@ -123,13 +153,16 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// scheme+host+path span; the wrapper exists for the fit/axios parity behaviours
 	// (proxy, x-request-id, safe logging) regardless. Do not swap to otelhttp.
 	var span *tracing.Span
-	if tracer := tracing.Global(); tracer != nil && tracer.IsEnabled() {
+	if tracer := tracing.Global(); t.traceRequests && tracer != nil && tracer.IsEnabled() {
 		ctx, s := tracer.StartSpan(req.Context(), "HTTP "+req.Method, tracing.SpanKindClient)
 		span = s
 		req = req.WithContext(ctx)
-		if span.TraceID() != "" && span.SpanID() != "" {
-			req.Header.Set(traceparentHeader, tracing.FormatTraceparent(span.TraceID(), span.SpanID(), span.IsSampled()))
-		}
+		// Use the configured process propagator rather than formatting traceparent
+		// ourselves. This carries traceparent, tracestate, baggage, and any future
+		// propagator configured by the process.
+		propagator := otel.GetTextMapPropagator()
+		removePropagationHeaders(req.Header, propagator)
+		propagator.Inject(req.Context(), propagation.HeaderCarrier(req.Header))
 		span.SetAttributes(map[string]any{
 			"http.method":     req.Method,
 			"http.url":        safeURL,
@@ -151,33 +184,93 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		span.SetAttribute("http.status_code", status)
 		switch {
 		case err != nil:
-			span.SetStatus(tracing.StatusError, err.Error())
-		case status >= http.StatusInternalServerError:
+			span.SetStatus(tracing.StatusError, redact.ErrorMessage(err))
+		case httpClientStatusIsError(status):
 			span.SetStatus(tracing.StatusError, http.StatusText(status))
-		default:
-			span.SetStatus(tracing.StatusOK, "")
 		}
 		span.End()
 	}
 
 	if t.logger != nil {
 		if err != nil {
-			t.logger.Error("httpclient: request failed",
+			t.logger.ErrorContext(req.Context(), "httpclient: request failed",
 				"method", req.Method, "url", safeURL,
 				"request_id", reqID, "duration_ms", duration.Milliseconds(),
-				"error", err.Error())
+				"error", redact.ErrorMessage(err))
 		} else {
-			t.logger.Info("httpclient: request",
+			t.logger.InfoContext(req.Context(), "httpclient: request",
 				"method", req.Method, "url", safeURL, "status", status,
 				"request_id", reqID, "duration_ms", duration.Milliseconds())
 		}
 	}
 
-	if t.metrics != nil {
-		t.metrics(req.Method, req.URL.Host, status, duration)
+	recorder := t.metrics
+	if !t.metricsConfigured {
+		if registry := metrics.Default(); registry != nil {
+			recorder = registry.HTTPClientRecorderFunc()
+		}
+	}
+	if recorder != nil {
+		recorder(req.Method, req.URL.Hostname(), status, duration)
 	}
 
 	return resp, err
+}
+
+// isOTelHTTPTransport recognizes the official OpenTelemetry HTTP transport.
+// FIT still wraps it for request IDs, safe logs, and metrics, but suppresses its
+// own span/propagation layer so the caller's OTel options remain authoritative.
+func isOTelHTTPTransport(base http.RoundTripper) bool {
+	typ := reflect.TypeOf(base)
+	if typ == nil {
+		return false
+	}
+	if typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	return isKnownOTelHTTPTransportType(typ.PkgPath(), typ.Name())
+}
+
+func isKnownOTelHTTPTransportType(packagePath, name string) bool {
+	return packagePath == "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp" && name == "Transport"
+}
+
+// removePropagationHeaders removes every field owned by the configured global
+// propagator before a fresh injection. Injectors leave absent context values
+// untouched, so replacing only fields they emit would forward stale baggage or
+// tracestate. The W3C fields are always removed so OTEL_PROPAGATORS=none is a
+// real propagation opt-out rather than a stale-context pass-through.
+func removePropagationHeaders(header http.Header, propagator propagation.TextMapPropagator) {
+	if len(header) == 0 {
+		return
+	}
+	for key := range header {
+		if tracing.IsPropagationField(key, propagator) {
+			// Delete the map entry directly. http.Header.Del canonicalizes its
+			// argument and would miss non-canonical keys inserted by callers.
+			delete(header, key)
+		}
+	}
+}
+
+// defaultTransportWithFitProxy preserves Go's tuned connection-pool, HTTP/2,
+// dial, TLS, and timeout defaults while replacing only the proxy callback on a
+// clone. A custom process-wide DefaultTransport is wrapped as-is because it may
+// not expose transport fields that can be cloned safely.
+func defaultTransportWithFitProxy() http.RoundTripper {
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		clone := base.Clone()
+		clone.Proxy = ProxyFromEnvWithForce
+		return clone
+	}
+	return http.DefaultTransport
+}
+
+// httpClientStatusIsError matches the OTel HTTP client convention used by the
+// legacy Node instrumentation: 1xx-3xx leave span status unset; 4xx, 5xx, and
+// invalid response codes are errors.
+func httpClientStatusIsError(status int) bool {
+	return status < 100 || status >= 400
 }
 
 // newRequestID returns a random 128-bit hex id (matches fit/axios's per-request

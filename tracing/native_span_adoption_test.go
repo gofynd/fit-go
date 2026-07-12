@@ -16,9 +16,12 @@ package tracing_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/gofynd/fit-go/internal/tracingtest"
@@ -127,6 +130,51 @@ func TestSpanFromContext_StillPrefersOwnSpan(t *testing.T) {
 		t.Fatal("SpanFromContext must return the StartSpan-created span, not an adopted wrapper")
 	}
 	own.End() // a non-adopted span still ends normally
+}
+
+func TestNativeChildWinsStaleFITParent(t *testing.T) {
+	tracer := tracingtest.EnabledGlobal(t)
+	parentCtx, parent := tracer.StartSpan(context.Background(), "fit-parent", tracing.SpanKindInternal)
+	defer parent.End()
+
+	childCtx, child := otel.Tracer("native-child").Start(parentCtx, "native-child")
+	defer child.End()
+	childSC := child.SpanContext()
+
+	got := tracing.SpanFromContext(childCtx)
+	if got == nil || got.SpanID() != childSC.SpanID().String() {
+		t.Fatalf("SpanFromContext selected %v, want native child span %s", got, childSC.SpanID())
+	}
+	if got == parent {
+		t.Fatal("SpanFromContext returned the stale FIT parent instead of the active native child")
+	}
+	if gotTrace := tracing.TraceIDFromContext(childCtx); gotTrace != childSC.TraceID().String() {
+		t.Fatalf("TraceIDFromContext = %q, want child trace %q", gotTrace, childSC.TraceID())
+	}
+	if gotSpan := tracing.SpanIDFromContext(childCtx); gotSpan != childSC.SpanID().String() {
+		t.Fatalf("SpanIDFromContext = %q, want active child %q", gotSpan, childSC.SpanID())
+	}
+
+	tracing.SetSpanAttributes(childCtx, tracing.SpanAttributes{"selected": "native-child"})
+	rw, ok := child.(sdktrace.ReadWriteSpan)
+	if !ok {
+		t.Fatal("native SDK span does not expose ReadWriteSpan for assertion")
+	}
+	found := false
+	for _, attr := range rw.Attributes() {
+		if string(attr.Key) == "selected" && attr.Value.AsString() == "native-child" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("SetSpanAttributes did not annotate the active native child")
+	}
+
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(childCtx, carrier)
+	if traceparent := carrier.Get("traceparent"); !strings.Contains(traceparent, childSC.SpanID().String()) {
+		t.Fatalf("injected traceparent = %q, want active child span ID %s", traceparent, childSC.SpanID())
+	}
 }
 
 // TestSpanFromContext_NoSpan: a bare context still yields nil (no false positives).

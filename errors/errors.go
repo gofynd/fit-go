@@ -97,6 +97,28 @@ func (r *ErrorRegistry) Init(
 	return nil
 }
 
+// InitServiceCode configures only the service error-code prefix while retaining
+// any message catalog already installed on the registry. fit.Init uses this
+// path because its environment contract supplies SERVICE_NAME_CODE but not a
+// service-specific error-code map.
+func (r *ErrorRegistry) InitServiceCode(serviceNameCode string) error {
+	return r.Init(serviceNameCode, map[string]int{"UNCAUGHT_EXCEPTION": 1}, nil, nil)
+}
+
+// Reset clears lifecycle-owned service/message state and restores the built-in
+// message-code mapping. It allows a Fit singleton to shut down and initialize a
+// different service identity without retaining the previous process lifecycle.
+func (r *ErrorRegistry) Reset() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.serviceNameCode = ""
+	r.messages = nil
+	r.messageCodes = copyIntMap(builtinMessageCodes)
+	r.mu.Unlock()
+}
+
 // FitError is a structured error carrying a machine-readable code, an HTTP
 // status code, optional metadata, and support for multilingual messages.
 type FitError struct {

@@ -4,6 +4,7 @@
 package tracing
 
 import (
+	"math"
 	"strings"
 	"testing"
 )
@@ -18,13 +19,16 @@ func TestBuildSampler(t *testing.T) {
 		wantHas    []string
 		wantHasNot []string
 	}{
-		{"empty -> parentbased ratio", "", 0.25, []string{"ParentBased", "TraceIDRatioBased"}, nil},
+		{"empty -> OTel parentbased always-on default", "", 0.25, []string{"ParentBased", "AlwaysOnSampler"}, []string{"TraceIDRatioBased"}},
 		{"platform config (parentbased_traceidratio 0.25)", "parentbased_traceidratio", 0.25, []string{"ParentBased", "TraceIDRatioBased"}, nil},
 		{"traceidratio is NOT parent-based", "traceidratio", 0.5, []string{"TraceIDRatioBased"}, []string{"ParentBased"}},
 		{"always_on", "always_on", 0.25, []string{"AlwaysOnSampler"}, nil},
 		{"always_off", "always_off", 1.0, []string{"AlwaysOffSampler"}, nil},
 		{"ratio>=1 collapses to always (old default preserved)", "parentbased_traceidratio", 1.0, []string{"AlwaysOnSampler"}, []string{"TraceIDRatioBased"}},
-		{"unknown falls back to parentbased ratio", "bogus", 0.25, []string{"ParentBased", "TraceIDRatioBased"}, nil},
+		{"unknown falls back to OTel default", "bogus", 0.25, []string{"ParentBased", "AlwaysOnSampler"}, []string{"TraceIDRatioBased"}},
+		{"negative ratio falls back to one", "traceidratio", -0.1, []string{"AlwaysOnSampler"}, []string{"AlwaysOffSampler"}},
+		{"ratio above one falls back to one", "traceidratio", 1.1, []string{"AlwaysOnSampler"}, []string{"TraceIDRatioBased"}},
+		{"NaN ratio falls back to one", "traceidratio", math.NaN(), []string{"AlwaysOnSampler"}, []string{"TraceIDRatioBased"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -58,5 +62,16 @@ func TestSampleRateFromEnv_DefaultsWhenUnset(t *testing.T) {
 	t.Setenv("OTEL_TRACES_SAMPLER_ARG", "")
 	if got := sampleRateFromEnv(); got != 1.0 {
 		t.Fatalf("sampleRateFromEnv (unset) = %v, want 1.0", got)
+	}
+}
+
+func TestSampleRateFromEnv_InvalidFallsBackToOne(t *testing.T) {
+	for _, value := range []string{"not-a-number", "-0.1", "1.1", "NaN", "+Inf"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("OTEL_TRACES_SAMPLER_ARG", value)
+			if got := sampleRateFromEnv(); got != 1.0 {
+				t.Fatalf("sampleRateFromEnv(%q) = %v, want OTel fallback 1.0", value, got)
+			}
+		})
 	}
 }

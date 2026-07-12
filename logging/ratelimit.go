@@ -24,11 +24,10 @@
 // │     opentelemetryLogFormat — rateLimitingFormat is exported by traceclue but │
 // │     never referenced. So no Node service rate-limits its logs.               │
 // │                                                                              │
-// │   * pyfit DEFINES it but never ATTACHES it. In pyfit's logging dictConfig    │
-// │     the filter appears under "filters", but neither the handler nor the      │
-// │     logger lists it in their own "filters" key — and in Python's dictConfig  │
-// │     a filter is INERT unless referenced. (pyfit attaches UvicornAccessFilter │
-// │     correctly at server.py:172-174, so the omission is a real bug there.)    │
+// │   * deployed pyfit synchronous logging DEFINES it but does not ATTACH it.     │
+// │     Current pyfit 2.x async logging does attach a DEBUG limiter (default      │
+// │     1000/sec, burst 1000, cap 6000), but none of the four Node migrations     │
+// │     audited for Metroplex uses pyfit.                                         │
 // │                                                                              │
 // │ Enabling this by default would therefore DROP log lines that every legacy    │
 // │ service emits — a silent, hard-to-debug regression, and exactly the kind of  │
@@ -194,18 +193,17 @@ func (h *rateLimitHandler) WithGroup(name string) slog.Handler {
 	return &rateLimitHandler{next: h.next.WithGroup(name), buckets: h.buckets, def: h.def, onDec: h.onDec}
 }
 
-// PyfitDebugRateLimit returns the configuration pyfit *intended* for its logging
-// filter (DEBUG: 100 tokens/sec, burst 100, cap 6000; every other level unlimited).
+// PyfitDebugRateLimit returns current pyfit 2.x async logging defaults
+// (DEBUG: 1000 tokens/sec, burst 1000, cap 6000; every other level unlimited).
 //
 // Provided for services that deliberately want that throttling. It is NOT applied
-// anywhere by default — see the file header for why: the filter is inert in pyfit, so
-// no legacy service actually rate-limits its logs.
+// anywhere by default: fit.js and deployed synchronous pyfit do not attach it.
 func PyfitDebugRateLimit() RateLimitConfig {
 	return RateLimitConfig{
 		Levels: map[slog.Level]TokenBucketConfig{
 			slog.LevelDebug: {
-				TokensPerSec:     100,
-				StartingTokens:   100,
+				TokensPerSec:     1000,
+				StartingTokens:   1000,
 				MaxTokensBalance: 6000,
 			},
 		},

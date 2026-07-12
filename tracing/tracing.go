@@ -21,9 +21,15 @@
 // - HTTP instrumentation hooks (ignoring health check paths)
 // - New Relic compatibility layer
 //
+// gRPC instrumentation is explicit through fit-go's grpc helpers. Deployed pyfit
+// installed grpcio as an optional runtime but did not install an OTel gRPC
+// interceptor, so automatic pyfit gRPC tracing is not a legacy capability.
+//
 // Environment variables:
 // - TRACING_ENABLED: Enable OpenTelemetry tracing (default: false)
-// - OTEL_EXPORTER_OTLP_ENDPOINT: OTLP collector endpoint
+// - OTEL_EXPORTER_OTLP_TRACES_ENDPOINT / OTEL_EXPORTER_OTLP_ENDPOINT: collector endpoint
+// - OTEL_EXPORTER_OTLP_TRACES_PROTOCOL / OTEL_EXPORTER_OTLP_PROTOCOL: grpc or http/protobuf
+// - OTEL_PROPAGATORS: tracecontext, baggage, b3, b3multi, and/or jaeger
 // - OTEL_SERVICE_NAME: Service name for spans
 // - OTEL_RESOURCE_ATTRIBUTES: Additional resource attributes
 // - NEWRELIC_LICENSE_KEY: New Relic license key (enables NR integration)
@@ -35,8 +41,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"maps"
+	"math"
+	"net/url"
 	"os"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -44,8 +54,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/contrib/propagators/b3"
+	"go.opentelemetry.io/contrib/propagators/jaeger"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
@@ -54,21 +67,28 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/gofynd/fit-go/logging"
+	"github.com/gofynd/fit-go/redact"
 )
 
 // Options configures the tracer.
 type Options struct {
-	ServiceName    string
-	Env            string
-	Endpoint       string            // OTLP endpoint (URL: scheme+host+port)
-	Protocol       string            // OTLP protocol: "grpc" | "http/protobuf" (default http/protobuf)
-	Sampler        string            // OTEL_TRACES_SAMPLER (e.g. "parentbased_traceidratio"); empty = parentbased over SampleRate
-	SampleRate     float64           // Sampling ratio (0.0-1.0); from OTEL_TRACES_SAMPLER_ARG
-	BatchTimeout   time.Duration     // Span batch export timeout
-	MaxExportBatch int               // Maximum spans per export batch
-	Attributes     map[string]string // Additional resource attributes
+	ServiceName string // Explicit resource service.name; higher precedence than every env/resource value
+	// FallbackServiceName is used only when neither ServiceName,
+	// OTEL_SERVICE_NAME, nor resource attributes provide service.name. It maps
+	// FIT's legacy SERVICE_NAME without overriding the OTel resource contract.
+	FallbackServiceName string
+	Env                 string
+	Endpoint            string            // Explicit OTLP URL; overrides traces-specific/common env endpoints
+	Protocol            string            // OTLP protocol: "grpc" | "http/protobuf" (default: http/protobuf)
+	Propagators         string            // OTEL_PROPAGATORS: tracecontext,baggage,b3,b3multi,jaeger
+	Sampler             string            // OTEL_TRACES_SAMPLER; empty/unknown = parentbased_always_on
+	SampleRate          float64           // Sampling ratio (0.0-1.0); from OTEL_TRACES_SAMPLER_ARG
+	BatchTimeout        time.Duration     // Span batch export timeout
+	MaxExportBatch      int               // Maximum spans per export batch
+	Attributes          map[string]string // Additional resource attributes
 	// Enabled, when non-nil, overrides the TRACING_ENABLED env var. Set it from a
 	// merged config so tracing enabled via a config FILE (which doesn't populate
 	// the process env) isn't silently a no-op. nil = use the env var.
@@ -83,27 +103,38 @@ type Options struct {
 // DefaultOptions returns default tracer options from environment.
 func DefaultOptions() Options {
 	return Options{
-		ServiceName:    envString("OTEL_SERVICE_NAME", envString("SERVICE_NAME", "unknown")),
-		Env:            envString("GO_ENV", envString("NODE_ENV", "development")),
-		Endpoint:       envString("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
-		Protocol:       envString("OTEL_EXPORTER_OTLP_PROTOCOL", ""),
-		Sampler:        envString("OTEL_TRACES_SAMPLER", ""),
-		SampleRate:     sampleRateFromEnv(),
-		BatchTimeout:   5 * time.Second,
-		MaxExportBatch: 512,
+		ServiceName:         envString("OTEL_SERVICE_NAME", ""),
+		FallbackServiceName: envString("SERVICE_NAME", ""),
+		Env:                 envString("GO_ENV", envString("NODE_ENV", "development")),
+		Endpoint:            envString("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", envString("OTEL_EXPORTER_OTLP_ENDPOINT", "")),
+		Protocol:            envString("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", envString("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")),
+		Propagators:         envString("OTEL_PROPAGATORS", ""),
+		Sampler:             envString("OTEL_TRACES_SAMPLER", ""),
+		SampleRate:          sampleRateFromEnv(),
+		BatchTimeout:        5 * time.Second,
+		MaxExportBatch:      512,
 	}
 }
 
 // sampleRateFromEnv reads the OTel-standard OTEL_TRACES_SAMPLER_ARG (the ratio for
-// the *ratio samplers) and defaults to 1.0 (sample all) when unset/unparseable —
-// matching the SDK's default and the prior fit-go behaviour.
+// the *ratio samplers) and defaults to 1.0 when unset, malformed, or outside
+// [0,1]. The argument is ignored unless a ratio sampler is selected.
 func sampleRateFromEnv() float64 {
 	if v := os.Getenv("OTEL_TRACES_SAMPLER_ARG"); v != "" {
 		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
-			return f
+			return validSampleRate(f)
 		}
 	}
 	return 1.0
+}
+
+// validSampleRate applies the OTel fallback for malformed ratio arguments.
+// Invalid values do not silently become NeverSample or AlwaysSample.
+func validSampleRate(rate float64) float64 {
+	if math.IsNaN(rate) || math.IsInf(rate, 0) || rate < 0 || rate > 1 {
+		return 1.0
+	}
+	return rate
 }
 
 // SpanKind represents the role of the span.
@@ -182,6 +213,7 @@ func (s *Span) SetAttributes(attrs map[string]any) {
 
 // SetStatus sets the span status.
 func (s *Span) SetStatus(code SpanStatusCode, message string) {
+	message = redact.Text(message)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.status = code
@@ -243,22 +275,81 @@ func (s *Span) Status() SpanStatusCode {
 
 // Tracer wraps OpenTelemetry tracing functionality.
 type Tracer struct {
-	serviceName string
-	env         string
-	enabled     bool
-	options     Options
-	mu          sync.RWMutex
-	provider    *sdktrace.TracerProvider
-	otelTracer  trace.Tracer
+	serviceName        string
+	env                string
+	enabled            bool
+	options            Options
+	mu                 sync.RWMutex
+	provider           *sdktrace.TracerProvider
+	otelTracer         trace.Tracer
+	propagator         propagation.TextMapPropagator
+	previousTP         trace.TracerProvider
+	previousPropagator propagation.TextMapPropagator
+	previousOwner      *Tracer
+	otelOwner          *otelGlobalOwner
+	shutdownOnce       sync.Once
+	shutdownErr        error
+	closed             atomic.Bool
 }
 
 var (
-	globalTracer     atomic.Pointer[Tracer]
-	globalTracerOnce sync.Once
+	globalTracer       atomic.Pointer[Tracer]
+	globalTracerMu     sync.Mutex
+	globalInitErr      error
+	implicitTraceMu    sync.Mutex
+	globalTracerOwners = struct {
+		current *globalTracerOwner
+		active  map[*globalTracerOwner]struct{}
+	}{active: make(map[*globalTracerOwner]struct{})}
+	otelOwners = struct {
+		sync.Mutex
+		current *otelGlobalOwner
+		active  map[*otelGlobalOwner]struct{}
+	}{active: make(map[*otelGlobalOwner]struct{})}
 )
 
-// New creates a new tracer. When tracing is enabled, this initializes the
-// real OpenTelemetry SDK with an OTLP HTTP exporter.
+type globalTracerOwner struct {
+	tracer      *Tracer
+	initErr     error
+	previous    *globalTracerOwner
+	baseline    *Tracer
+	baselineErr error
+	active      bool
+}
+
+type otelGlobalOwner struct {
+	tracer             *Tracer
+	provider           trace.TracerProvider
+	propagator         *ownedTextMapPropagator
+	previous           *otelGlobalOwner
+	baselineTP         trace.TracerProvider
+	baselinePropagator propagation.TextMapPropagator
+	active             bool
+	primary            bool
+}
+
+// ownedTextMapPropagator gives each installation a comparable identity while
+// preserving the configured propagator's behavior. TextMapPropagator
+// implementations are not required to be comparable, so comparing the raw
+// interface during restoration can panic.
+type ownedTextMapPropagator struct {
+	delegate propagation.TextMapPropagator
+}
+
+func (p *ownedTextMapPropagator) Inject(ctx context.Context, carrier propagation.TextMapCarrier) {
+	p.delegate.Inject(ctx, carrier)
+}
+
+func (p *ownedTextMapPropagator) Extract(ctx context.Context, carrier propagation.TextMapCarrier) context.Context {
+	return p.delegate.Extract(ctx, carrier)
+}
+
+func (p *ownedTextMapPropagator) Fields() []string {
+	return p.delegate.Fields()
+}
+
+// New creates a new tracer. When tracing is enabled, this initializes the real
+// OpenTelemetry SDK with the configured OTLP transport.
 func New(ctx context.Context, opts Options) (*Tracer, error) {
 	t := &Tracer{
 		serviceName: opts.ServiceName,
@@ -267,13 +358,9 @@ func New(ctx context.Context, opts Options) (*Tracer, error) {
 		options:     opts,
 	}
 
-	// Keep the logger's implicit trace-in-logs fallback in lock-step with the
-	// tracer's enabled state, so the goroutine-local lookup (runtime.Stack) only
-	// runs when tracing is actually on.
-	logging.SetImplicitTraceEnabled(t.enabled)
-
 	if t.enabled {
 		if err := t.initOTel(ctx, opts); err != nil {
+			t.enabled = false
 			return t, fmt.Errorf("fit/tracing: failed to initialize OTel: %w", err)
 		}
 	}
@@ -304,40 +391,111 @@ func sdkDisabled() bool {
 	return strings.EqualFold(strings.TrimSpace(os.Getenv("OTEL_SDK_DISABLED")), "true")
 }
 
-// newOTLPExporter builds the OTLP span exporter, selecting gRPC vs HTTP by
-// OTEL_EXPORTER_OTLP_PROTOCOL ("grpc" | "http/protobuf", the OTel-spec values;
-// default http/protobuf). The endpoint may be a full URL with scheme+host+port —
-// WithEndpointURL parses it correctly, whereas WithEndpoint expects bare host:port
-// and mangles a scheme into "http://http://...".
-func newOTLPExporter(ctx context.Context, opts Options) (sdktrace.SpanExporter, error) {
-	protocol := opts.Protocol
-	if protocol == "" {
-		protocol = os.Getenv("OTEL_EXPORTER_OTLP_PROTOCOL")
+type otlpEndpointSource uint8
+
+const (
+	otlpEndpointDefault otlpEndpointSource = iota
+	otlpEndpointCommon
+	otlpEndpointTraces
+	otlpEndpointExplicit
+)
+
+// resolveOTLPEndpoint preserves signal-specific > common precedence. An Endpoint
+// supplied directly in Options is explicit unless it is the value populated by
+// DefaultOptions from the current environment.
+func resolveOTLPEndpoint(opts Options) (string, otlpEndpointSource) {
+	tracesEndpoint := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"))
+	commonEndpoint := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
+	endpoint := strings.TrimSpace(opts.Endpoint)
+
+	if endpoint != "" {
+		switch {
+		case tracesEndpoint != "" && endpoint == tracesEndpoint:
+			return endpoint, otlpEndpointTraces
+		case tracesEndpoint == "" && commonEndpoint != "" && endpoint == commonEndpoint:
+			return endpoint, otlpEndpointCommon
+		default:
+			return endpoint, otlpEndpointExplicit
+		}
 	}
-	if strings.EqualFold(protocol, "grpc") {
+	if tracesEndpoint != "" {
+		return tracesEndpoint, otlpEndpointTraces
+	}
+	if commonEndpoint != "" {
+		return commonEndpoint, otlpEndpointCommon
+	}
+	return "", otlpEndpointDefault
+}
+
+// resolveOTLPProtocol applies the OTel/NodeSDK precedence and default used by
+// the deployed TraceClue generation. Go has no OTLP http/json trace exporter;
+// unsupported values therefore fall back to the standard http/protobuf default.
+func resolveOTLPProtocol(opts Options) string {
+	protocol := strings.ToLower(strings.TrimSpace(opts.Protocol))
+	if protocol == "" {
+		protocol = strings.ToLower(strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")))
+	}
+	if protocol == "" {
+		protocol = strings.ToLower(strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_PROTOCOL")))
+	}
+	switch protocol {
+	case "grpc":
+		return "grpc"
+	case "http/protobuf", "":
+		return "http/protobuf"
+	default:
+		return "http/protobuf"
+	}
+}
+
+func httpTraceEndpoint(endpoint string, source otlpEndpointSource) string {
+	if endpoint == "" || source != otlpEndpointCommon {
+		return endpoint
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return endpoint
+	}
+	u.Path = strings.TrimRight(u.Path, "/") + "/v1/traces"
+	return u.String()
+}
+
+// newOTLPExporter builds the OTLP span exporter. Explicit Options override the
+// environment; otherwise traces-specific environment variables override common
+// OTLP variables. The OTel default protocol is http/protobuf.
+func newOTLPExporter(ctx context.Context, opts Options) (sdktrace.SpanExporter, error) {
+	endpoint, source := resolveOTLPEndpoint(opts)
+	if endpoint != "" {
+		u, err := url.Parse(endpoint)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			if err == nil {
+				err = fmt.Errorf("endpoint must include scheme and host")
+			}
+			return nil, fmt.Errorf("invalid OTLP endpoint %q: %w", endpoint, err)
+		}
+	}
+	if resolveOTLPProtocol(opts) == "grpc" {
 		var grpcOpts []otlptracegrpc.Option
-		if opts.Endpoint != "" {
-			grpcOpts = append(grpcOpts, otlptracegrpc.WithEndpointURL(opts.Endpoint))
+		if endpoint != "" {
+			grpcOpts = append(grpcOpts, otlptracegrpc.WithEndpointURL(endpoint))
 		}
 		return otlptracegrpc.New(ctx, grpcOpts...)
 	}
 	var httpOpts []otlptracehttp.Option
-	if opts.Endpoint != "" {
-		httpOpts = append(httpOpts, otlptracehttp.WithEndpointURL(opts.Endpoint))
+	if endpoint != "" {
+		httpOpts = append(httpOpts, otlptracehttp.WithEndpointURL(httpTraceEndpoint(endpoint, source)))
 	}
 	return otlptracehttp.New(ctx, httpOpts...)
 }
 
 // buildSampler resolves the OTel-standard OTEL_TRACES_SAMPLER value (opts.Sampler)
-// into a sampler, using opts.SampleRate as the ratio for the *ratio variants. When
-// unset it defaults to parentbased-over-ratio (the platform default), so an
-// upstream sampling decision on the W3C traceparent is honoured — a trace sampled
-// OUT upstream isn't re-recorded here, and the configured ratio is respected for
-// locally-rooted traces (previously ignored, which sampled everything).
+// into a sampler, using opts.SampleRate only for the *ratio variants. Unset or
+// unknown sampler names use the OTel SDK default, parentbased_always_on.
 // It is then wrapped by the traceclue ServiceEntryPointSampler when
 // TRACECLUE_ALWAYS_SAMPLE_SERVICE_ENTRY_POINTS=true (the platform default for the
-// Node/Python fleet), so this service's entry-point spans are always sampled while
-// the interior of a trace still honours the configured ratio.
+// Node/Python fleet). Faithful to legacy, a force-sampled entry span also causes
+// ParentBased descendants to remain sampled; this wrapper does not independently
+// thin interior spans.
 func buildSampler(opts Options) sdktrace.Sampler {
 	return wrapWithEntryPointSampler(buildBaseSampler(opts))
 }
@@ -356,17 +514,19 @@ func buildBaseSampler(opts Options) sdktrace.Sampler {
 		return sdktrace.ParentBased(sdktrace.AlwaysSample())
 	case "parentbased_always_off":
 		return sdktrace.ParentBased(sdktrace.NeverSample())
-	case "parentbased_traceidratio", "":
-		return sdktrace.ParentBased(ratioSampler(opts.SampleRate))
+	case "parentbased_traceidratio":
+		return sdktrace.ParentBased(ratioSampler(validSampleRate(opts.SampleRate)))
+	case "":
+		return sdktrace.ParentBased(sdktrace.AlwaysSample())
 	default:
-		// Unknown value — fall back to the safe default rather than failing init.
-		return sdktrace.ParentBased(ratioSampler(opts.SampleRate))
+		return sdktrace.ParentBased(sdktrace.AlwaysSample())
 	}
 }
 
 // ratioSampler maps a ratio to a sampler, collapsing the >=1 / <=0 edges to
 // Always/Never so TraceIDRatioBased only sees a genuine fraction.
 func ratioSampler(ratio float64) sdktrace.Sampler {
+	ratio = validSampleRate(ratio)
 	if ratio >= 1.0 {
 		return sdktrace.AlwaysSample()
 	}
@@ -376,36 +536,264 @@ func ratioSampler(ratio float64) sdktrace.Sampler {
 	return sdktrace.TraceIDRatioBased(ratio)
 }
 
-// initOTel sets up the real OTel TracerProvider with OTLP exporter.
-func (t *Tracer) initOTel(ctx context.Context, opts Options) error {
-	// Build resource attributes.
-	attrs := []attribute.KeyValue{
-		semconv.ServiceName(opts.ServiceName),
-		attribute.String("deployment.environment", opts.Env),
-	}
-	for k, v := range opts.Attributes {
-		attrs = append(attrs, attribute.String(k, v))
+// buildPropagator mirrors NodeSDK 0.205.0 used by TraceClue 3.1.3. TraceContext
+// and Baggage are the default pair when the setting is empty. Configured names
+// are deduplicated; unknown names are warned and ignored. If no configured name
+// is valid, a no-op propagator is returned rather than falling back to defaults.
+func buildPropagator(value string) (propagation.TextMapPropagator, error) {
+	if strings.TrimSpace(value) == "" {
+		value = "tracecontext,baggage"
 	}
 
-	// service.instance.id = hostname (the pod name in k8s). traceclue sets this from
-	// os.hostname(); without it every replica of a service is indistinguishable in
-	// traces, so you cannot tell which pod served a request.
-	if host, hostErr := os.Hostname(); hostErr == nil && host != "" {
-		attrs = append(attrs, semconv.ServiceInstanceID(host))
+	names := make([]string, 0, 2)
+	for _, raw := range strings.Split(value, ",") {
+		if name := strings.ToLower(strings.TrimSpace(raw)); name != "" {
+			names = append(names, name)
+		}
+	}
+	seen := make(map[string]struct{})
+	propagators := make([]propagation.TextMapPropagator, 0, 2)
+	for _, name := range names {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		switch name {
+		case "tracecontext":
+			propagators = append(propagators, propagation.TraceContext{})
+		case "baggage":
+			propagators = append(propagators, propagation.Baggage{})
+		case "b3":
+			propagators = append(propagators, b3.New())
+		case "b3multi":
+			propagators = append(propagators, b3.New(b3.WithInjectEncoding(b3.B3MultipleHeader)))
+		case "jaeger":
+			// The Go Jaeger propagator handles only uber-trace-id. The installed
+			// Node propagator also maps OTel baggage to dynamic uberctx-* headers,
+			// so compose the missing baggage half explicitly.
+			propagators = append(propagators, jaeger.Jaeger{}, jaegerBaggagePropagator{})
+		default:
+			slog.Warn("fit/tracing: unavailable configured propagator ignored")
+		}
+	}
+	if len(propagators) == 0 {
+		return propagation.NewCompositeTextMapPropagator(), nil
+	}
+	return propagation.NewCompositeTextMapPropagator(propagators...), nil
+}
+
+// jaegerBaggagePropagator reproduces the dynamic uberctx-* baggage behavior of
+// @opentelemetry/propagator-jaeger used by the legacy Node services.
+type jaegerBaggagePropagator struct{}
+
+func (jaegerBaggagePropagator) Inject(ctx context.Context, carrier propagation.TextMapCarrier) {
+	for _, member := range baggage.FromContext(ctx).Members() {
+		carrier.Set("uberctx-"+member.Key(), encodeURIComponent(member.Value()))
+	}
+}
+
+func (jaegerBaggagePropagator) Extract(ctx context.Context, carrier propagation.TextMapCarrier) context.Context {
+	current := baggage.FromContext(ctx)
+	changed := false
+	for _, key := range carrier.Keys() {
+		if !strings.HasPrefix(strings.ToLower(key), "uberctx-") || len(key) <= len("uberctx-") {
+			continue
+		}
+		value, err := url.PathUnescape(carrier.Get(key))
+		if err != nil {
+			continue
+		}
+		member, err := baggage.NewMemberRaw(key[len("uberctx-"):], value)
+		if err != nil {
+			continue
+		}
+		current, err = current.SetMember(member)
+		if err == nil {
+			changed = true
+		}
+	}
+	if !changed {
+		return ctx
+	}
+	return baggage.ContextWithBaggage(ctx, current)
+}
+
+// Dynamic uberctx-* fields cannot be enumerated by TextMapPropagator.Fields.
+func (jaegerBaggagePropagator) Fields() []string { return nil }
+
+func encodeURIComponent(value string) string {
+	const hex = "0123456789ABCDEF"
+	var encoded strings.Builder
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			strings.ContainsRune("-_.!~*'()", rune(c)) {
+			encoded.WriteByte(c)
+			continue
+		}
+		encoded.WriteByte('%')
+		encoded.WriteByte(hex[c>>4])
+		encoded.WriteByte(hex[c&0x0f])
+	}
+	return encoded.String()
+}
+
+// PropagationFields returns every standard propagation field fit-go supports,
+// plus fields owned by the active propagator. Outbound transports must remove
+// this complete set before injection. Otherwise changing OTEL_PROPAGATORS at a
+// service boundary can forward a stale B3 or Jaeger parent alongside the newly
+// injected W3C context, making downstream extraction order-dependent.
+func PropagationFields(propagator propagation.TextMapPropagator) []string {
+	fields := []string{
+		"traceparent", "tracestate", "baggage",
+		"b3",
+		"x-b3-traceid", "x-b3-spanid", "x-b3-sampled", "x-b3-flags", "x-b3-parentspanid",
+		"uber-trace-id",
+	}
+	if propagator != nil {
+		fields = append(fields, propagator.Fields()...)
+	}
+	seen := make(map[string]struct{}, len(fields))
+	unique := fields[:0]
+	for _, field := range fields {
+		canonical := strings.ToLower(strings.TrimSpace(field))
+		if canonical == "" {
+			continue
+		}
+		if _, ok := seen[canonical]; ok {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		unique = append(unique, canonical)
+	}
+	return unique
+}
+
+// IsPropagationField recognizes both enumerable propagation headers and the
+// Jaeger propagator's dynamic uberctx-* baggage family.
+func IsPropagationField(name string, propagator propagation.TextMapPropagator) bool {
+	canonical := strings.ToLower(strings.TrimSpace(name))
+	if canonical == "" {
+		return false
+	}
+	if strings.HasPrefix(canonical, "uberctx-") {
+		return true
+	}
+	for _, field := range PropagationFields(propagator) {
+		if canonical == field {
+			return true
+		}
+	}
+	return false
+}
+
+// buildResource mirrors the default NodeSDK detector set used by TraceClue:
+// telemetry SDK, process, host, then environment. Explicit fit-go attributes
+// override detector values, and ServiceName/Env are authoritative last.
+//
+// Process command arguments and owner are deliberately excluded even though the
+// legacy Node detector emitted them: command lines can contain credentials and the
+// Commerce telemetry contract forbids secret/PII export.
+//
+// Resource detectors can return useful partial resources together with errors.
+// Those errors are reported to the OTel error handler but do not disable tracing.
+func buildResource(ctx context.Context, opts Options) *resource.Resource {
+	serviceName := strings.TrimSpace(opts.ServiceName)
+	if serviceName == "" {
+		serviceName = strings.TrimSpace(os.Getenv("OTEL_SERVICE_NAME"))
+	}
+	fallbackServiceName := strings.TrimSpace(opts.FallbackServiceName)
+	if fallbackServiceName == "" {
+		fallbackServiceName = strings.TrimSpace(os.Getenv("SERVICE_NAME"))
+	}
+	environment := opts.Env
+	if environment == "" {
+		environment = envString("GO_ENV", envString("NODE_ENV", "development"))
+	}
+	defaults := make([]attribute.KeyValue, 0, 1)
+	if host, err := os.Hostname(); err == nil && host != "" {
+		// Legacy TraceClue identifies a replica by hostname. Environment and explicit
+		// attributes below may intentionally override this default.
+		defaults = append(defaults, semconv.ServiceInstanceID(host))
+	}
+
+	explicit := make([]attribute.KeyValue, 0, len(opts.Attributes))
+	for k, v := range opts.Attributes {
+		explicit = append(explicit, attribute.String(k, v))
+	}
+	authoritative := []attribute.KeyValue{attribute.String("deployment.environment", environment)}
+	if serviceName != "" {
+		authoritative = append(authoritative, semconv.ServiceName(serviceName))
 	}
 
 	res, err := resource.New(ctx,
-		// WithFromEnv parses the OTel-standard OTEL_RESOURCE_ATTRIBUTES (k=v,k=v) and
-		// OTEL_SERVICE_NAME. fit-go previously ignored both, so platform-injected
-		// resource attributes were silently dropped from Go spans while the Node/Python
-		// fleet reported them.
-		resource.WithFromEnv(),
-		resource.WithAttributes(attrs...),
+		resource.WithTelemetrySDK(),
+		resource.WithProcessPID(),
+		resource.WithProcessExecutableName(),
+		resource.WithProcessExecutablePath(),
+		resource.WithProcessRuntimeName(),
+		resource.WithProcessRuntimeVersion(),
 		resource.WithProcessRuntimeDescription(),
+		resource.WithHost(),
+		resource.WithAttributes(defaults...),
+		resource.WithFromEnv(),
+		resource.WithAttributes(explicit...),
+		resource.WithAttributes(authoritative...),
 	)
 	if err != nil {
-		return fmt.Errorf("creating resource: %w", err)
+		// Detector errors can include raw OTEL_RESOURCE_ATTRIBUTES input. Do not
+		// echo it because operators may have accidentally placed sensitive values
+		// there; valid partial attributes are still retained below.
+		slog.Warn("fit/tracing: resource detection incomplete; valid attributes retained")
 	}
+	if res == nil {
+		return resource.Empty()
+	}
+	if value, ok := res.Set().Value(semconv.ServiceNameKey); !ok || strings.TrimSpace(value.AsString()) == "" {
+		if fallbackServiceName == "" {
+			fallbackServiceName = "unknown_service"
+		}
+		fallback := resource.NewSchemaless(semconv.ServiceName(fallbackServiceName))
+		merged, mergeErr := resource.Merge(res, fallback)
+		if mergeErr == nil && merged != nil {
+			res = merged
+		}
+	}
+	return res
+}
+
+func isOTelDefaultDelegate(value interface{}) bool {
+	typ := reflect.TypeOf(value)
+	if typ == nil {
+		return false
+	}
+	if typ.Kind() == reflect.Ptr {
+		typ = typ.Elem()
+	}
+	return typ.PkgPath() == "go.opentelemetry.io/otel/internal/global"
+}
+
+func snapshotTracerProvider(provider trace.TracerProvider) trace.TracerProvider {
+	if provider == nil || isOTelDefaultDelegate(provider) {
+		return tracenoop.NewTracerProvider()
+	}
+	return provider
+}
+
+func snapshotPropagator(propagator propagation.TextMapPropagator) propagation.TextMapPropagator {
+	if propagator == nil || isOTelDefaultDelegate(propagator) {
+		return propagation.NewCompositeTextMapPropagator()
+	}
+	return propagator
+}
+
+// initOTel sets up the real OTel TracerProvider with OTLP exporter.
+func (t *Tracer) initOTel(ctx context.Context, opts Options) error {
+	propagator, err := buildPropagator(opts.Propagators)
+	if err != nil {
+		return fmt.Errorf("creating propagator: %w", err)
+	}
+	res := buildResource(ctx, opts)
 
 	// Determine span exporter.
 	var exporter sdktrace.SpanExporter
@@ -444,25 +832,155 @@ func (t *Tracer) initOTel(ctx context.Context, opts Options) error {
 	)
 
 	t.provider = tp
-	t.otelTracer = tp.Tracer("fit.go/" + opts.ServiceName)
-	otel.SetTracerProvider(tp)
-
-	// Install the W3C trace-context propagator globally so the OTel
-	// instrumentation libraries (otelgin, otelhttp, redisotel, otelpgx) extract
-	// inbound traceparent and inject it on outbound calls. Only set here, on the
-	// enabled path — when tracing is off the global stays the no-op propagator,
-	// so those libraries are inert (zero overhead).
-	// W3C TraceContext (traceparent/tracestate) + Baggage. traceclue/OTel install both
-	// by default; fit-go previously registered TraceContext only, so W3C `baggage`
-	// propagated by an upstream Node/Python service was silently dropped at the Go
-	// boundary. Baggage.Inject writes nothing when the context carries no baggage, so
-	// this adds no header to existing traffic.
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
-		propagation.TraceContext{},
-		propagation.Baggage{},
-	))
+	if serviceName, ok := res.Set().Value(semconv.ServiceNameKey); ok {
+		t.serviceName = serviceName.AsString()
+	}
+	t.otelTracer = tp.Tracer("fit.go/" + t.serviceName)
+	t.propagator = propagator
+	t.otelOwner = installOTelGlobals(t, true)
+	refreshImplicitTraceEnabled()
 
 	return nil
+}
+
+// installOTelGlobals records an ownership node before replacing both OTel
+// globals. New and SetGlobal each receive a node so either lifecycle can end
+// out of order without reviving an already-shut-down owner.
+func installOTelGlobals(t *Tracer, primary bool) *otelGlobalOwner {
+	if t == nil || t.provider == nil || t.closed.Load() {
+		return nil
+	}
+
+	otelOwners.Lock()
+	defer otelOwners.Unlock()
+
+	currentTP := otel.GetTracerProvider()
+	currentPropagator := otel.GetTextMapPropagator()
+	previous := otelOwners.current
+	if previous == nil || currentTP != previous.provider || !ownedByPropagator(currentPropagator, previous.propagator) {
+		// One or both process globals were independently replaced. Start a new
+		// chain from the actual values instead of linking to a stale fit owner.
+		previous = nil
+	}
+	owner := &otelGlobalOwner{
+		tracer:             t,
+		provider:           t.provider,
+		propagator:         &ownedTextMapPropagator{delegate: t.propagator},
+		previous:           previous,
+		baselineTP:         snapshotTracerProvider(currentTP),
+		baselinePropagator: snapshotPropagator(currentPropagator),
+		active:             true,
+		primary:            primary,
+	}
+	if primary {
+		t.previousTP = owner.baselineTP
+		t.previousPropagator = owner.baselinePropagator
+		if previous != nil {
+			t.previousOwner = previous.tracer
+		}
+	}
+	otelOwners.current = owner
+	otelOwners.active[owner] = struct{}{}
+	otel.SetTracerProvider(t.provider)
+	// Install the configured propagator globally so native instrumentation uses
+	// the same TraceContext/Baggage/B3/Jaeger format as the legacy process.
+	otel.SetTextMapPropagator(owner.propagator)
+	return owner
+}
+
+func ownedByPropagator(current propagation.TextMapPropagator, owner *ownedTextMapPropagator) bool {
+	installed, ok := current.(*ownedTextMapPropagator)
+	return ok && installed == owner
+}
+
+func effectiveOTelPredecessor(owner *otelGlobalOwner) (*otelGlobalOwner, trace.TracerProvider, propagation.TextMapPropagator) {
+	previous := owner.previous
+	fallbackTP := owner.baselineTP
+	fallbackPropagator := owner.baselinePropagator
+	for previous != nil && !previous.active {
+		fallbackTP = previous.baselineTP
+		fallbackPropagator = previous.baselinePropagator
+		previous = previous.previous
+	}
+	return previous, fallbackTP, fallbackPropagator
+}
+
+func restoreOTelOwnerLocked(owner *otelGlobalOwner) {
+	if otelOwners.current != owner {
+		return
+	}
+	previous, fallbackTP, fallbackPropagator := effectiveOTelPredecessor(owner)
+	otelOwners.current = previous
+
+	// Provider and propagator ownership are independent. An external component
+	// may replace only one of them, and fit-go must preserve that replacement.
+	if otel.GetTracerProvider() == owner.provider {
+		if previous != nil {
+			otel.SetTracerProvider(previous.provider)
+		} else {
+			otel.SetTracerProvider(fallbackTP)
+		}
+	}
+	if ownedByPropagator(otel.GetTextMapPropagator(), owner.propagator) {
+		if previous != nil {
+			otel.SetTextMapPropagator(previous.propagator)
+		} else {
+			otel.SetTextMapPropagator(fallbackPropagator)
+		}
+	}
+}
+
+func refreshLegacyOTelSnapshotsLocked() {
+	for owner := range otelOwners.active {
+		if !owner.active || !owner.primary {
+			continue
+		}
+		previous, fallbackTP, fallbackPropagator := effectiveOTelPredecessor(owner)
+		owner.tracer.previousTP = fallbackTP
+		owner.tracer.previousPropagator = fallbackPropagator
+		owner.tracer.previousOwner = nil
+		if previous != nil {
+			owner.tracer.previousTP = previous.provider
+			owner.tracer.previousPropagator = previous.propagator
+			owner.tracer.previousOwner = previous.tracer
+		}
+	}
+}
+
+func deactivateOTelOwner(owner *otelGlobalOwner) {
+	if owner == nil {
+		return
+	}
+	otelOwners.Lock()
+	if !owner.active {
+		otelOwners.Unlock()
+		return
+	}
+	owner.active = false
+	delete(otelOwners.active, owner)
+	restoreOTelOwnerLocked(owner)
+	refreshLegacyOTelSnapshotsLocked()
+	otelOwners.Unlock()
+	refreshImplicitTraceEnabled()
+}
+
+func relinquishOTelGlobals(t *Tracer) {
+	if t == nil {
+		return
+	}
+	otelOwners.Lock()
+	for owner := range otelOwners.active {
+		if owner.tracer == t {
+			owner.active = false
+			delete(otelOwners.active, owner)
+		}
+	}
+	if otelOwners.current != nil && !otelOwners.current.active {
+		restoreOTelOwnerLocked(otelOwners.current)
+	}
+	refreshLegacyOTelSnapshotsLocked()
+	otelOwners.Unlock()
+	refreshImplicitTraceEnabled()
 }
 
 // Init initializes the global tracer with default options.
@@ -473,41 +991,183 @@ func Init() error {
 
 // InitWithOptions initializes the global tracer with custom options.
 func InitWithOptions(opts Options) (*Tracer, error) {
-	var initErr error
-	globalTracerOnce.Do(func() {
-		t, err := New(context.Background(), opts)
-		if err != nil {
-			initErr = err
-		}
-		globalTracer.Store(t)
-	})
-	return globalTracer.Load(), initErr
+	globalTracerMu.Lock()
+	defer globalTracerMu.Unlock()
+	if current := globalTracer.Load(); current != nil {
+		return current, globalInitErr
+	}
+
+	t, err := New(context.Background(), opts)
+	installGlobalTracerLocked(t, err)
+	refreshImplicitTraceEnabled()
+	return t, err
 }
 
 // Global returns the global tracer instance.
+//
+// This compatibility API cannot return initialization failures. Boot paths that
+// require strict telemetry startup should call Init or GlobalWithError.
 func Global() *Tracer {
-	if globalTracer.Load() == nil {
-		Init()
+	t, _ := GlobalWithError()
+	return t
+}
+
+// GlobalWithError returns the global tracer and the cached initialization error.
+// Unlike the old sync.Once path, repeated callers observe the same failure.
+func GlobalWithError() (*Tracer, error) {
+	globalTracerMu.Lock()
+	if current := globalTracer.Load(); current != nil {
+		err := globalInitErr
+		globalTracerMu.Unlock()
+		return current, err
 	}
-	return globalTracer.Load()
+	globalTracerMu.Unlock()
+	return InitWithOptions(DefaultOptions())
+}
+
+// InitError reports the last global initialization failure, if any.
+func InitError() error {
+	globalTracerMu.Lock()
+	defer globalTracerMu.Unlock()
+	return globalInitErr
 }
 
 // SetGlobal replaces the global tracer and returns a function that restores the
-// previous one. It bypasses the sync.Once init, so it is the way to install a
-// specific tracer (e.g. an enabled tracer built with New) regardless of whether
-// Init has already run — primarily for tests and advanced wiring. Restore with
-// the returned func (typically `defer SetGlobal(tr)()`).
+// previous one. It installs a specific tracer regardless of whether Init has
+// already run, primarily for tests and advanced wiring. Restore with the returned
+// function (typically `defer SetGlobal(tr)()`).
 func SetGlobal(t *Tracer) (restore func()) {
-	prev := globalTracer.Swap(t)
-	return func() { globalTracer.Store(prev) }
+	otelOwner := installOTelGlobals(t, false)
+	globalTracerMu.Lock()
+	if t != nil && t.closed.Load() {
+		globalTracerMu.Unlock()
+		deactivateOTelOwner(otelOwner)
+		return func() {}
+	}
+	owner := installGlobalTracerLocked(t, nil)
+	globalTracerMu.Unlock()
+	refreshImplicitTraceEnabled()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			deactivateGlobalTracerOwner(owner)
+			deactivateOTelOwner(otelOwner)
+		})
+	}
+}
+
+func installGlobalTracerLocked(t *Tracer, initErr error) *globalTracerOwner {
+	previous := globalTracerOwners.current
+	current := globalTracer.Load()
+	if previous == nil || current != previous.tracer {
+		// The package state was replaced outside the tracked owner chain (tests
+		// and advanced wiring can do this from within package tracing).
+		previous = nil
+	}
+	owner := &globalTracerOwner{
+		tracer:      t,
+		initErr:     initErr,
+		previous:    previous,
+		baseline:    current,
+		baselineErr: globalInitErr,
+		active:      true,
+	}
+	globalTracerOwners.current = owner
+	globalTracerOwners.active[owner] = struct{}{}
+	globalTracer.Store(t)
+	globalInitErr = initErr
+	return owner
+}
+
+func effectiveGlobalTracerPredecessor(owner *globalTracerOwner) (*globalTracerOwner, *Tracer, error) {
+	previous := owner.previous
+	fallback := owner.baseline
+	fallbackErr := owner.baselineErr
+	for previous != nil && !previous.active {
+		fallback = previous.baseline
+		fallbackErr = previous.baselineErr
+		previous = previous.previous
+	}
+	return previous, fallback, fallbackErr
+}
+
+func restoreGlobalTracerOwnerLocked(owner *globalTracerOwner) {
+	if globalTracerOwners.current != owner {
+		return
+	}
+	previous, fallback, fallbackErr := effectiveGlobalTracerPredecessor(owner)
+	globalTracerOwners.current = previous
+	if globalTracer.Load() != owner.tracer {
+		return
+	}
+	if previous != nil {
+		globalTracer.Store(previous.tracer)
+		globalInitErr = previous.initErr
+		return
+	}
+	globalTracer.Store(fallback)
+	globalInitErr = fallbackErr
+}
+
+func deactivateGlobalTracerOwner(owner *globalTracerOwner) {
+	if owner == nil {
+		return
+	}
+	globalTracerMu.Lock()
+	if owner.active {
+		owner.active = false
+		delete(globalTracerOwners.active, owner)
+		restoreGlobalTracerOwnerLocked(owner)
+	}
+	globalTracerMu.Unlock()
+	refreshImplicitTraceEnabled()
+}
+
+func relinquishGlobalTracer(t *Tracer) {
+	if t == nil {
+		return
+	}
+	globalTracerMu.Lock()
+	for owner := range globalTracerOwners.active {
+		if owner.tracer == t {
+			owner.active = false
+			delete(globalTracerOwners.active, owner)
+		}
+	}
+	if globalTracerOwners.current != nil && !globalTracerOwners.current.active {
+		restoreGlobalTracerOwnerLocked(globalTracerOwners.current)
+	} else if globalTracerOwners.current == nil && globalTracer.Load() == t {
+		globalTracer.Store(nil)
+		globalInitErr = nil
+	}
+	globalTracerMu.Unlock()
+	refreshImplicitTraceEnabled()
+}
+
+func refreshImplicitTraceEnabled() {
+	implicitTraceMu.Lock()
+	defer implicitTraceMu.Unlock()
+	if current := globalTracer.Load(); current != nil && current.enabled && !current.closed.Load() {
+		logging.SetImplicitTraceEnabled(true)
+		return
+	}
+	otelOwners.Lock()
+	owner := otelOwners.current
+	enabled := owner != nil && owner.active && owner.tracer != nil && !owner.tracer.closed.Load()
+	otelOwners.Unlock()
+	logging.SetImplicitTraceEnabled(enabled)
 }
 
 // Shutdown gracefully shuts down the global tracer, flushing any remaining spans.
 func Shutdown(ctx context.Context) error {
-	if g := globalTracer.Load(); g != nil {
-		return g.shutdown(ctx)
+	globalTracerMu.Lock()
+	g := globalTracer.Load()
+	globalTracerMu.Unlock()
+	if g == nil {
+		return nil
 	}
-	return nil
+	return g.Shutdown(ctx)
 }
 
 // Shutdown gracefully shuts down this tracer, flushing any remaining spans.
@@ -516,18 +1176,23 @@ func (t *Tracer) Shutdown(ctx context.Context) error {
 }
 
 func (t *Tracer) shutdown(ctx context.Context) error {
-	if !t.enabled {
+	if t == nil {
 		return nil
 	}
-	if t.provider != nil {
-		return t.provider.Shutdown(ctx)
-	}
-	return nil
+	t.shutdownOnce.Do(func() {
+		t.closed.Store(true)
+		relinquishGlobalTracer(t)
+		relinquishOTelGlobals(t)
+		if t.enabled && t.provider != nil {
+			t.shutdownErr = t.provider.Shutdown(ctx)
+		}
+	})
+	return t.shutdownErr
 }
 
 // IsEnabled returns whether tracing is active.
 func (t *Tracer) IsEnabled() bool {
-	return t.enabled
+	return t != nil && t.enabled && !t.closed.Load()
 }
 
 // toOtelSpanKind converts our SpanKind to the OTel trace.SpanKind.
@@ -624,10 +1289,19 @@ func SpanFromContext(ctx context.Context) *Span {
 	if ctx == nil {
 		return nil
 	}
-	if span, ok := ctx.Value(currentSpanKey).(*Span); ok {
-		return span
+	privateSpan, _ := ctx.Value(currentSpanKey).(*Span)
+	nativeSpan := trace.SpanFromContext(ctx)
+	nativeSC := nativeSpan.SpanContext()
+	if nativeSC.IsValid() {
+		// StartSpan stores both representations of the same span. Preserve its
+		// richer wrapper only while it is still the native active span. If native
+		// instrumentation created a child afterwards, that child is authoritative.
+		if privateSpan != nil && privateSpan.spanID == nativeSC.SpanID().String() {
+			return privateSpan
+		}
+		return adoptOtelSpan(ctx)
 	}
-	return adoptOtelSpan(ctx)
+	return privateSpan
 }
 
 // adoptOtelSpan wraps the context's native OTel span in a *Span so the fit-go
@@ -758,19 +1432,18 @@ func ContextWithTrace(ctx context.Context, traceID, spanID string, sampled bool)
 	return ctx
 }
 
-// TraceIDFromContext extracts the trace ID from context. It prefers the value
-// seeded by this package and falls back to the NATIVE OTel span context, so a
-// request carrying only an otelgin/otelgrpc span still reports its trace id (used
-// for span parenting in StartSpan and for log correlation).
+// TraceIDFromContext extracts the active trace ID. Native OTel context is the
+// source of truth because instrumentation can create a child after fit-go seeded
+// its private compatibility keys.
 func TraceIDFromContext(ctx context.Context) string {
 	if ctx == nil {
 		return ""
 	}
-	if v, ok := ctx.Value(traceIDKey).(string); ok && v != "" {
-		return v
-	}
 	if sc := trace.SpanFromContext(ctx).SpanContext(); sc.HasTraceID() {
 		return sc.TraceID().String()
+	}
+	if v, ok := ctx.Value(traceIDKey).(string); ok && v != "" {
+		return v
 	}
 	return ""
 }
@@ -781,11 +1454,11 @@ func SpanIDFromContext(ctx context.Context) string {
 	if ctx == nil {
 		return ""
 	}
-	if v, ok := ctx.Value(spanIDKey).(string); ok && v != "" {
-		return v
-	}
 	if sc := trace.SpanFromContext(ctx).SpanContext(); sc.HasSpanID() {
 		return sc.SpanID().String()
+	}
+	if v, ok := ctx.Value(spanIDKey).(string); ok && v != "" {
+		return v
 	}
 	return ""
 }
@@ -813,10 +1486,12 @@ func (d *decorators) Trace(name string, fn func(ctx context.Context) error) func
 
 		ctx, span := tracer.StartSpan(ctx, name, SpanKindInternal)
 		defer span.End()
+		restoreActiveContext := InjectContextIntoGoroutine(ctx)
+		defer restoreActiveContext()
 
 		err := fn(ctx)
 		if err != nil {
-			span.SetStatus(StatusError, err.Error())
+			span.SetStatus(StatusError, redact.ErrorMessage(err))
 		} else {
 			span.SetStatus(StatusOK, "")
 		}
@@ -835,10 +1510,12 @@ func TraceWithResult[T any](name string, fn func(ctx context.Context) (T, error)
 
 		ctx, span := tracer.StartSpan(ctx, name, SpanKindInternal)
 		defer span.End()
+		restoreActiveContext := InjectContextIntoGoroutine(ctx)
+		defer restoreActiveContext()
 
 		result, err := fn(ctx)
 		if err != nil {
-			span.SetStatus(StatusError, err.Error())
+			span.SetStatus(StatusError, redact.ErrorMessage(err))
 		} else {
 			span.SetStatus(StatusOK, "")
 		}

@@ -87,6 +87,17 @@ func TestCommandTracer_Lifecycle(t *testing.T) {
 	ct.finished(999, nil)
 }
 
+func TestMongoCommandFailureStatusDoesNotExposeServerValues(t *testing.T) {
+	const secret = "duplicate key: { email: secret@example.com }"
+	status := mongoCommandFailureStatus(errors.New(secret))
+	if status == "" || status == secret {
+		t.Fatalf("unsafe Mongo status %q", status)
+	}
+	if status != "mongodb command failed" {
+		t.Fatalf("status = %q", status)
+	}
+}
+
 // An in-flight span whose completion event never arrives (connection torn down
 // mid-command) must not leak: the stale sweep ends and removes it, while a fresh
 // in-flight span is left untouched.

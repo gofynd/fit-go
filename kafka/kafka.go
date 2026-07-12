@@ -217,24 +217,34 @@ type KafkaClient interface {
 	Close() error
 }
 
+// KafkaHealthChecker is implemented by drivers that can perform a broker
+// metadata round trip without producing or consuming a message.
+type KafkaHealthChecker interface {
+	Ping(context.Context) error
+}
+
 // KafkaProducer is the interface a driver's producer must implement.
 type KafkaProducer interface {
 	// Connect establishes the producer connection to the brokers.
 	Connect() error
 
-	// Produce sends messages to a single topic.
+	// Produce sends messages to a single topic. When FIT has installed an active
+	// goroutine context it receives the same automatic producer tracing as legacy
+	// KafkaJS; use ProduceCtx when cancellation or explicit context propagation is
+	// required.
 	Produce(topic string, messages []Message, acks int) error
 
-	// ProduceBatch sends messages to multiple topics in one call.
+	// ProduceBatch sends messages to multiple topics with the same automatic
+	// tracing behavior as Produce.
 	ProduceBatch(topicMessages []TopicMessages, acks int) error
 
-	// ProduceCtx is Produce with a context: when tracing is enabled it injects the
-	// active span's W3C traceparent into each message's headers (so downstream
-	// consumers continue the trace), then delegates to Produce. A no-op-injection
-	// passthrough when tracing is off or ctx has no span.
+	// ProduceCtx is the canonical single-topic producer API. When tracing is
+	// enabled it creates one producer span per message and injects the configured
+	// propagator fields; tracing-disabled behavior is a broker-call passthrough.
 	ProduceCtx(ctx context.Context, topic string, messages []Message, acks int) error
 
-	// ProduceBatchCtx is ProduceBatch with traceparent injection (see ProduceCtx).
+	// ProduceBatchCtx is the canonical multi-topic producer API and applies the
+	// same per-message span and propagation behavior as ProduceCtx.
 	ProduceBatchCtx(ctx context.Context, topicMessages []TopicMessages, acks int) error
 
 	// Close disconnects the producer gracefully.
@@ -246,20 +256,44 @@ type KafkaConsumer interface {
 	// Connect subscribes to the given topics and starts the consumer.
 	Connect(topics []TopicConfig) error
 
-	// Consume processes messages one at a time via the handler.
+	// Consume processes messages with automatic consumer spans. The active FIT
+	// goroutine context is installed around the handler for source-compatible raw
+	// handlers; use ConsumeCtx when the handler needs the context value directly.
 	Consume(handler MessageHandler, opts ConsumerOptions) error
 
 	// ConsumeCtx is Consume with a context-aware handler: it opens a consumer span
-	// per message (parented to the producer's traceparent header) and threads the
-	// span context into the handler, so consumer-side logs and downstream spans
-	// join the trace. A transparent passthrough when tracing is off.
+	// per message from the extracted producer context and threads the span context
+	// into the handler, so consumer-side logs and downstream spans join the trace.
+	// It is a transparent passthrough when tracing is off.
 	ConsumeCtx(handler MessageHandlerCtx, opts ConsumerOptions) error
 
-	// ConsumeBatch processes messages in batches via the handler.
+	// ConsumeBatch processes messages in batches with automatic batch tracing but
+	// does not expose the span context. Use ConsumeBatchCtx when the handler needs it.
 	ConsumeBatch(handler BatchHandler, opts ConsumerOptions) error
 
 	// Close disconnects the consumer gracefully.
 	Close() error
+}
+
+// KafkaBatchConsumerCtx is the optional context-aware batch extension. It is
+// separate from KafkaConsumer so adding batch tracing does not break alternate
+// drivers that already implement the original public interface.
+type KafkaBatchConsumerCtx interface {
+	ConsumeBatchCtx(handler BatchHandlerCtx, opts ConsumerOptions) error
+}
+
+// ConsumeBatchCtx is the canonical context-aware batch entry point. Native
+// implementations can provide KafkaBatchConsumerCtx; older/alternate drivers are
+// adapted through their existing ConsumeBatch method without a source-breaking
+// interface change.
+func ConsumeBatchCtx(consumer KafkaConsumer, handler BatchHandlerCtx, opts ConsumerOptions) error {
+	if consumer == nil {
+		return fmt.Errorf("kafka: consumer is nil")
+	}
+	if contextConsumer, ok := consumer.(KafkaBatchConsumerCtx); ok {
+		return contextConsumer.ConsumeBatchCtx(handler, opts)
+	}
+	return consumer.ConsumeBatch(TracedBatchHandlerCtx(handler), opts)
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +310,26 @@ type Client struct {
 	// concrete driver is registered. Code that only needs the config (e.g.
 	// config validation at startup) can use Client without a driver.
 	Driver KafkaClient
+}
+
+// Ping verifies broker reachability through the configured driver. Drivers
+// that do not expose a metadata health check return an explicit error rather
+// than reporting a false healthy state.
+func (c *Client) Ping(ctx context.Context) error {
+	if c == nil || c.Driver == nil {
+		return fmt.Errorf("kafka: driver is not initialized")
+	}
+	checker, ok := c.Driver.(KafkaHealthChecker)
+	if !ok {
+		return fmt.Errorf("kafka: driver does not support health checks")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := checker.Ping(ctx); err != nil {
+		return newKafkaHealthError("kafka health check failed", err)
+	}
+	return nil
 }
 
 // NewClient creates a Kafka Client from the given config. If cfg is nil,

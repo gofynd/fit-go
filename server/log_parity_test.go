@@ -14,10 +14,9 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// The access logger keeps legacy parity with fit.js/pyfit: request_url is
-// path-only, query params (full values) + route params are structured fields,
-// opted-in header values are logged verbatim, and there is no redaction.
-func TestLogRequestResponse_LegacyParity(t *testing.T) {
+// The access logger keeps the legacy field shape while enforcing Commerce's
+// no-PII/no-secrets telemetry boundary.
+func TestLogRequestResponse_SecureLegacyFieldShape(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
@@ -35,25 +34,27 @@ func TestLogRequestResponse_LegacyParity(t *testing.T) {
 	engine.ServeHTTP(httptest.NewRecorder(), req)
 	out := buf.String()
 
-	// Full query values (verbatim, NOT redacted).
-	if !strings.Contains(out, "jane@x.com") || !strings.Contains(out, `"limit":"50"`) {
-		t.Fatalf("query params should be logged in full: %s", out)
+	// Operational query controls remain visible; arbitrary values are masked.
+	if !strings.Contains(out, `"limit":"50"`) || !strings.Contains(out, `"email":"[REDACTED]"`) {
+		t.Fatalf("query params should use allowlist redaction: %s", out)
+	}
+	if strings.Contains(out, "jane@x.com") {
+		t.Fatalf("query PII leaked: %s", out)
 	}
 	// Route params logged (fit.js request_params / pyfit path_params).
 	if !strings.Contains(out, `"company_id":"42"`) {
 		t.Fatalf("path_params should be logged: %s", out)
 	}
-	// Opted-in header values logged verbatim (no masking).
-	if !strings.Contains(out, "Bearer topsecret") || !strings.Contains(out, "req-123") {
-		t.Fatalf("header values should be logged verbatim: %s", out)
+	// Safe opted-in headers remain visible; credentials are always masked.
+	if !strings.Contains(out, `"Authorization":"[REDACTED]"`) || !strings.Contains(out, "req-123") {
+		t.Fatalf("headers should apply credential masking: %s", out)
+	}
+	if strings.Contains(out, "Bearer topsecret") {
+		t.Fatalf("authorization secret leaked: %s", out)
 	}
 	// request_url is path only (no query string).
 	if strings.Contains(out, "/v1/company/42/ticket?") {
 		t.Fatalf("request_url must be path-only: %s", out)
-	}
-	// Nothing is redacted.
-	if strings.Contains(out, "[REDACTED]") {
-		t.Fatalf("parity mode must not redact: %s", out)
 	}
 }
 
@@ -113,11 +114,15 @@ func TestLogRequestResponse_OriginalURLOptIn(t *testing.T) {
 	engine.Use(LogRequestResponse(LogRequestResponseConfig{Logger: logger, LegacyOriginalURL: true}))
 	engine.GET("/v1/items", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
 
-	engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/v1/items?limit=10", nil))
+	engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/v1/items?limit=10&token=topsecret", nil))
 	out := buf.String()
 
-	if !strings.Contains(out, `/v1/items?limit=10`) {
-		t.Fatalf("original URL mode should include query string in request_url: %s", out)
+	if !strings.Contains(out, `/v1/items?limit=10&amp;token=[REDACTED]`) &&
+		!strings.Contains(out, `/v1/items?limit=10&token=[REDACTED]`) {
+		t.Fatalf("original URL mode should include a redacted query string: %s", out)
+	}
+	if strings.Contains(out, "topsecret") {
+		t.Fatalf("original URL mode leaked query secret: %s", out)
 	}
 }
 

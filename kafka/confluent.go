@@ -25,10 +25,12 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	ckafka "github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/gofynd/fit-go/logging"
+	"github.com/gofynd/fit-go/redact"
 )
 
 // ---------------------------------------------------------------------------
@@ -36,9 +38,10 @@ import (
 // ---------------------------------------------------------------------------
 
 var (
-	_ KafkaClient   = (*ConfluentClient)(nil)
-	_ KafkaProducer = (*ConfluentProducer)(nil)
-	_ KafkaConsumer = (*ConfluentConsumer)(nil)
+	_ KafkaClient           = (*ConfluentClient)(nil)
+	_ KafkaProducer         = (*ConfluentProducer)(nil)
+	_ KafkaConsumer         = (*ConfluentConsumer)(nil)
+	_ KafkaBatchConsumerCtx = (*ConfluentConsumer)(nil)
 )
 
 // ---------------------------------------------------------------------------
@@ -112,14 +115,14 @@ func (cc *ConfluentClient) Producer(config ProducerConfig) (KafkaProducer, error
 	// Clone the base config for producer-specific overrides.
 	pCfg := cloneConfigMap(cc.baseCfg)
 
-	// Apply producer-specific settings.
-	if config.Acks != 0 {
-		switch config.Acks {
-		case -1:
-			_ = pCfg.SetKey("acks", "all")
-		default:
-			_ = pCfg.SetKey("acks", fmt.Sprintf("%d", config.Acks))
+	configuredAcks := -1
+	// Non-zero values historically meant "set". AcksSet adds the missing way
+	// to explicitly request KafkaJS-compatible acks=0 at producer construction.
+	if config.AcksSet || config.Acks != 0 {
+		if err := setConfluentAcks(pCfg, config.Acks); err != nil {
+			return nil, err
 		}
+		configuredAcks = config.Acks
 	}
 
 	if config.Compression != CompressionNone {
@@ -130,6 +133,7 @@ func (cc *ConfluentClient) Producer(config ProducerConfig) (KafkaProducer, error
 		_ = pCfg.SetKey("enable.idempotence", true)
 		_ = pCfg.SetKey("acks", "all")
 		_ = pCfg.SetKey("max.in.flight.requests.per.connection", 1)
+		configuredAcks = -1
 	}
 
 	if config.Timeout > 0 {
@@ -145,9 +149,12 @@ func (cc *ConfluentClient) Producer(config ProducerConfig) (KafkaProducer, error
 	}
 
 	return &ConfluentProducer{
-		configMap: pCfg,
-		logger:    cc.logger,
-		brokers:   cc.brokers,
+		configMap:      pCfg,
+		logger:         cc.logger,
+		brokers:        cc.brokers,
+		configuredAcks: configuredAcks,
+		idempotent:     config.IdempotentProducer,
+		producers:      make(map[int]confluentProducerDriver),
 	}, nil
 }
 
@@ -204,6 +211,9 @@ func (cc *ConfluentClient) Consumer(config ConsumerConfig) (KafkaConsumer, error
 
 	// Auto-commit settings.
 	_ = cCfg.SetKey("enable.auto.commit", config.AutoCommit)
+	// Resolve/store offsets only after a handler succeeds. librdkafka's default
+	// stores on ReadMessage, which can commit work that is still running.
+	_ = cCfg.SetKey("enable.auto.offset.store", false)
 	if config.AutoCommitInterval > 0 {
 		_ = cCfg.SetKey("auto.commit.interval.ms", int(config.AutoCommitInterval.Milliseconds()))
 	}
@@ -230,6 +240,34 @@ func (cc *ConfluentClient) Close() error {
 	return nil
 }
 
+// Ping performs the same broker-metadata class of check used by legacy
+// KafkaJS admin.listTopics, without changing topics or consumer group state.
+func (cc *ConfluentClient) Ping(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	admin, err := ckafka.NewAdminClient(cloneConfigMap(cc.baseCfg))
+	if err != nil {
+		return newKafkaHealthError("kafka/confluent: health admin client", err)
+	}
+	defer admin.Close()
+
+	timeout := 2 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return newKafkaHealthError("kafka/confluent: broker metadata", ctx.Err())
+		}
+		if remaining < timeout {
+			timeout = remaining
+		}
+	}
+	if _, err := admin.GetMetadata(nil, false, int(timeout.Milliseconds())); err != nil {
+		return newKafkaHealthError("kafka/confluent: broker metadata", err)
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // ConfluentProducer
 // ---------------------------------------------------------------------------
@@ -237,13 +275,32 @@ func (cc *ConfluentClient) Close() error {
 // ConfluentProducer implements KafkaProducer using confluent-kafka-go's
 // Producer. It sends messages synchronously by waiting for delivery reports.
 type ConfluentProducer struct {
-	configMap *ckafka.ConfigMap
-	logger    *logging.Logger
-	brokers   []string
+	configMap      *ckafka.ConfigMap
+	logger         *logging.Logger
+	brokers        []string
+	configuredAcks int
+	idempotent     bool
+	newProducer    func(*ckafka.ConfigMap) (confluentProducerDriver, error)
 
-	mu       sync.Mutex
-	producer *ckafka.Producer
-	closed   bool
+	mu        sync.Mutex
+	inFlight  sync.WaitGroup
+	producer  confluentProducerDriver
+	producers map[int]confluentProducerDriver
+	closed    bool
+	closeDone chan struct{}
+	closeErr  error
+
+	closeTimeout   time.Duration
+	pendingReports atomic.Int64
+}
+
+// confluentProducerDriver is the narrow librdkafka surface used by the fit
+// producer. Keeping it internal makes delivery and shutdown behavior testable
+// without a Kafka broker while *ckafka.Producer remains the production driver.
+type confluentProducerDriver interface {
+	Produce(*ckafka.Message, chan ckafka.Event) error
+	Flush(timeoutMs int) int
+	Close()
 }
 
 // Connect establishes the confluent Producer connection to the brokers.
@@ -251,27 +308,44 @@ func (cp *ConfluentProducer) Connect() error {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
 
+	if cp.closed {
+		return fmt.Errorf("kafka/confluent: producer is closed")
+	}
 	if cp.producer != nil {
 		return nil
 	}
 
-	producer, err := ckafka.NewProducer(cp.configMap)
+	producer, err := cp.createProducer(cp.configMap)
 	if err != nil {
 		return fmt.Errorf("kafka/confluent: producer connect failed: %w", err)
 	}
 
 	cp.producer = producer
+	if cp.producers == nil {
+		cp.producers = make(map[int]confluentProducerDriver)
+	}
+	cp.producers[cp.configuredAcks] = producer
 	cp.logger.Info("kafka/confluent: producer connected",
 		"brokers", strings.Join(cp.brokers, ","),
 	)
 	return nil
 }
 
-// Produce sends messages to a single topic. The acks parameter is configured
-// at the producer level in confluent-kafka-go via the ConfigMap.
+const defaultProducerCloseTimeout = 15 * time.Second
+
+// Produce sends messages to a single topic. Raw calls retain KafkaJS-like
+// automatic tracing by adopting FIT's active goroutine context when one exists.
 func (cp *ConfluentProducer) Produce(topic string, messages []Message, acks int) error {
-	_, err := cp.ProduceWithMetadata(topic, messages, acks)
-	return err
+	ctx := automaticProducerContext()
+	return produceTopicMessagesWithTrace(
+		ctx,
+		[]TopicMessages{{Topic: topic, Messages: messages}},
+		acks,
+		func(traced []TopicMessages, tracedAcks int) error {
+			_, err := cp.produceWithMetadata(ctx, topic, traced[0].Messages, tracedAcks)
+			return err
+		},
+	)
 }
 
 // ProduceWithMetadata sends messages to a single topic and returns KafkaJS-style
@@ -280,37 +354,32 @@ func (cp *ConfluentProducer) Produce(topic string, messages []Message, acks int)
 // requirement, so existing drivers and callers that only need Produce remain
 // unchanged.
 func (cp *ConfluentProducer) ProduceWithMetadata(topic string, messages []Message, acks int) ([]RecordMetadata, error) {
-	cp.mu.Lock()
-	producer := cp.producer
-	cp.mu.Unlock()
+	ctx := automaticProducerContext()
+	topicMessages := []TopicMessages{{Topic: topic, Messages: messages}}
+	spans := startProducerMessageSpans(ctx, topicMessages)
+	metadata, err := cp.produceWithMetadata(ctx, topic, topicMessages[0].Messages, acks)
+	endProducerMessageSpans(spans, err)
+	return metadata, err
+}
 
-	if producer == nil {
-		return nil, fmt.Errorf("kafka/confluent: producer not connected")
+func (cp *ConfluentProducer) produceWithMetadata(ctx context.Context, topic string, messages []Message, acks int) ([]RecordMetadata, error) {
+	producer, done, err := cp.beginProduce(acks)
+	if err != nil {
+		return nil, err
 	}
 
-	deliveryChan := make(chan ckafka.Event, len(messages))
-	defer close(deliveryChan)
-
+	brokerMessages := make([]*ckafka.Message, 0, len(messages))
 	for _, msg := range messages {
-		km := buildConfluentMessage(topic, msg)
-		if err := producer.Produce(km, deliveryChan); err != nil {
-			return nil, fmt.Errorf("kafka/confluent: produce to %s failed: %w", topic, err)
-		}
+		brokerMessages = append(brokerMessages, buildConfluentMessage(topic, msg))
+	}
+	deliveries, err := cp.produceAndDrain(ctx, producer, brokerMessages, done)
+	if err != nil {
+		return nil, fmt.Errorf("kafka/confluent: produce to %s failed: %w", topic, err)
 	}
 
 	metadata := make([]RecordMetadata, 0, len(messages))
 	metadataByPartition := make(map[string]int, len(messages))
-
-	// Wait for all delivery reports.
-	for i := 0; i < len(messages); i++ {
-		e := <-deliveryChan
-		m, ok := e.(*ckafka.Message)
-		if !ok {
-			return nil, fmt.Errorf("kafka/confluent: produce to %s failed: unexpected delivery event %T", topic, e)
-		}
-		if m.TopicPartition.Error != nil {
-			return nil, fmt.Errorf("kafka/confluent: produce to %s failed: %w", topic, m.TopicPartition.Error)
-		}
+	for _, m := range deliveries {
 		md := mapConfluentToRecordMetadata(m)
 		key := fmt.Sprintf("%s:%d", md.TopicName, md.Partition)
 		if idx, ok := metadataByPartition[key]; ok {
@@ -329,12 +398,16 @@ func (cp *ConfluentProducer) ProduceWithMetadata(topic string, messages []Messag
 
 // ProduceBatch sends messages to multiple topics in one call.
 func (cp *ConfluentProducer) ProduceBatch(topicMessages []TopicMessages, acks int) error {
-	cp.mu.Lock()
-	producer := cp.producer
-	cp.mu.Unlock()
+	ctx := automaticProducerContext()
+	return produceTopicMessagesWithTrace(ctx, topicMessages, acks, func(traced []TopicMessages, tracedAcks int) error {
+		return cp.produceBatch(ctx, traced, tracedAcks)
+	})
+}
 
-	if producer == nil {
-		return fmt.Errorf("kafka/confluent: producer not connected")
+func (cp *ConfluentProducer) produceBatch(ctx context.Context, topicMessages []TopicMessages, acks int) error {
+	producer, done, err := cp.beginProduce(acks)
+	if err != nil {
+		return err
 	}
 
 	totalMessages := 0
@@ -343,94 +416,324 @@ func (cp *ConfluentProducer) ProduceBatch(topicMessages []TopicMessages, acks in
 	}
 
 	if totalMessages == 0 {
+		done()
 		return nil
 	}
 
-	deliveryChan := make(chan ckafka.Event, totalMessages)
-	defer close(deliveryChan)
-
+	brokerMessages := make([]*ckafka.Message, 0, totalMessages)
 	for _, tm := range topicMessages {
 		for _, msg := range tm.Messages {
-			km := buildConfluentMessage(tm.Topic, msg)
-			if err := producer.Produce(km, deliveryChan); err != nil {
-				return fmt.Errorf("kafka/confluent: batch produce failed: %w", err)
-			}
+			brokerMessages = append(brokerMessages, buildConfluentMessage(tm.Topic, msg))
 		}
 	}
-
-	// Wait for all delivery reports.
-	for i := 0; i < totalMessages; i++ {
-		e := <-deliveryChan
-		m := e.(*ckafka.Message)
-		if m.TopicPartition.Error != nil {
-			return fmt.Errorf("kafka/confluent: batch produce failed: %w", m.TopicPartition.Error)
-		}
+	if _, err := cp.produceAndDrain(ctx, producer, brokerMessages, done); err != nil {
+		return fmt.Errorf("kafka/confluent: batch produce failed: %w", err)
 	}
 
 	return nil
 }
 
-// ProduceCtx injects the active span's traceparent into each message's headers
-// (when tracing is enabled and ctx carries a span), then delegates to Produce.
-// Existing Produce callers are unaffected; this is the trace-propagating variant.
-// It opens a SpanKindProducer span around the produce (latency + messaging attributes
-// + failure status) and injects the traceparent FROM that span, so the consumer parents
-// to the producer span rather than to whatever span was merely active at the call site.
+// ProduceCtx is the canonical producer path. It creates and injects one producer
+// span per message, matching KafkaJS instrumentation, then performs the same raw
+// broker operation with the caller's acks value.
 func (cp *ConfluentProducer) ProduceCtx(ctx context.Context, topic string, messages []Message, acks int) error {
-	ctx, span := StartProducerSpan(ctx, topic, len(messages))
-	InjectTraceHeadersToMessages(ctx, messages)
-	err := cp.Produce(topic, messages, acks)
-	EndProducerSpan(span, err)
-	return err
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return produceTopicMessagesWithTrace(
+		ctx,
+		[]TopicMessages{{Topic: topic, Messages: messages}},
+		acks,
+		func(traced []TopicMessages, tracedAcks int) error {
+			_, err := cp.produceWithMetadata(ctx, topic, traced[0].Messages, tracedAcks)
+			return err
+		},
+	)
 }
 
 // ProduceCtxWithMetadata is ProduceWithMetadata with a producer span + per-message
 // traceparent injection.
 func (cp *ConfluentProducer) ProduceCtxWithMetadata(ctx context.Context, topic string, messages []Message, acks int) ([]RecordMetadata, error) {
-	ctx, span := StartProducerSpan(ctx, topic, len(messages))
-	InjectTraceHeadersToMessages(ctx, messages)
-	md, err := cp.ProduceWithMetadata(topic, messages, acks)
-	EndProducerSpan(span, err)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	topicMessages := []TopicMessages{{Topic: topic, Messages: messages}}
+	spans := startProducerMessageSpans(ctx, topicMessages)
+	md, err := cp.produceWithMetadata(ctx, topic, topicMessages[0].Messages, acks)
+	endProducerMessageSpans(spans, err)
 	return md, err
 }
 
-// ProduceBatchCtx is ProduceBatch with a producer span + per-message traceparent
-// injection across every topic in the batch.
+// ProduceBatchCtx creates one correctly-labelled producer span per message across
+// every topic, injects from each message's span, and preserves the raw batch call's
+// message ordering, acks and delivery error.
 func (cp *ConfluentProducer) ProduceBatchCtx(ctx context.Context, topicMessages []TopicMessages, acks int) error {
-	total := 0
-	topic := ""
-	for i := range topicMessages {
-		total += len(topicMessages[i].Messages)
-		if topic == "" {
-			topic = topicMessages[i].Topic
-		}
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	ctx, span := StartProducerSpan(ctx, topic, total)
-	for i := range topicMessages {
-		InjectTraceHeadersToMessages(ctx, topicMessages[i].Messages)
-	}
-	err := cp.ProduceBatch(topicMessages, acks)
-	EndProducerSpan(span, err)
-	return err
+	return produceTopicMessagesWithTrace(ctx, topicMessages, acks, func(traced []TopicMessages, tracedAcks int) error {
+		return cp.produceBatch(ctx, traced, tracedAcks)
+	})
 }
 
-// Close disconnects the producer gracefully by flushing pending messages.
+// Close stops admission immediately and bounds how long the caller waits for
+// accepted delivery reports, flush, and driver shutdown. If the deadline is
+// reached, the same ordered shutdown continues in the background; a driver is
+// never closed while an accepted delivery report is still being drained.
 func (cp *ConfluentProducer) Close() error {
+	cp.mu.Lock()
+	if cp.closeDone != nil {
+		done := cp.closeDone
+		cp.mu.Unlock()
+		<-done
+		cp.mu.Lock()
+		err := cp.closeErr
+		cp.mu.Unlock()
+		return err
+	}
+	cp.closed = true
+	cp.closeDone = make(chan struct{})
+	done := cp.closeDone
+	timeout := cp.closeTimeout
+	if timeout <= 0 {
+		timeout = defaultProducerCloseTimeout
+	}
+
+	// Flush every acknowledgement-specific producer exactly once. Per-call acks
+	// require separate librdkafka instances because acks is not a request option.
+	unique := make(map[confluentProducerDriver]struct{}, len(cp.producers)+1)
+	if cp.producer != nil {
+		unique[cp.producer] = struct{}{}
+	}
+	for _, producer := range cp.producers {
+		if producer != nil {
+			unique[producer] = struct{}{}
+		}
+	}
+	cp.mu.Unlock()
+
+	result := make(chan error, 1)
+	go func() {
+		result <- cp.finishClose(unique, timeout)
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	var closeErr error
+	select {
+	case closeErr = <-result:
+	case <-timer.C:
+		closeErr = fmt.Errorf(
+			"kafka/confluent: producer close timed out after %s with %d accepted delivery report(s) outstanding; shutdown continues in background",
+			timeout,
+			cp.pendingReports.Load(),
+		)
+	}
+
+	cp.mu.Lock()
+	cp.closeErr = closeErr
+	close(done)
+	cp.mu.Unlock()
+
+	if closeErr != nil {
+		cp.logger.Warn("kafka/confluent: producer close incomplete", "error", redact.ErrorMessage(closeErr))
+	} else {
+		cp.logger.Info("kafka/confluent: producer closed")
+	}
+	return closeErr
+}
+
+func (cp *ConfluentProducer) finishClose(producers map[confluentProducerDriver]struct{}, timeout time.Duration) error {
+	type flushResult struct{ remaining int }
+	flushResults := make(chan flushResult, len(producers))
+	timeoutMs := int(timeout.Milliseconds())
+	if timeoutMs < 1 {
+		timeoutMs = 1
+	}
+	for producer := range producers {
+		go func(driver confluentProducerDriver) {
+			flushResults <- flushResult{remaining: driver.Flush(timeoutMs)}
+		}(producer)
+	}
+
+	remaining := 0
+	for range producers {
+		remaining += (<-flushResults).remaining
+	}
+
+	// Flush dispatches delivery reports; wait until their drainers have consumed
+	// every accepted result before allowing driver Close to invalidate resources.
+	cp.inFlight.Wait()
+	for producer := range producers {
+		producer.Close()
+	}
+
+	cp.mu.Lock()
+	cp.producer = nil
+	cp.producers = nil
+	cp.mu.Unlock()
+
+	if remaining > 0 {
+		return fmt.Errorf("kafka/confluent: producer close left %d message(s) undelivered after flush", remaining)
+	}
+	return nil
+}
+
+func setConfluentAcks(config *ckafka.ConfigMap, acks int) error {
+	if config == nil {
+		return fmt.Errorf("kafka/confluent: producer config is nil")
+	}
+	var value any
+	switch acks {
+	case -1:
+		value = "all"
+	case 0, 1:
+		value = fmt.Sprintf("%d", acks)
+	default:
+		return fmt.Errorf("kafka/confluent: unsupported acks value %d (want -1, 0, or 1)", acks)
+	}
+	if err := config.SetKey("acks", value); err != nil {
+		return fmt.Errorf("kafka/confluent: configure acks: %w", err)
+	}
+	return nil
+}
+
+// producerForAcks honors KafkaJS's per-send acks contract. librdkafka exposes
+// acks only as producer configuration, so each distinct value is backed by a
+// cached producer with otherwise identical connection/security settings.
+func (cp *ConfluentProducer) beginProduce(acks int) (confluentProducerDriver, func(), error) {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
 
-	if cp.producer == nil || cp.closed {
-		return nil
+	producer, err := cp.producerForAcksLocked(acks)
+	if err != nil {
+		return nil, nil, err
+	}
+	cp.inFlight.Add(1)
+	return producer, cp.inFlight.Done, nil
+}
+
+func (cp *ConfluentProducer) producerForAcksLocked(acks int) (confluentProducerDriver, error) {
+	if cp.closed {
+		return nil, fmt.Errorf("kafka/confluent: producer is closed")
+	}
+	if cp.producer == nil {
+		return nil, fmt.Errorf("kafka/confluent: producer not connected")
+	}
+	if cp.idempotent && acks != -1 {
+		return nil, fmt.Errorf("kafka/confluent: idempotent producer requires acks=-1")
+	}
+	if existing := cp.producers[acks]; existing != nil {
+		return existing, nil
 	}
 
-	cp.closed = true
+	config := cloneConfigMap(cp.configMap)
+	if err := setConfluentAcks(config, acks); err != nil {
+		return nil, err
+	}
+	producer, err := cp.createProducer(config)
+	if err != nil {
+		return nil, fmt.Errorf("kafka/confluent: producer for acks=%d failed: %w", acks, err)
+	}
+	if cp.producers == nil {
+		cp.producers = make(map[int]confluentProducerDriver)
+	}
+	cp.producers[acks] = producer
+	return producer, nil
+}
 
-	// Flush outstanding messages with a 15-second timeout.
-	cp.producer.Flush(15 * 1000)
-	cp.producer.Close()
+func (cp *ConfluentProducer) createProducer(config *ckafka.ConfigMap) (confluentProducerDriver, error) {
+	if cp.newProducer != nil {
+		return cp.newProducer(config)
+	}
+	return ckafka.NewProducer(config)
+}
 
-	cp.logger.Info("kafka/confluent: producer closed")
-	return nil
+// produceAndDrain enqueues records and consumes exactly one delivery event for
+// every record accepted by librdkafka. Cancellation returns control to the caller
+// immediately, while the drainer remains responsible for accepted reports and
+// keeps the producer in-flight until they arrive. The librdkafka-owned delivery
+// channel is deliberately never closed by fit-go.
+func (cp *ConfluentProducer) produceAndDrain(
+	ctx context.Context,
+	producer confluentProducerDriver,
+	messages []*ckafka.Message,
+	done func(),
+) ([]*ckafka.Message, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(messages) == 0 {
+		done()
+		return nil, nil
+	}
+
+	deliveryChan := make(chan ckafka.Event, len(messages))
+	accepted := 0
+	var firstErr error
+	for _, message := range messages {
+		if err := ctx.Err(); err != nil {
+			firstErr = err
+			break
+		}
+		if err := producer.Produce(message, deliveryChan); err != nil {
+			firstErr = fmt.Errorf("enqueue failed: %w", err)
+			break
+		}
+		accepted++
+		cp.pendingReports.Add(1)
+	}
+
+	if accepted == 0 {
+		done()
+		return nil, firstErr
+	}
+
+	type drainResult struct {
+		deliveries []*ckafka.Message
+		err        error
+	}
+	result := make(chan drainResult, 1)
+	go func(initialErr error) {
+		defer done()
+		deliveries := make([]*ckafka.Message, 0, accepted)
+		drainErr := initialErr
+		for i := 0; i < accepted; i++ {
+			event, ok := <-deliveryChan
+			if !ok {
+				if drainErr == nil {
+					drainErr = fmt.Errorf("delivery channel closed with %d report(s) outstanding", accepted-i)
+				}
+				break
+			}
+			cp.pendingReports.Add(-1)
+			message, ok := event.(*ckafka.Message)
+			if !ok || message == nil {
+				if drainErr == nil {
+					drainErr = fmt.Errorf("unexpected delivery event %T", event)
+				}
+				continue
+			}
+			deliveries = append(deliveries, message)
+			if message.TopicPartition.Error != nil && drainErr == nil {
+				drainErr = fmt.Errorf("delivery failed: %w", message.TopicPartition.Error)
+			}
+		}
+		result <- drainResult{deliveries: deliveries, err: drainErr}
+	}(firstErr)
+
+	// Prefer cancellation when it was already observable before delivery
+	// completion; this makes a canceled context deterministic even when the last
+	// report races the select below.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case drained := <-result:
+		return drained.deliveries, drained.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -446,11 +749,25 @@ type ConfluentConsumer struct {
 	config    ConsumerConfig
 	logger    *logging.Logger
 
-	mu       sync.Mutex
-	consumer *ckafka.Consumer
-	topics   []string
-	cancelFn context.CancelFunc
-	closed   bool
+	mu        sync.Mutex
+	consumer  confluentConsumerDriver
+	topics    []string
+	cancelFn  context.CancelFunc
+	runDone   chan struct{}
+	closed    bool
+	closeDone chan struct{}
+	closeErr  error
+}
+
+// confluentConsumerDriver is the message-loop subset of *ckafka.Consumer.
+// Connect still creates the real driver and supplies its rebalance callback;
+// the narrow interface keeps run-option and commit semantics broker-free in
+// unit tests.
+type confluentConsumerDriver interface {
+	ReadMessage(timeout time.Duration) (*ckafka.Message, error)
+	CommitMessage(message *ckafka.Message) ([]ckafka.TopicPartition, error)
+	StoreMessage(message *ckafka.Message) ([]ckafka.TopicPartition, error)
+	Close() error
 }
 
 // Connect subscribes to the given topics by creating a confluent Consumer.
@@ -459,6 +776,9 @@ func (cc *ConfluentConsumer) Connect(topics []TopicConfig) error {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 
+	if cc.closed {
+		return fmt.Errorf("kafka/confluent: consumer is closed")
+	}
 	if cc.consumer != nil {
 		return nil
 	}
@@ -513,7 +833,7 @@ func (cc *ConfluentConsumer) Connect(topics []TopicConfig) error {
 func (cc *ConfluentConsumer) ensureTopics(names []string) {
 	admin, err := ckafka.NewAdminClient(cloneConfigMap(cc.configMap))
 	if err != nil {
-		cc.logger.Warn("kafka/confluent: topic auto-create skipped (admin client)", "error", err.Error())
+		cc.logger.Warn("kafka/confluent: topic auto-create skipped (admin client)", "error", redact.ErrorMessage(err))
 		return
 	}
 	defer admin.Close()
@@ -528,7 +848,7 @@ func (cc *ConfluentConsumer) ensureTopics(names []string) {
 	defer cancel()
 	results, err := admin.CreateTopics(ctx, specs)
 	if err != nil {
-		cc.logger.Warn("kafka/confluent: topic auto-create failed", "error", err.Error())
+		cc.logger.Warn("kafka/confluent: topic auto-create failed", "error", redact.ErrorMessage(err))
 		return
 	}
 	for _, r := range results {
@@ -564,7 +884,7 @@ func (cc *ConfluentConsumer) rebalanceCb(consumer *ckafka.Consumer, event ckafka
 			// Surface it, don't swallow: returning nil tells librdkafka the rebalance
 			// succeeded with no partitions assigned — a silent zombie consumer that
 			// polls forever and reads nothing.
-			cc.logger.Error("kafka/confluent: partition assign failed", "groupId", cc.groupID, "error", err.Error())
+			cc.logger.Error("kafka/confluent: partition assign failed", "groupId", cc.groupID, "error", redact.ErrorMessage(err))
 			return err
 		}
 		cc.logger.Info("kafka/confluent: partitions assigned",
@@ -585,7 +905,7 @@ func (cc *ConfluentConsumer) rebalanceCb(consumer *ckafka.Consumer, event ckafka
 			err = consumer.Unassign()
 		}
 		if err != nil {
-			cc.logger.Error("kafka/confluent: partition unassign failed", "groupId", cc.groupID, "error", err.Error())
+			cc.logger.Error("kafka/confluent: partition unassign failed", "groupId", cc.groupID, "error", redact.ErrorMessage(err))
 			return err
 		}
 	}
@@ -618,135 +938,180 @@ func toPartitionAssignments(parts []ckafka.TopicPartition) []PartitionAssignment
 	return out
 }
 
-// Consume processes messages one at a time via the handler. It blocks until
-// the consumer is closed or an unrecoverable error occurs.
-func (cc *ConfluentConsumer) Consume(handler MessageHandler, opts ConsumerOptions) error {
-	cc.mu.Lock()
-	consumer := cc.consumer
-	cc.mu.Unlock()
+type confluentMessageHandler func(context.Context, MessagePayload) error
+type confluentBatchHandler func(context.Context, BatchPayload) error
 
-	if consumer == nil {
-		return fmt.Errorf("kafka/confluent: consumer not connected")
+// Consume processes messages with automatic KafkaJS-like consumer tracing. The
+// span context is active for same-goroutine FIT helpers even though the raw
+// handler signature remains source compatible.
+func (cc *ConfluentConsumer) Consume(handler MessageHandler, opts ConsumerOptions) error {
+	if handler == nil {
+		return fmt.Errorf("kafka/confluent: message handler is nil")
+	}
+	return cc.consumeMessages(func(ctx context.Context, payload MessagePayload) error {
+		return runTracedMessageHandler(ctx, payload, func(_ context.Context, traced MessagePayload) error {
+			return handler(traced)
+		})
+	}, opts)
+}
+
+func (cc *ConfluentConsumer) ConsumeCtx(handler MessageHandlerCtx, opts ConsumerOptions) error {
+	if handler == nil {
+		return fmt.Errorf("kafka/confluent: message handler is nil")
+	}
+	return cc.consumeMessages(func(ctx context.Context, payload MessagePayload) error {
+		return runTracedMessageHandler(ctx, payload, handler)
+	}, opts)
+}
+
+func (cc *ConfluentConsumer) consumeMessages(handler confluentMessageHandler, opts ConsumerOptions) error {
+	isAutoCommit, pollTimeout, concurrency, err := validateConfluentConsumerOptions(cc.config.AutoCommit, opts, 100*time.Millisecond)
+	if err != nil {
+		return err
+	}
+	consumer, ctx, finish, err := cc.beginConsumeRun()
+	if err != nil {
+		return err
+	}
+	defer finish()
+
+	waveSize := opts.MaxRecords
+	if waveSize <= 0 {
+		waveSize = concurrency
+	}
+	if waveSize < 1 {
+		waveSize = 1
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cc.mu.Lock()
-	cc.cancelFn = cancel
-	cc.mu.Unlock()
-	defer cancel()
-
-	isAutoCommit := resolveAutoCommit(cc.config.AutoCommit, opts.AutoCommit)
-
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return nil
-		default:
 		}
-
-		msg, err := consumer.ReadMessage(100 * time.Millisecond)
-		if err != nil {
-			// Timeout is expected when no messages are available.
-			if kafkaErr, ok := err.(ckafka.Error); ok && kafkaErr.Code() == ckafka.ErrTimedOut {
+		first, readErr := consumer.ReadMessage(pollTimeout)
+		if readErr != nil {
+			if isConfluentPollTimeout(readErr) {
 				continue
 			}
 			if ctx.Err() != nil {
 				return nil
 			}
-			return fmt.Errorf("kafka/confluent: consume error: %w", err)
+			return fmt.Errorf("kafka/confluent: consume error: %w", readErr)
 		}
 
-		payload := mapConfluentToPayload(msg)
+		messages := []*ckafka.Message{first}
+		var deferredReadErr error
+		for len(messages) < waveSize && ctx.Err() == nil {
+			message, err := consumer.ReadMessage(0)
+			if err != nil {
+				if isConfluentPollTimeout(err) {
+					break
+				}
+				deferredReadErr = err
+				break
+			}
+			messages = append(messages, message)
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		groups := groupConfluentBatchMessages(messages)
+		if err := runConfluentPartitionGroups(ctx, groups, concurrency, func(groupCtx context.Context, group confluentBatchGroup) error {
+			return cc.processMessageGroup(groupCtx, consumer, group, handler, isAutoCommit, opts)
+		}); err != nil {
+			return err
+		}
+		if deferredReadErr != nil {
+			return fmt.Errorf("kafka/confluent: consume error: %w", deferredReadErr)
+		}
+	}
+}
 
+func (cc *ConfluentConsumer) processMessageGroup(
+	ctx context.Context,
+	consumer confluentConsumerDriver,
+	group confluentBatchGroup,
+	handler confluentMessageHandler,
+	isAutoCommit bool,
+	opts ConsumerOptions,
+) error {
+	for i, message := range group.messages {
+		if ctx.Err() != nil {
+			return nil
+		}
+		payload := group.payload.Messages[i]
 		if !isAutoCommit && opts.CommitBeforeHandler {
-			if _, err := consumer.CommitMessage(msg); err != nil {
-				cc.logger.Error("kafka/confluent: pre-handler commit failed",
-					"topic", *msg.TopicPartition.Topic,
-					"partition", msg.TopicPartition.Partition,
-					"offset", msg.TopicPartition.Offset,
-					"error", err,
-				)
+			if _, err := consumer.CommitMessage(message); err != nil {
+				cc.logMessageFailure("kafka/confluent: pre-handler commit failed", message, err)
 				return fmt.Errorf("kafka/confluent: pre-handler commit failed: %w", err)
 			}
 		}
 
-		if err := handler(payload); err != nil {
-			cc.logger.Error("kafka/confluent: message handler error",
-				"topic", *msg.TopicPartition.Topic,
-				"partition", msg.TopicPartition.Partition,
-				"offset", msg.TopicPartition.Offset,
-				"error", err,
-			)
+		if err := handler(ctx, payload); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			cc.logMessageFailure("kafka/confluent: message handler error", message, err)
 			continue
 		}
 
-		if !isAutoCommit && !opts.CommitBeforeHandler {
-			if _, err := consumer.CommitMessage(msg); err != nil {
-				cc.logger.Error("kafka/confluent: commit failed",
-					"topic", *msg.TopicPartition.Topic,
-					"partition", msg.TopicPartition.Partition,
-					"offset", msg.TopicPartition.Offset,
-					"error", err,
-				)
-			}
+		if err := cc.resolveMessageOffset(consumer, message, isAutoCommit, opts.CommitBeforeHandler); err != nil {
+			cc.logMessageFailure("kafka/confluent: post-handler offset resolution failed", message, err)
+			return err
 		}
 	}
+	return nil
 }
 
-// ConsumeCtx is Consume with a context-aware handler. It reuses the exact same
-// consume loop, wrapping the handler so each message opens a Consumer span
-// (parented to the producer's traceparent header) and the span context is threaded
-// into the handler. Transparent passthrough when tracing is disabled.
-func (cc *ConfluentConsumer) ConsumeCtx(handler MessageHandlerCtx, opts ConsumerOptions) error {
-	return cc.Consume(TracedMessageHandlerCtx(handler), opts)
-}
-
-// ConsumeBatch processes messages in batches via the handler. It collects
-// messages and delivers them as BatchPayload to the handler.
 func (cc *ConfluentConsumer) ConsumeBatch(handler BatchHandler, opts ConsumerOptions) error {
-	cc.mu.Lock()
-	consumer := cc.consumer
-	cc.mu.Unlock()
-
-	if consumer == nil {
-		return fmt.Errorf("kafka/confluent: consumer not connected")
+	if handler == nil {
+		return fmt.Errorf("kafka/confluent: batch handler is nil")
 	}
+	return cc.consumeBatches(func(ctx context.Context, payload BatchPayload) error {
+		return runTracedBatchHandler(ctx, payload, func(_ context.Context, traced BatchPayload) error {
+			return handler(traced)
+		})
+	}, opts)
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cc.mu.Lock()
-	cc.cancelFn = cancel
-	cc.mu.Unlock()
-	defer cancel()
+func (cc *ConfluentConsumer) ConsumeBatchCtx(handler BatchHandlerCtx, opts ConsumerOptions) error {
+	if handler == nil {
+		return fmt.Errorf("kafka/confluent: batch handler is nil")
+	}
+	return cc.consumeBatches(func(ctx context.Context, payload BatchPayload) error {
+		return runTracedBatchHandler(ctx, payload, handler)
+	}, opts)
+}
 
-	isAutoCommit := resolveAutoCommit(cc.config.AutoCommit, opts.AutoCommit)
+func (cc *ConfluentConsumer) consumeBatches(handler confluentBatchHandler, opts ConsumerOptions) error {
+	isAutoCommit, batchTimeout, concurrency, err := validateConfluentConsumerOptions(cc.config.AutoCommit, opts, time.Second)
+	if err != nil {
+		return err
+	}
+	consumer, ctx, finish, err := cc.beginConsumeRun()
+	if err != nil {
+		return err
+	}
+	defer finish()
 
-	// Default batch size.
-	const batchSize = 100
-	const batchTimeout = 1 * time.Second
-
+	batchSize := opts.MaxRecords
+	if batchSize <= 0 {
+		batchSize = 100
+	}
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return nil
-		default:
 		}
 
-		var batch []MessagePayload
-		var lastMsg *ckafka.Message
-		var batchTopic string
-		var batchPartition int32
-
+		messages := make([]*ckafka.Message, 0, batchSize)
 		deadline := time.Now().Add(batchTimeout)
-
-		for len(batch) < batchSize && time.Now().Before(deadline) {
+		for len(messages) < batchSize && time.Now().Before(deadline) && ctx.Err() == nil {
 			remaining := time.Until(deadline)
 			if remaining <= 0 {
 				break
 			}
-
-			msg, err := consumer.ReadMessage(remaining)
+			message, err := consumer.ReadMessage(remaining)
 			if err != nil {
-				if kafkaErr, ok := err.(ckafka.Error); ok && kafkaErr.Code() == ckafka.ErrTimedOut {
+				if isConfluentPollTimeout(err) {
 					break
 				}
 				if ctx.Err() != nil {
@@ -754,85 +1119,260 @@ func (cc *ConfluentConsumer) ConsumeBatch(handler BatchHandler, opts ConsumerOpt
 				}
 				return fmt.Errorf("kafka/confluent: consume batch error: %w", err)
 			}
-
-			payload := mapConfluentToPayload(msg)
-			batch = append(batch, payload)
-			lastMsg = msg
-
-			if len(batch) == 1 {
-				batchTopic = payload.Topic
-				batchPartition = int32(payload.Partition)
-			}
+			messages = append(messages, message)
 		}
 
-		if len(batch) == 0 {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if len(messages) == 0 {
 			continue
 		}
-
-		batchPayload := BatchPayload{
-			Topic:       batchTopic,
-			Partition:   int(batchPartition),
-			Messages:    batch,
-			FirstOffset: batch[0].Offset,
-			LastOffset:  batch[len(batch)-1].Offset,
-		}
-
-		if !isAutoCommit && opts.CommitBeforeHandler && lastMsg != nil {
-			if _, err := consumer.CommitMessage(lastMsg); err != nil {
-				cc.logger.Error("kafka/confluent: pre-handler batch commit failed",
-					"topic", batchTopic,
-					"partition", batchPartition,
-					"firstOffset", batchPayload.FirstOffset,
-					"lastOffset", batchPayload.LastOffset,
-					"error", err,
-				)
-				return fmt.Errorf("kafka/confluent: pre-handler batch commit failed: %w", err)
-			}
-		}
-
-		if err := handler(batchPayload); err != nil {
-			cc.logger.Error("kafka/confluent: batch handler error",
-				"topic", batchTopic,
-				"partition", batchPartition,
-				"firstOffset", batchPayload.FirstOffset,
-				"lastOffset", batchPayload.LastOffset,
-				"error", err,
-			)
+		groups := groupConfluentBatchMessages(messages)
+		if err := runConfluentPartitionGroups(ctx, groups, concurrency, func(groupCtx context.Context, group confluentBatchGroup) error {
+			return cc.processBatchGroup(groupCtx, consumer, group, handler, isAutoCommit, opts)
+		}); err != nil {
 			return err
-		}
-
-		if !isAutoCommit && !opts.CommitBeforeHandler && lastMsg != nil {
-			if _, err := consumer.CommitMessage(lastMsg); err != nil {
-				cc.logger.Error("kafka/confluent: batch commit failed",
-					"error", err,
-				)
-			}
 		}
 	}
 }
 
-// Close disconnects the consumer gracefully, cancelling any active
-// consumption loop and leaving the consumer group.
-func (cc *ConfluentConsumer) Close() error {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
+func (cc *ConfluentConsumer) processBatchGroup(
+	ctx context.Context,
+	consumer confluentConsumerDriver,
+	group confluentBatchGroup,
+	handler confluentBatchHandler,
+	isAutoCommit bool,
+	opts ConsumerOptions,
+) error {
+	if !isAutoCommit && opts.CommitBeforeHandler {
+		if _, err := consumer.CommitMessage(group.lastMessage); err != nil {
+			cc.logBatchFailure("kafka/confluent: pre-handler batch commit failed", group.payload, err)
+			return fmt.Errorf("kafka/confluent: pre-handler batch commit failed: %w", err)
+		}
+	}
+	if err := handler(ctx, group.payload); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		cc.logBatchFailure("kafka/confluent: batch handler error", group.payload, err)
+		return err
+	}
+	if err := cc.resolveMessageOffset(consumer, group.lastMessage, isAutoCommit, opts.CommitBeforeHandler); err != nil {
+		cc.logBatchFailure("kafka/confluent: post-handler batch offset resolution failed", group.payload, err)
+		return err
+	}
+	return nil
+}
 
-	if cc.closed {
+func (cc *ConfluentConsumer) resolveMessageOffset(
+	consumer confluentConsumerDriver,
+	message *ckafka.Message,
+	isAutoCommit bool,
+	committedBeforeHandler bool,
+) error {
+	if !isAutoCommit && committedBeforeHandler {
 		return nil
 	}
-	cc.closed = true
+	if isAutoCommit && cc.config.AutoCommit {
+		if _, err := consumer.StoreMessage(message); err != nil {
+			return fmt.Errorf("kafka/confluent: post-handler offset store failed: %w", err)
+		}
+		return nil
+	}
+	if _, err := consumer.CommitMessage(message); err != nil {
+		return fmt.Errorf("kafka/confluent: post-handler commit failed: %w", err)
+	}
+	return nil
+}
 
-	// Cancel the consumption context.
-	if cc.cancelFn != nil {
-		cc.cancelFn()
+func (cc *ConfluentConsumer) logMessageFailure(message string, record *ckafka.Message, err error) {
+	payload := mapConfluentToPayload(record)
+	cc.logger.Error(message,
+		"topic", payload.Topic,
+		"partition", payload.Partition,
+		"offset", payload.Offset,
+		"error", redact.ErrorMessage(err),
+	)
+}
+
+func (cc *ConfluentConsumer) logBatchFailure(message string, batch BatchPayload, err error) {
+	cc.logger.Error(message,
+		"topic", batch.Topic,
+		"partition", batch.Partition,
+		"firstOffset", batch.FirstOffset,
+		"lastOffset", batch.LastOffset,
+		"error", redact.ErrorMessage(err),
+	)
+}
+
+func runConfluentPartitionGroups(
+	ctx context.Context,
+	groups []confluentBatchGroup,
+	concurrency int,
+	handler func(context.Context, confluentBatchGroup) error,
+) error {
+	if len(groups) == 0 {
+		return nil
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	waveCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	var firstErr error
+	var errOnce sync.Once
+
+	for _, group := range groups {
+		select {
+		case sem <- struct{}{}:
+		case <-waveCtx.Done():
+			break
+		}
+		if waveCtx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		go func(current confluentBatchGroup) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := handler(waveCtx, current); err != nil {
+				errOnce.Do(func() {
+					firstErr = err
+					cancel()
+				})
+			}
+		}(group)
+	}
+	wg.Wait()
+	return firstErr
+}
+
+func isConfluentPollTimeout(err error) bool {
+	kafkaErr, ok := err.(ckafka.Error)
+	return ok && kafkaErr.Code() == ckafka.ErrTimedOut
+}
+
+func (cc *ConfluentConsumer) beginConsumeRun() (
+	confluentConsumerDriver,
+	context.Context,
+	func(),
+	error,
+) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	if cc.closed {
+		return nil, nil, nil, fmt.Errorf("kafka/confluent: consumer is closed")
+	}
+	if cc.consumer == nil {
+		return nil, nil, nil, fmt.Errorf("kafka/confluent: consumer not connected")
+	}
+	if cc.runDone != nil {
+		return nil, nil, nil, fmt.Errorf("kafka/confluent: consumer is already running")
 	}
 
-	if cc.consumer != nil {
-		if err := cc.consumer.Close(); err != nil {
-			return fmt.Errorf("kafka/confluent: consumer close failed: %w", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	cc.cancelFn = cancel
+	cc.runDone = done
+	finish := func() {
+		cancel()
+		cc.mu.Lock()
+		if cc.runDone == done {
+			cc.cancelFn = nil
+			cc.runDone = nil
+			close(done)
+		}
+		cc.mu.Unlock()
+	}
+	return cc.consumer, ctx, finish, nil
+}
+
+type confluentBatchGroup struct {
+	payload     BatchPayload
+	messages    []*ckafka.Message
+	lastMessage *ckafka.Message
+}
+
+func groupConfluentBatchMessages(messages []*ckafka.Message) []confluentBatchGroup {
+	groups := make([]confluentBatchGroup, 0)
+	indexes := make(map[string]int)
+	for _, message := range messages {
+		if message == nil {
+			continue
+		}
+		payload := mapConfluentToPayload(message)
+		key := fmt.Sprintf("%s\x00%d", payload.Topic, payload.Partition)
+		index, exists := indexes[key]
+		if !exists {
+			index = len(groups)
+			indexes[key] = index
+			groups = append(groups, confluentBatchGroup{payload: BatchPayload{
+				Topic:       payload.Topic,
+				Partition:   payload.Partition,
+				FirstOffset: payload.Offset,
+			}})
+		}
+		group := &groups[index]
+		group.payload.Messages = append(group.payload.Messages, payload)
+		group.messages = append(group.messages, message)
+		group.payload.LastOffset = payload.Offset
+		group.lastMessage = message
+	}
+	return groups
+}
+
+// Close cancels the active run context, waits for every handler and offset
+// operation to finish, and only then closes the driver. This ordering mirrors
+// KafkaJS runner.stop and prevents ReadMessage/CommitMessage from racing Close.
+func (cc *ConfluentConsumer) Close() error {
+	cc.mu.Lock()
+	if cc.closeDone != nil {
+		done := cc.closeDone
+		cc.mu.Unlock()
+		<-done
+		cc.mu.Lock()
+		err := cc.closeErr
+		cc.mu.Unlock()
+		return err
+	}
+	cc.closed = true
+	cc.closeDone = make(chan struct{})
+	done := cc.closeDone
+	cancel := cc.cancelFn
+	runDone := cc.runDone
+	consumer := cc.consumer
+	cc.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if runDone != nil {
+		<-runDone
+	}
+
+	var closeErr error
+	if consumer != nil {
+		if err := consumer.Close(); err != nil {
+			closeErr = fmt.Errorf("kafka/confluent: consumer close failed: %w", err)
 		}
 	}
 
+	cc.mu.Lock()
+	cc.consumer = nil
+	cc.closeErr = closeErr
+	close(done)
+	cc.mu.Unlock()
+
+	if closeErr != nil {
+		cc.logger.Error("kafka/confluent: consumer close failed",
+			"groupId", cc.groupID,
+			"error", redact.ErrorMessage(closeErr),
+		)
+		return closeErr
+	}
 	cc.logger.Info("kafka/confluent: consumer closed",
 		"groupId", cc.groupID,
 	)
@@ -1067,4 +1607,30 @@ func resolveAutoCommit(configDefault bool, override *bool) bool {
 		return *override
 	}
 	return configDefault
+}
+
+func validateConfluentConsumerOptions(
+	configAutoCommit bool,
+	opts ConsumerOptions,
+	defaultPollTimeout time.Duration,
+) (bool, time.Duration, int, error) {
+	if opts.PartitionsConsumedConcurrently < 0 {
+		return false, 0, 0, fmt.Errorf("kafka/confluent: PartitionsConsumedConcurrently must not be negative")
+	}
+	if opts.PollTimeout < 0 {
+		return false, 0, 0, fmt.Errorf("kafka/confluent: PollTimeout must not be negative")
+	}
+	if opts.MaxRecords < 0 {
+		return false, 0, 0, fmt.Errorf("kafka/confluent: MaxRecords must not be negative")
+	}
+
+	pollTimeout := opts.PollTimeout
+	if pollTimeout == 0 {
+		pollTimeout = defaultPollTimeout
+	}
+	concurrency := opts.PartitionsConsumedConcurrently
+	if concurrency == 0 {
+		concurrency = 1
+	}
+	return resolveAutoCommit(configAutoCommit, opts.AutoCommit), pollTimeout, concurrency, nil
 }

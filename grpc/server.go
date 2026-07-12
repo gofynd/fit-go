@@ -170,6 +170,10 @@ type Config struct {
 	// Matches grpc.keepalive_timeout_ms. Default: 10s.
 	KeepaliveTimeout time.Duration
 
+	// ShutdownTimeout bounds graceful shutdown before in-flight RPCs are
+	// forcefully stopped. Default: 10s.
+	ShutdownTimeout time.Duration
+
 	// Logger is the structured logger. If nil, slog.Default() is used.
 	Logger *slog.Logger
 
@@ -209,6 +213,9 @@ func (c *Config) defaults() error {
 	}
 	if c.KeepaliveTimeout == 0 {
 		c.KeepaliveTimeout = 10 * time.Second
+	}
+	if c.ShutdownTimeout == 0 {
+		c.ShutdownTimeout = 10 * time.Second
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
@@ -257,9 +264,10 @@ type MethodSchema struct {
 
 // Server manages a gRPC server instance.
 type Server struct {
-	mu     sync.Mutex
-	cfg    Config
-	logger *slog.Logger
+	mu         sync.Mutex
+	shutdownMu sync.Mutex
+	cfg        Config
+	logger     *slog.Logger
 
 	// grpcServer is the real gRPC server instance.
 	grpcServer *grpc.Server
@@ -286,7 +294,32 @@ type Server struct {
 	running bool
 
 	// done channel is closed when the server stops.
-	done chan struct{}
+	done     chan struct{}
+	doneOnce sync.Once
+}
+
+// currentHealthServer refreshes dependency state before serving the standard
+// gRPC health API. health.Server otherwise caches the status assigned during
+// initialization and can continue reporting SERVING after a dependency fails.
+type currentHealthServer struct {
+	healthpb.UnimplementedHealthServer
+	owner    *Server
+	delegate *health.Server
+}
+
+func (h *currentHealthServer) Check(ctx context.Context, req *healthpb.HealthCheckRequest) (*healthpb.HealthCheckResponse, error) {
+	h.owner.syncHealthStatus()
+	return h.delegate.Check(ctx, req)
+}
+
+func (h *currentHealthServer) List(ctx context.Context, req *healthpb.HealthListRequest) (*healthpb.HealthListResponse, error) {
+	h.owner.syncHealthStatus()
+	return h.delegate.List(ctx, req)
+}
+
+func (h *currentHealthServer) Watch(req *healthpb.HealthCheckRequest, stream grpc.ServerStreamingServer[healthpb.HealthCheckResponse]) error {
+	h.owner.syncHealthStatus()
+	return h.delegate.Watch(req, stream)
 }
 
 // Init initializes a new gRPC server with the given configuration.
@@ -321,13 +354,9 @@ func Init(cfg Config) (*Server, error) {
 	}
 	grpcServer := grpc.NewServer(serverOpts...)
 
-	// Register gRPC health check service.
+	// Create the health state store. Registration happens after Server exists so
+	// each health RPC can evaluate the current checker through its owner.
 	healthServer := health.NewServer()
-	healthpb.RegisterHealthServer(grpcServer, healthServer)
-	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
-
-	// Enable server reflection for debugging.
-	reflection.Register(grpcServer)
 
 	s := &Server{
 		cfg:           cfg,
@@ -339,6 +368,11 @@ func Init(cfg Config) (*Server, error) {
 		healthChecker: cfg.HealthChecker,
 		done:          make(chan struct{}),
 	}
+	healthpb.RegisterHealthServer(grpcServer, &currentHealthServer{owner: s, delegate: healthServer})
+	s.syncHealthStatus()
+
+	// Enable server reflection for debugging.
+	reflection.Register(grpcServer)
 
 	// Attempt to load response type schema (optional, used for validation).
 	typeSchemaPath := filepath.Join(cfg.ProtoDir, cfg.ServerType, cfg.FileName+".type.json")
@@ -395,9 +429,9 @@ func (s *Server) AddServiceDefinitions(implementations ServiceImplementation) er
 
 // syncHealthStatus updates the gRPC health server status based on the
 // fit health checker results.
-func (s *Server) syncHealthStatus() {
+func (s *Server) syncHealthStatus() []string {
 	if s.healthServer == nil || s.healthChecker == nil {
-		return
+		return nil
 	}
 	errs := s.healthChecker.Check()
 	if len(errs) > 0 {
@@ -407,6 +441,7 @@ func (s *Server) syncHealthStatus() {
 		s.healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 		s.healthServer.SetServingStatus(s.cfg.FileName, healthpb.HealthCheckResponse_SERVING)
 	}
+	return errs
 }
 
 // handleMethodMiddlewares wraps each method's handler chain into a single
@@ -691,12 +726,8 @@ func isCompatibleType(actual, expected string) bool {
 // Check protocol. Port healthCheckMethods.
 func (s *Server) healthCheckHandler() HandlerFunc {
 	return func(call *CallInfo, callback Callback, next NextFunc) {
-		errs := s.healthChecker.Check()
+		errs := s.syncHealthStatus()
 		if len(errs) > 0 {
-			// Update gRPC health server status.
-			if s.healthServer != nil {
-				s.healthServer.SetServingStatus("", healthpb.HealthCheckResponse_NOT_SERVING)
-			}
 			callback(nil, map[string]interface{}{
 				"status": "NOT_SERVING",
 				"meta": map[string]interface{}{
@@ -704,9 +735,6 @@ func (s *Server) healthCheckHandler() HandlerFunc {
 				},
 			})
 		} else {
-			if s.healthServer != nil {
-				s.healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
-			}
 			callback(nil, map[string]interface{}{
 				"status": "SERVING",
 			})
@@ -746,63 +774,86 @@ func (s *Server) Start() error {
 	s.running = false
 	s.mu.Unlock()
 
-	// Signal done so any goroutines waiting on it can proceed.
-	select {
-	case <-s.done:
-		// Already closed.
-	default:
-		close(s.done)
-	}
+	s.signalDone()
 
 	return err
 }
 
-// Shutdown gracefully shuts down the gRPC server.
+// Shutdown gracefully shuts down the gRPC server within Config.ShutdownTimeout,
+// then forcefully stops remaining RPCs.
 func (s *Server) Shutdown() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout)
+	defer cancel()
+	return s.ShutdownContext(ctx)
+}
 
+// ShutdownContext gracefully shuts down until ctx expires. On expiry it calls
+// grpc.Server.Stop so shutdown remains bounded and returns the context error.
+func (s *Server) ShutdownContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.shutdownMu.Lock()
+	defer s.shutdownMu.Unlock()
+
+	s.mu.Lock()
 	if !s.running {
+		s.mu.Unlock()
 		return nil
 	}
-
 	s.running = false
+	server := s.grpcServer
+	s.mu.Unlock()
 
-	// GracefulStop stops the gRPC server gracefully. It stops accepting new
-	// connections and RPCs and blocks until all pending RPCs finish.
-	s.grpcServer.GracefulStop()
+	if s.healthServer != nil {
+		s.healthServer.Shutdown()
+	}
+	stopped := make(chan struct{})
+	go func() {
+		server.GracefulStop()
+		close(stopped)
+	}()
 
 	select {
-	case <-s.done:
-		// Already closed.
-	default:
-		close(s.done)
+	case <-stopped:
+		s.signalDone()
+		s.logger.Info("gRPC Server Stopped")
+		return nil
+	case <-ctx.Done():
+		server.Stop()
+		<-stopped
+		s.signalDone()
+		s.logger.Warn("gRPC Server Force Stopped after graceful shutdown deadline")
+		return fmt.Errorf("grpc: graceful shutdown: %w", ctx.Err())
 	}
-
-	s.logger.Info("gRPC Server Stopped")
-	return nil
 }
 
 // Stop forcefully stops the gRPC server without waiting for pending RPCs.
 func (s *Server) Stop() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.shutdownMu.Lock()
+	defer s.shutdownMu.Unlock()
 
+	s.mu.Lock()
 	if !s.running {
+		s.mu.Unlock()
 		return nil
 	}
-
 	s.running = false
-	s.grpcServer.Stop()
+	server := s.grpcServer
+	s.mu.Unlock()
 
-	select {
-	case <-s.done:
-	default:
-		close(s.done)
+	if s.healthServer != nil {
+		s.healthServer.Shutdown()
 	}
+	server.Stop()
+	s.signalDone()
 
 	s.logger.Info("gRPC Server Force Stopped")
 	return nil
+}
+
+func (s *Server) signalDone() {
+	s.doneOnce.Do(func() { close(s.done) })
 }
 
 // IsRunning returns whether the server is currently running.

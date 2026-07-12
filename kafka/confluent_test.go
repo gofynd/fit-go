@@ -15,6 +15,7 @@
 package kafka
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"strings"
@@ -479,6 +480,10 @@ func TestConfluentConsumer_TopicConfig(t *testing.T) {
 		if autoCommit != true {
 			t.Error("enable.auto.commit should be true")
 		}
+		autoStore, _ := cc.configMap.Get("enable.auto.offset.store", true)
+		if autoStore != false {
+			t.Error("enable.auto.offset.store should be false so handlers resolve offsets")
+		}
 
 		autoCommitInterval, _ := cc.configMap.Get("auto.commit.interval.ms", 0)
 		if autoCommitInterval != 10000 {
@@ -875,6 +880,24 @@ func TestProducerConfigOverrides(t *testing.T) {
 		}
 	})
 
+	t.Run("producer explicitly configures fire and forget", func(t *testing.T) {
+		producer, err := client.Producer(ProducerConfig{Acks: 0, AcksSet: true})
+		if err != nil {
+			t.Fatalf("Producer() error = %v", err)
+		}
+		cp := producer.(*ConfluentProducer)
+		acksVal, _ := cp.configMap.Get("acks", "")
+		if acksVal != "0" || cp.configuredAcks != 0 {
+			t.Errorf("explicit acks=0 resolved to config=%v default=%d", acksVal, cp.configuredAcks)
+		}
+	})
+
+	t.Run("producer rejects unsupported acks", func(t *testing.T) {
+		if _, err := client.Producer(ProducerConfig{Acks: 2}); err == nil {
+			t.Fatal("Producer() accepted unsupported acks=2")
+		}
+	})
+
 	t.Run("idempotent producer forces acks=all", func(t *testing.T) {
 		producer, err := client.Producer(ProducerConfig{
 			IdempotentProducer: true,
@@ -1115,6 +1138,18 @@ func TestConfluentProducer_NotConnected(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "not connected") {
 		t.Errorf("Expected 'not connected' error, got: %v", err)
 	}
+
+	// Canonical context-aware calls retain the same broker error contract.
+	err = producer.ProduceCtx(context.Background(), "topic", []Message{{Value: []byte("test")}}, 0)
+	if err == nil || !strings.Contains(err.Error(), "not connected") {
+		t.Errorf("Expected context produce 'not connected' error, got: %v", err)
+	}
+	err = producer.ProduceBatchCtx(context.Background(), []TopicMessages{
+		{Topic: "topic", Messages: []Message{{Value: []byte("test")}}},
+	}, 0)
+	if err == nil || !strings.Contains(err.Error(), "not connected") {
+		t.Errorf("Expected context batch produce 'not connected' error, got: %v", err)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1146,6 +1181,13 @@ func TestConfluentConsumer_NotConnected(t *testing.T) {
 	err = consumer.ConsumeBatch(func(p BatchPayload) error { return nil }, ConsumerOptions{})
 	if err == nil || !strings.Contains(err.Error(), "not connected") {
 		t.Errorf("Expected 'not connected' error, got: %v", err)
+	}
+
+	// The canonical package-level context-aware adapter must preserve the
+	// concrete consumer's broker error instead of hiding or rewriting it.
+	err = ConsumeBatchCtx(consumer, func(context.Context, BatchPayload) error { return nil }, ConsumerOptions{})
+	if err == nil || !strings.Contains(err.Error(), "not connected") {
+		t.Errorf("Expected context batch 'not connected' error, got: %v", err)
 	}
 }
 
@@ -1270,5 +1312,46 @@ func TestFormatAndConvertPartitions(t *testing.T) {
 	pa := toPartitionAssignments(parts)
 	if len(pa) != 3 || pa[0].Topic != "orders" || pa[0].Partition != 0 || pa[1].Topic != "clicks" || pa[1].Partition != 3 || pa[2].Topic != "" {
 		t.Fatalf("toPartitionAssignments = %+v", pa)
+	}
+}
+
+func TestGroupConfluentBatchMessagesSplitsTopicPartitions(t *testing.T) {
+	message := func(topic string, partition int32, offset int64) *ckafka.Message {
+		return &ckafka.Message{TopicPartition: ckafka.TopicPartition{
+			Topic: &topic, Partition: partition, Offset: ckafka.Offset(offset),
+		}}
+	}
+	groups := groupConfluentBatchMessages([]*ckafka.Message{
+		message("orders", 0, 1),
+		message("clicks", 0, 4),
+		message("orders", 0, 2),
+		message("orders", 1, 9),
+	})
+	if len(groups) != 3 {
+		t.Fatalf("groups = %d, want 3", len(groups))
+	}
+	wants := []struct {
+		topic       string
+		partition   int
+		offsets     []int64
+		first, last int64
+	}{
+		{topic: "orders", partition: 0, offsets: []int64{1, 2}, first: 1, last: 2},
+		{topic: "clicks", partition: 0, offsets: []int64{4}, first: 4, last: 4},
+		{topic: "orders", partition: 1, offsets: []int64{9}, first: 9, last: 9},
+	}
+	for i, want := range wants {
+		got := groups[i].payload
+		if got.Topic != want.topic || got.Partition != want.partition || got.FirstOffset != want.first || got.LastOffset != want.last {
+			t.Errorf("group[%d] = %+v, want topic=%s partition=%d offsets=%d..%d", i, got, want.topic, want.partition, want.first, want.last)
+		}
+		if len(got.Messages) != len(want.offsets) {
+			t.Fatalf("group[%d] messages = %d, want %d", i, len(got.Messages), len(want.offsets))
+		}
+		for j, offset := range want.offsets {
+			if got.Messages[j].Topic != want.topic || got.Messages[j].Partition != want.partition || got.Messages[j].Offset != offset {
+				t.Errorf("group[%d].message[%d] = %+v, want homogeneous offset %d", i, j, got.Messages[j], offset)
+			}
+		}
 	}
 }

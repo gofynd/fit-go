@@ -10,6 +10,7 @@
 //	TRACING_ENABLED=true
 //	OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
 //	FIT_PROMETHEUS_ENABLED=true
+//	METRICS_DIR=/var/data/metrics
 //	PROFILING_ENABLED=true
 //	PROFILING_DISTRIBUTOR_ADDRESS=http://localhost:4040
 //
@@ -24,6 +25,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 
 	"github.com/gofynd/fit-go/metrics"
 	"github.com/gofynd/fit-go/profiling"
@@ -54,6 +56,7 @@ func main() {
 
 	// --- Metrics ---------------------------------------------------------
 	registry, err := metrics.New(metrics.Options{
+		MetricsDir:        os.Getenv("METRICS_DIR"),
 		ServerEnabled:     true,
 		HTTPClientEnabled: true,
 	})
@@ -61,6 +64,8 @@ func main() {
 		log.Fatalf("metrics init: %v", err)
 	}
 	defer registry.Shutdown()
+	restoreMetrics := metrics.SetDefault(registry)
+	defer restoreMetrics()
 
 	// --- Profiling -------------------------------------------------------
 	// NewFromEnv reads PROFILING_* env vars; Start is a no-op when disabled.

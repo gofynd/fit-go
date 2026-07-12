@@ -24,6 +24,12 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gofynd/fit-go/internal/tracingtest"
+	"github.com/gofynd/fit-go/metrics"
+	"github.com/gofynd/fit-go/redact"
+	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/baggage"
 )
 
 // ---------------------------------------------------------------------------
@@ -48,7 +54,7 @@ func (l *testLogger) Info(msg string, kvs ...interface{}) {
 func (l *testLogger) Error(msg string, kvs ...interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.messages = append(l.messages, "ERROR: "+msg)
+	l.messages = append(l.messages, "ERROR: "+msg+" "+fmt.Sprint(kvs...))
 }
 func (l *testLogger) Messages() []string {
 	l.mu.Lock()
@@ -69,6 +75,10 @@ type metricRecord struct {
 	Status   string
 	Duration time.Duration
 }
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
 
 func (m *testMetrics) RecordHTTPClient(method, host, statusCode string, duration time.Duration) {
 	m.mu.Lock()
@@ -269,6 +279,59 @@ func TestHTTPClient_ErrorLogging(t *testing.T) {
 	}
 	if !foundError {
 		t.Error("Expected ERROR log message on failure")
+	}
+}
+
+func TestHTTPClient_ErrorLoggingRedactsURLAndRawTransportError(t *testing.T) {
+	logger := &testLogger{}
+	client := NewHTTPClient(HTTPClientOptions{Logger: logger})
+	client.client.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("dial failed for user@example.com password=hunter2 api_key=secret")
+	})
+
+	_, err := client.Get("https://alice:hunter2@example.com/send?email=user@example.com&api_key=secret")
+	if err == nil {
+		t.Fatal("expected original transport error")
+	}
+	joined := strings.Join(logger.Messages(), "\n")
+	for _, forbidden := range []string{"alice", "hunter2", "user@example.com", "api_key=secret"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("log leaked %q: %s", forbidden, joined)
+		}
+	}
+	for _, want := range []string{"https://example.com/send", "operation failed"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("safe error log missing %q: %s", want, joined)
+		}
+	}
+}
+
+func TestHTTPClient_SuccessDebugLoggingUsesSafeURL(t *testing.T) {
+	logger := &testLogger{}
+	client := NewHTTPClient(HTTPClientOptions{Logger: logger})
+	client.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       http.NoBody,
+			Request:    req,
+		}, nil
+	})
+
+	resp, err := client.Get("https://alice:hunter2@example.com/reset-token/path-secret?email=user@example.com&api_key=query-secret")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	joined := strings.Join(logger.Messages(), "\n")
+	for _, forbidden := range []string{"alice", "hunter2", "path-secret", "user@example.com", "query-secret"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("successful HTTP log leaked %q: %s", forbidden, joined)
+		}
+	}
+	if !strings.Contains(joined, "https://example.com/reset-token/"+redact.Mask) {
+		t.Fatalf("successful HTTP log lost safe route context: %s", joined)
 	}
 }
 
@@ -488,6 +551,24 @@ func TestHTTPClient_DefaultTimeout(t *testing.T) {
 	}
 }
 
+func TestHTTPClient_PreservesCustomDefaultTransport(t *testing.T) {
+	previous := http.DefaultTransport
+	http.DefaultTransport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody, Header: make(http.Header)}, nil
+	})
+	t.Cleanup(func() { http.DefaultTransport = previous })
+
+	client := NewHTTPClient(HTTPClientOptions{})
+	resp, err := client.Get("http://custom.transport/test")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", resp.StatusCode)
+	}
+}
+
 func TestExtractHost(t *testing.T) {
 	tests := []struct {
 		url      string
@@ -518,5 +599,133 @@ func TestGenerateRequestID(t *testing.T) {
 	}
 	if len(id1) != 32 { // 16 bytes hex-encoded
 		t.Errorf("Expected 32-char hex ID, got length %d", len(id1))
+	}
+}
+
+func TestHTTPClient_PropagatesTraceContextAndBaggage(t *testing.T) {
+	tracingtest.EnabledGlobal(t)
+	headers := make(chan http.Header, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		headers <- r.Header.Clone()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	member, err := baggage.NewMember("tenant", "acme")
+	if err != nil {
+		t.Fatalf("NewMember: %v", err)
+	}
+	bag, err := baggage.New(member)
+	if err != nil {
+		t.Fatalf("New baggage: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodGet, server.URL, nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req = req.WithContext(baggage.ContextWithBaggage(req.Context(), bag))
+	client := NewHTTPClient(HTTPClientOptions{Timeout: 5 * time.Second})
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	got := <-headers
+	if got.Get("traceparent") == "" {
+		t.Fatal("legacy HTTPClient did not inject traceparent")
+	}
+	if got.Get("baggage") != "tenant=acme" {
+		t.Fatalf("baggage = %q, want tenant=acme", got.Get("baggage"))
+	}
+	if got.Get("x-request-id") == "" {
+		t.Fatal("legacy HTTPClient did not forward its request id")
+	}
+}
+
+func TestHTTPClient_InitializesNilRequestHeaders(t *testing.T) {
+	client := NewHTTPClient(HTTPClientOptions{})
+	client.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Header.Get("x-request-id") == "" {
+			t.Fatal("instrumented request is missing x-request-id")
+		}
+		return &http.Response{
+			StatusCode: http.StatusNoContent,
+			Body:       http.NoBody,
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	})
+	req, err := http.NewRequest(http.MethodGet, "http://example.com/work", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header = nil
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	_ = resp.Body.Close()
+	if req.Header == nil {
+		t.Fatal("Do did not initialize caller request headers")
+	}
+}
+
+func TestHTTPClient_UsesProcessDefaultMetrics(t *testing.T) {
+	registry, err := metrics.New(metrics.Options{
+		HTTPClientEnabled:  true,
+		PrometheusRegistry: prometheus.NewRegistry(),
+	})
+	if err != nil {
+		t.Fatalf("metrics.New: %v", err)
+	}
+	defer registry.Shutdown()
+	restore := metrics.SetDefault(registry)
+	defer restore()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	client := NewHTTPClient(HTTPClientOptions{})
+	resp, err := client.Get(server.URL + "/work")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	output := registry.GetMetricsOutput()
+	if !strings.Contains(output, "fit_http_client_request_duration_ms") ||
+		!strings.Contains(output, `status_code="202"`) {
+		t.Fatalf("legacy HTTPClient did not use process-default metrics:\n%s", output)
+	}
+}
+
+func TestHTTPClient_CustomMetricsOverridesProcessDefault(t *testing.T) {
+	registry, _ := metrics.New(metrics.Options{
+		HTTPClientEnabled:  true,
+		PrometheusRegistry: prometheus.NewRegistry(),
+	})
+	defer registry.Shutdown()
+	restore := metrics.SetDefault(registry)
+	defer restore()
+	custom := &testMetrics{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(HTTPClientOptions{MetricsRecorder: custom})
+	resp, err := client.Get(server.URL)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	_ = resp.Body.Close()
+	if len(custom.Records()) != 1 {
+		t.Fatalf("custom metric records = %d, want 1", len(custom.Records()))
+	}
+	if output := registry.GetMetricsOutput(); output != "" {
+		t.Fatalf("process-default metrics should not double-count custom recorder:\n%s", output)
 	}
 }

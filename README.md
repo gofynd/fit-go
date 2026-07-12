@@ -8,7 +8,7 @@ A batteries-included Go framework for building scalable microservices. Provides 
 |---|---|
 | `config` | Type-safe config from env vars, `.env`, JSON, and YAML files |
 | `server` | Gin-based HTTP server with multi-type routing, middleware, and payload limits |
-| `grpc` | gRPC server with middleware chains, health checks, and reflection |
+| `grpc` | gRPC server plus traced outbound clients via `fitgrpc.NewClient` or `TracingDialOptions`, middleware chains, health checks, and reflection |
 | `mongo` | MongoDB connection manager with read/write splitting and pool tuning |
 | `postgres` | PostgreSQL client via `lib/pq` with connection pooling |
 | `mysql` | MySQL client via `go-sql-driver/mysql` |
@@ -96,7 +96,7 @@ but all of them compile and start without extra setup.
 | [03-logging](examples/03-logging) | `logging` | Structured JSON logging, derived loggers, trace context |
 | [04-http-server](examples/04-http-server) | `server` | Gin-based HTTP server, routing by ServerType, health routes |
 | [05-databases](examples/05-databases) | `mongo`, `postgres`, `redis`, `health` | Connect with read/write split and aggregate health checks |
-| [06-kafka](examples/06-kafka) | `kafka` | Produce and consume messages with the confluent driver |
+| [06-kafka](examples/06-kafka) | `kafka` | Context-aware produce and consume with the confluent driver |
 | [07-caching](examples/07-caching) | `groupcache` | Read-through distributed cache with a single-flight loader |
 | [08-encryption](examples/08-encryption) | `encryption` | AES-256-GCM encrypt/decrypt with pluggable key providers |
 | [09-errors](examples/09-errors) | `errors` | Structured error codes with localized messages |
@@ -172,9 +172,46 @@ conn := client.Service("cache")
 write := conn.Write // Connection for writes
 ```
 
+## gRPC
+
+Use the fit-go client helper for every outbound gRPC connection. Calling
+`google.golang.org/grpc.NewClient` directly without `TracingDialOptions` does
+not install the OpenTelemetry client handler, so it creates no client span and
+does not propagate the active trace to the server.
+
+```go
+import (
+    fitgrpc "github.com/gofynd/fit-go/grpc"
+    grpc "google.golang.org/grpc"
+    "google.golang.org/grpc/credentials/insecure"
+)
+
+conn, err := fitgrpc.NewClient(
+    "dns:///orders:50051",
+    grpc.WithTransportCredentials(insecure.NewCredentials()),
+)
+if err != nil {
+    return err
+}
+defer conn.Close()
+
+// Pass a context carrying the active span to each RPC.
+response, err := orders.NewOrdersClient(conn).GetOrder(ctx, request)
+```
+
+Code that must call the upstream `grpc.NewClient` directly should append
+`fitgrpc.TracingDialOptions()` to its dial options instead:
+
+```go
+opts := []grpc.DialOption{grpc.WithTransportCredentials(credentials)}
+opts = append(opts, fitgrpc.TracingDialOptions()...)
+conn, err := grpc.NewClient(target, opts...)
+```
+
 ## Kafka
 
 ```go
+ctx := context.Background()
 client, err := kafka.NewConfluentClient(&kafka.Config{
     Brokers:  []string{"localhost:9092"},
     ClientID: "my-service",
@@ -185,10 +222,26 @@ producer, err := client.Producer(kafka.ProducerConfig{})
 defer producer.Close()
 
 // acks: -1 = all in-sync replicas, 1 = leader only, 0 = fire-and-forget.
-err = producer.Produce("my-topic", []kafka.Message{
+// ProduceCtx creates one producer span per message and injects the configured
+// propagator fields without changing keys, values, partitions or acks.
+err = producer.ProduceCtx(ctx, "my-topic", []kafka.Message{
     {Key: []byte("k"), Value: []byte(`{"hello":"world"}`)},
 }, -1)
 ```
+
+Use `ProduceCtx`, `ProduceBatchCtx`, and `ConsumeCtx` for application code. For
+batch handlers, call `kafka.ConsumeBatchCtx(consumer, handler, opts)`; it works
+with the built-in Confluent consumer and adapts alternate drivers without
+changing the base interface. The raw `Produce`, `ProduceBatch`, `Consume`, and
+`ConsumeBatch` methods are compatibility escape hatches that intentionally omit
+trace propagation.
+
+The Confluent driver honors the `acks` argument on every produce call. Because
+librdkafka configures acknowledgements per producer rather than per request,
+fit-go caches one otherwise-identical producer per requested acknowledgement
+level and closes all of them during shutdown. Set `ProducerConfig.AcksSet=true`
+when the producer's default must explicitly be `0`; a zero-value config keeps
+the safe `-1` default.
 
 ## Observability
 
@@ -204,8 +257,14 @@ logger, _ := logging.New(logging.Options{
 })
 
 logger.Info("request processed", "user_id", "u123", "duration_ms", 42)
-// {"level":"info","timestamp":"2025-01-15T10:30:00Z","msg":"request processed","user_id":"u123","duration_ms":42}
+// {"level":"info","timestamp":"2025-01-15T10:30:00Z","message":"request processed","extra":{"user_id":"u123","duration_ms":42}}
 ```
+
+The platform envelope remains the default. `FIT_LOG_SCHEMA=traceclue` enables
+the legacy OTel-shaped envelope. Its default body policy matches TraceClue
+3.1.3 (`debug-only`); set `FIT_TRACECLUE_BODY_TRUNCATION=always` for the
+TraceClue 3.0.5/2.1.x behavior. See
+[TraceClue compatibility](docs/TRACECLUE_COMPATIBILITY.md).
 
 ### Tracing
 
@@ -213,6 +272,8 @@ logger.Info("request processed", "user_id", "u123", "duration_ms", 42)
 TRACING_ENABLED=true
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
 OTEL_SERVICE_NAME=my-service
+# Optional: tracecontext,baggage (default), b3, b3multi, jaeger, or none
+OTEL_PROPAGATORS=tracecontext,baggage
 ```
 
 ```go
@@ -226,19 +287,47 @@ span.SetAttribute("order.id", "o-123")
 defer span.End()
 ```
 
+Trace resource identity precedence is `tracing.Options.ServiceName`,
+`OTEL_SERVICE_NAME`, `Options.Attributes["service.name"]`,
+`OTEL_RESOURCE_ATTRIBUTES=service.name=...`, `SERVICE_NAME`, then
+`unknown_service`. `SERVICE_NAME` remains the case-sensitive application
+identity used by FIT configuration and is only a telemetry fallback; setting an
+explicit `OTEL_SERVICE_NAME` intentionally moves telemetry to that dashboard
+identity. The `SERVICE_NAME` fallback is an explicit fit-go improvement over
+legacy TraceClue processes that reported `unknown_service:*` when only the FIT
+application identity was configured.
+
+Calling `fit.Init` twice without an intervening `Shutdown` returns an error.
+Shutdown restores process-global tracing, propagation, metrics, and slog state,
+stops periodic health work, clears lifecycle-owned connections/errors/checks,
+and permits a clean reinitialization.
+
 ### Metrics
 
 ```bash
 FIT_PROMETHEUS_ENABLED=true
+METRICS_DIR=/var/data/metrics
 ```
 
 ```go
-registry, _ := metrics.New(metrics.Options{
-    ServerEnabled:     true,
-    HTTPClientEnabled: true,
-})
-// Prometheus metrics are automatically collected for HTTP server and client
+framework, _ := fit.Init(ctx)
+defer framework.Shutdown(ctx)
+
+// fit.Init installs the enabled registry for fit servers and both HTTP clients.
+client := httpclient.NewHTTPClient()
 ```
+
+With `METRICS_DIR`, fit creates and atomically refreshes a
+node-exporter-compatible `.prom` textfile every four seconds. The deployed Node
+`prom-file-client` 0.1.1 also uses four seconds and
+`<K8S_POD_NAME>-<pid>.prom`, but waits for the first tick and opens with `wx`, so
+later refreshes fail. Immediate creation and atomic replacement are intentional
+bug fixes, not byte parity. Direct `metrics.New` users may instead expose
+`registry.Handler()` for scraping and call `metrics.SetDefault(registry)` to opt
+into automatic server/client recording. Periodic write failures are retained by
+`LastFlushError` and reported through `Options.OnFlushError` (or a generic safe
+error log). See
+[the transport and metrics parity notes](docs/OBSERVABILITY_TRANSPORT_METRICS.md).
 
 ### Profiling
 
@@ -286,7 +375,14 @@ checker.AddCheck(func() string {
 })
 
 errors := checker.Check() // empty slice = healthy
+
+checker.StartPeriodicCheck(30)
+defer checker.StopPeriodicCheck()
 ```
+
+`Fit.Shutdown` calls `Health.Reset` automatically. Direct checker owners can
+call `Reset` to stop periodic work, remove registered checks, and clear the
+health file before reusing the checker.
 
 ## Requirements
 

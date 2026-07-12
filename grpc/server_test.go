@@ -20,6 +20,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -28,6 +29,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,6 +38,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/gofynd/fit-go/health"
 )
@@ -103,6 +106,50 @@ func startServer(t *testing.T, srv *Server) func() {
 	}
 }
 
+type blockingService interface {
+	Block(context.Context, *emptypb.Empty) (*emptypb.Empty, error)
+}
+
+type blockingServiceImpl struct {
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingServiceImpl) Block(ctx context.Context, _ *emptypb.Empty) (*emptypb.Empty, error) {
+	s.once.Do(func() { close(s.entered) })
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func blockingServiceHandler(
+	server any,
+	ctx context.Context,
+	decode func(any) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (any, error) {
+	req := new(emptypb.Empty)
+	if err := decode(req); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return server.(blockingService).Block(ctx, req)
+	}
+	info := &grpc.UnaryServerInfo{Server: server, FullMethod: "/fit.test.Blocking/Block"}
+	handler := func(ctx context.Context, req any) (any, error) {
+		return server.(blockingService).Block(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, req, info, handler)
+}
+
+var blockingServiceDescription = grpc.ServiceDesc{
+	ServiceName: "fit.test.Blocking",
+	HandlerType: (*blockingService)(nil),
+	Methods: []grpc.MethodDesc{{
+		MethodName: "Block",
+		Handler:    blockingServiceHandler,
+	}},
+}
+
 // generateRSAKeyPair generates an RSA key pair for testing RS256 JWT.
 func generateRSAKeyPair(t *testing.T) (*rsa.PrivateKey, string) {
 	t.Helper()
@@ -167,6 +214,9 @@ func TestConfig_Defaults(t *testing.T) {
 	}
 	if cfg.KeepaliveTimeout != 10*time.Second {
 		t.Errorf("KeepaliveTimeout = %v, want 10s", cfg.KeepaliveTimeout)
+	}
+	if cfg.ShutdownTimeout != 10*time.Second {
+		t.Errorf("ShutdownTimeout = %v, want 10s", cfg.ShutdownTimeout)
 	}
 	if cfg.Logger == nil {
 		t.Error("Logger should be set to default")
@@ -432,6 +482,53 @@ func TestServer_ShutdownWithoutStart(t *testing.T) {
 	}
 }
 
+func TestServer_ShutdownDeadlineForcesActiveRPC(t *testing.T) {
+	srv := newTestServer(t)
+	srv.cfg.ShutdownTimeout = 40 * time.Millisecond
+	service := &blockingServiceImpl{entered: make(chan struct{})}
+	srv.GRPCServer().RegisterService(&blockingServiceDescription, service)
+	cleanup := startServer(t, srv)
+	defer cleanup()
+
+	conn, err := grpc.NewClient(
+		srv.Listener().Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+
+	callDone := make(chan error, 1)
+	go func() {
+		callDone <- conn.Invoke(
+			context.Background(),
+			"/fit.test.Blocking/Block",
+			&emptypb.Empty{},
+			&emptypb.Empty{},
+		)
+	}()
+	select {
+	case <-service.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocking RPC did not start")
+	}
+
+	started := time.Now()
+	err = srv.Shutdown()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("forced shutdown took %v, want bounded completion", elapsed)
+	}
+	select {
+	case <-callDone:
+	case <-time.After(time.Second):
+		t.Fatal("forced stop did not cancel the active RPC")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Health check tests
 // ---------------------------------------------------------------------------
@@ -465,6 +562,51 @@ func TestServer_HealthCheck(t *testing.T) {
 	if resp.Status != healthpb.HealthCheckResponse_SERVING {
 		t.Errorf("health status = %v, want SERVING", resp.Status)
 	}
+}
+
+func TestServer_HealthCheckReflectsCurrentDependencyState(t *testing.T) {
+	srv := newTestServer(t)
+	checker := health.NewChecker()
+	var unhealthy atomic.Bool
+	checker.AddCheck(func() string {
+		if unhealthy.Load() {
+			return "database unavailable"
+		}
+		return ""
+	})
+	srv.healthChecker = checker
+	cleanup := startServer(t, srv)
+	defer cleanup()
+
+	conn, err := grpc.NewClient(
+		srv.Listener().Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+	client := healthpb.NewHealthClient(conn)
+
+	check := func(service string, want healthpb.HealthCheckResponse_ServingStatus) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		resp, err := client.Check(ctx, &healthpb.HealthCheckRequest{Service: service})
+		if err != nil {
+			t.Fatalf("Health.Check(%q): %v", service, err)
+		}
+		if resp.Status != want {
+			t.Fatalf("Health.Check(%q) = %s, want %s", service, resp.Status, want)
+		}
+	}
+
+	check("", healthpb.HealthCheckResponse_SERVING)
+	unhealthy.Store(true)
+	check("", healthpb.HealthCheckResponse_NOT_SERVING)
+	check("test", healthpb.HealthCheckResponse_NOT_SERVING)
+	unhealthy.Store(false)
+	check("test", healthpb.HealthCheckResponse_SERVING)
 }
 
 func TestServer_HealthCheckHandler_Healthy(t *testing.T) {

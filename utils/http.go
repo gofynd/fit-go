@@ -28,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	fithttp "github.com/gofynd/fit-go/httpclient"
 	"github.com/gofynd/fit-go/redact"
 )
 
@@ -53,7 +54,8 @@ type HTTPClientOptions struct {
 	// Logger receives structured log entries. If nil, logging is disabled.
 	Logger HTTPLogger
 
-	// MetricsRecorder receives request duration metrics. If nil, metrics are
+	// MetricsRecorder receives request duration metrics. If nil, the process-
+	// default fit metrics registry is used when installed; otherwise metrics are
 	// disabled.
 	MetricsRecorder HTTPMetricsRecorder
 
@@ -157,10 +159,15 @@ func NewHTTPClient(opts HTTPClientOptions) *HTTPClient {
 		}
 	}
 
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	baseTransport := http.DefaultTransport
+	transport, transportConfigurable := http.DefaultTransport.(*http.Transport)
+	if transportConfigurable {
+		transport = transport.Clone()
+		baseTransport = transport
+	}
 
 	// Configure proxy if set.
-	if proxyURL != "" {
+	if proxyURL != "" && transportConfigurable {
 		proxyParsed, err := url.Parse(proxyURL)
 		if err == nil {
 			transport.Proxy = func(req *http.Request) (*url.URL, error) {
@@ -189,10 +196,17 @@ func NewHTTPClient(opts HTTPClientOptions) *HTTPClient {
 		}
 	}
 
+	transportOptions := make([]fithttp.Option, 0, 1)
+	if opts.MetricsRecorder != nil {
+		// The legacy recorder below remains authoritative when supplied. Disable
+		// the process-default transport recorder to avoid double-counting.
+		transportOptions = append(transportOptions, fithttp.WithMetrics(nil))
+	}
+
 	return &HTTPClient{
 		client: &http.Client{
 			Timeout:   opts.Timeout,
-			Transport: transport,
+			Transport: fithttp.WrapTransport(baseTransport, transportOptions...),
 		},
 		baseURL:              strings.TrimRight(opts.BaseURL, "/"),
 		defaultHeaders:       opts.Headers,
@@ -212,6 +226,10 @@ func NewHTTPClient(opts HTTPClientOptions) *HTTPClient {
 //
 // Port of the axios request/response interceptors.
 func (c *HTTPClient) Do(req *http.Request) (*http.Response, error) {
+	if req.Header == nil {
+		req.Header = make(http.Header)
+	}
+
 	// Apply base URL if the request URL is relative.
 	if c.baseURL != "" && !req.URL.IsAbs() {
 		parsed, err := url.Parse(c.baseURL + req.URL.String())
@@ -237,7 +255,11 @@ func (c *HTTPClient) Do(req *http.Request) (*http.Response, error) {
 	}
 
 	// Generate request ID for log correlation.
-	requestID := generateRequestID()
+	requestID := req.Header.Get("x-request-id")
+	if requestID == "" {
+		requestID = generateRequestID()
+		req.Header.Set("x-request-id", requestID)
+	}
 	action := strings.ToUpper(req.Method)
 	externalURL := req.URL.String()
 	// logURL is what we LOG: scheme://host/path, never the query string (outbound
@@ -266,7 +288,7 @@ func (c *HTTPClient) Do(req *http.Request) (*http.Response, error) {
 			c.logger.Error(fmt.Sprintf("[EXT] Failed %s to %s with %s", action, logURL, requestID),
 				"request_url", logURL,
 				"request_method", action,
-				"error", err.Error(),
+				"error", redact.ErrorMessage(err),
 			)
 		}
 		return nil, err
@@ -291,7 +313,7 @@ func (c *HTTPClient) Do(req *http.Request) (*http.Response, error) {
 		ct := resp.Header.Get("Content-Type")
 		for _, allowed := range whitelistedContentTypes {
 			if strings.Contains(ct, allowed) {
-				c.logger.Debug(fmt.Sprintf("[EXT] Response Data of %s to %s with Request ID: %s", action, externalURL, requestID),
+				c.logger.Debug(fmt.Sprintf("[EXT] Response Data of %s to %s with Request ID: %s", action, logURL, requestID),
 					"content_type", ct,
 				)
 				break

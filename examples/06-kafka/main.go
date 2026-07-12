@@ -14,6 +14,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
@@ -31,11 +32,11 @@ func main() {
 	}
 	defer client.Close()
 
-	produce(client)
+	produce(context.Background(), client)
 	consume(client)
 }
 
-func produce(client *kafka.ConfluentClient) {
+func produce(ctx context.Context, client *kafka.ConfluentClient) {
 	producer, err := client.Producer(kafka.ProducerConfig{})
 	if err != nil {
 		log.Fatalf("producer: %v", err)
@@ -48,7 +49,9 @@ func produce(client *kafka.ConfluentClient) {
 	}
 
 	// acks: -1 = all in-sync replicas, 1 = leader only, 0 = fire-and-forget.
-	err = producer.Produce("orders", []kafka.Message{
+	// Context-aware methods are canonical: every message gets a producer span
+	// and carries traceparent, tracestate and baggage when tracing is enabled.
+	err = producer.ProduceCtx(ctx, "orders", []kafka.Message{
 		{Key: []byte("o-1"), Value: []byte(`{"id":"o-1","total":42}`)},
 		{Key: []byte("o-2"), Value: []byte(`{"id":"o-2","total":99}`)},
 	}, -1)
@@ -79,7 +82,7 @@ func consume(client *kafka.ConfluentClient) {
 	// Consume blocks, dispatching each message to the handler. Here we stop
 	// after a short demo window by returning an error from the handler.
 	deadline := time.Now().Add(5 * time.Second)
-	handler := func(msg kafka.MessagePayload) error {
+	handler := func(_ context.Context, msg kafka.MessagePayload) error {
 		fmt.Printf("consumed topic=%s partition=%d offset=%d value=%s\n",
 			msg.Topic, msg.Partition, msg.Offset, string(msg.Value))
 		if time.Now().After(deadline) {
@@ -88,7 +91,7 @@ func consume(client *kafka.ConfluentClient) {
 		return nil
 	}
 
-	if err := consumer.Consume(handler, kafka.ConsumerOptions{}); err != nil {
+	if err := consumer.ConsumeCtx(handler, kafka.ConsumerOptions{}); err != nil {
 		log.Printf("consume ended: %v", err)
 	}
 }

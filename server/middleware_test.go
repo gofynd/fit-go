@@ -392,12 +392,84 @@ func TestLogRequestResponse_Middleware(t *testing.T) {
 		}
 	})
 
+	t.Run("metrics use route template and integer milliseconds", func(t *testing.T) {
+		var gotRoute string
+		var gotDuration float64
+		engine := gin.New()
+		engine.Use(LogRequestResponse(LogRequestResponseConfig{
+			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			MetricsRecorder: func(_, route, _ string, durationMs float64) {
+				gotRoute = route
+				gotDuration = durationMs
+			},
+		}))
+		platform := engine.Group("/service/platform")
+		platform.GET("/companies/:companyID/orders/:orderID", func(c *gin.Context) {
+			time.Sleep(5 * time.Millisecond)
+			c.Status(http.StatusNoContent)
+		})
+
+		request := httptest.NewRequest(http.MethodGet, "/service/platform/companies/acme/orders/order-abc", nil)
+		engine.ServeHTTP(httptest.NewRecorder(), request)
+
+		if gotRoute != "/service/platform/companies/:companyID/orders/:orderID" {
+			t.Fatalf("route = %q, want registered route template", gotRoute)
+		}
+		if gotDuration < 1 || gotDuration != float64(int64(gotDuration)) {
+			t.Fatalf("duration = %v, want elapsed whole milliseconds", gotDuration)
+		}
+	})
+
+	t.Run("metrics normalize path when route template is unavailable", func(t *testing.T) {
+		var gotRoute string
+		engine := gin.New()
+		engine.Use(LogRequestResponse(LogRequestResponseConfig{
+			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			MetricsRecorder: func(_, route, _ string, _ float64) {
+				gotRoute = route
+			},
+		}))
+		engine.NoRoute(func(c *gin.Context) { c.Status(http.StatusNotFound) })
+
+		request := httptest.NewRequest(http.MethodGet, "/orders/123/550e8400-e29b-41d4-a716-446655440000", nil)
+		engine.ServeHTTP(httptest.NewRecorder(), request)
+
+		if gotRoute != "/orders/:id/:uuid" {
+			t.Fatalf("route = %q, want normalized fallback", gotRoute)
+		}
+	})
+
+	t.Run("metrics ignore fit server catch-all route", func(t *testing.T) {
+		var gotRoute string
+		engine := gin.New()
+		engine.Use(LogRequestResponse(LogRequestResponseConfig{
+			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			MetricsRecorder: func(_, route, _ string, _ float64) {
+				gotRoute = route
+			},
+		}))
+		engine.GET("/application/*path", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+		request := httptest.NewRequest(http.MethodGet, "/application/orders/123", nil)
+		engine.ServeHTTP(httptest.NewRecorder(), request)
+
+		if gotRoute != "/application/orders/:id" {
+			t.Fatalf("route = %q, want normalized mounted-handler fallback", gotRoute)
+		}
+	})
+
 	t.Run("skips health check paths", func(t *testing.T) {
 		var logBuf bytes.Buffer
 		logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+		metricsCalls := 0
 
 		engine := gin.New()
-		engine.Use(LogRequestResponse(LogRequestResponseConfig{Logger: logger}))
+		engine.Use(LogRequestResponse(LogRequestResponseConfig{
+			Logger: logger,
+			MetricsRecorder: func(_, _, _ string, _ float64) {
+				metricsCalls++
+			},
+		}))
 		engine.GET("/_healthz", func(c *gin.Context) { c.Status(http.StatusOK) })
 		engine.GET("/_readyz", func(c *gin.Context) { c.Status(http.StatusOK) })
 
@@ -410,6 +482,9 @@ func TestLogRequestResponse_Middleware(t *testing.T) {
 			if logBuf.Len() > 0 {
 				t.Errorf("Path %s should not be logged", path)
 			}
+		}
+		if metricsCalls != 0 {
+			t.Fatalf("health probes recorded %d metrics, want none", metricsCalls)
 		}
 	})
 

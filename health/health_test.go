@@ -18,7 +18,9 @@ import (
 	"errors"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -409,4 +411,73 @@ func TestChecker_WriteHealthFile(t *testing.T) {
 			t.Error("Health file should be removed when unhealthy")
 		}
 	})
+}
+
+func TestCheckerPeriodicLifecycleStopsRestartsAndResets(t *testing.T) {
+	c := NewChecker()
+	t.Cleanup(c.Reset)
+
+	var calls atomic.Int32
+	c.AddCheck(func() string {
+		calls.Add(1)
+		return ""
+	})
+	c.startPeriodicCheck(2 * time.Millisecond)
+	waitForHealthCalls(t, &calls, 2)
+
+	c.StopPeriodicCheck()
+	stoppedAt := calls.Load()
+	time.Sleep(10 * time.Millisecond)
+	if got := calls.Load(); got != stoppedAt {
+		t.Fatalf("periodic check continued after StopPeriodicCheck: %d -> %d", stoppedAt, got)
+	}
+	c.StopPeriodicCheck() // idempotent
+
+	c.startPeriodicCheck(2 * time.Millisecond)
+	waitForHealthCalls(t, &calls, stoppedAt+2)
+	c.Reset()
+	resetAt := calls.Load()
+	time.Sleep(10 * time.Millisecond)
+	if got := calls.Load(); got != resetAt {
+		t.Fatalf("periodic check continued after Reset: %d -> %d", resetAt, got)
+	}
+	if errs := c.Check(); len(errs) != 0 {
+		t.Fatalf("reset checker returned errors: %v", errs)
+	}
+	c.mu.RLock()
+	checks := len(c.checks)
+	c.mu.RUnlock()
+	if checks != 0 {
+		t.Fatalf("Reset retained %d checks", checks)
+	}
+}
+
+func TestCheckerPeriodicLifecycleConcurrentStartStop(t *testing.T) {
+	c := NewChecker()
+	t.Cleanup(c.Reset)
+	c.AddCheck(func() string { return "" })
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.startPeriodicCheck(time.Millisecond)
+			_ = c.Check()
+			c.StopPeriodicCheck()
+		}()
+	}
+	wg.Wait()
+	c.Reset()
+}
+
+func waitForHealthCalls(t *testing.T, calls *atomic.Int32, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for calls.Load() < want && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := calls.Load(); got < want {
+		t.Fatalf("health calls = %d, want at least %d", got, want)
+	}
 }

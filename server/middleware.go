@@ -33,6 +33,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gofynd/fit-go/errors"
+	"github.com/gofynd/fit-go/redact"
 )
 
 // Middleware is the standard middleware signature used throughout fit.go.
@@ -195,8 +196,9 @@ type LogRequestResponseConfig struct {
 	// for fit.js/pyfit parity. Use ResponseLogSeverityStatusBased for services that
 	// intentionally want 4xx=WARN and 5xx=ERROR.
 	ResponseLogSeverity ResponseLogSeverityMode
-	// LegacyOriginalURL logs request_url as the original request URI, including the
-	// query string. The default is path-only, with query params logged separately.
+	// LegacyOriginalURL keeps the legacy request_url field shape by appending the
+	// query string, but values are still allowlist-redacted. The default is
+	// path-only, with redacted query params logged separately.
 	LegacyOriginalURL bool
 	// MetricsRecorder is an optional callback invoked with method, route, status, and
 	// duration so that the caller can record Prometheus histograms.
@@ -235,12 +237,10 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 
 		start := time.Now()
 
-		// Legacy parity (fit.js log-request-response-details / pyfit tracing
-		// middleware): request_url = path; query params (full values) and route
-		// params are structured fields; opted-in header values are logged verbatim.
-		// The same base fields are repeated on the RES line, mirroring how Node/pyfit
-		// reuse a single logDetails object. Values are NOT redacted here — this is
-		// deliberate parity with the platform's Node/Python request logging.
+		// Preserve the legacy field names and REQ/RES duplication, but enforce the
+		// Commerce telemetry boundary: arbitrary query values and credential headers
+		// are never emitted. Pagination/sort controls remain visible through the
+		// shared allowlist so logs retain operational value without carrying PII.
 		base := []slog.Attr{
 			slog.String("request_url", requestURL),
 			slog.String("request_method", c.Request.Method),
@@ -254,7 +254,7 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 		if cfg.IncludeHeaders != "" {
 			for _, h := range strings.Split(cfg.IncludeHeaders, ",") {
 				if h = strings.TrimSpace(h); h != "" {
-					base = append(base, slog.String(h, c.Request.Header.Get(h)))
+					base = append(base, slog.String(h, redact.HeaderValue(h, c.Request.Header.Get(h))))
 				}
 			}
 		}
@@ -273,7 +273,15 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 
 		// Record Prometheus metrics via callback
 		if cfg.MetricsRecorder != nil {
-			route := normalizeRoutePath(path)
+			// Express labels a matched request with req.baseUrl + req.route.path.
+			// Gin's equivalent is FullPath. fit Server mounts generic handlers on
+			// /*path, however, so that outer transport route carries no useful
+			// service-level cardinality; use the same UUID/numeric fallback that
+			// fit.js uses when req.route is unavailable in that case.
+			route := c.FullPath()
+			if route == "" || strings.HasSuffix(route, "/*path") {
+				route = normalizeRoutePath(path)
+			}
 			cfg.MetricsRecorder(c.Request.Method, route, strconv.Itoa(statusCode), float64(duration.Milliseconds()))
 		}
 
@@ -297,8 +305,8 @@ var GinLogRequestResponse = LogRequestResponse
 
 func requestURLForLog(c *gin.Context, cfg LogRequestResponseConfig) string {
 	if cfg.LegacyOriginalURL || strings.EqualFold(strings.TrimSpace(envGet("FIT_LOG_REQUEST_URL", "")), "original") {
-		if uri := c.Request.URL.RequestURI(); uri != "" {
-			return uri
+		if query := redact.Query(c.Request.URL.RawQuery, nil); query != "" {
+			return c.Request.URL.Path + "?" + query
 		}
 	}
 	return c.Request.URL.Path
@@ -321,17 +329,10 @@ func responseLogLevel(statusCode int, cfg LogRequestResponseConfig) slog.Level {
 	return slog.LevelInfo
 }
 
-// queryParams flattens query values into a key->value map (multi-valued joined
-// with ",") for structured logging. Full values, legacy parity. nil when empty.
+// queryParams retains the legacy structured field while masking every value
+// outside the shared pagination/sort allowlist. nil when empty.
 func queryParams(v map[string][]string) map[string]string {
-	if len(v) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(v))
-	for k, vs := range v {
-		out[k] = strings.Join(vs, ",")
-	}
-	return out
+	return redact.QueryMap(v, nil)
 }
 
 // pathParams renders gin route params (fit.js request_params / pyfit path_params)
@@ -791,7 +792,7 @@ func decryptNestedField(data map[string]interface{}, keys []string, decrypt Decr
 	if err != nil {
 		slog.Error("DecryptionMiddleware: failed to decrypt field",
 			"path", strings.Join(keys, "."),
-			"error", err,
+			"error", redact.ErrorMessage(err),
 		)
 		return
 	}

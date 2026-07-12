@@ -18,6 +18,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -27,20 +28,20 @@ import (
 // ---------------------------------------------------------------------------
 
 type mockConnection struct {
-	pingCalled  bool
-	closeCalled bool
+	pingCalled  atomic.Bool
+	closeCalled atomic.Bool
 	pingErr     error
 	closeErr    error
 	isCluster   bool
 }
 
 func (m *mockConnection) Ping(ctx context.Context) error {
-	m.pingCalled = true
+	m.pingCalled.Store(true)
 	return m.pingErr
 }
 
 func (m *mockConnection) Close() error {
-	m.closeCalled = true
+	m.closeCalled.Store(true)
 	return m.closeErr
 }
 
@@ -490,10 +491,10 @@ func TestClient_Close(t *testing.T) {
 		t.Errorf("Close() error = %v, want nil", err)
 	}
 
-	if !read.closeCalled {
+	if !read.closeCalled.Load() {
 		t.Error("Read connection Close() should be called")
 	}
-	if !write.closeCalled {
+	if !write.closeCalled.Load() {
 		t.Error("Write connection Close() should be called")
 	}
 

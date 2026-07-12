@@ -43,10 +43,11 @@ const AlwaysSampleEntryPointsEnv = "TRACECLUE_ALWAYS_SAMPLE_SERVICE_ENTRY_POINTS
 // request/message). Every other span (internal/downstream, i.e. a local parent) falls
 // back to the env-configured sampler.
 //
-// Why: with OTEL_TRACES_SAMPLER=parentbased_traceidratio and ARG=0.25 — the platform
-// default — a plain ratio sampler drops ~75% of locally-rooted requests entirely, so
-// they are invisible in traces and RED metrics. This sampler keeps 100% of entry
-// points while still thinning the interior of each trace at the configured ratio.
+// Why: traceclue guarantees a sampled boundary span for every local root and remote
+// parent, even when the incoming traceparent is unsampled. With a ParentBased
+// delegate, descendants of that sampled entry inherit the sampled decision; they are
+// not independently ratio-thinned. This can make an entire service-local trace 100%
+// sampled, and is preserved because it is the deployed legacy behavior.
 //
 // NOTE (faithful to legacy): a REMOTE parent is force-sampled even when the upstream
 // traceparent says sampled=0. That is deliberately what traceclue does — it guarantees

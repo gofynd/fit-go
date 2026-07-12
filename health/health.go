@@ -18,6 +18,7 @@ package health
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,10 @@ type Checker struct {
 	checks []CheckFunc
 	// skipCounter is used for adaptive health checking to reduce load
 	skipCounter int
+
+	periodicMu   sync.Mutex
+	periodicStop chan struct{}
+	periodicDone chan struct{}
 }
 
 // NewChecker creates a new health checker.
@@ -51,10 +56,11 @@ func (c *Checker) AddCheck(check CheckFunc) {
 // Returns empty slice if all healthy.
 func (c *Checker) Check() []string {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	checks := append([]CheckFunc(nil), c.checks...)
+	c.mu.RUnlock()
 
 	var errs []string
-	for _, check := range c.checks {
+	for _, check := range checks {
 		if msg := check(); msg != "" {
 			errs = append(errs, msg)
 		}
@@ -76,20 +82,83 @@ func (c *Checker) StartPeriodicCheck(intervalSeconds int) {
 
 	// Override from env
 	if envVal := os.Getenv("HEALTH_CHECK_INTERVAL_SECONDS"); envVal != "" {
-		fmt.Sscanf(envVal, "%d", &intervalSeconds)
+		if configured, err := strconv.Atoi(strings.TrimSpace(envVal)); err == nil && configured > 0 {
+			intervalSeconds = configured
+		}
+	}
+	c.startPeriodicCheck(time.Duration(intervalSeconds) * time.Second)
+}
+
+func (c *Checker) startPeriodicCheck(interval time.Duration) {
+	if c == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = 30 * time.Second
 	}
 
+	c.periodicMu.Lock()
+	c.stopPeriodicCheckLocked()
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	c.periodicStop = stop
+	c.periodicDone = done
+
 	go func() {
-		ticker := time.NewTicker(time.Duration(intervalSeconds) * time.Second)
+		defer close(done)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
 		// Run immediately
 		c.writeHealthFile()
 
-		for range ticker.C {
-			c.writeHealthFile()
+		for {
+			select {
+			case <-ticker.C:
+				c.writeHealthFile()
+			case <-stop:
+				return
+			}
 		}
 	}()
+	c.periodicMu.Unlock()
+}
+
+// StopPeriodicCheck stops periodic health-file work and waits for an in-flight
+// check/write to finish. It is safe to call repeatedly and concurrently with
+// StartPeriodicCheck.
+func (c *Checker) StopPeriodicCheck() {
+	if c == nil {
+		return
+	}
+	c.periodicMu.Lock()
+	c.stopPeriodicCheckLocked()
+	c.periodicMu.Unlock()
+}
+
+func (c *Checker) stopPeriodicCheckLocked() {
+	if c.periodicStop == nil {
+		return
+	}
+	close(c.periodicStop)
+	<-c.periodicDone
+	c.periodicStop = nil
+	c.periodicDone = nil
+}
+
+// Reset stops background work, removes all registered checks, and removes the
+// liveness file written by this checker. A reset checker can be reused, though
+// fit.Init installs a fresh checker for each framework lifecycle.
+func (c *Checker) Reset() {
+	if c == nil {
+		return
+	}
+	c.StopPeriodicCheck()
+	c.mu.Lock()
+	c.checks = nil
+	c.skipCounter = 0
+	c.mu.Unlock()
+	_ = os.Remove("/tmp/_healthz")
 }
 
 // writeHealthFile writes to /tmp/_healthz if healthy.

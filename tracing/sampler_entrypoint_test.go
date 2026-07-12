@@ -105,7 +105,8 @@ func TestServiceEntryPointSampler_RemoteParent(t *testing.T) {
 
 // TestServiceEntryPointSampler_LocalParentDelegates: an INTERNAL span (local parent)
 // is not an entry point, so the configured sampler decides. This is what keeps the
-// interior of a trace thinned at the configured ratio.
+// descendants delegated to ParentBased sampling (and therefore sampled when their
+// local parent is sampled).
 func TestServiceEntryPointSampler_LocalParentDelegates(t *testing.T) {
 	s := serviceEntryPointSampler{fallback: neverSampler{}}
 
@@ -144,15 +145,34 @@ func TestBuildSampler_EntryPointGatedByEnv(t *testing.T) {
 	}
 }
 
-// TestBuildBaseSampler_ZeroRateIsNeverSample pins the trap behind the fit.Init bug:
-// a zero SampleRate collapses to NeverSample. fit.Init used to construct a bare
-// Options{} (SampleRate 0), so any service booting through it produced NO
-// locally-rooted traces. fit.Init now merges over DefaultOptions().
-func TestBuildBaseSampler_ZeroRateIsNeverSample(t *testing.T) {
-	s := buildBaseSampler(Options{}) // zero value: Sampler "", SampleRate 0.0
+// TestBuildBaseSampler_ZeroOptionsUsesOTelDefault pins the standard default:
+// sampler args have no effect unless a ratio sampler is explicitly selected.
+func TestBuildBaseSampler_ZeroOptionsUsesOTelDefault(t *testing.T) {
+	s := buildBaseSampler(Options{})
 	res := s.ShouldSample(sdktrace.SamplingParameters{ParentContext: context.Background()})
-	if res.Decision != sdktrace.Drop {
-		t.Fatalf("zero-value Options decision = %v, want Drop — this is the trap fit.Init must avoid", res.Decision)
+	if res.Decision != sdktrace.RecordAndSample {
+		t.Fatalf("zero-value Options decision = %v, want OTel parentbased_always_on default", res.Decision)
+	}
+}
+
+func TestServiceEntryPointSampler_ParentBasedDescendantRemainsSampled(t *testing.T) {
+	base := sdktrace.ParentBased(sdktrace.TraceIDRatioBased(0))
+	s := serviceEntryPointSampler{fallback: base}
+	entry := s.ShouldSample(sdktrace.SamplingParameters{ParentContext: context.Background()})
+	if entry.Decision != sdktrace.RecordAndSample {
+		t.Fatalf("entry decision = %v, want sampled", entry.Decision)
+	}
+
+	parent := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    trace.TraceID{1},
+		SpanID:     trace.SpanID{1},
+		TraceFlags: trace.FlagsSampled,
+	})
+	child := s.ShouldSample(sdktrace.SamplingParameters{
+		ParentContext: trace.ContextWithSpanContext(context.Background(), parent),
+	})
+	if child.Decision != sdktrace.RecordAndSample {
+		t.Fatalf("local descendant decision = %v, want sampled via ParentBased inheritance", child.Decision)
 	}
 }
 

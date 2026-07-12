@@ -15,6 +15,9 @@
 package kafka
 
 import (
+	"strings"
+
+	"github.com/gofynd/fit-go/tracing"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 )
@@ -26,32 +29,56 @@ import (
 // platform ever changes the propagator.
 type messageCarrier struct{ msg *Message }
 
-// Get returns the first header value with the given key.
+// Get returns the first header value with the given key. Kafka header names are
+// case-sensitive at the protocol level, but propagation fields are HTTP-style
+// field names and must be matched case-insensitively so forwarded headers such
+// as TraceParent are not ignored.
 func (c messageCarrier) Get(key string) string {
+	if c.msg == nil {
+		return ""
+	}
 	for i := range c.msg.Headers {
-		if c.msg.Headers[i].Key == key {
+		if strings.EqualFold(c.msg.Headers[i].Key, key) {
 			return string(c.msg.Headers[i].Value)
 		}
 	}
 	return ""
 }
 
-// Set writes a header, REPLACING any existing header with the same key rather than
-// appending a second one. This matters for a forwarded/re-produced message: a stale
-// traceparent must be overwritten with the current span's, or the consumer (which
-// reads the first match) would continue the wrong trace.
+// Set writes exactly one canonical header, replacing the first case-insensitive
+// match and removing every duplicate. This matters for forwarded/re-produced
+// messages: leaving a stale TraceParent or a second baggage/tracestate field makes
+// extraction order-dependent and can continue the wrong trace.
 func (c messageCarrier) Set(key, value string) {
-	for i := range c.msg.Headers {
-		if c.msg.Headers[i].Key == key {
-			c.msg.Headers[i].Value = []byte(value)
-			return
-		}
+	if c.msg == nil {
+		return
 	}
-	c.msg.Headers = append(c.msg.Headers, Header{Key: key, Value: []byte(value)})
+
+	headers := c.msg.Headers[:0]
+	replaced := false
+	for _, header := range c.msg.Headers {
+		if strings.EqualFold(header.Key, key) {
+			if !replaced {
+				header.Key = key
+				header.Value = []byte(value)
+				headers = append(headers, header)
+				replaced = true
+			}
+			continue
+		}
+		headers = append(headers, header)
+	}
+	if !replaced {
+		headers = append(headers, Header{Key: key, Value: []byte(value)})
+	}
+	c.msg.Headers = headers
 }
 
 // Keys lists the header keys present on the message.
 func (c messageCarrier) Keys() []string {
+	if c.msg == nil {
+		return nil
+	}
 	keys := make([]string, 0, len(c.msg.Headers))
 	for i := range c.msg.Headers {
 		keys = append(keys, c.msg.Headers[i].Key)
@@ -65,7 +92,7 @@ type payloadCarrier struct{ headers []Header }
 
 func (c payloadCarrier) Get(key string) string {
 	for i := range c.headers {
-		if c.headers[i].Key == key {
+		if strings.EqualFold(c.headers[i].Key, key) {
 			return string(c.headers[i].Value)
 		}
 	}
@@ -86,3 +113,23 @@ func (c payloadCarrier) Keys() []string {
 // propagator returns the process-global text-map propagator (TraceContext + Baggage,
 // installed by tracing init).
 func propagator() propagation.TextMapPropagator { return otel.GetTextMapPropagator() }
+
+// removePropagationHeaders removes every field owned by the configured global
+// propagator before a fresh injection. Injectors do not call Set for absent values
+// (for example, a context without baggage), so merely replacing fields in Set would
+// leave stale baggage or tracestate on a forwarded message.
+func removePropagationHeaders(msg *Message) {
+	if msg == nil || len(msg.Headers) == 0 {
+		return
+	}
+	// Clear every format fit-go supports, not only the currently configured one.
+	// This makes propagator switches and OTEL_PROPAGATORS=none real opt-outs
+	// instead of accidentally forwarding a stale B3/Jaeger/W3C parent.
+	headers := msg.Headers[:0]
+	for _, header := range msg.Headers {
+		if !tracing.IsPropagationField(header.Key, propagator()) {
+			headers = append(headers, header)
+		}
+	}
+	msg.Headers = headers
+}

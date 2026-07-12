@@ -34,7 +34,7 @@ func newTestSlog(t *testing.T) (*slog.Logger, *bytes.Buffer) {
 	return slog.New(NewSlogHandler(lg)), &buf
 }
 
-// A plain log/slog call must come out in the fit OTel-JSON format.
+// A plain log/slog call must use the fit logger's selected JSON format.
 func TestSlogHandler_RoutesThroughFitLogger(t *testing.T) {
 	sl, buf := newTestSlog(t)
 	sl.Info("via slog", "key", "val")
@@ -79,5 +79,71 @@ func TestSlogHandler_WithAttrsAndGroup(t *testing.T) {
 	}
 	if !strings.Contains(out, `"g.k"`) {
 		t.Fatalf("WithGroup-prefixed key missing: %s", out)
+	}
+}
+
+func TestSetAsDefaultSlogRestoresBaselineAfterOutOfOrderOwners(t *testing.T) {
+	baseline := slog.Default()
+	first, err := New(Options{Level: "info", Env: "production", Output: &bytes.Buffer{}})
+	if err != nil {
+		t.Fatalf("first New: %v", err)
+	}
+	second, err := New(Options{Level: "info", Env: "production", Output: &bytes.Buffer{}})
+	if err != nil {
+		t.Fatalf("second New: %v", err)
+	}
+	restoreFirst := SetAsDefaultSlog(first)
+	secondInstalled := SetAsDefaultSlog(second)
+	current := slog.Default()
+
+	restoreFirst()
+	if slog.Default() != current {
+		t.Fatal("restoring the older owner clobbered the newer slog default")
+	}
+	secondInstalled()
+	if slog.Default() != baseline {
+		t.Fatal("newer owner restored the inactive older logger instead of the baseline")
+	}
+}
+
+func TestSetAsDefaultSlogDoesNotClobberExternalReplacement(t *testing.T) {
+	baseline := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(baseline) })
+	logger, err := New(Options{Level: "info", Env: "production", Output: &bytes.Buffer{}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	restore := SetAsDefaultSlog(logger)
+	external := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	slog.SetDefault(external)
+	restore()
+	if slog.Default() != external {
+		t.Fatal("restore clobbered an independently installed slog default")
+	}
+}
+
+func TestSetAsDefaultSlogStartsNewChainAfterExternalReplacement(t *testing.T) {
+	baseline := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(baseline) })
+	first, err := New(Options{Level: "info", Env: "production", Output: &bytes.Buffer{}})
+	if err != nil {
+		t.Fatalf("first New: %v", err)
+	}
+	second, err := New(Options{Level: "info", Env: "production", Output: &bytes.Buffer{}})
+	if err != nil {
+		t.Fatalf("second New: %v", err)
+	}
+	restoreFirst := SetAsDefaultSlog(first)
+	external := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	slog.SetDefault(external)
+	restoreSecond := SetAsDefaultSlog(second)
+
+	restoreSecond()
+	if slog.Default() != external {
+		t.Fatal("new owner revived an obsolete fit logger instead of the external baseline")
+	}
+	restoreFirst()
+	if slog.Default() != external {
+		t.Fatal("obsolete owner clobbered the external baseline")
 	}
 }

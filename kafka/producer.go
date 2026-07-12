@@ -84,6 +84,10 @@ type ProducerConfig struct {
 	// Acks is the default acknowledgement level:
 	// 0 = fire-and-forget, 1 = leader only, -1 = all ISR (default).
 	Acks int
+	// AcksSet distinguishes an explicit fire-and-forget value (Acks=0) from
+	// the zero value of ProducerConfig, which inherits the safe default (-1).
+	// Non-zero Acks values remain implicitly set for backward compatibility.
+	AcksSet bool
 
 	// IdempotentProducer enables exactly-once semantics when true.
 	IdempotentProducer bool

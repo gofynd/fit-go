@@ -44,6 +44,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gofynd/fit-go/metrics"
 )
 
 // Config holds the configuration for creating a new Server instance.
@@ -194,11 +195,18 @@ func (s *Server) Init(
 	// carry the trace without explicit threading (implicit propagation).
 	root.Use(GoroutineContextMiddleware())
 
-	// Request logging
+	// Request logging. fit.Init installs the enabled process-default metrics
+	// registry, while an explicit Config callback always takes precedence.
+	metricsRecorder := s.cfg.MetricsRecorder
+	if metricsRecorder == nil {
+		if registry := metrics.Default(); registry != nil && registry.ShouldRecordServerMetrics() {
+			metricsRecorder = registry.ServerRecorderFunc()
+		}
+	}
 	root.Use(GinLogRequestResponse(LogRequestResponseConfig{
 		Logger:          s.logger,
 		IncludeHeaders:  coalesce(s.cfg.IncludeHeadersInLog, os.Getenv("INCLUDE_HEADERS_IN_LOG")),
-		MetricsRecorder: s.cfg.MetricsRecorder,
+		MetricsRecorder: metricsRecorder,
 	}))
 
 	// CORS (dynamic, callback-based). Installed engine-level AFTER logging but BEFORE

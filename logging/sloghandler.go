@@ -14,8 +14,8 @@
 
 // sloghandler.go adapts the fit Logger to a standard library slog.Handler, so
 // that ALL log/slog output — service code AND third-party libraries that log via
-// slog — routes through the single fit logger: same OTel-shaped JSON, same sink,
-// and the same implicit trace context (via the goroutine-local active context).
+// slog — routes through the single fit logger: same selected JSON schema, same
+// sink, and the same implicit trace context (via the active goroutine context).
 // This is the Go analogue of patching Winston's default in fit.js.
 package logging
 
@@ -23,6 +23,7 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync"
 )
 
 // slogHandler implements slog.Handler by forwarding records to a fit Logger.
@@ -32,17 +33,75 @@ type slogHandler struct {
 	groups []string      // open WithGroup names, applied as a dotted key prefix
 }
 
-// NewSlogHandler returns a slog.Handler that writes through l (fit OTel-JSON
-// format + trace enrichment).
+var slogDefaultOwners struct {
+	sync.Mutex
+	current *slogDefaultOwner
+}
+
+type slogDefaultOwner struct {
+	installed *slog.Logger
+	previous  *slogDefaultOwner
+	baseline  *slog.Logger
+	active    bool
+}
+
+// NewSlogHandler returns a slog.Handler that writes through l using the logger's
+// selected schema and trace enrichment.
 func NewSlogHandler(l *Logger) slog.Handler {
 	return &slogHandler{logger: l}
 }
 
 // SetAsDefaultSlog installs l as the process-wide log/slog default, so plain
 // slog.Info/Warn/Error calls (including from dependencies) land in the fit log
-// stream. Call once at boot; fit.Init does this automatically.
-func SetAsDefaultSlog(l *Logger) {
-	slog.SetDefault(slog.New(NewSlogHandler(l)))
+// stream. Call once at boot; fit.Init does this automatically. The returned
+// function restores the previous default if this installation still owns it.
+func SetAsDefaultSlog(l *Logger) (restore func()) {
+	installed := slog.New(NewSlogHandler(l))
+	slogDefaultOwners.Lock()
+	previousOwner := slogDefaultOwners.current
+	if previousOwner != nil && slog.Default() != previousOwner.installed {
+		// An independent component replaced the process logger. Start a new
+		// ownership chain from that actual baseline instead of reviving an old
+		// fit logger when this owner is later restored.
+		previousOwner = nil
+	}
+	owner := &slogDefaultOwner{
+		installed: installed,
+		previous:  previousOwner,
+		baseline:  slog.Default(),
+		active:    true,
+	}
+	slogDefaultOwners.current = owner
+	slog.SetDefault(installed)
+	slogDefaultOwners.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			slogDefaultOwners.Lock()
+			defer slogDefaultOwners.Unlock()
+			owner.active = false
+			if slogDefaultOwners.current != owner {
+				return
+			}
+			fallback := owner.baseline
+			previous := owner.previous
+			for previous != nil && !previous.active {
+				fallback = previous.baseline
+				previous = previous.previous
+			}
+			slogDefaultOwners.current = previous
+			// Respect an independent component that replaced slog.Default after us.
+			if slog.Default() != installed {
+				return
+			}
+			if previous != nil {
+				slog.SetDefault(previous.installed)
+			} else {
+				slog.SetDefault(fallback)
+			}
+		})
+	}
 }
 
 func (h *slogHandler) Enabled(_ context.Context, lvl slog.Level) bool {

@@ -18,7 +18,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"sync"
 	"testing"
 	"time"
 
@@ -28,8 +27,12 @@ import (
 
 // resetGlobalTracer resets the global tracer for test isolation.
 func resetGlobalTracer() {
+	globalTracerMu.Lock()
+	defer globalTracerMu.Unlock()
 	globalTracer.Store(nil)
-	globalTracerOnce = sync.Once{}
+	globalInitErr = nil
+	globalTracerOwners.current = nil
+	globalTracerOwners.active = make(map[*globalTracerOwner]struct{})
 }
 
 // ---------------------------------------------------------------------------

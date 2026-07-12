@@ -40,10 +40,9 @@ func emit(h slog.Handler, lvl slog.Level, n int) {
 
 // TestRateLimit_ZeroConfigIsPassthrough is the MOST IMPORTANT test here.
 //
-// The rate limiter is active in NO legacy service (fit.js never wires it; pyfit
-// defines it but never attaches it, so it is inert). Enabling it by default would
-// silently DROP log lines that every legacy service emits. A zero-value config must
-// therefore let everything through.
+// The rate limiter is inactive in fit.js and deployed synchronous pyfit services.
+// Current pyfit 2.x enables it only in async mode. Enabling it by default here would
+// silently drop lines for the four audited Node migrations, so zero config passes all.
 func TestRateLimit_ZeroConfigIsPassthrough(t *testing.T) {
 	next := &countingHandler{}
 	h := NewRateLimitHandler(next, RateLimitConfig{})
@@ -173,8 +172,8 @@ func TestRateLimit_OnDecisionCallback(t *testing.T) {
 	}
 }
 
-// TestPyfitDebugRateLimit_ShapeMatchesPyfit: the documented pyfit intent (DEBUG only:
-// 100/sec, burst 100, cap 6000; every other level unlimited).
+// TestPyfitDebugRateLimit_ShapeMatchesPyfit: current pyfit async defaults (DEBUG only:
+// 1000/sec, burst 1000, cap 6000; every other level unlimited).
 func TestPyfitDebugRateLimit_ShapeMatchesPyfit(t *testing.T) {
 	cfg := PyfitDebugRateLimit()
 
@@ -182,8 +181,8 @@ func TestPyfitDebugRateLimit_ShapeMatchesPyfit(t *testing.T) {
 	if !ok {
 		t.Fatal("no DEBUG bucket")
 	}
-	if dbg.TokensPerSec != 100 || dbg.StartingTokens != 100 || dbg.MaxTokensBalance != 6000 {
-		t.Errorf("DEBUG bucket = %+v, want {100,100,6000} (pyfit's config)", dbg)
+	if dbg.TokensPerSec != 1000 || dbg.StartingTokens != 1000 || dbg.MaxTokensBalance != 6000 {
+		t.Errorf("DEBUG bucket = %+v, want {1000,1000,6000} (pyfit async config)", dbg)
 	}
 	if cfg.Default != nil {
 		t.Error("pyfit sets NO default bucket — INFO/WARN/ERROR must be unlimited")

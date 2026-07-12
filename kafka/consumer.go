@@ -66,6 +66,12 @@ type MessageHandlerCtx func(ctx context.Context, payload MessagePayload) error
 // Return an error to signal processing failure.
 type BatchHandler func(payload BatchPayload) error
 
+// BatchHandlerCtx is the context-aware batch handler. The context carries the
+// batch receive span; each message's extracted producer context is represented
+// as a link on its corresponding process span, matching KafkaJS eachBatch
+// instrumentation without falsely parenting the batch to its first message.
+type BatchHandlerCtx func(ctx context.Context, payload BatchPayload) error
+
 // ---------------------------------------------------------------------------
 // Topic configuration
 // ---------------------------------------------------------------------------
@@ -182,8 +188,11 @@ func DefaultConsumerConfig(groupID string) ConsumerConfig {
 // ConsumerOptions holds per-run options passed to Consume/ConsumeBatch.
 // Mirrors the ConsumerRunConfig.
 type ConsumerOptions struct {
-	// AutoCommit overrides the ConsumerConfig AutoCommit for this run.
-	// nil means use the ConsumerConfig default.
+	// AutoCommit requests the offset mode for this run. nil means use the
+	// ConsumerConfig value. The Confluent driver disables automatic offset storage,
+	// so either value resolves offsets only after a successful handler. When the
+	// construction-time mode is automatic, its configured interval is retained;
+	// the opposite run-time mode falls back to a synchronous commit.
 	AutoCommit *bool
 
 	// CommitBeforeHandler commits the consumed offset before invoking the message
@@ -192,12 +201,15 @@ type ConsumerOptions struct {
 	// side effects. It is ignored when auto-commit is enabled.
 	CommitBeforeHandler bool
 
-	// PartitionsConsumedConcurrently is the number of partitions processed
-	// concurrently. Default: 1 (sequential).
+	// PartitionsConsumedConcurrently is the requested number of partitions
+	// processed concurrently. Default: 1 (sequential). The Confluent driver keeps
+	// records from one topic-partition ordered and runs independent partition groups
+	// in parallel up to this limit.
 	PartitionsConsumedConcurrently int
 
 	// PollTimeout is how long each poll call waits for new messages before
-	// returning an empty batch. Default: 0 means use the driver default.
+	// returning an empty batch. Default: 0 means 100ms for message mode and 1s
+	// for batch mode.
 	PollTimeout time.Duration
 
 	// MaxRecords limits the number of records returned per poll. Default: 0

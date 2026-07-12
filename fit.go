@@ -20,6 +20,7 @@ package fit
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/gofynd/fit-go/config"
@@ -27,6 +28,7 @@ import (
 	"github.com/gofynd/fit-go/health"
 	"github.com/gofynd/fit-go/logging"
 	"github.com/gofynd/fit-go/metrics"
+	"github.com/gofynd/fit-go/redact"
 	"github.com/gofynd/fit-go/tracing"
 )
 
@@ -52,6 +54,10 @@ type Fit struct {
 	Metrics     *metrics.Registry
 	Health      *health.Checker
 	Errors      *errors.ErrorRegistry
+	metricsUndo func()
+	tracingUndo func()
+	loggingUndo func()
+	initialized bool
 }
 
 // instance is the global Fit singleton.
@@ -76,6 +82,17 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 	f := Instance()
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.initialized {
+		return nil, fmt.Errorf("fit: framework is already initialized; call Shutdown before reinitializing")
+	}
+	// Every Init owns a fresh set of mutable framework state. This also cleans up
+	// work started through Instance().Health before the first initialization.
+	if f.Health != nil {
+		f.Health.Reset()
+	}
+	f.Connections = Connections{}
+	f.Health = health.NewChecker()
+	f.Errors = nil
 
 	// Apply options
 	o := defaultOptions()
@@ -95,6 +112,7 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 		Level:    cfg.GetString("LOG_LEVEL", "info"),
 		Timezone: cfg.GetString("LOG_TIMEZONE", "UTC"),
 		Env:      cfg.GetString("NODE_ENV", "development"),
+		Service:  cfg.GetString("SERVICE_NAME", "unknown"),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("fit: failed to init logger: %w", err)
@@ -105,12 +123,21 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 	// slog.* calls (service code AND third-party libraries) land in the single
 	// OTel-shaped JSON stream with implicit trace context. (Node fit patches
 	// Winston's default similarly.)
-	logging.SetAsDefaultSlog(logger)
+	f.loggingUndo = logging.SetAsDefaultSlog(logger)
 
 	// 3. Initialize error registry if service name code is set
-	if code := cfg.GetString("SERVICE_NAME_CODE", ""); code != "" {
+	if code := strings.TrimSpace(cfg.GetString("SERVICE_NAME_CODE", "")); code != "" {
 		f.Errors = errors.DefaultRegistry
-		f.Errors.Init(code, nil, nil, nil)
+		if err := f.Errors.InitServiceCode(code); err != nil {
+			if f.loggingUndo != nil {
+				f.loggingUndo()
+				f.loggingUndo = nil
+			}
+			f.Logger = nil
+			f.Config = nil
+			f.Errors = nil
+			return nil, fmt.Errorf("fit: failed to init error registry: %w", err)
+		}
 	}
 
 	// 4. Initialize tracing if enabled
@@ -124,37 +151,54 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 		// OTel-standard env (OTEL_TRACES_SAMPLER, OTEL_TRACES_SAMPLER_ARG,
 		// OTEL_EXPORTER_OTLP_ENDPOINT, …) must survive this path.
 		opts := tracing.DefaultOptions()
-		opts.ServiceName = cfg.GetString("SERVICE_NAME", opts.ServiceName)
+		// OTel's standard service variable wins over FIT's legacy fallback. Do
+		// not replace an OTEL_SERVICE_NAME already resolved by DefaultOptions
+		// merely because SERVICE_NAME also exists in the merged config.
+		if serviceName := strings.TrimSpace(cfg.GetString("OTEL_SERVICE_NAME", "")); serviceName != "" {
+			opts.ServiceName = serviceName
+		}
+		// SERVICE_NAME is an application/Kafka/log identity fallback. It must not
+		// override a service.name supplied through OTEL_RESOURCE_ATTRIBUTES.
+		opts.FallbackServiceName = strings.TrimSpace(cfg.GetString("SERVICE_NAME", opts.FallbackServiceName))
 		opts.Env = cfg.GetString("NODE_ENV", opts.Env)
 		// Set explicitly: tracing.New's own gate reads only the env var, which is
 		// empty when TRACING_ENABLED came from a config file.
 		opts.Enabled = &enabled
 		tracer, err := tracing.New(ctx, opts)
 		if err != nil {
-			logger.Warn("fit: tracing init failed, continuing without tracing", "error", err)
+			logger.Warn("fit: tracing init failed, continuing without tracing", "error", redact.ErrorMessage(err))
 		} else {
 			f.Tracer = tracer
 			// Install as the process-global tracer so tracing.Global() (used by the
 			// server/kafka/db instrumentation) resolves to THIS tracer rather than a
 			// separately lazy-initialized one. Makes fit.Init a complete boot path.
-			tracing.SetGlobal(tracer)
+			f.tracingUndo = tracing.SetGlobal(tracer)
 		}
 	}
 
 	// 5. Initialize metrics if enabled
 	if cfg.GetBool("FIT_PROMETHEUS_ENABLED", false) {
-		registry, err := metrics.New(metrics.Options{
-			MetricsDir:        cfg.GetString("METRICS_DIR", ""),
-			ServerEnabled:     cfg.GetBool("FIT_PROMETHEUS_SERVER_ENABLED", true),
-			HTTPClientEnabled: cfg.GetBool("FIT_PROMETHEUS_AXIOS_ENABLED", true),
-			ServerBuckets:     cfg.GetString("FIT_PROMETHEUS_SERVER_BUCKETS", ""),
-			HTTPClientBuckets: cfg.GetString("FIT_PROMETHEUS_AXIOS_BUCKETS", ""),
-			DeploymentName:    cfg.GetString("DEPLOYMENT_NAME", ""),
-		})
-		if err != nil {
-			logger.Warn("fit: metrics init failed, continuing without metrics", "error", err)
+		metricsDir := cfg.GetString("METRICS_DIR", "")
+		if metricsDir == "" {
+			logger.Warn("fit: METRICS_DIR not set, prometheus metrics disabled")
 		} else {
-			f.Metrics = registry
+			registry, err := metrics.New(metrics.Options{
+				MetricsDir:        metricsDir,
+				ServerEnabled:     cfg.GetBool("FIT_PROMETHEUS_SERVER_ENABLED", true),
+				HTTPClientEnabled: cfg.GetBool("FIT_PROMETHEUS_AXIOS_ENABLED", true),
+				ServerBuckets:     cfg.GetString("FIT_PROMETHEUS_SERVER_BUCKETS", ""),
+				HTTPClientBuckets: cfg.GetString("FIT_PROMETHEUS_AXIOS_BUCKETS", ""),
+				DeploymentName:    cfg.GetString("DEPLOYMENT_NAME", ""),
+			})
+			if err != nil {
+				logger.Warn("fit: metrics init failed, continuing without metrics", "error", redact.ErrorMessage(err))
+			} else {
+				if f.metricsUndo != nil {
+					f.metricsUndo()
+				}
+				f.Metrics = registry
+				f.metricsUndo = metrics.SetDefault(registry)
+			}
 		}
 	}
 
@@ -162,6 +206,7 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 		"service", cfg.GetString("SERVICE_NAME", "unknown"),
 		"env", cfg.GetString("NODE_ENV", "development"),
 	)
+	f.initialized = true
 
 	return f, nil
 }
@@ -176,18 +221,45 @@ func (f *Fit) Shutdown(ctx context.Context) error {
 	}
 
 	var errs []error
+	if f.Health != nil {
+		f.Health.Reset()
+	}
 
+	if f.tracingUndo != nil {
+		f.tracingUndo()
+		f.tracingUndo = nil
+	}
 	if f.Tracer != nil {
 		if err := f.Tracer.Shutdown(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("tracer shutdown: %w", err))
 		}
+		f.Tracer = nil
 	}
 
 	if f.Metrics != nil {
+		if f.metricsUndo != nil {
+			f.metricsUndo()
+			f.metricsUndo = nil
+		}
 		if err := f.Metrics.Shutdown(); err != nil {
 			errs = append(errs, fmt.Errorf("metrics shutdown: %w", err))
 		}
+		f.Metrics = nil
 	}
+
+	if f.loggingUndo != nil {
+		f.loggingUndo()
+		f.loggingUndo = nil
+	}
+	f.Logger = nil
+	f.Config = nil
+	f.Connections = Connections{}
+	f.Health = health.NewChecker()
+	if f.Errors != nil {
+		f.Errors.Reset()
+	}
+	f.Errors = nil
+	f.initialized = false
 
 	if len(errs) > 0 {
 		return fmt.Errorf("fit: shutdown errors: %v", errs)

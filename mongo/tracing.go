@@ -129,11 +129,21 @@ func (ct *commandTracer) finished(reqID int64, cmdErr error) {
 		return
 	}
 	if cmdErr != nil {
-		e.span.SetStatus(tracing.StatusError, cmdErr.Error())
+		// Mongo server errors can echo document values (duplicate-key values,
+		// validation failures, etc.). The command name is already a safe span
+		// attribute; never copy the raw server message into telemetry.
+		e.span.SetStatus(tracing.StatusError, mongoCommandFailureStatus(cmdErr))
 	} else {
 		e.span.SetStatus(tracing.StatusOK, "")
 	}
 	e.span.End()
+}
+
+func mongoCommandFailureStatus(err error) string {
+	if err == nil {
+		return ""
+	}
+	return "mongodb command failed"
 }
 
 // evictOldestLocked ends and removes the single oldest in-flight span, to enforce

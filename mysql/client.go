@@ -487,7 +487,7 @@ func openDB(
 
 	dsn := opts.DSNTransform(parsed)
 
-	db, err := sql.Open(opts.DriverName, dsn)
+	db, err := openSQLDB(opts.DriverName, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: open %s_%s: %w", serviceName, connType, err)
 	}

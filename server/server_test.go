@@ -33,6 +33,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gofynd/fit-go/errors"
+	"github.com/gofynd/fit-go/metrics"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 func init() {
@@ -1297,5 +1299,37 @@ func TestConcurrentServerAccess(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		<-done
+	}
+}
+
+func TestServerInit_UsesProcessDefaultMetrics(t *testing.T) {
+	t.Setenv("SERVER_TYPE", "application")
+	t.Setenv("NODE_ENV", "production")
+	registry, err := metrics.New(metrics.Options{
+		ServerEnabled:      true,
+		DeploymentName:     "test",
+		PrometheusRegistry: prometheus.NewRegistry(),
+	})
+	if err != nil {
+		t.Fatalf("metrics.New: %v", err)
+	}
+	defer registry.Shutdown()
+	restore := metrics.SetDefault(registry)
+	defer restore()
+
+	s := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	if err := s.Init(map[ServerType]http.Handler{ServerTypeApplication: handler}, nil, nil); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	s.App.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/orders/123", nil))
+
+	output := registry.GetMetricsOutput()
+	if !strings.Contains(output, "fit_http_request_duration_ms") ||
+		!strings.Contains(output, `status_code="204"`) {
+		t.Fatalf("server did not use process-default metrics:\n%s", output)
 	}
 }
