@@ -281,13 +281,27 @@ func New(ctx context.Context, opts Options) (*Tracer, error) {
 	return t, nil
 }
 
-// tracingEnabled resolves the enable-gate: the explicit Options.Enabled override
-// when set, else the TRACING_ENABLED env var.
+// tracingEnabled resolves the enable-gate:
+//
+//  1. OTEL_SDK_DISABLED=true is the OTel-standard KILL SWITCH and wins over everything,
+//     including an explicit Options.Enabled and TRACING_ENABLED. traceclue/pyfit honour
+//     it; fit-go ignored it entirely, so an operator disabling telemetry fleet-wide via
+//     the standard env had no effect on Go services.
+//  2. otherwise the explicit Options.Enabled override when set,
+//  3. otherwise the TRACING_ENABLED env var.
 func tracingEnabled(opts Options) bool {
+	if sdkDisabled() {
+		return false
+	}
 	if opts.Enabled != nil {
 		return *opts.Enabled
 	}
 	return isTracingEnabled()
+}
+
+// sdkDisabled reports the OTel-standard OTEL_SDK_DISABLED kill switch.
+func sdkDisabled() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("OTEL_SDK_DISABLED")), "true")
 }
 
 // newOTLPExporter builds the OTLP span exporter, selecting gRPC vs HTTP by
@@ -373,7 +387,19 @@ func (t *Tracer) initOTel(ctx context.Context, opts Options) error {
 		attrs = append(attrs, attribute.String(k, v))
 	}
 
+	// service.instance.id = hostname (the pod name in k8s). traceclue sets this from
+	// os.hostname(); without it every replica of a service is indistinguishable in
+	// traces, so you cannot tell which pod served a request.
+	if host, hostErr := os.Hostname(); hostErr == nil && host != "" {
+		attrs = append(attrs, semconv.ServiceInstanceID(host))
+	}
+
 	res, err := resource.New(ctx,
+		// WithFromEnv parses the OTel-standard OTEL_RESOURCE_ATTRIBUTES (k=v,k=v) and
+		// OTEL_SERVICE_NAME. fit-go previously ignored both, so platform-injected
+		// resource attributes were silently dropped from Go spans while the Node/Python
+		// fleet reported them.
+		resource.WithFromEnv(),
 		resource.WithAttributes(attrs...),
 		resource.WithProcessRuntimeDescription(),
 	)
