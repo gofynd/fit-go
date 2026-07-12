@@ -143,6 +143,11 @@ type Span struct {
 	mu         sync.Mutex
 	// otelSpan holds the real OTel span when tracing is enabled.
 	otelSpan trace.Span
+	// adopted marks a Span that WRAPS a span created by native OTel instrumentation
+	// (otelgin / otelgrpc / redisotel / otelpgx) rather than by StartSpan. Such a
+	// span is annotate-only: the instrumentation that created it owns its lifecycle,
+	// so End() must not end it (see End). Set only by adoptOtelSpan.
+	adopted bool
 }
 
 // SetAttribute sets an attribute on the span.
@@ -194,9 +199,17 @@ func (s *Span) SetStatus(code SpanStatusCode, message string) {
 }
 
 // End marks the span as ended.
+//
+// An ADOPTED span (one wrapping a span created by otelgin/otelgrpc/redisotel/…) is
+// a no-op here: the instrumentation that created it owns its lifecycle and ends it
+// when the request/operation completes. Ending it from a helper would truncate the
+// server span mid-request and corrupt its duration.
 func (s *Span) End() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.adopted {
+		return
+	}
 	if !s.ended {
 		s.endTime = time.Now()
 		s.ended = true
@@ -307,7 +320,17 @@ func newOTLPExporter(ctx context.Context, opts Options) (sdktrace.SpanExporter, 
 // upstream sampling decision on the W3C traceparent is honoured — a trace sampled
 // OUT upstream isn't re-recorded here, and the configured ratio is respected for
 // locally-rooted traces (previously ignored, which sampled everything).
+// It is then wrapped by the traceclue ServiceEntryPointSampler when
+// TRACECLUE_ALWAYS_SAMPLE_SERVICE_ENTRY_POINTS=true (the platform default for the
+// Node/Python fleet), so this service's entry-point spans are always sampled while
+// the interior of a trace still honours the configured ratio.
 func buildSampler(opts Options) sdktrace.Sampler {
+	return wrapWithEntryPointSampler(buildBaseSampler(opts))
+}
+
+// buildBaseSampler resolves the OTel-standard sampler value alone (no entry-point
+// wrapping) — kept separate so the entry-point sampler can delegate to it.
+func buildBaseSampler(opts Options) sdktrace.Sampler {
 	switch strings.ToLower(strings.TrimSpace(opts.Sampler)) {
 	case "always_on":
 		return sdktrace.AlwaysSample()
@@ -545,11 +568,49 @@ func (t *Tracer) StartSpan(ctx context.Context, name string, kind SpanKind) (con
 }
 
 // SpanFromContext extracts the current span from context.
+//
+// It first looks for a span created by this package (StartSpan seeds a private
+// context key). When there is none it ADOPTS the native OTel span from the
+// context — the span created by otelgin / otelgrpc / redisotel / otelpgx, which
+// live in the STANDARD OTel context and never touch our private key.
+//
+// The fallback is essential, not cosmetic. server.OTelMiddleware installs otelgin,
+// which seeds ONLY the native span, so without it every helper built on this
+// function silently no-ops inside an HTTP handler:
+//
+//   - SetSpanAttributes / SetSpanStatus / SetSpanAttributesWithStatus — annotations
+//     vanish (the fit.js/traceclue setSpanAttributes equivalent works on the native
+//     active span);
+//   - kafka.InjectTraceHeaders — finds no span and injects NO traceparent, so an
+//     HTTP handler producing to Kafka SEVERS the trace: the consumer starts a fresh
+//     one instead of continuing the request's trace.
+//
+// The returned span is annotate-only when adopted: End() is a no-op on it (see End).
 func SpanFromContext(ctx context.Context) *Span {
+	if ctx == nil {
+		return nil
+	}
 	if span, ok := ctx.Value(currentSpanKey).(*Span); ok {
 		return span
 	}
-	return nil
+	return adoptOtelSpan(ctx)
+}
+
+// adoptOtelSpan wraps the context's native OTel span in a *Span so the fit-go
+// helpers can operate on it. Returns nil when the context carries no valid span
+// (tracing disabled, or a non-recording context).
+func adoptOtelSpan(ctx context.Context) *Span {
+	otelSpan := trace.SpanFromContext(ctx)
+	sc := otelSpan.SpanContext()
+	if !sc.IsValid() {
+		return nil
+	}
+	return &Span{
+		traceID:  sc.TraceID().String(),
+		spanID:   sc.SpanID().String(),
+		otelSpan: otelSpan,
+		adopted:  true,
+	}
 }
 
 // SpanAttributes represents key-value attributes for a span.
@@ -663,24 +724,34 @@ func ContextWithTrace(ctx context.Context, traceID, spanID string, sampled bool)
 	return ctx
 }
 
-// TraceIDFromContext extracts the trace ID from context.
+// TraceIDFromContext extracts the trace ID from context. It prefers the value
+// seeded by this package and falls back to the NATIVE OTel span context, so a
+// request carrying only an otelgin/otelgrpc span still reports its trace id (used
+// for span parenting in StartSpan and for log correlation).
 func TraceIDFromContext(ctx context.Context) string {
 	if ctx == nil {
 		return ""
 	}
-	if v, ok := ctx.Value(traceIDKey).(string); ok {
+	if v, ok := ctx.Value(traceIDKey).(string); ok && v != "" {
 		return v
+	}
+	if sc := trace.SpanFromContext(ctx).SpanContext(); sc.HasTraceID() {
+		return sc.TraceID().String()
 	}
 	return ""
 }
 
-// SpanIDFromContext extracts the span ID from context.
+// SpanIDFromContext extracts the span ID from context, with the same native-OTel
+// fallback as TraceIDFromContext.
 func SpanIDFromContext(ctx context.Context) string {
 	if ctx == nil {
 		return ""
 	}
-	if v, ok := ctx.Value(spanIDKey).(string); ok {
+	if v, ok := ctx.Value(spanIDKey).(string); ok && v != "" {
 		return v
+	}
+	if sc := trace.SpanFromContext(ctx).SpanContext(); sc.HasSpanID() {
+		return sc.SpanID().String()
 	}
 	return ""
 }
