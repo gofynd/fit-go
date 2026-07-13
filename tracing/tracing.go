@@ -19,7 +19,11 @@
 // - Span attribute setting matching traceclue API
 // - Function decorators for tracing
 // - HTTP instrumentation hooks (ignoring health check paths)
-// - New Relic compatibility layer
+// - OTLP export to an OpenTelemetry collector
+//
+// The package is observability-backend neutral. Deployments choose the backend
+// behind their OpenTelemetry collector; Commerce currently routes traces to
+// Grafana Tempo. Tempo configuration and credentials do not belong in fit-go.
 //
 // gRPC instrumentation is explicit through fit-go's grpc helpers. Deployed pyfit
 // installed grpcio as an optional runtime but did not install an OTel gRPC
@@ -32,8 +36,9 @@
 // - OTEL_PROPAGATORS: tracecontext, baggage, b3, b3multi, and/or jaeger
 // - OTEL_SERVICE_NAME: Service name for spans
 // - OTEL_RESOURCE_ATTRIBUTES: Additional resource attributes
-// - NEWRELIC_LICENSE_KEY: New Relic license key (enables NR integration)
-// - NEWRELIC_APP_NAME: New Relic application name
+// - OTEL_TRACES_EXPORTER: otlp, console, none, or a comma-separated list
+// - OTEL_TRACES_SAMPLER / OTEL_TRACES_SAMPLER_ARG: sampling policy and ratio
+// - OTEL_SDK_DISABLED: disable OpenTelemetry SDK initialization
 package tracing
 
 import (
@@ -62,6 +67,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -83,6 +89,7 @@ type Options struct {
 	Env                 string
 	Endpoint            string            // Explicit OTLP URL; overrides traces-specific/common env endpoints
 	Protocol            string            // OTLP protocol: "grpc" | "http/protobuf" (default: http/protobuf)
+	Exporters           string            // OTEL_TRACES_EXPORTER: otlp, console, none, or a comma-separated list
 	Propagators         string            // OTEL_PROPAGATORS: tracecontext,baggage,b3,b3multi,jaeger
 	Sampler             string            // OTEL_TRACES_SAMPLER; empty/unknown = parentbased_always_on
 	SampleRate          float64           // Sampling ratio (0.0-1.0); from OTEL_TRACES_SAMPLER_ARG
@@ -108,11 +115,10 @@ func DefaultOptions() Options {
 		Env:                 envString("GO_ENV", envString("NODE_ENV", "development")),
 		Endpoint:            envString("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", envString("OTEL_EXPORTER_OTLP_ENDPOINT", "")),
 		Protocol:            envString("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", envString("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")),
+		Exporters:           envString("OTEL_TRACES_EXPORTER", "otlp"),
 		Propagators:         envString("OTEL_PROPAGATORS", ""),
 		Sampler:             envString("OTEL_TRACES_SAMPLER", ""),
 		SampleRate:          sampleRateFromEnv(),
-		BatchTimeout:        5 * time.Second,
-		MaxExportBatch:      512,
 	}
 }
 
@@ -488,6 +494,76 @@ func newOTLPExporter(ctx context.Context, opts Options) (sdktrace.SpanExporter, 
 	return otlptracehttp.New(ctx, httpOpts...)
 }
 
+func resolveTraceExporters(opts Options) ([]string, error) {
+	value := strings.TrimSpace(opts.Exporters)
+	if value == "" {
+		value = strings.TrimSpace(os.Getenv("OTEL_TRACES_EXPORTER"))
+	}
+	if value == "" {
+		value = "otlp"
+	}
+
+	seen := make(map[string]struct{})
+	exporters := make([]string, 0, 2)
+	for _, raw := range strings.Split(value, ",") {
+		name := strings.ToLower(strings.TrimSpace(raw))
+		if name == "" {
+			continue
+		}
+		switch name {
+		case "otlp", "console", "none":
+		default:
+			return nil, fmt.Errorf("unsupported OTEL_TRACES_EXPORTER value %q", name)
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		exporters = append(exporters, name)
+	}
+	if len(exporters) == 0 {
+		return nil, fmt.Errorf("OTEL_TRACES_EXPORTER must select at least one exporter")
+	}
+	if _, hasNone := seen["none"]; hasNone && len(exporters) != 1 {
+		return nil, fmt.Errorf("OTEL_TRACES_EXPORTER=none cannot be combined with other exporters")
+	}
+	return exporters, nil
+}
+
+func newSpanExporters(ctx context.Context, opts Options) ([]sdktrace.SpanExporter, error) {
+	if opts.SpanExporter != nil {
+		return []sdktrace.SpanExporter{opts.SpanExporter}, nil
+	}
+
+	names, err := resolveTraceExporters(opts)
+	if err != nil {
+		return nil, err
+	}
+	exporters := make([]sdktrace.SpanExporter, 0, len(names))
+	shutdown := func() {
+		for _, exporter := range exporters {
+			_ = exporter.Shutdown(context.Background())
+		}
+	}
+	for _, name := range names {
+		var exporter sdktrace.SpanExporter
+		switch name {
+		case "none":
+			continue
+		case "otlp":
+			exporter, err = newOTLPExporter(ctx, opts)
+		case "console":
+			exporter, err = stdouttrace.New()
+		}
+		if err != nil {
+			shutdown()
+			return nil, fmt.Errorf("creating %s trace exporter: %w", name, err)
+		}
+		exporters = append(exporters, exporter)
+	}
+	return exporters, nil
+}
+
 // buildSampler resolves the OTel-standard OTEL_TRACES_SAMPLER value (opts.Sampler)
 // into a sampler, using opts.SampleRate only for the *ratio variants. Unset or
 // unknown sampler names use the OTel SDK default, parentbased_always_on.
@@ -787,7 +863,7 @@ func snapshotPropagator(propagator propagation.TextMapPropagator) propagation.Te
 	return propagator
 }
 
-// initOTel sets up the real OTel TracerProvider with OTLP exporter.
+// initOTel sets up the real OTel TracerProvider with the configured exporters.
 func (t *Tracer) initOTel(ctx context.Context, opts Options) error {
 	propagator, err := buildPropagator(opts.Propagators)
 	if err != nil {
@@ -795,41 +871,33 @@ func (t *Tracer) initOTel(ctx context.Context, opts Options) error {
 	}
 	res := buildResource(ctx, opts)
 
-	// Determine span exporter.
-	var exporter sdktrace.SpanExporter
-	if opts.SpanExporter != nil {
-		exporter = opts.SpanExporter
-	} else {
-		exp, err := newOTLPExporter(ctx, opts)
-		if err != nil {
-			return fmt.Errorf("creating OTLP exporter: %w", err)
-		}
-		exporter = exp
+	exporters, err := newSpanExporters(ctx, opts)
+	if err != nil {
+		return err
 	}
 
-	// Configure span processor.
-	var sp sdktrace.SpanProcessor
-	if opts.UseSimpleSpanProcessor {
-		// Synchronous processor for testing.
-		sp = sdktrace.NewSimpleSpanProcessor(exporter)
-	} else {
-		bspOpts := []sdktrace.BatchSpanProcessorOption{}
-		if opts.BatchTimeout > 0 {
-			bspOpts = append(bspOpts, sdktrace.WithBatchTimeout(opts.BatchTimeout))
-		}
-		if opts.MaxExportBatch > 0 {
-			bspOpts = append(bspOpts, sdktrace.WithMaxExportBatchSize(opts.MaxExportBatch))
-		}
-		sp = sdktrace.NewBatchSpanProcessor(exporter, bspOpts...)
-	}
-
-	sampler := buildSampler(opts)
-
-	tp := sdktrace.NewTracerProvider(
+	providerOpts := []sdktrace.TracerProviderOption{
 		sdktrace.WithResource(res),
-		sdktrace.WithSpanProcessor(sp),
-		sdktrace.WithSampler(sampler),
-	)
+		sdktrace.WithSampler(buildSampler(opts)),
+	}
+	for _, exporter := range exporters {
+		var processor sdktrace.SpanProcessor
+		if opts.UseSimpleSpanProcessor {
+			processor = sdktrace.NewSimpleSpanProcessor(exporter)
+		} else {
+			bspOpts := make([]sdktrace.BatchSpanProcessorOption, 0, 2)
+			if opts.BatchTimeout > 0 {
+				bspOpts = append(bspOpts, sdktrace.WithBatchTimeout(opts.BatchTimeout))
+			}
+			if opts.MaxExportBatch > 0 {
+				bspOpts = append(bspOpts, sdktrace.WithMaxExportBatchSize(opts.MaxExportBatch))
+			}
+			processor = sdktrace.NewBatchSpanProcessor(exporter, bspOpts...)
+		}
+		providerOpts = append(providerOpts, sdktrace.WithSpanProcessor(processor))
+	}
+
+	tp := sdktrace.NewTracerProvider(providerOpts...)
 
 	t.provider = tp
 	if serviceName, ok := res.Set().Value(semconv.ServiceNameKey); ok {

@@ -25,9 +25,11 @@ import (
 
 	"github.com/gofynd/fit-go/config"
 	"github.com/gofynd/fit-go/errors"
+	"github.com/gofynd/fit-go/feature"
 	"github.com/gofynd/fit-go/health"
 	"github.com/gofynd/fit-go/logging"
 	"github.com/gofynd/fit-go/metrics"
+	"github.com/gofynd/fit-go/profiling"
 	"github.com/gofynd/fit-go/redact"
 	"github.com/gofynd/fit-go/tracing"
 )
@@ -46,18 +48,20 @@ type Connections struct {
 
 // Fit is the main framework singleton that holds global state.
 type Fit struct {
-	mu          sync.RWMutex
-	Config      *config.Config
-	Connections Connections
-	Logger      *logging.Logger
-	Tracer      *tracing.Tracer
-	Metrics     *metrics.Registry
-	Health      *health.Checker
-	Errors      *errors.ErrorRegistry
-	metricsUndo func()
-	tracingUndo func()
-	loggingUndo func()
-	initialized bool
+	mu            sync.RWMutex
+	Config        *config.Config
+	Connections   Connections
+	Logger        *logging.Logger
+	Tracer        *tracing.Tracer
+	Metrics       *metrics.Registry
+	Health        *health.Checker
+	Profiler      *profiling.Profiler
+	Errors        *errors.ErrorRegistry
+	metricsUndo   func()
+	profilingUndo func()
+	tracingUndo   func()
+	loggingUndo   func()
+	initialized   bool
 }
 
 // instance is the global Fit singleton.
@@ -93,6 +97,7 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 	f.Connections = Connections{}
 	f.Health = health.NewChecker()
 	f.Errors = nil
+	f.Profiler = nil
 
 	// Apply options
 	o := defaultOptions()
@@ -107,6 +112,25 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 	}
 	f.Config = cfg
 
+	// Initialize FeatureHub before process-global logging/tracing state is
+	// installed so a required initial-state failure leaves no partial framework
+	// ownership behind.
+	if cfg.GetBool("FEATURE_FLAG_ENABLED", false) {
+		featureClient, err := feature.InitWithOptions(feature.Options{
+			Enabled:             true,
+			URL:                 cfg.GetString("FEATURE_FLAG_URL", ""),
+			APIKey:              cfg.GetString("FEATURE_FLAG_API_KEY", ""),
+			RequireInitialState: cfg.GetBool("FEATURE_FLAG_REQUIRE_INITIAL_STATE", false),
+		})
+		if err != nil {
+			f.Config = nil
+			return nil, fmt.Errorf("fit: failed to init feature flags: %w", err)
+		}
+		if featureClient != nil {
+			f.Connections.FeatureFlag = featureClient
+		}
+	}
+
 	// 2. Initialize logging
 	logger, err := logging.New(logging.Options{
 		Level:    cfg.GetString("LOG_LEVEL", "info"),
@@ -115,6 +139,8 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 		Service:  cfg.GetString("SERVICE_NAME", "unknown"),
 	})
 	if err != nil {
+		f.stopFeatureFlags()
+		f.Config = nil
 		return nil, fmt.Errorf("fit: failed to init logger: %w", err)
 	}
 	f.Logger = logger
@@ -136,6 +162,7 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 			f.Logger = nil
 			f.Config = nil
 			f.Errors = nil
+			f.stopFeatureFlags()
 			return nil, fmt.Errorf("fit: failed to init error registry: %w", err)
 		}
 	}
@@ -202,6 +229,27 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 		}
 	}
 
+	// 6. Install one profiler instance for framework routes and shutdown. Legacy
+	// profiling is on-demand: initialization exposes the control surface but does
+	// not begin collection until /_profiling/start or profiling.Start is called.
+	if cfg.GetBool("PROFILING_ENABLED", false) {
+		profilerConfig := profiling.DefaultConfig()
+		profilerConfig.Enabled = true
+		profilerConfig.Server = cfg.GetString("PROFILING_DISTRIBUTOR_ADDRESS", profilerConfig.Server)
+		profilerConfig.CPUEnabled = cfg.GetBool("PROFILING_CPU_ENABLED", profilerConfig.CPUEnabled)
+		profilerConfig.HeapEnabled = cfg.GetBool("PROFILING_HEAP_ENABLED", profilerConfig.HeapEnabled)
+		profilerConfig.WallEnabled = cfg.GetBool("PROFILING_CPU_WALL_ENABLED", profilerConfig.WallEnabled)
+		profilerConfig.TagsJSON = cfg.GetString("PROFILING_TAGS_JSON", profilerConfig.TagsJSON)
+		profilerConfig.FlushIntervalMs = cfg.GetInt("PROFILING_FLUSH_INTERVAL_MS", profilerConfig.FlushIntervalMs)
+		profilerConfig.HeapSamplingIntervalBytes = cfg.GetInt("PROFILING_HEAP_SAMPLING_INTERVAL_BYTES", profilerConfig.HeapSamplingIntervalBytes)
+		profilerConfig.HeapStackDepth = cfg.GetInt("PROFILING_HEAP_STACK_DEPTH", profilerConfig.HeapStackDepth)
+		profilerConfig.WallSamplingDurationMs = cfg.GetInt("PROFILING_WALL_SAMPLING_DURATION_MS", profilerConfig.WallSamplingDurationMs)
+		profilerConfig.WallSamplingIntervalMicros = cfg.GetInt("PROFILING_WALL_SAMPLING_INTERVAL_MICROS", profilerConfig.WallSamplingIntervalMicros)
+		profilerConfig.WallCollectCPUTime = cfg.GetBool("PROFILING_WALL_COLLECT_CPU_TIME", profilerConfig.WallCollectCPUTime)
+		f.Profiler = profiling.New(profilerConfig)
+		f.profilingUndo = profiling.SetDefault(f.Profiler)
+	}
+
 	logger.Info("fit: framework initialized",
 		"service", cfg.GetString("SERVICE_NAME", "unknown"),
 		"env", cfg.GetString("NODE_ENV", "development"),
@@ -223,6 +271,15 @@ func (f *Fit) Shutdown(ctx context.Context) error {
 	var errs []error
 	if f.Health != nil {
 		f.Health.Reset()
+	}
+	f.stopFeatureFlags()
+	if f.Profiler != nil {
+		f.Profiler.Stop()
+		f.Profiler = nil
+	}
+	if f.profilingUndo != nil {
+		f.profilingUndo()
+		f.profilingUndo = nil
 	}
 
 	if f.tracingUndo != nil {
@@ -265,6 +322,13 @@ func (f *Fit) Shutdown(ctx context.Context) error {
 		return fmt.Errorf("fit: shutdown errors: %v", errs)
 	}
 	return nil
+}
+
+func (f *Fit) stopFeatureFlags() {
+	if featureClient, ok := f.Connections.FeatureFlag.(interface{ Stop() }); ok {
+		featureClient.Stop()
+	}
+	f.Connections.FeatureFlag = nil
 }
 
 // Option configures the Fit framework initialization.

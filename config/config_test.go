@@ -192,6 +192,7 @@ func TestGetStringSlice(t *testing.T) {
 	cfg := New()
 	cfg.Set("SLICE_VAL", "a,b,c")
 	cfg.Set("SLICE_SPACES", " x , y , z ")
+	cfg.Set("JSON_SLICE", `["x","value,with,commas"]`)
 	cfg.Set("SINGLE_VAL", "only_one")
 	cfg.Set("EMPTY_SLICE", "")
 
@@ -203,6 +204,7 @@ func TestGetStringSlice(t *testing.T) {
 	}{
 		{"comma separated", "SLICE_VAL", nil, []string{"a", "b", "c"}},
 		{"with spaces", "SLICE_SPACES", nil, []string{"x", "y", "z"}},
+		{"JSON array", "JSON_SLICE", nil, []string{"x", "value,with,commas"}},
 		{"single value", "SINGLE_VAL", nil, []string{"only_one"}},
 		{"empty uses default", "EMPTY_SLICE", []string{"def"}, []string{"def"}},
 		{"missing uses default", "MISSING", []string{"def"}, []string{"def"}},
@@ -423,6 +425,98 @@ func TestLoadEnvPrecedence(t *testing.T) {
 	}
 }
 
+func TestLoadLaterFileOverridesEarlierFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	basePath := filepath.Join(tmpDir, "base.json")
+	overridePath := filepath.Join(tmpDir, "override.yaml")
+
+	if err := os.WriteFile(basePath, []byte(`{"service":{"port":8080,"name":"base"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(overridePath, []byte("service:\n  port: 9090\n  name: override\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(basePath, overridePath)
+	if err != nil {
+		t.Fatalf("Load() failed: %v", err)
+	}
+	if got := cfg.GetInt("SERVICE_PORT", 0); got != 9090 {
+		t.Fatalf("SERVICE_PORT = %d; want 9090", got)
+	}
+	if got := cfg.GetString("SERVICE_NAME", ""); got != "override" {
+		t.Fatalf("SERVICE_NAME = %q; want override", got)
+	}
+}
+
+func TestLoadDotenvDoesNotOverwriteExplicitlyEmptyEnvironment(t *testing.T) {
+	tmpDir := t.TempDir()
+	dotenvPath := filepath.Join(tmpDir, ".env")
+	if err := os.WriteFile(dotenvPath, []byte("FIT_CONFIG_EMPTY=from-dotenv\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DOTENV_PATH", dotenvPath)
+	t.Setenv("FIT_CONFIG_EMPTY", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() failed: %v", err)
+	}
+	if got, ok := cfg.Raw("FIT_CONFIG_EMPTY"); !ok || got != "" {
+		t.Fatalf("FIT_CONFIG_EMPTY = %q, %v; want an explicitly empty value", got, ok)
+	}
+}
+
+func TestLoadDotenvSupportsCommentsEscapesAndExpansion(t *testing.T) {
+	tmpDir := t.TempDir()
+	dotenvPath := filepath.Join(tmpDir, ".env")
+	contents := "FIT_CONFIG_BASE=world\n" +
+		"FIT_CONFIG_COMMENT=value # ignored\n" +
+		"FIT_CONFIG_EXPANDED=hello-${FIT_CONFIG_BASE}\n" +
+		"FIT_CONFIG_ESCAPED=\"line1\\nline2\"\n"
+	if err := os.WriteFile(dotenvPath, []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DOTENV_PATH", dotenvPath)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() failed: %v", err)
+	}
+	if got := cfg.GetString("FIT_CONFIG_COMMENT", ""); got != "value" {
+		t.Fatalf("FIT_CONFIG_COMMENT = %q; want value", got)
+	}
+	if got := cfg.GetString("FIT_CONFIG_EXPANDED", ""); got != "hello-world" {
+		t.Fatalf("FIT_CONFIG_EXPANDED = %q; want hello-world", got)
+	}
+	if got := cfg.GetString("FIT_CONFIG_ESCAPED", ""); got != "line1\nline2" {
+		t.Fatalf("FIT_CONFIG_ESCAPED = %q; want an escaped newline", got)
+	}
+}
+
+func TestLoadYAMLNestedCollections(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	contents := "database:\n  replicas:\n    - primary\n    - secondary,archive\n  credentials:\n    username: fit\n  optional: null\n"
+	if err := os.WriteFile(configPath, []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() failed: %v", err)
+	}
+	if got := cfg.GetStringSlice("DATABASE_REPLICAS", nil); len(got) != 2 || got[1] != "secondary,archive" {
+		t.Fatalf("DATABASE_REPLICAS = %#v; want YAML array values", got)
+	}
+	if got := cfg.GetString("DATABASE_CREDENTIALS_USERNAME", ""); got != "fit" {
+		t.Fatalf("DATABASE_CREDENTIALS_USERNAME = %q; want fit", got)
+	}
+	if got, ok := cfg.Raw("DATABASE_OPTIONAL"); !ok || got != "" {
+		t.Fatalf("DATABASE_OPTIONAL = %q, %v; want an empty null value", got, ok)
+	}
+}
+
 func TestParseDotenvLine(t *testing.T) {
 	tests := []struct {
 		line      string
@@ -433,6 +527,8 @@ func TestParseDotenvLine(t *testing.T) {
 		{"KEY=value", "KEY", "value", true},
 		{"KEY=\"quoted value\"", "KEY", "quoted value", true},
 		{"KEY='single quoted'", "KEY", "single quoted", true},
+		{"KEY=value # comment", "KEY", "value", true},
+		{`KEY="line1\nline2"`, "KEY", "line1\nline2", true},
 		{"export KEY=exported", "KEY", "exported", true},
 		{" KEY = spaced ", "KEY", "spaced", true},
 		{"EMPTY=", "EMPTY", "", true},

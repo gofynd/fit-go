@@ -34,6 +34,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gofynd/fit-go/errors"
 	"github.com/gofynd/fit-go/metrics"
+	"github.com/gofynd/fit-go/profiling"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -1009,6 +1010,62 @@ func TestHealthRoutes(t *testing.T) {
 			t.Errorf("status = %v, want 'unhealthy'", result["status"])
 		}
 	})
+}
+
+type staticHealthChecker []string
+
+func (checker staticHealthChecker) Check() []string { return checker }
+
+func TestHealthAndReadinessCanUseIndependentCheckers(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	RegisterHealthRoutesWithCheckers(
+		engine,
+		staticHealthChecker(nil),
+		staticHealthChecker([]string{"dependencies are not ready"}),
+	)
+
+	health := httptest.NewRecorder()
+	engine.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/_healthz", nil))
+	if health.Code != http.StatusOK {
+		t.Fatalf("health status = %d; want 200", health.Code)
+	}
+
+	readiness := httptest.NewRecorder()
+	engine.ServeHTTP(readiness, httptest.NewRequest(http.MethodGet, "/_readyz", nil))
+	if readiness.Code != http.StatusBadRequest {
+		t.Fatalf("readiness status = %d; want 400", readiness.Code)
+	}
+}
+
+func TestProfileRoutesControlTheProvidedProfiler(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	profiler := profiling.New(profiling.Config{
+		Enabled:                   true,
+		HeapEnabled:               true,
+		HeapSamplingIntervalBytes: 524288,
+	})
+	defer profiler.Stop()
+	engine := gin.New()
+	RegisterProfileRoutesWithProfiler(engine, profiler)
+
+	start := httptest.NewRecorder()
+	engine.ServeHTTP(start, httptest.NewRequest(http.MethodGet, "/_profiling/start_heap", nil))
+	if start.Code != http.StatusOK || !profiler.IsHeapProfilingRunning() {
+		t.Fatalf("start_heap status/running = %d/%v", start.Code, profiler.IsHeapProfilingRunning())
+	}
+
+	status := httptest.NewRecorder()
+	engine.ServeHTTP(status, httptest.NewRequest(http.MethodGet, "/_profiling/status", nil))
+	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"overall":{"message":"Profiling is active","running":true}`) {
+		t.Fatalf("status response = %d %s", status.Code, status.Body.String())
+	}
+
+	stop := httptest.NewRecorder()
+	engine.ServeHTTP(stop, httptest.NewRequest(http.MethodGet, "/_profiling/stop_heap", nil))
+	if stop.Code != http.StatusOK || profiler.IsHeapProfilingRunning() {
+		t.Fatalf("stop_heap status/running = %d/%v", stop.Code, profiler.IsHeapProfilingRunning())
+	}
 }
 
 // ---------------------------------------------------------------------------

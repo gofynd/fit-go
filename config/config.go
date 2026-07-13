@@ -28,8 +28,8 @@
 package config
 
 import (
-	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,20 +37,25 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/joho/godotenv"
+	"gopkg.in/yaml.v3"
 )
 
 // Config holds all configuration values loaded from environment variables and
 // config files. It provides type-safe getters with defaults and is safe for
 // concurrent access.
 type Config struct {
-	mu     sync.RWMutex
-	values map[string]string
+	mu      sync.RWMutex
+	values  map[string]string
+	envKeys map[string]struct{}
 }
 
 // New creates a new empty Config instance.
 func New() *Config {
 	return &Config{
-		values: make(map[string]string),
+		values:  make(map[string]string),
+		envKeys: make(map[string]struct{}),
 	}
 }
 
@@ -65,9 +70,8 @@ func Load(paths ...string) (*Config, error) {
 	cfg := New()
 
 	// 1. Load .env file if present.
-	if err := cfg.loadDotenv(); err != nil {
-		// Non-fatal: .env file is optional.
-		_ = err
+	if err := cfg.loadDotenv(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("config: failed to load dotenv: %w", err)
 	}
 
 	// 2. Load all environment variables.
@@ -85,74 +89,41 @@ func Load(paths ...string) (*Config, error) {
 }
 
 // loadDotenv reads a .env file from the current directory or the path specified
-// by DOTENV_PATH. Lines are parsed as KEY=VALUE pairs. Lines starting with #
-// are treated as comments.
+// by DOTENV_PATH. Existing process environment variables, including explicitly
+// empty values, are never overwritten.
 func (c *Config) loadDotenv() error {
 	dotenvPath := os.Getenv("DOTENV_PATH")
 	if dotenvPath == "" {
 		dotenvPath = ".env"
 	}
 
-	f, err := os.Open(dotenvPath)
+	values, err := godotenv.Read(dotenvPath)
 	if err != nil {
-		return err // file doesn't exist, that's fine
+		return err
 	}
-	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-
-		// Skip empty lines and comments.
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		key, value, ok := parseDotenvLine(line)
-		if !ok {
-			continue
-		}
-
-		// Only set in the process environment if not already set,
-		// matching dotenv behavior.
-		if os.Getenv(key) == "" {
-			os.Setenv(key, value)
+	for key, value := range values {
+		if _, exists := os.LookupEnv(key); !exists {
+			if err := os.Setenv(key, value); err != nil {
+				return fmt.Errorf("set %s: %w", key, err)
+			}
 		}
 	}
 
-	return scanner.Err()
+	return nil
 }
 
 // parseDotenvLine parses a single line from a .env file. It handles quoted
 // values (single and double quotes) and inline comments.
 func parseDotenvLine(line string) (key, value string, ok bool) {
-	// Split on first '='.
-	idx := strings.IndexByte(line, '=')
-	if idx < 0 {
+	values, err := godotenv.Unmarshal(line)
+	if err != nil || len(values) != 1 {
 		return "", "", false
 	}
-
-	key = strings.TrimSpace(line[:idx])
-	value = strings.TrimSpace(line[idx+1:])
-
-	if key == "" {
-		return "", "", false
+	for key, value = range values {
+		return key, value, key != ""
 	}
-
-	// Handle 'export KEY=VALUE' syntax.
-	if strings.HasPrefix(key, "export ") {
-		key = strings.TrimSpace(strings.TrimPrefix(key, "export"))
-	}
-
-	// Strip surrounding quotes.
-	if len(value) >= 2 {
-		if (value[0] == '"' && value[len(value)-1] == '"') ||
-			(value[0] == '\'' && value[len(value)-1] == '\'') {
-			value = value[1 : len(value)-1]
-		}
-	}
-
-	return key, value, true
+	return "", "", false
 }
 
 // loadEnvVars reads all current environment variables into the config map.
@@ -168,6 +139,7 @@ func (c *Config) loadEnvVars() {
 		key := env[:idx]
 		value := env[idx+1:]
 		c.values[key] = value
+		c.envKeys[key] = struct{}{}
 	}
 }
 
@@ -200,93 +172,30 @@ func (c *Config) loadJSON(data []byte) error {
 		return fmt.Errorf("invalid JSON: %w", err)
 	}
 
-	flat := flattenMap("", raw)
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for k, v := range flat {
-		// Only set if not already present (env vars win).
-		if _, exists := c.values[k]; !exists {
-			c.values[k] = v
-		}
-	}
-
+	c.applyFileValues(flattenMap("", raw))
 	return nil
 }
 
-// loadYAML parses a subset of YAML (simple key: value pairs and one level of
-// nesting). This avoids pulling in a YAML dependency. For full YAML support,
-// use JSON config files or set values via environment variables.
+// loadYAML parses YAML config data, including nested maps, arrays, quoted
+// scalars, comments, and null values.
 func (c *Config) loadYAML(data []byte) error {
-	result := make(map[string]interface{})
-	var currentSection string
-
-	scanner := bufio.NewScanner(strings.NewReader(string(data)))
-	for scanner.Scan() {
-		line := scanner.Text()
-		trimmed := strings.TrimSpace(line)
-
-		// Skip empty lines and comments.
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-
-		// Check indentation to determine nesting.
-		indent := len(line) - len(strings.TrimLeft(line, " \t"))
-
-		idx := strings.IndexByte(trimmed, ':')
-		if idx < 0 {
-			continue
-		}
-
-		key := strings.TrimSpace(trimmed[:idx])
-		value := strings.TrimSpace(trimmed[idx+1:])
-
-		if indent == 0 {
-			if value == "" {
-				// Section header.
-				currentSection = key
-				if _, ok := result[currentSection]; !ok {
-					result[currentSection] = make(map[string]interface{})
-				}
-			} else {
-				currentSection = ""
-				result[key] = stripYAMLQuotes(value)
-			}
-		} else if currentSection != "" {
-			section, ok := result[currentSection].(map[string]interface{})
-			if !ok {
-				section = make(map[string]interface{})
-				result[currentSection] = section
-			}
-			section[key] = stripYAMLQuotes(value)
-		}
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("invalid YAML: %w", err)
 	}
+	c.applyFileValues(flattenMap("", raw))
+	return nil
+}
 
-	flat := flattenMap("", result)
-
+func (c *Config) applyFileValues(values map[string]string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for k, v := range flat {
-		if _, exists := c.values[k]; !exists {
-			c.values[k] = v
+	for key, value := range values {
+		if _, fromEnvironment := c.envKeys[key]; !fromEnvironment {
+			c.values[key] = value
 		}
 	}
-
-	return scanner.Err()
-}
-
-// stripYAMLQuotes removes surrounding quotes from a YAML value string.
-func stripYAMLQuotes(s string) string {
-	if len(s) >= 2 {
-		if (s[0] == '"' && s[len(s)-1] == '"') ||
-			(s[0] == '\'' && s[len(s)-1] == '\'') {
-			return s[1 : len(s)-1]
-		}
-	}
-	return s
 }
 
 // flattenMap recursively flattens a nested map into a flat map with
@@ -318,7 +227,12 @@ func flattenMap(prefix string, m map[string]interface{}) map[string]string {
 		case nil:
 			result[fullKey] = ""
 		default:
-			result[fullKey] = fmt.Sprintf("%v", val)
+			encoded, err := json.Marshal(val)
+			if err != nil {
+				result[fullKey] = fmt.Sprintf("%v", val)
+			} else {
+				result[fullKey] = string(encoded)
+			}
 		}
 	}
 
@@ -431,6 +345,10 @@ func (c *Config) GetStringSlice(key string, defaultValue []string) []string {
 	defer c.mu.RUnlock()
 
 	if v, ok := c.values[key]; ok && v != "" {
+		var jsonValues []string
+		if strings.HasPrefix(strings.TrimSpace(v), "[") && json.Unmarshal([]byte(v), &jsonValues) == nil {
+			return jsonValues
+		}
 		parts := strings.Split(v, ",")
 		result := make([]string, 0, len(parts))
 		for _, p := range parts {

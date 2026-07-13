@@ -139,9 +139,11 @@ func DefaultConfig() Config {
 
 // New creates a new Profiler with the given configuration.
 func New(cfg Config) *Profiler {
-	return &Profiler{
+	profiler := &Profiler{
 		config: cfg,
 	}
+	profiler.enabled.Store(cfg.Enabled)
+	return profiler
 }
 
 // NewFromEnv creates a new Profiler using environment variable configuration.
@@ -648,29 +650,85 @@ func envInt(key string, defaultVal int) int {
 // Package-level singleton for simple usage
 // ---------------------------------------------------------------------------
 
-var defaultProfiler = NewFromEnv()
+type defaultProfilerOwner struct {
+	profiler *Profiler
+	previous *defaultProfilerOwner
+	baseline *Profiler
+	active   bool
+}
+
+var processDefault = struct {
+	sync.RWMutex
+	profiler *Profiler
+	owner    *defaultProfilerOwner
+}{profiler: NewFromEnv()}
 
 // Start starts the default profiler.
 func Start() {
-	defaultProfiler.Start()
+	Default().Start()
 }
 
 // Stop stops the default profiler.
 func Stop() {
-	defaultProfiler.Stop()
+	Default().Stop()
 }
 
 // Default returns the default profiler instance.
 func Default() *Profiler {
-	return defaultProfiler
+	processDefault.RLock()
+	defer processDefault.RUnlock()
+	return processDefault.profiler
+}
+
+// SetDefault installs profiler as the process default and returns an
+// idempotent restore function. Out-of-order restores do not revive an inactive
+// owner, matching the lifecycle guarantees of fit-go's tracing and metrics
+// defaults.
+func SetDefault(profiler *Profiler) func() {
+	if profiler == nil {
+		profiler = New(Config{})
+	}
+	processDefault.Lock()
+	owner := &defaultProfilerOwner{
+		profiler: profiler,
+		previous: processDefault.owner,
+		baseline: processDefault.profiler,
+		active:   true,
+	}
+	processDefault.profiler = profiler
+	processDefault.owner = owner
+	processDefault.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			processDefault.Lock()
+			owner.active = false
+			if processDefault.owner == owner {
+				fallback := owner.baseline
+				previous := owner.previous
+				for previous != nil && !previous.active {
+					fallback = previous.baseline
+					previous = previous.previous
+				}
+				processDefault.owner = previous
+				if previous != nil {
+					processDefault.profiler = previous.profiler
+				} else {
+					processDefault.profiler = fallback
+				}
+			}
+			processDefault.Unlock()
+		})
+	}
 }
 
 // Routes returns the HTTP routes for the default profiler.
 func Routes() http.Handler {
-	return defaultProfiler.Routes()
+	return Default().Routes()
 }
 
 // Status returns the status of the default profiler.
 func StatusMap() map[string]interface{} {
-	return defaultProfiler.Status()
+	return Default().Status()
 }

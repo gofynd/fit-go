@@ -429,6 +429,23 @@ func TestProfilerStatus(t *testing.T) {
 	})
 }
 
+func TestSetDefaultRestoresPreviousProfiler(t *testing.T) {
+	baseline := Default()
+	first := New(Config{Enabled: true})
+	second := New(Config{Enabled: true})
+	restoreFirst := SetDefault(first)
+	restoreSecond := SetDefault(second)
+
+	restoreFirst()
+	if Default() != second {
+		t.Fatal("restoring an older owner clobbered the active profiler")
+	}
+	restoreSecond()
+	if Default() != baseline {
+		t.Fatal("restoring the active owner did not restore the baseline profiler")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // HTTP routes tests
 // ---------------------------------------------------------------------------

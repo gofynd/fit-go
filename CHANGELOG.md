@@ -11,6 +11,15 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **FeatureHub SDK compatibility**: SSE now distinguishes client-evaluated keys
+  (API keys containing `*`) from server-evaluated keys, sends the JavaScript
+  SDK-compatible `x-featurehub` header/query context, accepts edge URLs with or
+  without a trailing `/features`, reconnects when server context changes, honors
+  numeric `edge.stale` delays, exposes request-scoped client-evaluated contexts,
+  and preserves the installed SDK's numeric matcher semantics.
+  FeatureHub is non-blocking/optional at startup by default, matching current
+  FIT.js; `FEATURE_FLAG_REQUIRE_INITIAL_STATE=true` provides pyfit-style bounded
+  fail-fast readiness when the application requires initial flag state.
 - **`server.DynamicCORS` + `Config.CORS`**: a callback-based, credentialed CORS
   middleware installed **engine-level** in `Server.Init` (after logging, before the
   payload/user-data parse middlewares), so it answers a preflight `OPTIONS` on gin's
@@ -83,6 +92,9 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The server no longer echoes a `traceparent` **response** header (non-standard;
   otelgin does not). Real propagation (inbound extract → span → outbound inject)
   is unchanged via the global W3C propagator.
+- Removed stale package documentation claiming New Relic compatibility and
+  `NEWRELIC_*` configuration. fit-go remains an OpenTelemetry/OTLP client;
+  deployments select trace storage such as Grafana Tempo behind their collector.
 
 ### Notes / follow-ups
 - Testcontainers-based integration tests for redis/mongo/kafka/postgres are a

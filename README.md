@@ -21,7 +21,7 @@ A batteries-included Go framework for building scalable microservices. Provides 
 | `profiling` | Continuous profiling via Pyroscope (CPU, heap, wall-clock) |
 | `errors` | Structured error codes with multilingual messages and Sentry integration |
 | `encryption` | AES-256-GCM encryption with Vault and GCP KMS key providers |
-| `feature` | Feature flag client with periodic refresh |
+| `feature` | FeatureHub SSE client with client/server evaluation contexts |
 | `health` | Health check orchestration across all connections |
 | `utils` | HTTP client, string helpers, and input sanitization |
 
@@ -352,15 +352,27 @@ decrypted, _ := mgr.Decrypt(encrypted)
 
 ```bash
 FEATURE_FLAG_ENABLED=true
-FEATURE_FLAG_SERVER_URL=http://featurehub:8085
+# A trailing /features or /features/ is also accepted, as in the JS SDK.
+FEATURE_FLAG_URL=http://featurehub:8085
+# Keys containing * use client-side rollout evaluation. Other keys use
+# server-side evaluation and send x-featurehub context as both the legacy
+# EventSource query parameter and request header.
 FEATURE_FLAG_API_KEY=your-sdk-key
+# Optional: make initial FeatureHub state a required startup dependency.
+FEATURE_FLAG_REQUIRE_INITIAL_STATE=false
 ```
 
 ```go
 client, _ := feature.Init()
+defer client.Stop()
 if client.IsEnabled("dark-mode") {
     // feature is on
 }
+
+ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+defer cancel()
+requestFlags := client.NewContext().UserKey("user-123").Attribute("plan", "gold")
+if err := requestFlags.Build(ctx); err != nil { ... }
 ```
 
 ## Health Checks

@@ -45,6 +45,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gofynd/fit-go/metrics"
+	"github.com/gofynd/fit-go/profiling"
 )
 
 // Config holds the configuration for creating a new Server instance.
@@ -83,6 +84,14 @@ type Config struct {
 	// HealthChecker is the health checker used by /_healthz and /_readyz routes.
 	// If nil, the package-level globalHealthChecker is used.
 	HealthChecker HealthChecker
+
+	// ReadinessChecker is used by /_readyz. When nil, HealthChecker is used,
+	// preserving fit.js behavior while allowing pyfit-style independent readiness.
+	ReadinessChecker HealthChecker
+
+	// Profiler owns the profiling routes registered by this server. When nil,
+	// the process default installed by fit.Init is used.
+	Profiler *profiling.Profiler
 
 	// CORS, when non-nil, installs the dynamic CORS middleware (see DynamicCORS/CORSOptions)
 	// engine-level so it also answers preflights on the no-route path. Nil disables
@@ -125,6 +134,12 @@ func New(cfg Config) *Server {
 	}
 	if cfg.HealthChecker != nil {
 		SetHealthChecker(cfg.HealthChecker)
+	}
+	if cfg.Profiler == nil {
+		cfg.Profiler = profiling.Default()
+		if envGetBool("PROFILING_ENABLED") && (cfg.Profiler == nil || cfg.Profiler.GetConfig().Enabled == false) {
+			cfg.Profiler = profiling.NewFromEnv()
+		}
 	}
 
 	gin.SetMode(gin.ReleaseMode)
@@ -237,11 +252,11 @@ func (s *Server) Init(
 	}
 
 	// 2. Register health routes (before service routes)
-	RegisterHealthRoutes(root)
+	RegisterHealthRoutesWithCheckers(root, s.cfg.HealthChecker, s.cfg.ReadinessChecker)
 
 	// 3. Register profiling routes if enabled
-	if envGetBool("PROFILING_ENABLED") {
-		RegisterProfileRoutes(root)
+	if s.cfg.Profiler != nil && s.cfg.Profiler.GetConfig().Enabled {
+		RegisterProfileRoutesWithProfiler(root, s.cfg.Profiler)
 		s.logger.Info("[Profiling] Profiling routes registered")
 	}
 
@@ -317,6 +332,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	srv := s.server
 	s.mu.RUnlock()
 
+	if s.cfg.Profiler != nil {
+		s.cfg.Profiler.Stop()
+	}
 	if srv == nil {
 		return nil
 	}

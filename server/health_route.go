@@ -76,26 +76,45 @@ func SetHealthChecker(hc HealthChecker) {
 // RegisterHealthRoutes registers the /_healthz and /_readyz endpoints on the
 // given gin.Engine. These endpoints are
 func RegisterHealthRoutes(engine *gin.Engine) {
-	engine.GET("/_healthz", ginHealthHandler)
-	engine.GET("/_readyz", ginHealthHandler)
+	RegisterHealthRoutesWithCheckers(engine, nil, nil)
+}
+
+// RegisterHealthRoutesWithCheckers registers independent liveness and
+// readiness checkers. A nil health checker uses the package default; a nil
+// readiness checker reuses the selected health checker for fit.js compatibility.
+func RegisterHealthRoutesWithCheckers(engine *gin.Engine, health, readiness HealthChecker) {
+	if health == nil {
+		health = healthChecker
+	}
+	if readiness == nil {
+		readiness = health
+	}
+	engine.GET("/_healthz", healthHandler(health))
+	engine.GET("/_readyz", healthHandler(readiness))
 }
 
 // ginHealthHandler returns {"status":"healthy","ok":"ok"} when all checks pass,
 // or {"status":"unhealthy","meta":{"error_messages":"..."}} with 400 on failure.
 func ginHealthHandler(c *gin.Context) {
-	errorMsgs := healthChecker.Check()
-	if len(errorMsgs) > 0 {
-		c.JSON(http.StatusBadRequest, map[string]interface{}{
-			"status": "unhealthy",
-			"meta": map[string]interface{}{
-				"error_messages": strings.Join(errorMsgs, ", "),
-			},
-		})
-		return
-	}
+	healthHandler(healthChecker)(c)
+}
 
-	c.JSON(http.StatusOK, map[string]interface{}{
-		"status": "healthy",
-		"ok":     "ok",
-	})
+func healthHandler(checker HealthChecker) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		errorMsgs := checker.Check()
+		if len(errorMsgs) > 0 {
+			c.JSON(http.StatusBadRequest, map[string]interface{}{
+				"status": "unhealthy",
+				"meta": map[string]interface{}{
+					"error_messages": strings.Join(errorMsgs, ", "),
+				},
+			})
+			return
+		}
+
+		c.JSON(http.StatusOK, map[string]interface{}{
+			"status": "healthy",
+			"ok":     "ok",
+		})
+	}
 }

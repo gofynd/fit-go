@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 // newOTLPExporter must construct cleanly for both protocols when the endpoint is
@@ -50,6 +52,81 @@ func TestResolveOTLPProtocolPrecedence(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResolveTraceExporters(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		want    []string
+		wantErr bool
+	}{
+		{name: "default", want: []string{"otlp"}},
+		{name: "none", value: "none", want: []string{"none"}},
+		{name: "multiple and deduplicated", value: "console, otlp,console", want: []string{"console", "otlp"}},
+		{name: "unknown", value: "zipkin", wantErr: true},
+		{name: "none cannot be mixed", value: "none,otlp", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("OTEL_TRACES_EXPORTER", "")
+			got, err := resolveTraceExporters(Options{Exporters: tt.value})
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("resolveTraceExporters() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if !tt.wantErr && len(got) != len(tt.want) {
+				t.Fatalf("exporters = %#v, want %#v", got, tt.want)
+			}
+			for index := range got {
+				if got[index] != tt.want[index] {
+					t.Fatalf("exporters = %#v, want %#v", got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+func TestDefaultOptionsLeaveBatchProcessorSettingsToOTelEnvironment(t *testing.T) {
+	t.Setenv("OTEL_BSP_SCHEDULE_DELAY", "37")
+	t.Setenv("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "17")
+	opts := DefaultOptions()
+	if opts.BatchTimeout != 0 || opts.MaxExportBatch != 0 {
+		t.Fatalf("DefaultOptions overrides OTEL_BSP settings: timeout=%s batch=%d", opts.BatchTimeout, opts.MaxExportBatch)
+	}
+}
+
+func TestNewTraceExporterSelection(t *testing.T) {
+	t.Setenv("TRACING_ENABLED", "true")
+
+	t.Run("none initializes without an exporter", func(t *testing.T) {
+		tracer, err := New(context.Background(), Options{ServiceName: "test", Exporters: "none"})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		defer tracer.Shutdown(context.Background())
+		if !tracer.IsEnabled() {
+			t.Fatal("tracing should stay enabled with the none exporter")
+		}
+	})
+
+	t.Run("custom exporter takes precedence", func(t *testing.T) {
+		tracer, err := New(context.Background(), Options{
+			ServiceName:            "test",
+			Exporters:              "invalid",
+			SpanExporter:           tracetest.NewInMemoryExporter(),
+			UseSimpleSpanProcessor: true,
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		defer tracer.Shutdown(context.Background())
+	})
+
+	t.Run("invalid exporter fails initialization", func(t *testing.T) {
+		if _, err := New(context.Background(), Options{ServiceName: "test", Exporters: "invalid"}); err == nil {
+			t.Fatal("New should reject an unsupported trace exporter")
+		}
+	})
 }
 
 func TestResolveOTLPEndpointPrecedence(t *testing.T) {
