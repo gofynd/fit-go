@@ -205,6 +205,9 @@ func (s *Server) Init(
 	// OTel express plugin, with no per-service wiring. (/_healthz and /_readyz are
 	// skipped inside the middleware via tracing.ShouldTrace.)
 	root.Use(OTelMiddleware())
+	// Finalize the server span with the resolved route template. Nested service
+	// routers install this middleware on their own engine as well.
+	root.Use(OTelRouteMiddleware())
 
 	// Make the server span the goroutine-local active context so handler logs
 	// carry the trace without explicit threading (implicit propagation).

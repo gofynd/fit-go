@@ -15,15 +15,19 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/gofynd/fit-go/internal/tracingtest"
+	fittracing "github.com/gofynd/fit-go/tracing"
 )
 
 // zeroTraceID is the string of an invalid/absent span context — i.e. no span.
@@ -42,6 +46,70 @@ func TestOTelMiddleware_TracingDisabled_Passthrough(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, "ok", w.Body.String())
+}
+
+func TestOTelRouteMiddleware_FinalizesNestedRouteAndRequestHost(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("OTEL_SDK_DISABLED", "false")
+	t.Setenv("SERVICE_NAME", "must-not-be-server-address")
+
+	previousProvider := otel.GetTracerProvider()
+	exporter := tracetest.NewInMemoryExporter()
+	enabled := true
+	tracer, err := fittracing.New(context.Background(), fittracing.Options{
+		ServiceName:            "route-test",
+		Enabled:                &enabled,
+		Sampler:                "always_on",
+		SpanExporter:           exporter,
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("tracing.New: %v", err)
+	}
+	restore := fittracing.SetGlobal(tracer)
+	t.Cleanup(func() {
+		restore()
+		_ = tracer.Shutdown(context.Background())
+		otel.SetTracerProvider(previousProvider)
+	})
+
+	outer := gin.New()
+	outer.Use(OTelMiddleware())
+	child := gin.New()
+	child.Use(OTelRouteMiddleware())
+	child.GET("/company/:company_id/item/:item_id", func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
+	outer.NoRoute(gin.WrapH(child))
+
+	req := httptest.NewRequest(http.MethodGet, "http://api.example.test/company/42/item/secret", nil)
+	w := httptest.NewRecorder()
+	outer.ServeHTTP(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusNoContent)
+	}
+
+	spans := exporter.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("exported spans = %d, want 1", len(spans))
+	}
+	span := spans[0]
+	if span.Name != "GET /company/:company_id/item/:item_id" {
+		t.Fatalf("span name = %q", span.Name)
+	}
+	attrs := map[string]any{}
+	for _, attr := range span.Attributes {
+		attrs[string(attr.Key)] = attr.Value.AsInterface()
+	}
+	if attrs["http.route"] != "/company/:company_id/item/:item_id" {
+		t.Fatalf("http.route = %#v", attrs["http.route"])
+	}
+	if attrs["server.address"] != "api.example.test" {
+		t.Fatalf("server.address = %#v, want request host", attrs["server.address"])
+	}
+	if attrs["server.address"] == "must-not-be-server-address" {
+		t.Fatal("SERVICE_NAME leaked into server.address")
+	}
 }
 
 // With tracing enabled, otelgin opens a span for normal routes but the

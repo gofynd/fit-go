@@ -164,9 +164,11 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		removePropagationHeaders(req.Header, propagator)
 		propagator.Inject(req.Context(), propagation.HeaderCarrier(req.Header))
 		span.SetAttributes(map[string]any{
-			"http.method":     req.Method,
-			"http.url":        safeURL,
-			"http.host":       req.URL.Host,
+			"http.request.method": req.Method,
+			// url.full is deliberately query/userinfo-free. The standard key is
+			// retained while its value follows Commerce's stricter privacy policy.
+			"url.full":        safeURL,
+			"server.address":  req.URL.Hostname(),
 			"http.request_id": reqID,
 		})
 	}
@@ -181,7 +183,7 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	if span != nil {
-		span.SetAttribute("http.status_code", status)
+		span.SetAttribute("http.response.status_code", status)
 		switch {
 		case err != nil:
 			span.SetStatus(tracing.StatusError, redact.ErrorMessage(err))

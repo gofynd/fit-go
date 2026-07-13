@@ -11,6 +11,18 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Deploy-time trace identity without mandatory new envs**: trace resources now
+  infer `service.version`, `vcs.ref.head.revision`, and
+  `deployment.environment.name` from existing release/Git/deployment variables
+  or Go build metadata. Standard `OTEL_RESOURCE_ATTRIBUTES` still has higher
+  precedence.
+- **Nested Gin route finalization**: `server.OTelRouteMiddleware` lets the Gin
+  engine that owns the concrete route update a server span created by an outer
+  fit-go engine, preserving one server span while exporting a bounded
+  `METHOD /route/:parameter` name and `http.route`.
+- **Modern privacy-safe HTTP client attributes**: outbound spans use
+  `http.request.method`, `http.response.status_code`, `server.address`, and a
+  query/userinfo-free `url.full` while retaining trace propagation.
 - **Legacy callback context continuity**: instrumented outbound HTTP, Mongo,
   Redis, MySQL, PostgreSQL, gRPC, and explicit Kafka producer operations now
   fill a missing parent from fit-go's same-goroutine active boundary context.

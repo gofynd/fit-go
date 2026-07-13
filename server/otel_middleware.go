@@ -17,10 +17,12 @@
 package server
 
 import (
-	"os"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
+	"go.opentelemetry.io/otel/attribute"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/gofynd/fit-go/tracing"
 )
@@ -41,12 +43,36 @@ func OTelMiddleware() gin.HandlerFunc {
 		return func(c *gin.Context) { c.Next() }
 	}
 	return otelgin.Middleware(
-		os.Getenv("SERVICE_NAME"),
+		// The first otelgin argument is the primary HTTP server address, not the
+		// OTel resource service.name. Empty makes otelgin derive server.address
+		// from Request.Host instead of incorrectly exporting SERVICE_NAME there.
+		"",
 		// WithGinFilter skips a request when the filter returns false.
 		otelgin.WithGinFilter(func(c *gin.Context) bool {
 			return tracing.ShouldTrace(c.Request.URL.Path)
 		}),
 	)
+}
+
+// OTelRouteMiddleware updates the active HTTP server span after Gin resolves the
+// matched route. Install it on every Gin engine that owns concrete routes. This
+// matters when a fit-go root engine delegates through NoRoute/gin.WrapH to a
+// nested Gin engine: the outer engine only sees a fallback and cannot know the
+// child's route template when otelgin starts the span.
+func OTelRouteMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Next()
+		route := strings.TrimSpace(c.FullPath())
+		if route == "" {
+			return
+		}
+		span := oteltrace.SpanFromContext(c.Request.Context())
+		if !span.SpanContext().IsValid() {
+			return
+		}
+		span.SetName(c.Request.Method + " " + route)
+		span.SetAttributes(attribute.String("http.route", route))
+	}
 }
 
 // GoroutineContextMiddleware stores the request context (carrying the otelgin

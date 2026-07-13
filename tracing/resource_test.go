@@ -85,6 +85,31 @@ func TestBuildResourceKeepsPartialEnvironmentResource(t *testing.T) {
 	}
 }
 
+func TestBuildResourceAddsReleaseRevisionAndDeploymentIdentity(t *testing.T) {
+	t.Setenv("SENTRY_RELEASE", "release-from-env")
+	t.Setenv("GITSHA", "0123456789abcdef")
+	t.Setenv("SENTRY_ENVIRONMENT", "fyndz0")
+	// OTel's standard resource input must retain precedence over inferred values.
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "service.version=release-from-resource")
+
+	values := resourceValues(buildResource(context.Background(), Options{
+		ServiceName: "service",
+		Env:         "production",
+	}))
+	want := map[string]string{
+		"service.version":             "release-from-resource",
+		"vcs.ref.head.revision":       "0123456789abcdef",
+		"deployment.environment":      "production",
+		"deployment.environment.name": "fyndz0",
+	}
+	for key, expected := range want {
+		value, ok := values[key]
+		if !ok || value.AsString() != expected {
+			t.Errorf("resource[%q] = %v, want %q", key, value, expected)
+		}
+	}
+}
+
 func TestBuildResourceServiceNamePrecedence(t *testing.T) {
 	t.Run("resource service survives without explicit service", func(t *testing.T) {
 		t.Setenv("OTEL_SERVICE_NAME", "")

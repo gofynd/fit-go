@@ -53,6 +53,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -786,11 +787,29 @@ func buildResource(ctx context.Context, opts Options) *resource.Resource {
 	if environment == "" {
 		environment = envString("GO_ENV", envString("NODE_ENV", "development"))
 	}
-	defaults := make([]attribute.KeyValue, 0, 1)
+	defaults := make([]attribute.KeyValue, 0, 4)
 	if host, err := os.Hostname(); err == nil && host != "" {
 		// Legacy TraceClue identifies a replica by hostname. Environment and explicit
 		// attributes below may intentionally override this default.
 		defaults = append(defaults, semconv.ServiceInstanceID(host))
+	}
+	buildVersion, buildRevision := detectedBuildMetadata()
+	version := firstEnvironmentValue("SENTRY_RELEASE", "SERVICE_VERSION", "PLATFORM_VERSION")
+	if version == "" {
+		version = buildVersion
+	}
+	if version != "" {
+		defaults = append(defaults, attribute.String("service.version", version))
+	}
+	revision := firstEnvironmentValue("GITSHA", "GIT_SHA")
+	if revision == "" {
+		revision = buildRevision
+	}
+	if revision != "" {
+		defaults = append(defaults, attribute.String("vcs.ref.head.revision", revision))
+	}
+	if deploymentName := firstEnvironmentValue("DEPLOY_ENV", "SENTRY_ENVIRONMENT"); deploymentName != "" {
+		defaults = append(defaults, attribute.String("deployment.environment.name", deploymentName))
 	}
 
 	explicit := make([]attribute.KeyValue, 0, len(opts.Attributes))
@@ -836,6 +855,32 @@ func buildResource(ctx context.Context, opts Options) *resource.Resource {
 		}
 	}
 	return res
+}
+
+func firstEnvironmentValue(keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func detectedBuildMetadata() (version, revision string) {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "", ""
+	}
+	if value := strings.TrimSpace(info.Main.Version); value != "" && value != "(devel)" {
+		version = value
+	}
+	for _, setting := range info.Settings {
+		if setting.Key == "vcs.revision" {
+			revision = strings.TrimSpace(setting.Value)
+			break
+		}
+	}
+	return version, revision
 }
 
 // ResourceFromOptions builds the process resource used by fit-go telemetry.

@@ -128,6 +128,14 @@ func exportedHTTPSpan(t *testing.T, exporter *tracetest.InMemoryExporter, name s
 	return tracetest.SpanStub{}
 }
 
+func spanAttributes(span tracetest.SpanStub) map[string]any {
+	attrs := make(map[string]any, len(span.Attributes))
+	for _, attr := range span.Attributes {
+		attrs[string(attr.Key)] = attr.Value.AsInterface()
+	}
+	return attrs
+}
+
 func TestRoundTrip_GeneratesRequestID(t *testing.T) {
 	f := &fakeRT{}
 	rt := WrapTransport(f)
@@ -195,6 +203,35 @@ func TestRoundTrip_InjectsTraceparentWhenEnabled(t *testing.T) {
 
 	if got := f.got.Header.Get(traceparentHeader); got == "" {
 		t.Fatal("expected traceparent header injected when tracing enabled")
+	}
+}
+
+func TestRoundTrip_UsesModernPrivacySafeHTTPAttributes(t *testing.T) {
+	_, exporter := recordingHTTPTracer(t)
+	f := &fakeRT{status: http.StatusCreated}
+	req := httptest.NewRequest(http.MethodPost, "https://user:secret@api.example.test:8443/v1/items?token=secret&email=user@example.com", nil)
+	do(t, WrapTransport(f), req)
+
+	attrs := spanAttributes(exportedHTTPSpan(t, exporter, "HTTP POST"))
+	want := map[string]any{
+		"http.request.method":       http.MethodPost,
+		"http.response.status_code": int64(http.StatusCreated),
+		"url.full":                  "https://api.example.test:8443/v1/items",
+		"server.address":            "api.example.test",
+	}
+	for key, value := range want {
+		if attrs[key] != value {
+			t.Errorf("attribute %s = %#v, want %#v", key, attrs[key], value)
+		}
+	}
+	for _, legacy := range []string{"http.method", "http.status_code", "http.url", "http.host"} {
+		if _, ok := attrs[legacy]; ok {
+			t.Errorf("legacy attribute %q is still exported", legacy)
+		}
+	}
+	text, _ := attrs["url.full"].(string)
+	if strings.Contains(text, "secret") || strings.Contains(text, "user@example.com") {
+		t.Fatalf("url.full leaked sensitive URL data: %q", text)
 	}
 }
 
