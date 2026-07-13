@@ -37,16 +37,22 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bufbuild/protocompile"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/reflection"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/dynamicpb"
 
 	fithealth "github.com/gofynd/fit-go/health"
+	"github.com/gofynd/fit-go/redact"
 	"github.com/gofynd/fit-go/tracing"
 )
 
@@ -137,6 +143,13 @@ type NextFunc func(err error)
 // Each method can have a single handler or a chain of middleware + handler.
 type ServiceImplementation map[string][]HandlerFunc
 
+// ServiceRegistrationOptions controls FIT-style dynamic service registration.
+type ServiceRegistrationOptions struct {
+	// ErrorHandler receives errors passed to next. When absent, callers receive
+	// a generic Internal response and the original error is logged server-side.
+	ErrorHandler ErrorHandlerFunc
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -180,6 +193,11 @@ type Config struct {
 	// HealthChecker is the health checker used for the gRPC health service.
 	// If nil, a new default Checker is created.
 	HealthChecker *fithealth.Checker
+
+	// UnaryInterceptors and StreamInterceptors are installed on the native gRPC
+	// server. They apply to generated and dynamic registrations alike.
+	UnaryInterceptors  []grpc.UnaryServerInterceptor
+	StreamInterceptors []grpc.StreamServerInterceptor
 }
 
 // defaults fills in zero-valued fields with sensible defaults.
@@ -287,6 +305,10 @@ type Server struct {
 	// responseSchema is loaded from the .type.json file for response validation.
 	responseSchema *ProtoTypeSchema
 
+	// dynamicService is compiled from the configured proto file and backs
+	// FIT-style AddServiceDefinitions registration.
+	dynamicService protoreflect.ServiceDescriptor
+
 	// healthChecker is used for the built-in health check service.
 	healthChecker *fithealth.Checker
 
@@ -323,8 +345,9 @@ func (h *currentHealthServer) Watch(req *healthpb.HealthCheckRequest, stream grp
 }
 
 // Init initializes a new gRPC server with the given configuration.
-// It validates the config, verifies proto file existence, and optionally
-// loads the response type schema.
+// It validates the config and optionally loads the response type schema.
+// Source proto files are only required when AddServiceDefinitions is used;
+// generated registrations can use GRPCServer without runtime proto sources.
 func Init(cfg Config) (*Server, error) {
 	if err := cfg.defaults(); err != nil {
 		return nil, err
@@ -332,12 +355,10 @@ func Init(cfg Config) (*Server, error) {
 
 	cfg.Logger.Info("Initializing gRPC Server")
 
-	// Resolve and verify proto file path.
+	// Resolve the proto path for optional FIT-style dynamic registration. Do not
+	// require it here: generated-only callers register descriptors directly on
+	// GRPCServer and do not need source protos or their imports at runtime.
 	protoPath := filepath.Join(cfg.ProtoDir, cfg.ServerType, cfg.FileName+".proto")
-	if _, err := os.Stat(protoPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("grpc: proto file not found at %s - ensure the file exists (run proto generation if needed)", protoPath)
-	}
-
 	// Create the real gRPC server with keepalive parameters.
 	serverOpts := []grpc.ServerOption{
 		grpc.KeepaliveParams(keepalive.ServerParameters{
@@ -351,6 +372,12 @@ func Init(cfg Config) (*Server, error) {
 	// Added only when tracing is enabled, so there is zero overhead when off.
 	if t := tracing.Global(); t != nil && t.IsEnabled() {
 		serverOpts = append(serverOpts, grpc.StatsHandler(otelgrpc.NewServerHandler()))
+	}
+	if len(cfg.UnaryInterceptors) > 0 {
+		serverOpts = append(serverOpts, grpc.ChainUnaryInterceptor(cfg.UnaryInterceptors...))
+	}
+	if len(cfg.StreamInterceptors) > 0 {
+		serverOpts = append(serverOpts, grpc.ChainStreamInterceptor(cfg.StreamInterceptors...))
 	}
 	grpcServer := grpc.NewServer(serverOpts...)
 
@@ -389,6 +416,49 @@ func Init(cfg Config) (*Server, error) {
 	return s, nil
 }
 
+func compileDynamicService(cfg Config, protoPath string) (protoreflect.ServiceDescriptor, error) {
+	info, err := os.Stat(protoPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("grpc: proto file not found at %s - source protos are required for dynamic registration", protoPath)
+		}
+		return nil, fmt.Errorf("grpc: cannot stat proto file %s: %w", protoPath, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("grpc: proto path %s is not a regular file", protoPath)
+	}
+
+	protoDir := filepath.Dir(protoPath)
+	resolver := protocompile.WithStandardImports(&protocompile.SourceResolver{
+		ImportPaths: []string{protoDir, cfg.ProtoDir, "."},
+	})
+	files, err := (&protocompile.Compiler{Resolver: resolver}).Compile(context.Background(), filepath.Base(protoPath))
+	if err != nil {
+		return nil, fmt.Errorf("grpc: compile proto %s: %w", protoPath, err)
+	}
+	if len(files) != 1 {
+		return nil, fmt.Errorf("grpc: compile proto %s returned %d root descriptors", protoPath, len(files))
+	}
+
+	services := files[0].Services()
+	wanted := protoreflect.Name(Capitalize(cfg.FileName))
+	for i := 0; i < services.Len(); i++ {
+		if services.Get(i).Name() == wanted {
+			return services.Get(i), nil
+		}
+	}
+	if services.Len() == 1 {
+		return services.Get(0), nil
+	}
+	// Generated-only users may keep a proto with no service and register their
+	// generated descriptor through GRPCServer. Dynamic registration will return
+	// a precise error if attempted.
+	if services.Len() == 0 {
+		return nil, nil
+	}
+	return nil, fmt.Errorf("grpc: proto %s has no unambiguous service named %s", protoPath, wanted)
+}
+
 // ---------------------------------------------------------------------------
 // Service registration
 // ---------------------------------------------------------------------------
@@ -398,14 +468,43 @@ func Init(cfg Config) (*Server, error) {
 //
 // The implementations map keys are method names, and values are handler chains.
 // Each chain is executed in order; calling next() advances to the next handler.
-// A handler with the ErrorHandlerFunc signature in the chain acts as an error
-// handler (port of the JS "functions with 4 params" convention).
+// AddServiceDefinitionsWithOptions accepts the explicit ErrorHandlerFunc used
+// to port the JS "functions with 4 params" convention.
 //
 // A built-in gRPC health check service (Check/Watch) is auto-registered using
 // the server's HealthChecker.
 func (s *Server) AddServiceDefinitions(implementations ServiceImplementation) error {
+	return s.AddServiceDefinitionsWithOptions(implementations, ServiceRegistrationOptions{})
+}
+
+// AddServiceDefinitionsWithOptions registers a descriptor-backed dynamic
+// service and optional FIT-style error handler.
+func (s *Server) AddServiceDefinitionsWithOptions(implementations ServiceImplementation, opts ServiceRegistrationOptions) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.running {
+		return fmt.Errorf("grpc: service definitions must be registered before Start")
+	}
+	if s.dynamicService == nil {
+		dynamicService, err := compileDynamicService(s.cfg, s.protoPath)
+		if err != nil {
+			return err
+		}
+		if dynamicService == nil {
+			return fmt.Errorf("grpc: configured proto %s does not define a dynamic service", s.protoPath)
+		}
+		s.dynamicService = dynamicService
+	}
+	serviceName := string(s.dynamicService.FullName())
+	if _, registered := s.services[serviceName]; registered {
+		return fmt.Errorf("grpc: service %s is already registered", serviceName)
+	}
+	for i := 0; i < s.dynamicService.Methods().Len(); i++ {
+		method := s.dynamicService.Methods().Get(i)
+		if method.IsStreamingClient() || method.IsStreamingServer() {
+			return fmt.Errorf("grpc: FIT-style dynamic method %s is streaming; register generated streaming services through GRPCServer", method.FullName())
+		}
+	}
 
 	// Auto-register health check service.
 	s.services["grpc.health.v1.Health"] = ServiceImplementation{
@@ -417,14 +516,148 @@ func (s *Server) AddServiceDefinitions(implementations ServiceImplementation) er
 	s.syncHealthStatus()
 
 	// Register primary service with middleware processing.
-	processed := s.handleMethodMiddlewares(implementations)
-	s.services[s.cfg.FileName] = processed
+	processed := s.handleMethodMiddlewares(implementations, opts.ErrorHandler)
+	s.services[serviceName] = processed
+	s.grpcServer.RegisterService(s.dynamicServiceDescription(processed), dynamicServiceReceiver{})
 
 	s.logger.Info("Service definitions registered",
-		"service", s.cfg.FileName,
+		"service", s.dynamicService.FullName(),
 		"methods", len(implementations),
 	)
 	return nil
+}
+
+type dynamicServiceInterface interface{}
+type dynamicServiceReceiver struct{}
+
+func (s *Server) dynamicServiceDescription(implementations ServiceImplementation) *grpc.ServiceDesc {
+	desc := &grpc.ServiceDesc{
+		ServiceName: string(s.dynamicService.FullName()),
+		HandlerType: (*dynamicServiceInterface)(nil),
+		Metadata:    s.protoPath,
+	}
+	methods := s.dynamicService.Methods()
+	for i := 0; i < methods.Len(); i++ {
+		method := methods.Get(i)
+		desc.Methods = append(desc.Methods, grpc.MethodDesc{
+			MethodName: string(method.Name()),
+			Handler:    s.dynamicUnaryHandler(method, lookupDynamicHandler(implementations, method.Name())),
+		})
+	}
+	return desc
+}
+
+func lookupDynamicHandler(implementations ServiceImplementation, name protoreflect.Name) []HandlerFunc {
+	if handlers, ok := implementations[string(name)]; ok {
+		return handlers
+	}
+	for candidate, handlers := range implementations {
+		if strings.EqualFold(candidate, string(name)) {
+			return handlers
+		}
+	}
+	return nil
+}
+
+func (s *Server) dynamicUnaryHandler(method protoreflect.MethodDescriptor, chain []HandlerFunc) grpc.MethodHandler {
+	fullMethod := "/" + string(method.Parent().FullName()) + "/" + string(method.Name())
+	return func(_ any, ctx context.Context, decode func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
+		request := dynamicpb.NewMessage(method.Input())
+		if err := decode(request); err != nil {
+			return nil, err
+		}
+		invoke := func(ctx context.Context, req any) (any, error) {
+			return s.invokeDynamicUnary(ctx, fullMethod, method, chain, req.(proto.Message))
+		}
+		if interceptor == nil {
+			return invoke(ctx, request)
+		}
+		return interceptor(ctx, request, &grpc.UnaryServerInfo{
+			Server:     dynamicServiceReceiver{},
+			FullMethod: fullMethod,
+		}, invoke)
+	}
+}
+
+type dynamicResult struct {
+	response map[string]interface{}
+	err      error
+}
+
+func (s *Server) invokeDynamicUnary(
+	ctx context.Context,
+	fullMethod string,
+	method protoreflect.MethodDescriptor,
+	chain []HandlerFunc,
+	request proto.Message,
+) (proto.Message, error) {
+	if len(chain) == 0 {
+		return nil, status.Error(codes.Unimplemented, "method not implemented")
+	}
+	requestMap, err := protobufMessageToMap(request)
+	if err != nil {
+		return nil, status.Error(codes.Internal, "failed to decode request")
+	}
+	call := &CallInfo{
+		FullMethod: fullMethod,
+		Request:    requestMap,
+		Metadata:   incomingMetadata(ctx),
+		Context:    ctx,
+	}
+	result := make(chan dynamicResult, 1)
+	var callbackOnce sync.Once
+	callback := func(err error, response map[string]interface{}) {
+		callbackOnce.Do(func() { result <- dynamicResult{response: response, err: err} })
+	}
+
+	s.executeChain(chain, call, callback)
+	select {
+	case <-ctx.Done():
+		return nil, status.FromContextError(ctx.Err()).Err()
+	case completed := <-result:
+		if completed.err != nil {
+			return nil, dynamicStatusError(completed.err)
+		}
+		response := dynamicpb.NewMessage(method.Output())
+		if err := mapToProtobufMessage(completed.response, response); err != nil {
+			s.logger.Error("gRPC response encoding failed", "method", fullMethod, "error", err)
+			return nil, status.Error(codes.Internal, "failed to encode response")
+		}
+		return response, nil
+	}
+}
+
+func incomingMetadata(ctx context.Context) Metadata {
+	values := Metadata{}
+	if incoming, ok := metadata.FromIncomingContext(ctx); ok {
+		for key, entries := range incoming {
+			values[strings.ToLower(key)] = append([]string(nil), entries...)
+		}
+	}
+	return values
+}
+
+func dynamicStatusError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if rpcErr, ok := err.(*RPCError); ok {
+		return publicDynamicStatus(rpcErr.Code, rpcErr.Message)
+	}
+	if grpcStatus, ok := status.FromError(err); ok {
+		return publicDynamicStatus(grpcStatus.Code(), grpcStatus.Message())
+	}
+	return status.Error(codes.Internal, "Internal Server Error, Please try again!")
+}
+
+func publicDynamicStatus(code codes.Code, message string) error {
+	switch code {
+	case codes.Internal, codes.Unknown, codes.DataLoss:
+		message = "Internal Server Error, Please try again!"
+	case codes.Unavailable:
+		message = "Service temporarily unavailable"
+	}
+	return status.Error(code, redact.Text(message))
 }
 
 // syncHealthStatus updates the gRPC health server status based on the
@@ -446,7 +679,7 @@ func (s *Server) syncHealthStatus() []string {
 
 // handleMethodMiddlewares wraps each method's handler chain into a single
 // handler that executes the middleware chain with next() support.
-func (s *Server) handleMethodMiddlewares(methods ServiceImplementation) ServiceImplementation {
+func (s *Server) handleMethodMiddlewares(methods ServiceImplementation, errorHandler ErrorHandlerFunc) ServiceImplementation {
 	processed := make(ServiceImplementation, len(methods))
 
 	for methodName, chain := range methods {
@@ -458,20 +691,20 @@ func (s *Server) handleMethodMiddlewares(methods ServiceImplementation) ServiceI
 
 		processed[methodName] = []HandlerFunc{
 			func(call *CallInfo, callback Callback, _ NextFunc) {
-				s.executeChain(wrappedChain, call, callback)
+				s.executeChainWithErrorHandler(wrappedChain, call, callback, errorHandler)
 			},
 		}
 	}
 	return processed
 }
 
-// executeChain runs a middleware chain sequentially. If next() is called with
-// an error, it looks for an error handler in the chain (analogous to the JS
-// convention of functions with 4 parameters).
+// executeChain runs a middleware chain sequentially with the default sanitized
+// internal-error mapping.
 func (s *Server) executeChain(chain []HandlerFunc, call *CallInfo, callback Callback) {
-	// Find error handler (if any) - this is a convention from the JS version
-	// where functions with 4 params are treated as error handlers.
-	var errorHandler ErrorHandlerFunc
+	s.executeChainWithErrorHandler(chain, call, callback, nil)
+}
+
+func (s *Server) executeChainWithErrorHandler(chain []HandlerFunc, call *CallInfo, callback Callback, errorHandler ErrorHandlerFunc) {
 
 	nextCounter := 0
 
@@ -481,11 +714,8 @@ func (s *Server) executeChain(chain []HandlerFunc, call *CallInfo, callback Call
 				errorHandler(err, call, callback)
 				return
 			}
-			msg := err.Error()
-			if msg == "" {
-				msg = "Internal Server Error, Please try again!"
-			}
-			callback(&RPCError{Code: Internal, Message: msg}, nil)
+			s.logger.Error("gRPC middleware failed", "method", call.FullMethod, "error", redact.Text(err.Error()))
+			callback(&RPCError{Code: Internal, Message: "Internal Server Error, Please try again!"}, nil)
 			return
 		}
 		nextCounter++
@@ -501,11 +731,11 @@ func (s *Server) executeChain(chain []HandlerFunc, call *CallInfo, callback Call
 				if r := recover(); r != nil {
 					s.logger.Error("panic in gRPC handler",
 						"method", call.FullMethod,
-						"error", fmt.Sprintf("%v", r),
+						"error", redact.Text(fmt.Sprintf("%v", r)),
 					)
 					callback(&RPCError{
 						Code:    Internal,
-						Message: fmt.Sprintf("%v", r),
+						Message: "Internal Server Error, Please try again!",
 					}, nil)
 				}
 			}()
@@ -548,7 +778,7 @@ func (s *Server) wrapWithResponseEncoding(methodName string, chain []HandlerFunc
 						"method", methodName,
 						"error", validationErr,
 					)
-					callback(&RPCError{Code: Internal, Message: validationErr.Error()}, nil)
+					callback(&RPCError{Code: Internal, Message: "Internal Server Error, Please try again!"}, nil)
 					return
 				}
 			}

@@ -112,6 +112,67 @@ func TestOTelRouteMiddleware_FinalizesNestedRouteAndRequestHost(t *testing.T) {
 	}
 }
 
+func TestServerInit_MultiTypeKeepsNestedRouteTemplate(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("OTEL_SDK_DISABLED", "false")
+	t.Setenv("SERVER_TYPE", "platform,partner")
+	t.Setenv("UNIFY_SERVER", "false")
+
+	previousProvider := otel.GetTracerProvider()
+	exporter := tracetest.NewInMemoryExporter()
+	enabled := true
+	tracer, err := fittracing.New(context.Background(), fittracing.Options{
+		ServiceName:            "multi-type-route-test",
+		Enabled:                &enabled,
+		Sampler:                "always_on",
+		SpanExporter:           exporter,
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("tracing.New: %v", err)
+	}
+	restore := fittracing.SetGlobal(tracer)
+	t.Cleanup(func() {
+		restore()
+		_ = tracer.Shutdown(context.Background())
+		otel.SetTracerProvider(previousProvider)
+	})
+
+	newRouter := func() http.Handler {
+		engine := gin.New()
+		engine.Use(OTelRouteMiddleware())
+		engine.GET("/company/:company_id/item/:item_id", func(c *gin.Context) {
+			c.Status(http.StatusNoContent)
+		})
+		return engine
+	}
+	server := New(Config{})
+	if err := server.Init(map[ServerType]http.Handler{
+		ServerTypePlatform: newRouter(),
+		ServerTypePartner:  newRouter(),
+	}, nil, nil); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	server.Router.ServeHTTP(recorder, httptest.NewRequest(
+		http.MethodGet,
+		"http://api.example.test/platform/company/42/item/private",
+		nil,
+	))
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNoContent)
+	}
+
+	spans := exporter.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("exported spans = %d, want 1", len(spans))
+	}
+	if got, want := spans[0].Name, "GET /company/:company_id/item/:item_id"; got != want {
+		t.Fatalf("span name = %q, want %q", got, want)
+	}
+}
+
 // With tracing enabled, otelgin opens a span for normal routes but the
 // ShouldTrace filter skips /_healthz and /_readyz (legacy fit.js parity). The
 // handler echoes its context trace id, so "no span" shows up as the zero id.

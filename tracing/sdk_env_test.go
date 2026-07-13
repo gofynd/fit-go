@@ -55,3 +55,33 @@ func TestOTELSDKDisabled_UnsetLeavesTracingOn(t *testing.T) {
 		t.Fatal("tracing should be enabled when OTEL_SDK_DISABLED is unset")
 	}
 }
+
+func TestPyfitActivationModeEnablesWhenSDKDisableEnvIsAbsent(t *testing.T) {
+	os.Unsetenv("OTEL_SDK_DISABLED")
+	t.Setenv("TRACING_ENABLED", "")
+	if !tracingEnabled(Options{ActivationMode: "pyfit"}) {
+		t.Fatal("pyfit compatibility mode should initialize when OTEL_SDK_DISABLED is absent")
+	}
+}
+
+func TestPyfitActivationModePreservesLegacyPresenceSemantics(t *testing.T) {
+	// pyfit historically treated any configured value, including the string
+	// "false", as disabled. Keep this behavior opt-in and isolated from the
+	// OTel-standard default mode.
+	t.Setenv("OTEL_SDK_DISABLED", "false")
+	if tracingEnabled(Options{ActivationMode: "pyfit"}) {
+		t.Fatal("pyfit compatibility mode should preserve legacy env-presence behavior")
+	}
+	if !tracingEnabled(Options{ActivationMode: "explicit", Enabled: boolPointer(true)}) {
+		t.Fatal("standard explicit mode should not treat OTEL_SDK_DISABLED=false as disabled")
+	}
+}
+
+func TestPyfitActivationModeTreatsEmptySDKDisableAsEnabled(t *testing.T) {
+	t.Setenv("OTEL_SDK_DISABLED", "")
+	if !tracingEnabled(Options{ActivationMode: "pyfit"}) {
+		t.Fatal("pyfit compatibility mode should treat an empty OTEL_SDK_DISABLED as enabled")
+	}
+}
+
+func boolPointer(value bool) *bool { return &value }

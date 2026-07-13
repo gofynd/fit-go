@@ -24,6 +24,7 @@ require (
 require (
 	github.com/99designs/gqlgen v0.17.94
 	github.com/XSAM/otelsql v0.42.0
+	github.com/bufbuild/protocompile v0.14.1
 	github.com/exaring/otelpgx v0.11.1
 	github.com/gofrs/flock v0.13.0
 	github.com/jackc/pgx/v5 v5.9.2

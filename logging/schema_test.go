@@ -278,6 +278,8 @@ func TestTraceClueBodyTruncationProfiles(t *testing.T) {
 	}{
 		{name: "3.1.3 non-debug keeps body", level: "info", wantLength: 501},
 		{name: "3.1.3 debug truncates", level: "debug", wantLength: 500, wantFlag: true},
+		{name: "pyfit non-debug truncates", level: "info", mode: TraceClueTruncateNonDebug, wantLength: 500, wantFlag: true},
+		{name: "pyfit debug keeps body", level: "debug", mode: TraceClueTruncateNonDebug, wantLength: 501},
 		{name: "3.0.5 always truncates", level: "info", mode: TraceClueTruncateAlways, wantLength: 500, wantFlag: true},
 		{name: "explicitly disabled", level: "debug", mode: TraceClueTruncateNever, wantLength: 501},
 	}

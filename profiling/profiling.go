@@ -44,12 +44,14 @@
 package profiling
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"runtime"
 	"runtime/pprof"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -684,6 +686,28 @@ var processDefault = struct {
 	profiler *Profiler
 	owner    *defaultProfilerOwner
 }{profiler: NewFromEnv()}
+
+// TagWrapper runs fn with scoped Pyroscope/pprof labels. Labels are attached to
+// samples taken while fn executes and are also carried in the callback context,
+// matching pyfit's per-function tag-wrapper capability without global mutation.
+func TagWrapper(ctx context.Context, tags map[string]string, fn func(context.Context)) {
+	if fn == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	keys := make([]string, 0, len(tags))
+	for key := range tags {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	labels := make([]string, 0, len(tags)*2)
+	for _, key := range keys {
+		labels = append(labels, key, tags[key])
+	}
+	pyroscope.TagWrapper(ctx, pyroscope.Labels(labels...), fn)
+}
 
 // Start starts the default profiler.
 func Start() {

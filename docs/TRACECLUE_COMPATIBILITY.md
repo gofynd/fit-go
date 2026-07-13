@@ -10,10 +10,10 @@ mode. The normal fit-go platform schema remains the default.
 | Sentinel and Pointblank, TraceClue 3.1.3 | 500-character body limit only when configured `LOG_LEVEL=debug` | `debug-only` (default) |
 | Highbrow, TraceClue 3.0.5 | 500-character body limit at every level | `always` |
 | TriggerHappy, TraceClue commit `c61fd045` (package 2.1.2) / `winston-opentelemetry-format` 0.0.4 | 500-character body limit at every level | `always` |
+| pyfit 1.10 queue formatter | 500-character body limit outside debug | `non-debug` |
 
-Select the older profile with `FIT_TRACECLUE_BODY_TRUNCATION=always`, or set
-`Options.TraceClueBodyTruncation` directly. `never` is available only as an
-explicit Go policy override.
+Select a profile with `FIT_TRACECLUE_BODY_TRUNCATION=debug-only|non-debug|always|never`,
+or set `Options.TraceClueBodyTruncation` directly.
 
 When a body is truncated, fit-go emits `_body_too_large=true` and
 `_body_original_length`. `TraceClueRestrictAttributesTo` enables the legacy
@@ -54,6 +54,18 @@ unknown telemetry service even while FIT routing and Kafka used `triggerhappy`.
 Using `SERVICE_NAME` only as the final telemetry fallback is an explicit identity
 improvement; an explicit `OTEL_SERVICE_NAME` still wins and represents a named
 dashboard migration.
+
+## Tracing Activation
+
+The normal fit-go contract is explicit: `TRACING_ENABLED=true` enables the
+tracer. `FIT_TRACING_ACTIVATION_MODE=pyfit` is available for ports whose
+deployment contract relied on pyfit import-time activation. In that mode,
+`OTEL_SDK_DISABLED` being absent or empty enables tracing; every non-empty
+value disables it, including `false`. Root `fit.Init` and direct
+`tracing.New` resolve this identically.
+
+This unusual truthiness rule is compatibility behavior, not a recommended new
+deployment convention. New Go services should use the explicit mode.
 
 ## Instrumentation Extensions
 
@@ -103,3 +115,10 @@ the FIT Prometheus textfile metrics and remains opt-in.
 pyfit's `PROFILING_SAMPLE_RATE` is parsed and reported for compatibility. The
 current Go profiler has a fixed effective 100 Hz rate, so fit-go reports both
 the requested and effective values and marks the setting non-configurable.
+`profiling.TagWrapper` adds scoped Pyroscope/pprof labels without mutating
+process-global tags.
+
+The wrapper intentionally applies labels when tags are present. Some pyfit
+releases contained an inverted decorator condition that skipped the labelled
+path when tags were supplied; fit-go treats that as a legacy defect rather
+than reproducing it.

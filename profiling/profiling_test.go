@@ -15,15 +15,35 @@
 package profiling
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"runtime"
+	"runtime/pprof"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestTagWrapperScopesProfilingLabels(t *testing.T) {
+	var observed map[string]string
+	TagWrapper(context.Background(), map[string]string{"region": "us-east-1", "vehicle": "car"}, func(ctx context.Context) {
+		observed = map[string]string{}
+		pprof.ForLabels(ctx, func(key, value string) bool {
+			observed[key] = value
+			return true
+		})
+	})
+	if observed["region"] != "us-east-1" || observed["vehicle"] != "car" {
+		t.Fatalf("profiling labels = %#v", observed)
+	}
+}
+
+func TestTagWrapperNilCallbackIsNoop(t *testing.T) {
+	TagWrapper(nil, map[string]string{"key": "value"}, nil)
+}
 
 // ---------------------------------------------------------------------------
 // Config tests

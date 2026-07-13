@@ -321,6 +321,26 @@ opts = append(opts, fitgrpc.TracingDialOptions()...)
 conn, err := grpc.NewClient(target, opts...)
 ```
 
+For FIT-style runtime proto loading, call `AddServiceDefinitions` before
+`Start`. fit-go lazily compiles the configured proto at dynamic registration,
+registers unary methods on the native server, and executes callback middleware
+such as `AuthorizeJWTToken` on the real network path. Generated-only users of
+`GRPCServer()` do not require the source proto or its imports at runtime.
+
+Dynamic handler maps preserve FIT/proto-loader semantics: proto field names,
+string representations for 64-bit integers and enums, byte slices, collection
+defaults, oneof discriminator fields, and JSON-compatible Struct/Value/ListValue
+well-known types. Unknown response keys are ignored so additive application data
+does not break an older wire contract. Internal, Unknown, and DataLoss status text
+is sanitized before it crosses the network.
+Companion `.type.json` files are optional validation input rather than a
+runtime requirement; descriptor validation remains authoritative.
+
+Use `AddServiceDefinitionsWithOptions` for a custom error mapper. Streaming
+services use generated registration through `GRPCServer()`;
+`Config.UnaryInterceptors` and `Config.StreamInterceptors` apply to both
+generated and dynamic registrations.
+
 ## Kafka
 
 ```go
@@ -376,8 +396,8 @@ logger.Info("request processed", "user_id", "u123", "duration_ms", 42)
 
 The platform envelope remains the default. `FIT_LOG_SCHEMA=traceclue` enables
 the legacy OTel-shaped envelope. Its default body policy matches TraceClue
-3.1.3 (`debug-only`); set `FIT_TRACECLUE_BODY_TRUNCATION=always` for the
-TraceClue 3.0.5/2.1.x behavior. See
+3.1.3 (`debug-only`); use `always` for TraceClue 3.0.5/2.1.x or `non-debug`
+for pyfit 1.10 queue formatting. See
 [TraceClue compatibility](docs/TRACECLUE_COMPATIBILITY.md).
 
 ### Tracing
@@ -389,6 +409,18 @@ OTEL_SERVICE_NAME=my-service
 # Optional: tracecontext,baggage (default), b3, b3multi, jaeger, or none
 OTEL_PROPAGATORS=tracecontext,baggage
 ```
+
+The default activation contract requires `TRACING_ENABLED=true`. A pyfit port
+that must preserve pyfit's historical activation behavior can opt in with
+`FIT_TRACING_ACTIVATION_MODE=pyfit`: tracing is enabled when
+`OTEL_SDK_DISABLED` is absent or empty and disabled by every non-empty value,
+including the literal value `false`. Root `fit.Init` and direct `tracing.New`
+use the same rule.
+
+When `fit.Init` receives `WithConfigPaths`, the OTel tracing, sampler,
+propagator, exporter, endpoint/protocol, resource-attribute, and SDK-disable
+settings are resolved from the merged config as well as the process environment;
+an explicitly set environment variable retains precedence.
 
 ```go
 tracer, _ := tracing.New(ctx, tracing.Options{
@@ -489,6 +521,25 @@ PROFILING_SAMPLE_RATE=10
 deprecated sample-rate field, so profiler status reports `requested`,
 `effective`, and `configurable=false` separately instead of claiming the legacy
 value changed collection behavior.
+
+Use `profiling.TagWrapper` to attach scoped Pyroscope and pprof labels to a
+work unit without mutating process-global profiling state.
+
+### Error Reporting
+
+`errors.InitSentryWithConfig` is retryable when the DSN is initially absent or
+SDK initialization fails. Error events and explicitly enabled transaction
+events are sanitized both before and after optional caller hooks: request
+bodies/query strings/cookies and user data are removed, while sensitive keyed
+values and secret or PII text are redacted. Bounded reflection also sanitizes
+typed nested values and cycles without invoking custom string or marshal code.
+Sentry logs and metrics are disabled because fit-go uses OpenTelemetry for
+those signals.
+
+Use `errors.WithSentryContext` for request-local tags, extras, correlation IDs,
+and breadcrumbs. It clones the request hub so concurrent requests do not share
+scope mutation. Capture methods retain the original Go error object for Sentry
+grouping and application control flow.
 
 ## Encryption
 

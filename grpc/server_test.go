@@ -36,9 +36,13 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/gofynd/fit-go/health"
 )
@@ -50,12 +54,23 @@ import (
 // newTestServer creates a Server with a temp proto file, ready for testing.
 // It uses port "0" so the OS assigns a random available port.
 func newTestServer(t *testing.T) *Server {
+	return newTestServerWithConfig(t, nil)
+}
+
+func newTestServerWithConfig(t *testing.T, configure func(*Config)) *Server {
 	t.Helper()
 	tmpDir := t.TempDir()
 	serverType := "testservice"
 	protoDir := filepath.Join(tmpDir, serverType)
 	os.MkdirAll(protoDir, 0755)
-	os.WriteFile(filepath.Join(protoDir, "test.proto"), []byte(`syntax = "proto3";`), 0644)
+	os.WriteFile(filepath.Join(protoDir, "test.proto"), []byte(`
+syntax = "proto3";
+package test;
+import "google/protobuf/struct.proto";
+service Test {
+  rpc GetUser(google.protobuf.Struct) returns (google.protobuf.Struct);
+}
+`), 0644)
 
 	os.Setenv("SERVER_TYPE", serverType)
 	os.Setenv("PORT", "0")
@@ -64,11 +79,15 @@ func newTestServer(t *testing.T) *Server {
 		os.Unsetenv("PORT")
 	})
 
-	srv, err := Init(Config{
+	cfg := Config{
 		FileName: "test",
 		ProtoDir: tmpDir,
 		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
+	}
+	if configure != nil {
+		configure(&cfg)
+	}
+	srv, err := Init(cfg)
 	if err != nil {
 		t.Fatalf("Init() error = %v", err)
 	}
@@ -344,19 +363,17 @@ func TestInit_CustomConfig(t *testing.T) {
 }
 
 func TestInit_MissingProtoFile(t *testing.T) {
-	os.Setenv("SERVER_TYPE", "testserver")
-	os.Setenv("PORT", "50051")
-	defer func() {
-		os.Unsetenv("SERVER_TYPE")
-		os.Unsetenv("PORT")
-	}()
-
-	_, err := Init(Config{
-		FileName: "nonexistent",
-		ProtoDir: "/tmp/nonexistent",
+	srv, err := Init(Config{
+		FileName:   "nonexistent",
+		ProtoDir:   "/tmp/nonexistent",
+		ServerType: "testserver",
+		Port:       "0",
 	})
-	if err == nil {
-		t.Error("Init() should fail when proto file doesn't exist")
+	if err != nil {
+		t.Fatalf("generated-only Init() should not require a source proto: %v", err)
+	}
+	if err := srv.AddServiceDefinitions(ServiceImplementation{}); err == nil || !strings.Contains(err.Error(), "proto file not found") {
+		t.Fatalf("dynamic registration should require a source proto: %v", err)
 	}
 }
 
@@ -685,6 +702,170 @@ func TestServer_AddServiceDefinitions(t *testing.T) {
 
 	if _, ok := services["grpc.health.v1.Health"]; !ok {
 		t.Error("Health service should be auto-registered")
+	}
+}
+
+func TestServer_AddServiceDefinitionsRejectsDuplicateRegistration(t *testing.T) {
+	srv := newTestServer(t)
+	implementation := ServiceImplementation{
+		"GetUser": {func(_ *CallInfo, callback Callback, _ NextFunc) {
+			callback(nil, map[string]interface{}{})
+		}},
+	}
+	if err := srv.AddServiceDefinitions(implementation); err != nil {
+		t.Fatalf("first registration: %v", err)
+	}
+	if err := srv.AddServiceDefinitions(implementation); err == nil {
+		t.Fatal("duplicate registration unexpectedly succeeded")
+	}
+}
+
+func TestServer_AddServiceDefinitionsServesDynamicUnaryWithJWT(t *testing.T) {
+	srv := newTestServer(t)
+	const secret = "dynamic-grpc-secret"
+	token := createHS256Token(t, jwt.MapClaims{
+		"company_id": float64(42),
+		"exp":        float64(time.Now().Add(time.Hour).Unix()),
+	}, secret)
+
+	err := srv.AddServiceDefinitions(ServiceImplementation{
+		"GetUser": {
+			AuthorizeJWTToken(JWTConfig{Secret: secret}),
+			func(call *CallInfo, callback Callback, _ NextFunc) {
+				if call.Decoded == nil {
+					t.Error("JWT middleware did not attach decoded claims")
+				}
+				callback(nil, map[string]interface{}{
+					"company_id": call.Request["company_id"],
+					"name":       "dynamic-user",
+				})
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AddServiceDefinitions: %v", err)
+	}
+	cleanup := startServer(t, srv)
+	defer cleanup()
+
+	conn, err := grpc.NewClient(srv.Listener().Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+	request, _ := structpb.NewStruct(map[string]interface{}{"company_id": float64(42)})
+	response := new(structpb.Struct)
+	ctx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs("authorization", "Bearer "+token))
+	if err := conn.Invoke(ctx, "/test.Test/GetUser", request, response); err != nil {
+		t.Fatalf("dynamic RPC: %v", err)
+	}
+	if got := response.AsMap()["name"]; got != "dynamic-user" {
+		t.Fatalf("response name = %v", got)
+	}
+}
+
+func TestServer_DynamicErrorsAndPanicsAreSanitized(t *testing.T) {
+	tests := []struct {
+		name    string
+		handler HandlerFunc
+	}{
+		{name: "error", handler: func(_ *CallInfo, _ Callback, next NextFunc) { next(fmt.Errorf("database password leaked")) }},
+		{name: "panic", handler: func(_ *CallInfo, _ Callback, _ NextFunc) { panic("provider token leaked") }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			if err := srv.AddServiceDefinitions(ServiceImplementation{"GetUser": {tt.handler}}); err != nil {
+				t.Fatalf("AddServiceDefinitions: %v", err)
+			}
+			cleanup := startServer(t, srv)
+			defer cleanup()
+			conn, err := grpc.NewClient(srv.Listener().Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				t.Fatalf("grpc.NewClient: %v", err)
+			}
+			defer conn.Close()
+			err = conn.Invoke(context.Background(), "/test.Test/GetUser", &structpb.Struct{}, &structpb.Struct{})
+			if status.Code(err) != codes.Internal {
+				t.Fatalf("status = %v, want Internal", status.Code(err))
+			}
+			if strings.Contains(err.Error(), "password") || strings.Contains(err.Error(), "token") {
+				t.Fatalf("internal detail leaked to client: %v", err)
+			}
+		})
+	}
+}
+
+func TestServer_DynamicErrorHandlerMapsExpectedError(t *testing.T) {
+	srv := newTestServer(t)
+	err := srv.AddServiceDefinitionsWithOptions(ServiceImplementation{
+		"GetUser": {func(_ *CallInfo, _ Callback, next NextFunc) { next(fmt.Errorf("not allowed")) }},
+	}, ServiceRegistrationOptions{
+		ErrorHandler: func(_ error, _ *CallInfo, callback Callback) {
+			callback(&RPCError{Code: Unauthenticated, Message: "Unauthorized"}, nil)
+		},
+	})
+	if err != nil {
+		t.Fatalf("AddServiceDefinitionsWithOptions: %v", err)
+	}
+	cleanup := startServer(t, srv)
+	defer cleanup()
+	conn, err := grpc.NewClient(srv.Listener().Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+	err = conn.Invoke(context.Background(), "/test.Test/GetUser", &structpb.Struct{}, &structpb.Struct{})
+	if status.Code(err) != codes.Unauthenticated || status.Convert(err).Message() != "Unauthorized" {
+		t.Fatalf("mapped error = %v", err)
+	}
+}
+
+func TestServer_ConfiguredUnaryAndStreamInterceptorsAreInstalled(t *testing.T) {
+	var unaryCalls atomic.Int32
+	var streamCalls atomic.Int32
+	srv := newTestServerWithConfig(t, func(cfg *Config) {
+		cfg.UnaryInterceptors = []grpc.UnaryServerInterceptor{
+			func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+				unaryCalls.Add(1)
+				return handler(ctx, req)
+			},
+		}
+		cfg.StreamInterceptors = []grpc.StreamServerInterceptor{
+			func(srv any, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+				streamCalls.Add(1)
+				return handler(srv, stream)
+			},
+		}
+	})
+	if err := srv.AddServiceDefinitions(ServiceImplementation{
+		"GetUser": {func(_ *CallInfo, callback Callback, _ NextFunc) { callback(nil, map[string]interface{}{}) }},
+	}); err != nil {
+		t.Fatalf("AddServiceDefinitions: %v", err)
+	}
+	cleanup := startServer(t, srv)
+	defer cleanup()
+	conn, err := grpc.NewClient(srv.Listener().Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+	if err := conn.Invoke(context.Background(), "/test.Test/GetUser", &structpb.Struct{}, &structpb.Struct{}); err != nil {
+		t.Fatalf("dynamic unary invoke: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	watch, err := healthpb.NewHealthClient(conn).Watch(ctx, &healthpb.HealthCheckRequest{})
+	if err != nil {
+		cancel()
+		t.Fatalf("health watch: %v", err)
+	}
+	_, _ = watch.Recv()
+	cancel()
+	if unaryCalls.Load() == 0 {
+		t.Fatal("configured unary interceptor was not called")
+	}
+	if streamCalls.Load() == 0 {
+		t.Fatal("configured stream interceptor was not called")
 	}
 }
 

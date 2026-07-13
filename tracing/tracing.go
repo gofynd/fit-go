@@ -39,6 +39,7 @@
 // - OTEL_TRACES_EXPORTER: otlp, console, none, or a comma-separated list
 // - OTEL_TRACES_SAMPLER / OTEL_TRACES_SAMPLER_ARG: sampling policy and ratio
 // - OTEL_SDK_DISABLED: disable OpenTelemetry SDK initialization
+// - FIT_TRACING_ACTIVATION_MODE: explicit (default) or pyfit compatibility
 package tracing
 
 import (
@@ -92,8 +93,10 @@ type Options struct {
 	Protocol            string            // OTLP protocol: "grpc" | "http/protobuf" (default: http/protobuf)
 	Exporters           string            // OTEL_TRACES_EXPORTER: otlp, console, none, or a comma-separated list
 	Propagators         string            // OTEL_PROPAGATORS: tracecontext,baggage,b3,b3multi,jaeger
+	ActivationMode      string            // "explicit" (default) or "pyfit" compatibility
 	Sampler             string            // OTEL_TRACES_SAMPLER; empty/unknown = parentbased_always_on
 	SampleRate          float64           // Sampling ratio (0.0-1.0); from OTEL_TRACES_SAMPLER_ARG
+	ResourceAttributes  string            // OTEL_RESOURCE_ATTRIBUTES from an explicit config source
 	BatchTimeout        time.Duration     // Span batch export timeout
 	MaxExportBatch      int               // Maximum spans per export batch
 	Attributes          map[string]string // Additional resource attributes
@@ -101,6 +104,9 @@ type Options struct {
 	// merged config so tracing enabled via a config FILE (which doesn't populate
 	// the process env) isn't silently a no-op. nil = use the env var.
 	Enabled *bool `json:"-"`
+	// SDKDisabled carries OTEL_SDK_DISABLED when it came from a merged config
+	// source that is not visible through os.Getenv. nil = use the environment.
+	SDKDisabled *bool `json:"-"`
 	// SpanExporter allows injecting a custom span exporter (useful for testing).
 	SpanExporter sdktrace.SpanExporter `json:"-"`
 	// UseSimpleSpanProcessor uses a synchronous span processor instead of batch.
@@ -118,6 +124,7 @@ func DefaultOptions() Options {
 		Protocol:            envString("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", envString("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")),
 		Exporters:           envString("OTEL_TRACES_EXPORTER", "otlp"),
 		Propagators:         envString("OTEL_PROPAGATORS", ""),
+		ActivationMode:      envString("FIT_TRACING_ACTIVATION_MODE", "explicit"),
 		Sampler:             envString("OTEL_TRACES_SAMPLER", ""),
 		SampleRate:          sampleRateFromEnv(),
 	}
@@ -382,13 +389,25 @@ func New(ctx context.Context, opts Options) (*Tracer, error) {
 //     it; fit-go ignored it entirely, so an operator disabling telemetry fleet-wide via
 //     the standard env had no effect on Go services.
 //  2. otherwise the explicit Options.Enabled override when set,
-//  3. otherwise the TRACING_ENABLED env var.
+//  3. in explicit mode, the TRACING_ENABLED env var,
+//  4. in pyfit compatibility mode, enabled when OTEL_SDK_DISABLED is absent.
 func tracingEnabled(opts Options) bool {
+	if opts.SDKDisabled != nil && *opts.SDKDisabled {
+		return false
+	}
 	if sdkDisabled() {
 		return false
 	}
 	if opts.Enabled != nil {
 		return *opts.Enabled
+	}
+	if strings.EqualFold(strings.TrimSpace(opts.ActivationMode), "pyfit") {
+		if opts.SDKDisabled != nil {
+			return !*opts.SDKDisabled
+		}
+		// pyfit/TraceClue use Python truthiness here: an absent or explicitly
+		// empty value enables the SDK, while every non-empty value disables it.
+		return strings.TrimSpace(os.Getenv("OTEL_SDK_DISABLED")) == ""
 	}
 	return isTracingEnabled()
 }
@@ -812,8 +831,17 @@ func buildResource(ctx context.Context, opts Options) *resource.Resource {
 		defaults = append(defaults, attribute.String("deployment.environment.name", deploymentName))
 	}
 
-	explicit := make([]attribute.KeyValue, 0, len(opts.Attributes))
-	for k, v := range opts.Attributes {
+	explicitAttributes := maps.Clone(opts.Attributes)
+	if explicitAttributes == nil {
+		explicitAttributes = make(map[string]string)
+	}
+	for k, v := range parseResourceAttributes(opts.ResourceAttributes) {
+		if _, exists := explicitAttributes[k]; !exists {
+			explicitAttributes[k] = v
+		}
+	}
+	explicit := make([]attribute.KeyValue, 0, len(explicitAttributes))
+	for k, v := range explicitAttributes {
 		explicit = append(explicit, attribute.String(k, v))
 	}
 	authoritative := []attribute.KeyValue{attribute.String("deployment.environment", environment)}
@@ -855,6 +883,26 @@ func buildResource(ctx context.Context, opts Options) *resource.Resource {
 		}
 	}
 	return res
+}
+
+func parseResourceAttributes(raw string) map[string]string {
+	attributes := make(map[string]string)
+	for _, pair := range strings.Split(raw, ",") {
+		key, value, ok := strings.Cut(pair, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if decoded, err := url.PathUnescape(value); err == nil {
+			value = decoded
+		}
+		attributes[key] = value
+	}
+	return attributes
 }
 
 func firstEnvironmentValue(keys ...string) string {

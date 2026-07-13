@@ -63,7 +63,11 @@ func OTelRouteMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Next()
 		route := strings.TrimSpace(c.FullPath())
-		if route == "" {
+		// A multi-type fit-go server mounts nested engines under an outer
+		// `/<server-type>/*path` route. That wildcard is only a delegation
+		// boundary; the nested engine has already finalized the concrete route.
+		// Leaving the wildcard untouched preserves the useful child template.
+		if route == "" || strings.HasSuffix(route, "/*path") {
 			return
 		}
 		span := oteltrace.SpanFromContext(c.Request.Context())

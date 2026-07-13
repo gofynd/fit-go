@@ -21,6 +21,7 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 
@@ -176,34 +177,15 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 		}
 	}
 
-	// 4. Initialize tracing if enabled
-	if cfg.GetBool("TRACING_ENABLED", false) {
-		enabled := true
-		// Start from DefaultOptions and OVERRIDE only what config supplies. Building a
-		// bare Options{} here silently dropped the sampler, sample rate, exporter
-		// endpoint/protocol and batching defaults — and a zero SampleRate collapses to
-		// NeverSample() in buildSampler, so a service booting through fit.Init produced
-		// NO locally-rooted traces at all. Everything the platform configures via the
-		// OTel-standard env (OTEL_TRACES_SAMPLER, OTEL_TRACES_SAMPLER_ARG,
-		// OTEL_EXPORTER_OTLP_ENDPOINT, …) must survive this path.
-		opts := tracing.DefaultOptions()
-		// OTel's standard service variable wins over FIT's legacy fallback. Do
-		// not replace an OTEL_SERVICE_NAME already resolved by DefaultOptions
-		// merely because SERVICE_NAME also exists in the merged config.
-		if serviceName := strings.TrimSpace(cfg.GetString("OTEL_SERVICE_NAME", "")); serviceName != "" {
-			opts.ServiceName = serviceName
-		}
-		// SERVICE_NAME is an application/Kafka/log identity fallback. It must not
-		// override a service.name supplied through OTEL_RESOURCE_ATTRIBUTES.
-		opts.FallbackServiceName = strings.TrimSpace(cfg.GetString("SERVICE_NAME", opts.FallbackServiceName))
-		opts.Env = cfg.GetString("NODE_ENV", opts.Env)
-		// Set explicitly: tracing.New's own gate reads only the env var, which is
-		// empty when TRACING_ENABLED came from a config file.
-		opts.Enabled = &enabled
+	// 4. Resolve tracing through the tracing package's single activation gate.
+	// Explicit mode follows TRACING_ENABLED; pyfit compatibility mode follows
+	// pyfit's OTEL_SDK_DISABLED truthiness contract.
+	{
+		opts := tracingOptionsFromConfig(cfg)
 		tracer, err := tracing.New(ctx, opts)
 		if err != nil {
 			logger.Warn("fit: tracing init failed, continuing without tracing", "error", redact.ErrorMessage(err))
-		} else {
+		} else if tracer.IsEnabled() {
 			f.Tracer = tracer
 			// Install as the process-global tracer so tracing.Global() (used by the
 			// server/kafka/db instrumentation) resolves to THIS tracer rather than a
@@ -333,6 +315,72 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 	f.initialized = true
 
 	return f, nil
+}
+
+func tracingOptionsFromConfig(cfg *config.Config) tracing.Options {
+	opts := tracing.DefaultOptions()
+	if cfg == nil {
+		return opts
+	}
+
+	// OTel's standard service variable wins over FIT's legacy fallback.
+	opts.ServiceName = strings.TrimSpace(cfg.GetString("OTEL_SERVICE_NAME", opts.ServiceName))
+	opts.FallbackServiceName = strings.TrimSpace(cfg.GetString("SERVICE_NAME", opts.FallbackServiceName))
+	opts.Env = cfg.GetString("NODE_ENV", opts.Env)
+	opts.ActivationMode = cfg.GetString("FIT_TRACING_ACTIVATION_MODE", opts.ActivationMode)
+	opts.Exporters = configValueUnlessEnvironmentSet(cfg, "OTEL_TRACES_EXPORTER", opts.Exporters)
+	opts.Propagators = configValueUnlessEnvironmentSet(cfg, "OTEL_PROPAGATORS", opts.Propagators)
+	opts.Sampler = configValueUnlessEnvironmentSet(cfg, "OTEL_TRACES_SAMPLER", opts.Sampler)
+	if !environmentSet("OTEL_TRACES_SAMPLER_ARG") {
+		opts.SampleRate = cfg.GetFloat("OTEL_TRACES_SAMPLER_ARG", opts.SampleRate)
+	}
+
+	// Signal-specific variables have precedence over common variables, while an
+	// explicitly set environment variable always wins over config-file values.
+	if !environmentSet("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") && !environmentSet("OTEL_EXPORTER_OTLP_ENDPOINT") {
+		if endpoint := strings.TrimSpace(cfg.GetString("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "")); endpoint != "" {
+			opts.Endpoint = endpoint
+		} else {
+			opts.Endpoint = cfg.GetString("OTEL_EXPORTER_OTLP_ENDPOINT", opts.Endpoint)
+		}
+	}
+	if !environmentSet("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL") && !environmentSet("OTEL_EXPORTER_OTLP_PROTOCOL") {
+		if protocol := strings.TrimSpace(cfg.GetString("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "")); protocol != "" {
+			opts.Protocol = protocol
+		} else {
+			opts.Protocol = cfg.GetString("OTEL_EXPORTER_OTLP_PROTOCOL", opts.Protocol)
+		}
+	}
+	if !environmentSet("OTEL_RESOURCE_ATTRIBUTES") {
+		opts.ResourceAttributes = cfg.GetString("OTEL_RESOURCE_ATTRIBUTES", "")
+	}
+
+	if raw := strings.TrimSpace(cfg.GetString("TRACING_ENABLED", "")); raw != "" &&
+		!strings.EqualFold(strings.TrimSpace(opts.ActivationMode), "pyfit") {
+		enabled := cfg.GetBool("TRACING_ENABLED", false)
+		opts.Enabled = &enabled
+	}
+	if raw := strings.TrimSpace(cfg.GetString("OTEL_SDK_DISABLED", "")); raw != "" {
+		disabled := strings.EqualFold(raw, "true")
+		if strings.EqualFold(strings.TrimSpace(opts.ActivationMode), "pyfit") {
+			// pyfit treats any non-empty value as disabled, including "false".
+			disabled = true
+		}
+		opts.SDKDisabled = &disabled
+	}
+	return opts
+}
+
+func environmentSet(key string) bool {
+	_, ok := os.LookupEnv(key)
+	return ok
+}
+
+func configValueUnlessEnvironmentSet(cfg *config.Config, key, fallback string) string {
+	if environmentSet(key) {
+		return fallback
+	}
+	return cfg.GetString(key, fallback)
 }
 
 // Shutdown gracefully shuts down all framework components.

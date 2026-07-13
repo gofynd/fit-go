@@ -97,8 +97,8 @@ var levelFromString = map[string]Level{
 type Schema string
 
 // TraceClueBodyTruncation selects the installed TraceClue generation's body
-// behavior. TraceClue 3.1.3 truncates only when LOG_LEVEL=debug; 3.0.5 and the
-// formatter used by TriggerHappy truncate at every level.
+// behavior. TraceClue 3.1.3 truncates only when LOG_LEVEL=debug; pyfit 1.10
+// truncates at non-debug levels; 3.0.5 and TriggerHappy truncate at every level.
 type TraceClueBodyTruncation string
 
 const (
@@ -109,6 +109,7 @@ const (
 	SchemaTraceClue Schema = "traceclue"
 
 	TraceClueTruncateDebugOnly TraceClueBodyTruncation = "debug-only"
+	TraceClueTruncateNonDebug  TraceClueBodyTruncation = "non-debug"
 	TraceClueTruncateAlways    TraceClueBodyTruncation = "always"
 	TraceClueTruncateNever     TraceClueBodyTruncation = "never"
 )
@@ -285,7 +286,7 @@ func New(opts Options) (*Logger, error) {
 		}
 	}
 	switch opts.TraceClueBodyTruncation {
-	case TraceClueTruncateDebugOnly, TraceClueTruncateAlways, TraceClueTruncateNever:
+	case TraceClueTruncateDebugOnly, TraceClueTruncateNonDebug, TraceClueTruncateAlways, TraceClueTruncateNever:
 	default:
 		return nil, fmt.Errorf("logging: unsupported TraceClue body truncation mode %q", opts.TraceClueBodyTruncation)
 	}
@@ -734,7 +735,8 @@ func (l *Logger) traceClueBodyAndAttributes(body interface{}, raw map[string]int
 		attributes[key] = value
 	}
 	truncate := l.traceClueBodyTruncation == TraceClueTruncateAlways ||
-		(l.traceClueBodyTruncation == TraceClueTruncateDebugOnly && configuredLevel == LevelDebug)
+		(l.traceClueBodyTruncation == TraceClueTruncateDebugOnly && configuredLevel == LevelDebug) ||
+		(l.traceClueBodyTruncation == TraceClueTruncateNonDebug && configuredLevel != LevelDebug)
 	if truncate {
 		switch value := body.(type) {
 		case string:
