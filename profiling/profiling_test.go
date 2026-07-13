@@ -53,6 +53,9 @@ func TestProfilerConfig(t *testing.T) {
 		if cfg.FlushIntervalMs != 10000 {
 			t.Errorf("Expected FlushIntervalMs=10000, got %d", cfg.FlushIntervalMs)
 		}
+		if cfg.SampleRate != 10 || cfg.EffectiveSampleRate != 100 || cfg.SampleRateConfigurable {
+			t.Errorf("unexpected sample-rate compatibility config: %+v", cfg)
+		}
 		if cfg.HeapSamplingIntervalBytes != 524288 {
 			t.Errorf("Expected HeapSamplingIntervalBytes=524288, got %d", cfg.HeapSamplingIntervalBytes)
 		}
@@ -75,6 +78,7 @@ func TestProfilerConfig(t *testing.T) {
 		t.Setenv("PROFILING_DISTRIBUTOR_ADDRESS", "http://test:4040")
 		t.Setenv("PROFILING_CPU_ENABLED", "false")
 		t.Setenv("PROFILING_FLUSH_INTERVAL_MS", "5000")
+		t.Setenv("PROFILING_SAMPLE_RATE", "25")
 		t.Setenv("PROFILING_HEAP_SAMPLING_INTERVAL_BYTES", "1048576")
 		t.Setenv("PROFILING_WALL_COLLECT_CPU_TIME", "true")
 
@@ -91,6 +95,9 @@ func TestProfilerConfig(t *testing.T) {
 		}
 		if cfg.FlushIntervalMs != 5000 {
 			t.Errorf("Expected FlushIntervalMs=5000, got %d", cfg.FlushIntervalMs)
+		}
+		if cfg.SampleRate != 25 || cfg.EffectiveSampleRate != 100 || cfg.SampleRateConfigurable {
+			t.Errorf("unexpected sample-rate compatibility config: %+v", cfg)
 		}
 		if cfg.HeapSamplingIntervalBytes != 1048576 {
 			t.Errorf("Expected HeapSamplingIntervalBytes=1048576, got %d", cfg.HeapSamplingIntervalBytes)
@@ -419,6 +426,10 @@ func TestProfilerStatus(t *testing.T) {
 		if cpuStatus["running"] != true {
 			t.Error("Expected cpu.running=true")
 		}
+		sampleRate, ok := s["sampleRate"].(map[string]interface{})
+		if !ok || sampleRate["requested"] != 10 || sampleRate["effective"] != 100 || sampleRate["configurable"] != false {
+			t.Errorf("unexpected sample-rate status: %#v", s["sampleRate"])
+		}
 	})
 
 	t.Run("default profiler exists", func(t *testing.T) {
@@ -629,6 +640,7 @@ func clearProfilingEnv(t *testing.T) {
 		"PROFILING_ENABLED", "PROFILING_DISTRIBUTOR_ADDRESS", "PROFILING_CPU_ENABLED",
 		"PROFILING_HEAP_ENABLED", "PROFILING_CPU_WALL_ENABLED", "PROFILING_TAGS_JSON",
 		"PROFILING_FLUSH_INTERVAL_MS", "PROFILING_HEAP_SAMPLING_INTERVAL_BYTES",
+		"PROFILING_SAMPLE_RATE",
 		"PROFILING_HEAP_STACK_DEPTH", "PROFILING_WALL_SAMPLING_DURATION_MS",
 		"PROFILING_WALL_SAMPLING_INTERVAL_MICROS", "PROFILING_WALL_COLLECT_CPU_TIME",
 	} {

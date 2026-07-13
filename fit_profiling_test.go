@@ -14,6 +14,7 @@ func TestInitOwnsAndRestoresProcessProfiler(t *testing.T) {
 	baseline := profiling.Default()
 	t.Setenv("SERVICE_NAME", "profiling-lifecycle-test")
 	t.Setenv("PROFILING_ENABLED", "true")
+	t.Setenv("PROFILING_SAMPLE_RATE", "20")
 	t.Setenv("TRACING_ENABLED", "false")
 	t.Setenv("FIT_PROMETHEUS_ENABLED", "false")
 
@@ -26,6 +27,10 @@ func TestInitOwnsAndRestoresProcessProfiler(t *testing.T) {
 	}
 	if framework.Profiler.IsRunning() {
 		t.Fatal("Init should preserve legacy on-demand profiling behavior")
+	}
+	profilerConfig := framework.Profiler.GetConfig()
+	if profilerConfig.SampleRate != 20 || profilerConfig.EffectiveSampleRate != 100 || profilerConfig.SampleRateConfigurable {
+		t.Fatalf("unexpected profiler sample-rate config: %+v", profilerConfig)
 	}
 	if err := framework.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown: %v", err)

@@ -11,6 +11,22 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Future platform capability set**: privacy-safe gqlgen operation/resolver
+  tracing (`fitgraphql`), generic OTLP/console metrics with ownership-safe
+  lifecycle (`otelmetrics`), explicit worker/cron/job/task tracing boundaries,
+  a statically linked typed instrumentation registry compatible with TraceClue
+  selection/config envs, strict config-schema primitives, compiled checkpointed
+  migrations with local/GCS/S3 state, and safe fitproto-compatible contract
+  fetching/generation. Dynamic plugin loading and telemetry payload capture are
+  deliberately excluded. GraphQL operation names require an explicit bounded
+  mapper. Metrics use a stable routing provider so pre-initialized synchronous
+  and observable instruments survive repeated SDK lifecycles. Cloud migrations
+  require renewable lease-loss context, monotonic fencing, and an atomic fenced
+  state writer; proto output uses locked, fsynced, crash-recoverable staged
+  replacement.
+- **Profiler sample-rate truthfulness**: `PROFILING_SAMPLE_RATE` is retained as
+  the requested legacy value while status also reports pyroscope-go's fixed
+  effective 100 Hz rate and `configurable=false`.
 - **FeatureHub SDK compatibility**: SSE now distinguishes client-evaluated keys
   (API keys containing `*`) from server-evaluated keys, sends the JavaScript
   SDK-compatible `x-featurehub` header/query context, accepts edge URLs with or

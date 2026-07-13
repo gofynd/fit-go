@@ -19,6 +19,7 @@ package fit
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -27,11 +28,14 @@ import (
 	"github.com/gofynd/fit-go/errors"
 	"github.com/gofynd/fit-go/feature"
 	"github.com/gofynd/fit-go/health"
+	"github.com/gofynd/fit-go/instrumentation"
 	"github.com/gofynd/fit-go/logging"
 	"github.com/gofynd/fit-go/metrics"
+	"github.com/gofynd/fit-go/otelmetrics"
 	"github.com/gofynd/fit-go/profiling"
 	"github.com/gofynd/fit-go/redact"
 	"github.com/gofynd/fit-go/tracing"
+	"go.opentelemetry.io/otel"
 )
 
 // Connections holds all initialized database and service connections.
@@ -48,20 +52,23 @@ type Connections struct {
 
 // Fit is the main framework singleton that holds global state.
 type Fit struct {
-	mu            sync.RWMutex
-	Config        *config.Config
-	Connections   Connections
-	Logger        *logging.Logger
-	Tracer        *tracing.Tracer
-	Metrics       *metrics.Registry
-	Health        *health.Checker
-	Profiler      *profiling.Profiler
-	Errors        *errors.ErrorRegistry
-	metricsUndo   func()
-	profilingUndo func()
-	tracingUndo   func()
-	loggingUndo   func()
-	initialized   bool
+	mu               sync.RWMutex
+	Config           *config.Config
+	Connections      Connections
+	Logger           *logging.Logger
+	Tracer           *tracing.Tracer
+	Metrics          *metrics.Registry
+	OTelMetrics      *otelmetrics.Provider
+	Instrumentations *instrumentation.Manager
+	Health           *health.Checker
+	Profiler         *profiling.Profiler
+	Errors           *errors.ErrorRegistry
+	metricsUndo      func()
+	otelMetricsUndo  func()
+	profilingUndo    func()
+	tracingUndo      func()
+	loggingUndo      func()
+	initialized      bool
 }
 
 // instance is the global Fit singleton.
@@ -98,6 +105,8 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 	f.Health = health.NewChecker()
 	f.Errors = nil
 	f.Profiler = nil
+	f.OTelMetrics = nil
+	f.Instrumentations = nil
 
 	// Apply options
 	o := defaultOptions()
@@ -203,7 +212,73 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 		}
 	}
 
-	// 5. Initialize metrics if enabled
+	// 5. Initialize the generic OTel metrics pipeline when explicitly enabled.
+	// The OTel specification's exporter environment variables are supported, but
+	// fit-go keeps export opt-in so an upgrade cannot unexpectedly connect every
+	// service to localhost:4317.
+	if otelMetricsRequested(cfg) {
+		enabled := true
+		metricOptions := otelmetrics.DefaultOptions()
+		metricOptions.Enabled = &enabled
+		if serviceName := strings.TrimSpace(cfg.GetString("OTEL_SERVICE_NAME", "")); serviceName != "" {
+			metricOptions.ServiceName = serviceName
+		}
+		metricOptions.FallbackServiceName = strings.TrimSpace(cfg.GetString("SERVICE_NAME", metricOptions.FallbackServiceName))
+		metricOptions.Env = cfg.GetString("NODE_ENV", metricOptions.Env)
+		metricOptions.Exporters = cfg.GetString("OTEL_METRICS_EXPORTER", "otlp")
+		if endpoint := strings.TrimSpace(cfg.GetString("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "")); endpoint != "" {
+			metricOptions.Endpoint = endpoint
+			metricOptions.EndpointIsCommon = false
+		} else if endpoint := strings.TrimSpace(cfg.GetString("OTEL_EXPORTER_OTLP_ENDPOINT", "")); endpoint != "" {
+			metricOptions.Endpoint = endpoint
+			metricOptions.EndpointIsCommon = true
+		}
+		metricOptions.Protocol = cfg.GetString("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+			cfg.GetString("OTEL_EXPORTER_OTLP_PROTOCOL", metricOptions.Protocol))
+		metricOptions.ExportInterval = cfg.GetDuration("OTEL_METRIC_EXPORT_INTERVAL", metricOptions.ExportInterval)
+		metricOptions.ExportTimeout = cfg.GetDuration("OTEL_METRIC_EXPORT_TIMEOUT", metricOptions.ExportTimeout)
+		metricOptions.ErrorHandler = otel.ErrorHandlerFunc(func(err error) {
+			logger.Warn("fit: OpenTelemetry metrics runtime error", "error_type", fmt.Sprintf("%T", err))
+		})
+
+		provider, err := otelmetrics.New(ctx, metricOptions)
+		if err != nil {
+			logger.Warn("fit: OpenTelemetry metrics init failed, continuing without OTel metrics", "error_type", fmt.Sprintf("%T", err))
+		} else if provider.IsEnabled() {
+			f.OTelMetrics = provider
+			f.otelMetricsUndo = otelmetrics.InstallGlobal(provider)
+		}
+	}
+
+	// Legacy TraceClue variables are interpreted only after typed
+	// instrumentation is explicitly activated. This lets existing deployments
+	// carry now-ignored legacy variables through a non-breaking fit-go upgrade.
+	if instrumentationRequested(cfg, o) {
+		configuredInstrumentations, err := instrumentation.ParseOptions(
+			cfg.GetString(instrumentation.ExtraEnv, ""),
+			cfg.GetString(instrumentation.ConfigEnv, ""),
+		)
+		if err != nil {
+			cleanupErr := f.cleanupFailedInit(ctx)
+			return nil, stderrors.Join(fmt.Errorf("fit: invalid instrumentation config: %w", err), cleanupErr)
+		}
+		configuredInstrumentations.Extra = append(configuredInstrumentations.Extra, o.InstrumentationOptions.Extra...)
+		for name, value := range o.InstrumentationOptions.Config {
+			configuredInstrumentations.Config[name] = value
+		}
+		if o.InstrumentationRegistry == nil {
+			cleanupErr := f.cleanupFailedInit(ctx)
+			return nil, stderrors.Join(stderrors.New("fit: typed instrumentation is enabled but no registry was supplied"), cleanupErr)
+		}
+		manager, startErr := o.InstrumentationRegistry.Start(ctx, configuredInstrumentations)
+		if startErr != nil {
+			cleanupErr := f.cleanupFailedInit(ctx)
+			return nil, stderrors.Join(fmt.Errorf("fit: start instrumentation: %w", startErr), cleanupErr)
+		}
+		f.Instrumentations = manager
+	}
+
+	// 6. Initialize legacy FIT Prometheus metrics if enabled.
 	if cfg.GetBool("FIT_PROMETHEUS_ENABLED", false) {
 		metricsDir := cfg.GetString("METRICS_DIR", "")
 		if metricsDir == "" {
@@ -229,7 +304,7 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 		}
 	}
 
-	// 6. Install one profiler instance for framework routes and shutdown. Legacy
+	// 7. Install one profiler instance for framework routes and shutdown. Legacy
 	// profiling is on-demand: initialization exposes the control surface but does
 	// not begin collection until /_profiling/start or profiling.Start is called.
 	if cfg.GetBool("PROFILING_ENABLED", false) {
@@ -241,6 +316,7 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 		profilerConfig.WallEnabled = cfg.GetBool("PROFILING_CPU_WALL_ENABLED", profilerConfig.WallEnabled)
 		profilerConfig.TagsJSON = cfg.GetString("PROFILING_TAGS_JSON", profilerConfig.TagsJSON)
 		profilerConfig.FlushIntervalMs = cfg.GetInt("PROFILING_FLUSH_INTERVAL_MS", profilerConfig.FlushIntervalMs)
+		profilerConfig.SampleRate = cfg.GetInt("PROFILING_SAMPLE_RATE", profilerConfig.SampleRate)
 		profilerConfig.HeapSamplingIntervalBytes = cfg.GetInt("PROFILING_HEAP_SAMPLING_INTERVAL_BYTES", profilerConfig.HeapSamplingIntervalBytes)
 		profilerConfig.HeapStackDepth = cfg.GetInt("PROFILING_HEAP_STACK_DEPTH", profilerConfig.HeapStackDepth)
 		profilerConfig.WallSamplingDurationMs = cfg.GetInt("PROFILING_WALL_SAMPLING_DURATION_MS", profilerConfig.WallSamplingDurationMs)
@@ -272,6 +348,12 @@ func (f *Fit) Shutdown(ctx context.Context) error {
 	if f.Health != nil {
 		f.Health.Reset()
 	}
+	if f.Instrumentations != nil {
+		if err := f.Instrumentations.Shutdown(ctx); err != nil {
+			errs = append(errs, err)
+		}
+		f.Instrumentations = nil
+	}
 	f.stopFeatureFlags()
 	if f.Profiler != nil {
 		f.Profiler.Stop()
@@ -285,6 +367,16 @@ func (f *Fit) Shutdown(ctx context.Context) error {
 	if f.tracingUndo != nil {
 		f.tracingUndo()
 		f.tracingUndo = nil
+	}
+	if f.OTelMetrics != nil {
+		if err := f.OTelMetrics.Shutdown(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("OpenTelemetry metrics shutdown: %w", err))
+		}
+		f.OTelMetrics = nil
+	}
+	if f.otelMetricsUndo != nil {
+		f.otelMetricsUndo()
+		f.otelMetricsUndo = nil
 	}
 	if f.Tracer != nil {
 		if err := f.Tracer.Shutdown(ctx); err != nil {
@@ -324,6 +416,30 @@ func (f *Fit) Shutdown(ctx context.Context) error {
 	return nil
 }
 
+func otelMetricsRequested(cfg *config.Config) bool {
+	if cfg == nil || cfg.GetBool("OTEL_SDK_DISABLED", false) {
+		return false
+	}
+	if exporter, exists := cfg.Raw("OTEL_METRICS_EXPORTER"); exists {
+		exporter = strings.TrimSpace(exporter)
+		if exporter == "" || strings.EqualFold(exporter, "none") {
+			return false
+		}
+		return true
+	}
+	return cfg.GetBool("OTEL_METRICS_ENABLED", false)
+}
+
+func instrumentationRequested(cfg *config.Config, options *options) bool {
+	if options == nil {
+		return false
+	}
+	return options.InstrumentationRegistry != nil ||
+		len(options.InstrumentationOptions.Extra) > 0 ||
+		len(options.InstrumentationOptions.Config) > 0 ||
+		(cfg != nil && cfg.GetBool("FIT_INSTRUMENTATION_ENABLED", false))
+}
+
 func (f *Fit) stopFeatureFlags() {
 	if featureClient, ok := f.Connections.FeatureFlag.(interface{ Stop() }); ok {
 		featureClient.Stop()
@@ -331,11 +447,65 @@ func (f *Fit) stopFeatureFlags() {
 	f.Connections.FeatureFlag = nil
 }
 
+func (f *Fit) cleanupFailedInit(ctx context.Context) error {
+	var cleanupErrors []error
+	if f.Instrumentations != nil {
+		cleanupErrors = append(cleanupErrors, f.Instrumentations.Shutdown(ctx))
+		f.Instrumentations = nil
+	}
+	if f.OTelMetrics != nil {
+		cleanupErrors = append(cleanupErrors, f.OTelMetrics.Shutdown(ctx))
+		f.OTelMetrics = nil
+	}
+	if f.otelMetricsUndo != nil {
+		f.otelMetricsUndo()
+		f.otelMetricsUndo = nil
+	}
+	if f.tracingUndo != nil {
+		f.tracingUndo()
+		f.tracingUndo = nil
+	}
+	if f.Tracer != nil {
+		cleanupErrors = append(cleanupErrors, f.Tracer.Shutdown(ctx))
+		f.Tracer = nil
+	}
+	if f.loggingUndo != nil {
+		f.loggingUndo()
+		f.loggingUndo = nil
+	}
+	f.Logger = nil
+	f.Config = nil
+	if f.Errors != nil {
+		f.Errors.Reset()
+	}
+	f.Errors = nil
+	f.stopFeatureFlags()
+	return stderrors.Join(cleanupErrors...)
+}
+
 // Option configures the Fit framework initialization.
 type Option func(*options)
 
 type options struct {
-	ConfigPaths []string
+	ConfigPaths             []string
+	InstrumentationRegistry *instrumentation.Registry
+	InstrumentationOptions  instrumentation.Options
+}
+
+// WithInstrumentationRegistry installs statically linked instrumentation
+// factories used by TraceClue-compatible extension configuration.
+func WithInstrumentationRegistry(registry *instrumentation.Registry) Option {
+	return func(options *options) {
+		options.InstrumentationRegistry = registry
+	}
+}
+
+// WithInstrumentations selects additional registered instrumentations and
+// provides typed factory JSON. Explicit values override environment config.
+func WithInstrumentations(configuration instrumentation.Options) Option {
+	return func(target *options) {
+		target.InstrumentationOptions = configuration
+	}
 }
 
 func defaultOptions() *options {

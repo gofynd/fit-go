@@ -6,9 +6,10 @@ A batteries-included Go framework for building scalable microservices. Provides 
 
 | Module | Description |
 |---|---|
-| `config` | Type-safe config from env vars, `.env`, JSON, and YAML files |
+| `config` | Type-safe config from env vars, `.env`, JSON, and YAML files, with strict schema validation |
 | `server` | Gin-based HTTP server with multi-type routing, middleware, and payload limits |
 | `grpc` | gRPC server plus traced outbound clients via `fitgrpc.NewClient` or `TracingDialOptions`, middleware chains, health checks, and reflection |
+| `fitgraphql` | Privacy-safe gqlgen operation and resolver tracing |
 | `mongo` | MongoDB connection manager with read/write splitting and pool tuning |
 | `postgres` | PostgreSQL client via `lib/pq` with connection pooling |
 | `mysql` | MySQL client via `go-sql-driver/mysql` |
@@ -18,11 +19,15 @@ A batteries-included Go framework for building scalable microservices. Provides 
 | `logging` | Structured JSON logger with timezone support and trace propagation |
 | `tracing` | OpenTelemetry tracing with OTLP export |
 | `metrics` | Prometheus metrics for HTTP server and client instrumentation |
+| `otelmetrics` | Generic OpenTelemetry metrics SDK with OTLP and console export |
+| `instrumentation` | Statically linked, typed instrumentation extension registry |
 | `profiling` | Continuous profiling via Pyroscope (CPU, heap, wall-clock) |
 | `errors` | Structured error codes with multilingual messages and Sentry integration |
 | `encryption` | AES-256-GCM encryption with Vault and GCP KMS key providers |
 | `feature` | FeatureHub SSE client with client/server evaluation contexts |
 | `health` | Health check orchestration across all connections |
+| `migration` | Compiled, checkpointed migrations with local, GCS, and S3 state stores |
+| `protofetch` | Safe `fitproto`-compatible contract fetching and Go generation |
 | `utils` | HTTP client, string helpers, and input sanitization |
 
 ## Quick Start
@@ -124,6 +129,109 @@ name := cfg.GetString("SERVICE_NAME", "my-service")
 hosts := cfg.GetStringSlice("ALLOWED_HOSTS", []string{"localhost"})
 ttl := cfg.GetDuration("CACHE_TTL", 5 * time.Minute)
 ```
+
+For Convict/Pydantic-style validation, define a strict schema and apply it
+before constructing dependencies. Defaults are installed only after the whole
+snapshot validates, and sensitive custom-validation failures are redacted.
+
+```go
+schema, err := config.NewSchema(
+    config.SchemaField{Key: "PORT", Kind: config.IntKind, Required: true},
+    config.SchemaField{Key: "CACHE_TTL", Kind: config.DurationKind,
+        Default: "5m", HasDefault: true},
+)
+if err != nil { return err }
+resolved, err := cfg.ApplySchema(schema)
+if err != nil { return err }
+```
+
+Application-specific Convict/Pydantic formats still require an explicit
+`SchemaField.Parser`; fit-go does not guess language-specific coercion.
+
+## Platform Boundaries And Tooling
+
+### GraphQL
+
+Register `fitgraphql.New` on each gqlgen server. It creates operation and
+resolver spans but deliberately cannot capture GraphQL documents, variables,
+arguments, response values, or raw error text. Client-supplied operation names
+are omitted by default; `Options.OperationName` may map persisted or allowlisted
+names to bounded telemetry identities.
+
+```go
+graphqlServer := handler.NewDefaultServer(schema)
+graphqlServer.Use(fitgraphql.New(fitgraphql.Options{}))
+```
+
+### Workers, Crons, And Jobs
+
+Non-HTTP entry points need an explicit boundary. Names and attributes must be
+stable operational metadata, never payloads or user identifiers.
+
+```go
+err := tracing.RunBoundary(ctx, tracing.BoundaryOptions{
+    Type: tracing.BoundaryCron,
+    Name: "expire-orders",
+}, func(ctx context.Context) error {
+    return expireOrders(ctx)
+})
+```
+
+The wrapper keeps the native OTel span active, bridges fit-go logging and
+transport context, marks generic failures, rethrows panics, and preserves the
+original result or error.
+
+### Typed Instrumentation Extensions
+
+Go cannot safely reproduce TraceClue's runtime `package:Class` loader. Register
+known factories at compile time, then allow the legacy env variables to select
+only those names and aliases:
+
+```go
+registry := instrumentation.NewRegistry()
+err := registry.Register(instrumentation.Registration{
+    Name: "custom-client",
+    Aliases: []string{"company/client:Instrumentation"},
+    Factory: newCustomClientHook,
+})
+framework, err := fit.Init(ctx, fit.WithInstrumentationRegistry(registry))
+```
+
+Unknown names/config fail startup. Hooks start deterministically, roll back on
+partial failure, and stop in reverse order. Legacy TraceClue env is interpreted
+only when a registry/options or `FIT_INSTRUMENTATION_ENABLED=true` explicitly
+activates this facility, so stale legacy variables do not break unrelated boots.
+
+### Migrations
+
+Applications compile migration functions into their own command and construct a
+`migration.Runner` with an explicit store and lock. Local state uses atomic
+JSON replacement and a sibling advisory lock. `migration/cloudstore` supports
+`gs://` and `s3://` buckets, but cloud runs require a renewable `LeaseLocker`, a
+monotonic fence token, and an application-owned `FencedWriteFunc` that validates
+the token atomically with each state write. A plain object write or expiring
+`SET NX` mutex is not sufficient because a stale runner can outlive its lock.
+
+The runner imports legacy Node/pyfit state, normalizes their migration IDs,
+checks optional checksums, checkpoints each successful step, and refuses
+unknown applied migrations. Every `Up` and `Down` must remain idempotent because
+an application mutation can succeed before a state-store checkpoint fails.
+Cloud migration functions can read `migration.FenceTokenFromContext`; they must
+validate that token in the same datastore transaction or conditional mutation
+when stale application writes also need to be prevented.
+`migration/migrationcli` supplies `list`, `run`, `revert`, `revert-one`, and
+safe Go skeleton creation for an application-linked binary.
+
+### Proto Contracts
+
+`go run github.com/gofynd/fit-go/cmd/fitproto get` and `getall` read the legacy
+`fit.config.json` API specification. The tool clones without a shell, rejects
+path traversal, unsafe output roots, symlinks, and non-regular generated files;
+serializes writers; fsyncs staged output; and transactionally replaces the
+output with sibling-renamed backup recovery. Generator or replacement failures
+preserve or restore the prior output. It can invoke `buf` with an explicit
+template or `protoc`. CI should pin the contract repository branch or revision
+policy and review generated diffs.
 
 ## Database Clients
 
@@ -304,6 +412,32 @@ and permits a clean reinitialization.
 
 ### Metrics
 
+Generic OpenTelemetry metrics are separate from the legacy FIT Prometheus
+histograms and can be enabled independently:
+
+```bash
+OTEL_METRICS_EXPORTER=otlp
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+OTEL_METRIC_EXPORT_INTERVAL=60000
+OTEL_METRIC_EXPORT_TIMEOUT=30000
+```
+
+`fit.Init` installs the resulting meter provider process-wide and shuts it down
+with ownership-safe restoration. A stable routing provider rebinds synchronous
+instruments and observable callbacks across repeated SDK lifecycles, including
+instruments created before initialization; equivalent meter scopes are reused.
+`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` and
+`OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` override their common equivalents.
+`console`, comma-separated exporters, injected readers/exporters, views, and
+`OTEL_SDK_DISABLED` are supported. Supplying a custom reader/exporter enables
+the provider unless `Enabled=false` is explicit. Runtime/exporter errors can be
+routed through `Options.ErrorHandler`; root `fit.Init` logs only their type.
+Export remains opt-in so upgrading fit-go does not unexpectedly connect a
+service to a local collector.
+
+The deployed FIT Prometheus contract remains available separately:
+
 ```bash
 FIT_PROMETHEUS_ENABLED=true
 METRICS_DIR=/var/data/metrics
@@ -334,7 +468,14 @@ error log). See
 ```bash
 PROFILING_ENABLED=true
 PROFILING_DISTRIBUTOR_ADDRESS=http://pyroscope:4040
+PROFILING_SAMPLE_RATE=10
 ```
+
+`PROFILING_SAMPLE_RATE` is retained as a legacy requested value. The current
+`pyroscope-go` runtime samples at a fixed effective 100 Hz and ignores its
+deprecated sample-rate field, so profiler status reports `requested`,
+`effective`, and `configurable=false` separately instead of claiming the legacy
+value changed collection behavior.
 
 ## Encryption
 

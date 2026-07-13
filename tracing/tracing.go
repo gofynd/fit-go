@@ -838,6 +838,14 @@ func buildResource(ctx context.Context, opts Options) *resource.Resource {
 	return res
 }
 
+// ResourceFromOptions builds the process resource used by fit-go telemetry.
+// Metrics and traces should call this helper so service identity, environment,
+// process, host, and OTEL_RESOURCE_ATTRIBUTES precedence cannot drift between
+// signals.
+func ResourceFromOptions(ctx context.Context, opts Options) *resource.Resource {
+	return buildResource(ctx, opts)
+}
+
 func isOTelDefaultDelegate(value interface{}) bool {
 	typ := reflect.TypeOf(value)
 	if typ == nil {

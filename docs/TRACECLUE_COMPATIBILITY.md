@@ -54,3 +54,52 @@ unknown telemetry service even while FIT routing and Kafka used `triggerhappy`.
 Using `SERVICE_NAME` only as the final telemetry fallback is an explicit identity
 improvement; an explicit `OTEL_SERVICE_NAME` still wins and represents a named
 dashboard migration.
+
+## Instrumentation Extensions
+
+TraceClue accepts `TRACECLUE_EXTRA_INSTRUMENTATIONS=package:Class,...` and a
+JSON `TRACECLUE_INSTRUMENTATION_CONFIGS` map, then loads JavaScript/Python code
+at runtime. fit-go preserves the selection/config contract without reproducing
+unsafe dynamic loading: applications register typed factories in
+`instrumentation.Registry`, including any legacy `package:Class` aliases, and
+pass that registry to `fit.Init`.
+
+Configured but unregistered names fail startup. Factories receive only their
+JSON config, start in deterministic order, roll back on partial startup, and
+shut down once in reverse order. Configuration alone does not silently enable a
+hook; it must be enabled by default or selected in the extra-instrumentation
+list. Legacy extension env is ignored unless the typed facility is explicitly
+activated by a registry/options or `FIT_INSTRUMENTATION_ENABLED=true`; this lets
+deployments retain stale TraceClue variables during migration. This is the
+statically linked Go equivalent, not plugin byte parity.
+
+## GraphQL And Non-HTTP Entry Points
+
+Legacy GraphQL instrumentation automatically patched supported runtimes and
+could capture documents, variables, arguments, results, and errors. The
+`fitgraphql` gqlgen extension must be registered explicitly and intentionally
+exports operation type, allowlisted operation identity, field identity, and
+generic error state. Raw client operation names are omitted unless an explicit
+`OperationNameMapper` maps them to a bounded persisted/allowlisted identity.
+Payload capture has no opt-in because application data does not belong in
+telemetry.
+
+Workers, crons, jobs, and detached tasks should run through
+`tracing.RunBoundary` (or `RunBoundaryWithResult`). This creates a stable entry
+span, preserves remote/native parent context, and bridges active-span logging
+without recording payloads or raw errors.
+
+## Metrics And Profiling
+
+`otelmetrics` supplies the generic OTel meter-provider path that TraceClue
+configured implicitly. It follows the signal-specific/common endpoint and
+protocol precedence, standard exporter/interval/timeout variables, shared
+resource identity, and ownership-safe shutdown. A stable process-global router
+rebinds pre-existing synchronous instruments and observable callback
+registrations across repeated provider lifecycles. Runtime exporter errors use
+an explicit handler; root fit-go emits only the error type. It is independent of
+the FIT Prometheus textfile metrics and remains opt-in.
+
+pyfit's `PROFILING_SAMPLE_RATE` is parsed and reported for compatibility. The
+current Go profiler has a fixed effective 100 Hz rate, so fit-go reports both
+the requested and effective values and marks the setting non-configurable.

@@ -30,6 +30,7 @@
 // - PROFILING_CPU_WALL_ENABLED: Enable wall profiling (default: true)
 // - PROFILING_TAGS_JSON: Additional tags as JSON object
 // - PROFILING_FLUSH_INTERVAL_MS: Flush interval (default: 10000)
+// - PROFILING_SAMPLE_RATE: Legacy requested CPU sample rate (default: 10)
 // - PROFILING_HEAP_SAMPLING_INTERVAL_BYTES: Heap sample rate (default: 524288)
 // - PROFILING_HEAP_STACK_DEPTH: Heap stack depth (default: 64)
 // - PROFILING_WALL_SAMPLING_DURATION_MS: Wall profile duration (default: 60000)
@@ -58,6 +59,8 @@ import (
 	pyroscope "github.com/grafana/pyroscope-go"
 )
 
+const pyroscopeEffectiveSampleRate = 100
+
 // Config holds the profiler configuration.
 type Config struct {
 	Enabled                    bool              `json:"enabled"`
@@ -67,6 +70,9 @@ type Config struct {
 	WallEnabled                bool              `json:"cpuWallEnabled"`
 	TagsJSON                   string            `json:"tagsJson"`
 	FlushIntervalMs            int               `json:"flushIntervalMs"`
+	SampleRate                 int               `json:"sampleRate"`
+	EffectiveSampleRate        int               `json:"effectiveSampleRate"`
+	SampleRateConfigurable     bool              `json:"sampleRateConfigurable"`
 	HeapSamplingIntervalBytes  int               `json:"heapSamplingIntervalBytes"`
 	HeapStackDepth             int               `json:"heapStackDepth"`
 	WallSamplingDurationMs     int               `json:"wallSamplingDurationMs"`
@@ -129,6 +135,9 @@ func DefaultConfig() Config {
 		WallEnabled:                envBool("PROFILING_CPU_WALL_ENABLED", true),
 		TagsJSON:                   envString("PROFILING_TAGS_JSON", "{}"),
 		FlushIntervalMs:            envInt("PROFILING_FLUSH_INTERVAL_MS", 10000),
+		SampleRate:                 envInt("PROFILING_SAMPLE_RATE", 10),
+		EffectiveSampleRate:        pyroscopeEffectiveSampleRate,
+		SampleRateConfigurable:     false,
 		HeapSamplingIntervalBytes:  envInt("PROFILING_HEAP_SAMPLING_INTERVAL_BYTES", 524288),
 		HeapStackDepth:             envInt("PROFILING_HEAP_STACK_DEPTH", 64),
 		WallSamplingDurationMs:     envInt("PROFILING_WALL_SAMPLING_DURATION_MS", 60000),
@@ -139,6 +148,14 @@ func DefaultConfig() Config {
 
 // New creates a new Profiler with the given configuration.
 func New(cfg Config) *Profiler {
+	if cfg.SampleRate <= 0 {
+		cfg.SampleRate = 10
+	}
+	// pyroscope-go exposes a deprecated SampleRate field but fixes collection
+	// at 100 Hz internally. Report the requested legacy value and the actual Go
+	// value separately rather than pretending the request changes collection.
+	cfg.EffectiveSampleRate = pyroscopeEffectiveSampleRate
+	cfg.SampleRateConfigurable = false
 	profiler := &Profiler{
 		config: cfg,
 	}
@@ -482,6 +499,11 @@ func (p *Profiler) Status() map[string]interface{} {
 		"enabled":         p.enabled.Load(),
 		"running":         p.overallRunning.Load(),
 		"applicationName": p.config.ApplicationName,
+		"sampleRate": map[string]interface{}{
+			"requested":    p.config.SampleRate,
+			"effective":    p.config.EffectiveSampleRate,
+			"configurable": p.config.SampleRateConfigurable,
+		},
 		"cpu": map[string]interface{}{
 			"enabled": p.config.CPUEnabled,
 			"running": p.cpuRunning.Load(),

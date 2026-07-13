@@ -24,16 +24,21 @@ boundary.
 | FG-33 | Public span-status description redaction | Implemented | `go test ./tracing -run PublicSpanStatus` |
 | FG-34 | FIT/health shutdown and clean reinitialization | Implemented | `go test -race . ./health` |
 | FG-35 | TriggerHappy object-message log mapping | Implemented with privacy improvement | `go test ./logging -run TriggerHappyObjectMessageGolden` |
+| FG-36 | Privacy-safe gqlgen operation/resolver tracing | Implemented with payload-capture prohibition | `go test ./fitgraphql` |
+| FG-37 | Generic OTel meter provider, OTLP/console exporters, and restart-safe instrument routing | Implemented, opt-in | `go test -race . ./otelmetrics` |
+| FG-38 | Typed TraceClue extension selection and lifecycle | Implemented with static-link divergence | `go test -race . ./instrumentation` |
+| FG-39 | Worker/cron/job/task entry boundaries | Implemented, explicit adoption | `go test -race ./tracing` |
+| FG-40 | Strict Convict/Pydantic-style config schema primitives | Implemented with explicit schema porting | `go test -race ./config` |
+| FG-41 | Compiled migrations and local/GCS/S3 state | Implemented; cloud state requires application-owned renewable fencing | `go test -race ./migration/...` |
+| FG-42 | Safe fitproto-compatible fetch/generation | Implemented with locked transactional replacement and crash recovery | `go test -race ./protofetch/... ./cmd/fitproto` |
 
-The tracker is complete only when the full commands above and `go test ./...`
-remain green after all parallel fit-go lanes are merged.
-
-Current verification:
-
-- `go test -count=1 ./...`: pass
-- `go vet ./...`: pass
-- `go test -race -count=1 . ./httpclient ./utils ./metrics ./mysql ./server ./mongo ./redis`: pass
-- `go test -race -count=1 ./...`: pass
+The tracker is source-complete in the local worktree. On 2026-07-13,
+`go mod tidy -diff`, `go vet ./...`, `go test -count=1 ./...`, and
+`go test -race -count=1 ./...` all passed. Metroplex also passed
+`go test -count=1 ./...` with a temporary module-file replacement pointing at
+this worktree; the real Metroplex dependency files were not modified. Publishing
+an immutable fit-go revision, pinning it, adopting opt-in capabilities, and
+collecting deployed collector/dashboard evidence remain separate release steps.
 
 ## HTTP
 
@@ -81,7 +86,46 @@ are returned, while handler errors retain the documented consume-loop behavior.
 Telemetry receives generic failure classifications; the caller still receives
 the original broker or handler error.
 
+## GraphQL And Process Boundaries
+
+`fitgraphql` is a gqlgen handler extension that creates an internal operation
+span and optional resolver spans under the surrounding HTTP/WebSocket span. It
+exports operation type, explicitly mapped persisted/allowlisted operation
+identity, resolver object/name, and generic error state/count only. Raw
+client-supplied operation names, query text, variables, aliases/paths,
+arguments, results, panic values, and raw GraphQL errors cannot be enabled,
+which is an intentional privacy improvement over the legacy automatic
+instrumentation.
+
+`tracing.RunBoundary`, `RunBoundaryWithResult`, and `WrapBoundary` cover worker,
+cron, job, and task entry points. They preserve a native or remote parent,
+create stable boundary attributes, bridge active context to fit logging and
+same-goroutine transports, mark generic error/panic state, and clean up before
+return/rethrow. Applications still have to pass the resulting context across
+detached goroutines; no library can infer that ownership safely.
+
 ## Metrics
+
+The `otelmetrics` package supplies a generic OTel SDK meter provider in addition
+to FIT's fixed Prometheus metrics. It supports `otlp`, `console`, `none`, and
+comma-separated exporter selection; OTLP gRPC and HTTP/protobuf; common and
+metrics-specific endpoint/protocol precedence; export interval/timeout; custom
+resources, readers, exporters, and views; and the same resource identity used
+by tracing. `fit.Init` enables it only when `OTEL_METRICS_EXPORTER` is present
+and not `none`, or when the compatibility switch `OTEL_METRICS_ENABLED=true` is
+set. This opt-in prevents an upgrade from creating an unexpected localhost
+exporter.
+
+Process-global meter providers use a stable routing provider plus non-LIFO owner
+stack. Synchronous instruments and observable callback registrations created
+before initialization or under an earlier provider are rebound to each active
+SDK lifecycle. Equivalent meter scopes are reused. Shutdown first detaches the
+SDK from recording, keeps the privacy-safe OTel error handler active while the
+SDK/exporters shut down, then restores the handler predecessor; a closed owner
+is never revived. Injected readers/exporters enable the provider unless an
+explicit `Enabled=false` overrides them.
+
+The legacy FIT Prometheus path remains separately environment-driven:
 
 The framework boot path is intentionally environment-driven:
 
@@ -147,7 +191,7 @@ preserved Kubernetes contract and the intentional differences.
 
 ## Global Lifecycle And Compatibility
 
-Tracer providers, propagators, metric registries, and default slog loggers use
+Tracer providers, propagators, OTel meter providers, Prometheus registries, and default slog loggers use
 ownership chains that tolerate out-of-order shutdown. `New`, `SetGlobal`, its
 restore callback, and tracer shutdown can overlap without reviving a closed
 predecessor. Provider and propagator ownership are checked independently, so an
@@ -167,6 +211,24 @@ TriggerHappy's object-first Winston calls are available through the explicit
 empty-body, nested-object, string-message, and array-message behavior. See
 `TRACECLUE_COMPATIBILITY.md` for the exact fit.js/TraceClue commits and the
 intentional error-value privacy difference.
+
+## Migration And Proto Tooling
+
+`migration.Runner` checkpoints every successful step, imports Node/pyfit state,
+normalizes aliases, detects checksum/registry drift, preflights irreversible
+reverts, and requires an explicit lock. Local file state is fsynced and atomically
+renamed. Cloud stores fail construction unless paired with a renewable
+`LeaseLocker` and an application-owned fenced writer that atomically validates a
+monotonic token. The same token is exposed to `Up`/`Down` through
+`FenceTokenFromContext`; idempotency remains required because no generic runner
+can atomically combine arbitrary application mutations with its state object.
+
+`protofetch` requires output to be a strict descendant of an explicit root,
+rejects traversal/symlinks/non-regular files and source/output overlap, suppresses
+child-process output, and serializes writers. It fsyncs the generated tree and
+uses sibling renames plus a backup to transactionally replace output. Startup
+recovers an interrupted pre-install rollback or finishes a post-install commit;
+directory replacement is not claimed to be one atomic filesystem operation.
 
 ## MySQL
 
