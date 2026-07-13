@@ -118,6 +118,101 @@ func spanByID(spans tracetest.SpanStubs, spanID string) (tracetest.SpanStub, boo
 	return tracetest.SpanStub{}, false
 }
 
+func TestExplicitProducerSpanEntryPointsAdoptActiveGoroutineParent(t *testing.T) {
+	tracer, _ := enabledKafkaTracer(t)
+	activeCtx, activeSpan := tracer.StartSpan(context.Background(), "active-handler", tracing.SpanKindServer)
+	defer activeSpan.End()
+	activeMember, err := baggage.NewMember("active-key", "active-value")
+	require.NoError(t, err)
+	activeBaggage, err := baggage.New(activeMember)
+	require.NoError(t, err)
+	activeCtx = baggage.ContextWithBaggage(activeCtx, activeBaggage)
+	restore := tracing.InjectContextIntoGoroutine(activeCtx)
+	defer restore()
+
+	baseMember, err := baggage.NewMember("base-key", "base-value")
+	require.NoError(t, err)
+	baseBaggage, err := baggage.New(baseMember)
+	require.NoError(t, err)
+	base, cancel := context.WithCancel(baggage.ContextWithBaggage(context.Background(), baseBaggage))
+	producerCtx, producerSpan := StartProducerSpan(base, "orders", 1)
+	messageCtx, messageSpan := startProducerMessageSpan(base, "orders", Message{Value: []byte("payload")})
+	manualMessage := Message{Value: []byte("manual")}
+	InjectTraceHeaders(base, &manualMessage)
+	require.NotNil(t, producerSpan)
+	require.NotNil(t, messageSpan)
+
+	activeSC := oteltrace.SpanContextFromContext(activeCtx)
+	for _, got := range []struct {
+		name string
+		ctx  context.Context
+	}{
+		{name: "producer span", ctx: producerCtx},
+		{name: "message span", ctx: messageCtx},
+	} {
+		require.Equal(t, activeSC.TraceID(), oteltrace.SpanContextFromContext(got.ctx).TraceID(), got.name)
+		require.Equal(t, "active-value", baggage.FromContext(got.ctx).Member("active-key").Value(), got.name)
+		require.Equal(t, "base-value", baggage.FromContext(got.ctx).Member("base-key").Value(), got.name)
+	}
+	manualCtx := propagator().Extract(context.Background(), payloadCarrier{headers: manualMessage.Headers})
+	manualSC := oteltrace.SpanContextFromContext(manualCtx)
+	require.Equal(t, activeSC.TraceID(), manualSC.TraceID())
+	require.Equal(t, activeSC.SpanID(), manualSC.SpanID())
+	require.Equal(t, activeSC.TraceFlags(), manualSC.TraceFlags())
+	require.Equal(t, activeSC.TraceState(), manualSC.TraceState())
+	require.Equal(t, "active-value", baggage.FromContext(manualCtx).Member("active-key").Value())
+	require.Equal(t, "base-value", baggage.FromContext(manualCtx).Member("base-key").Value())
+
+	cancel()
+	require.ErrorIs(t, producerCtx.Err(), context.Canceled)
+	require.ErrorIs(t, messageCtx.Err(), context.Canceled)
+	EndProducerSpan(producerSpan, nil)
+	EndProducerSpan(messageSpan, nil)
+}
+
+func TestExplicitProducerSpanEntryPointsPreserveExplicitParent(t *testing.T) {
+	tracer, _ := enabledKafkaTracer(t)
+	activeCtx, activeSpan := tracer.StartSpan(context.Background(), "active-handler", tracing.SpanKindServer)
+	defer activeSpan.End()
+	restore := tracing.InjectContextIntoGoroutine(activeCtx)
+	defer restore()
+
+	explicitCtx, explicitSpan := tracer.StartSpan(context.Background(), "explicit-caller", tracing.SpanKindInternal)
+	defer explicitSpan.End()
+	explicitCtx, cancel := context.WithCancel(explicitCtx)
+	producerCtx, producerSpan := StartProducerSpan(explicitCtx, "orders", 1)
+	messageCtx, messageSpan := startProducerMessageSpan(explicitCtx, "orders", Message{Value: []byte("payload")})
+	manualMessage := Message{Value: []byte("manual")}
+	InjectTraceHeaders(explicitCtx, &manualMessage)
+	require.NotNil(t, producerSpan)
+	require.NotNil(t, messageSpan)
+
+	explicitSC := oteltrace.SpanContextFromContext(explicitCtx)
+	activeSC := oteltrace.SpanContextFromContext(activeCtx)
+	require.NotEqual(t, activeSC.TraceID(), explicitSC.TraceID(), "test setup requires independent traces")
+	for _, got := range []struct {
+		name string
+		ctx  context.Context
+	}{
+		{name: "producer span", ctx: producerCtx},
+		{name: "message span", ctx: messageCtx},
+	} {
+		require.Equal(t, explicitSC.TraceID(), oteltrace.SpanContextFromContext(got.ctx).TraceID(), got.name)
+	}
+	manualCtx := propagator().Extract(context.Background(), payloadCarrier{headers: manualMessage.Headers})
+	manualSC := oteltrace.SpanContextFromContext(manualCtx)
+	require.Equal(t, explicitSC.TraceID(), manualSC.TraceID())
+	require.Equal(t, explicitSC.SpanID(), manualSC.SpanID())
+	require.Equal(t, explicitSC.TraceFlags(), manualSC.TraceFlags())
+	require.Equal(t, explicitSC.TraceState(), manualSC.TraceState())
+
+	cancel()
+	require.ErrorIs(t, producerCtx.Err(), context.Canceled)
+	require.ErrorIs(t, messageCtx.Err(), context.Canceled)
+	EndProducerSpan(producerSpan, nil)
+	EndProducerSpan(messageSpan, nil)
+}
+
 func TestConfluentProducerAPIsAdoptContextWithoutDuplicateSpans(t *testing.T) {
 	tracer, exporter := enabledKafkaTracer(t)
 	ctx, parent := tracer.StartSpan(context.Background(), "active-handler", tracing.SpanKindServer)

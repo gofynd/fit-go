@@ -80,6 +80,7 @@ type privacyTracer struct {
 }
 
 func (t *privacyTracer) Start(ctx context.Context, name string, opts ...trace.SpanStartOption) (context.Context, trace.Span) {
+	ctx = tracing.ContextWithActiveGoroutine(ctx)
 	ctx, span := t.Tracer.Start(ctx, name, opts...)
 	wrapped := &privacySpan{Span: span, provider: t.provider}
 	return trace.ContextWithSpan(ctx, wrapped), wrapped

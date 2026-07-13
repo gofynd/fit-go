@@ -87,6 +87,47 @@ func do(t *testing.T, rt http.RoundTripper, req *http.Request) {
 	}
 }
 
+func recordingHTTPTracer(t *testing.T) (*tracing.Tracer, *tracetest.InMemoryExporter) {
+	t.Helper()
+	t.Setenv("OTEL_SDK_DISABLED", "false")
+
+	previousProvider := otel.GetTracerProvider()
+	previousPropagator := otel.GetTextMapPropagator()
+	exporter := tracetest.NewInMemoryExporter()
+	enabled := true
+	tracer, err := tracing.New(context.Background(), tracing.Options{
+		ServiceName:            "httpclient-parent-test",
+		Enabled:                &enabled,
+		Sampler:                "always_on",
+		SpanExporter:           exporter,
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("tracing.New: %v", err)
+	}
+	restoreGlobal := tracing.SetGlobal(tracer)
+	t.Cleanup(func() {
+		restoreGlobal()
+		if err := tracer.Shutdown(context.Background()); err != nil {
+			t.Errorf("tracer shutdown: %v", err)
+		}
+		otel.SetTracerProvider(previousProvider)
+		otel.SetTextMapPropagator(previousPropagator)
+	})
+	return tracer, exporter
+}
+
+func exportedHTTPSpan(t *testing.T, exporter *tracetest.InMemoryExporter, name string) tracetest.SpanStub {
+	t.Helper()
+	for _, span := range exporter.GetSpans() {
+		if span.Name == name {
+			return span
+		}
+	}
+	t.Fatalf("exported span %q not found", name)
+	return tracetest.SpanStub{}
+}
+
 func TestRoundTrip_GeneratesRequestID(t *testing.T) {
 	f := &fakeRT{}
 	rt := WrapTransport(f)
@@ -154,6 +195,50 @@ func TestRoundTrip_InjectsTraceparentWhenEnabled(t *testing.T) {
 
 	if got := f.got.Header.Get(traceparentHeader); got == "" {
 		t.Fatal("expected traceparent header injected when tracing enabled")
+	}
+}
+
+func TestRoundTrip_InheritsActiveGoroutineParent(t *testing.T) {
+	tracer, exporter := recordingHTTPTracer(t)
+	activeCtx, active := tracer.StartSpan(context.Background(), "active-handler", tracing.SpanKindServer)
+	defer active.End()
+	restoreActive := tracing.InjectContextIntoGoroutine(activeCtx)
+	defer restoreActive()
+
+	base, cancel := context.WithCancel(context.Background())
+	cancel()
+	f := &fakeRT{}
+	req := httptest.NewRequest(http.MethodGet, "http://svc/x", nil).WithContext(base)
+	do(t, WrapTransport(f), req)
+
+	child := exportedHTTPSpan(t, exporter, "HTTP GET")
+	if got := child.Parent.SpanID().String(); got != active.SpanID() {
+		t.Fatalf("HTTP span parent = %s, want active goroutine span %s", got, active.SpanID())
+	}
+	if !errors.Is(f.got.Context().Err(), context.Canceled) {
+		t.Fatalf("forwarded request context error = %v, want caller cancellation", f.got.Context().Err())
+	}
+}
+
+func TestRoundTrip_ExplicitContextParentWins(t *testing.T) {
+	tracer, exporter := recordingHTTPTracer(t)
+	activeCtx, active := tracer.StartSpan(context.Background(), "active-handler", tracing.SpanKindServer)
+	defer active.End()
+	explicitCtx, explicit := tracer.StartSpan(context.Background(), "explicit-parent", tracing.SpanKindServer)
+	defer explicit.End()
+	restoreActive := tracing.InjectContextIntoGoroutine(activeCtx)
+	defer restoreActive()
+
+	f := &fakeRT{}
+	req := httptest.NewRequest(http.MethodGet, "http://svc/x", nil).WithContext(explicitCtx)
+	do(t, WrapTransport(f), req)
+
+	child := exportedHTTPSpan(t, exporter, "HTTP GET")
+	if got := child.Parent.SpanID().String(); got != explicit.SpanID() {
+		t.Fatalf("HTTP span parent = %s, want explicit span %s", got, explicit.SpanID())
+	}
+	if got := child.Parent.SpanID().String(); got == active.SpanID() {
+		t.Fatalf("HTTP span unexpectedly inherited active goroutine span %s", got)
 	}
 }
 

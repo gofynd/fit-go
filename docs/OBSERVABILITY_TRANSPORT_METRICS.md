@@ -31,6 +31,7 @@ boundary.
 | FG-40 | Strict Convict/Pydantic-style config schema primitives | Implemented with explicit schema porting | `go test -race ./config` |
 | FG-41 | Compiled migrations and local/GCS/S3 state | Implemented; cloud state requires application-owned renewable fencing | `go test -race ./migration/...` |
 | FG-42 | Safe fitproto-compatible fetch/generation | Implemented with locked transactional replacement and crash recovery | `go test -race ./protofetch/... ./cmd/fitproto` |
+| FG-43 | Legacy callback active-context adoption across outbound clients | Implemented with explicit-context precedence | `go test -race ./tracing ./httpclient ./mongo ./redis ./mysql ./postgres ./grpc ./kafka` |
 
 The tracker is source-complete in the local worktree. On 2026-07-13,
 `go mod tidy -diff`, `go vet ./...`, `go test -count=1 ./...`, and
@@ -70,6 +71,16 @@ Access/client logs retain method, safe scheme/host/path, status, request ID, and
 duration. Query values, URL userinfo, opted-in sensitive header values, and raw
 transport/provider errors are redacted; callers still receive the original error.
 
+All fit-go outbound HTTP, Mongo, Redis, MySQL, PostgreSQL, gRPC, and explicit
+Kafka producer entry points use the same active-context rule. A valid span on
+the caller-supplied context is authoritative. When that context has no span and
+the operation is running inside a fit-go consumer or process boundary, the
+client adopts the same-goroutine active span and baggage while retaining the
+supplied context's values, deadline, and cancellation. This matches legacy
+AsyncLocalStorage/context-local callback behavior without turning cancellation
+into hidden global state. The bridge never crosses a newly created goroutine;
+detached work must pass an explicit retained context.
+
 ## Kafka
 
 Context-aware producer and consumer APIs preserve the configured OTel wire
@@ -100,9 +111,10 @@ instrumentation.
 `tracing.RunBoundary`, `RunBoundaryWithResult`, and `WrapBoundary` cover worker,
 cron, job, and task entry points. They preserve a native or remote parent,
 create stable boundary attributes, bridge active context to fit logging and
-same-goroutine transports, mark generic error/panic state, and clean up before
-return/rethrow. Applications still have to pass the resulting context across
-detached goroutines; no library can infer that ownership safely.
+same-goroutine transports and datastore clients, mark generic error/panic state,
+and clean up before return/rethrow. Applications still have to pass the
+resulting context across detached goroutines; no library can infer that
+ownership safely.
 
 ## Metrics
 

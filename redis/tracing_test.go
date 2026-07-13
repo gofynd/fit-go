@@ -28,7 +28,34 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/gofynd/fit-go/internal/tracingtest"
+	"github.com/gofynd/fit-go/tracing"
 )
+
+func recordingRedisProvider(t *testing.T) (*sdktrace.TracerProvider, *tracetest.InMemoryExporter) {
+	t.Helper()
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithSyncer(exporter),
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+	)
+	t.Cleanup(func() {
+		if err := provider.Shutdown(context.Background()); err != nil {
+			t.Errorf("tracer provider shutdown: %v", err)
+		}
+	})
+	return provider, exporter
+}
+
+func exportedRedisSpan(t *testing.T, exporter *tracetest.InMemoryExporter, name string) tracetest.SpanStub {
+	t.Helper()
+	for _, span := range exporter.GetSpans() {
+		if span.Name == name {
+			return span
+		}
+	}
+	t.Fatalf("exported span %q not found", name)
+	return tracetest.SpanStub{}
+}
 
 // attachTracingHook is gated on tracing-enabled and never dials eagerly. Detailed
 // span behavior is pinned by the exporter test below.
@@ -65,6 +92,60 @@ func TestSafeRedisCommandVerb(t *testing.T) {
 				t.Fatalf("safeRedisCommandVerb() = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestSafeTracingHookInheritsActiveGoroutineParent(t *testing.T) {
+	provider, exporter := recordingRedisProvider(t)
+	hook := newSafeTracingHook(provider)
+	activeCtx, active := provider.Tracer("redis-parent-test").Start(context.Background(), "active-handler")
+	defer active.End()
+	restoreActive := tracing.InjectContextIntoGoroutine(activeCtx)
+	defer restoreActive()
+
+	base, cancel := context.WithCancel(context.Background())
+	cancel()
+	cmd := goredis.NewStringCmd(base, "get", "private-key")
+	err := hook.ProcessHook(func(ctx context.Context, got goredis.Cmder) error {
+		if got != cmd {
+			t.Fatalf("process command changed: got %p want %p", got, cmd)
+		}
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			t.Fatalf("process context error = %v, want caller cancellation", ctx.Err())
+		}
+		return nil
+	})(base, cmd)
+	if err != nil {
+		t.Fatalf("ProcessHook: %v", err)
+	}
+
+	child := exportedRedisSpan(t, exporter, "get")
+	if got := child.Parent.SpanID(); got != active.SpanContext().SpanID() {
+		t.Fatalf("Redis span parent = %s, want active goroutine span %s", got, active.SpanContext().SpanID())
+	}
+}
+
+func TestSafeTracingHookExplicitContextParentWins(t *testing.T) {
+	provider, exporter := recordingRedisProvider(t)
+	hook := newSafeTracingHook(provider)
+	activeCtx, active := provider.Tracer("redis-parent-test").Start(context.Background(), "active-handler")
+	defer active.End()
+	explicitCtx, explicit := provider.Tracer("redis-parent-test").Start(context.Background(), "explicit-parent")
+	defer explicit.End()
+	restoreActive := tracing.InjectContextIntoGoroutine(activeCtx)
+	defer restoreActive()
+
+	cmd := goredis.NewStringCmd(explicitCtx, "get", "private-key")
+	if err := hook.ProcessHook(func(context.Context, goredis.Cmder) error { return nil })(explicitCtx, cmd); err != nil {
+		t.Fatalf("ProcessHook: %v", err)
+	}
+
+	child := exportedRedisSpan(t, exporter, "get")
+	if got := child.Parent.SpanID(); got != explicit.SpanContext().SpanID() {
+		t.Fatalf("Redis span parent = %s, want explicit span %s", got, explicit.SpanContext().SpanID())
+	}
+	if got := child.Parent.SpanID(); got == active.SpanContext().SpanID() {
+		t.Fatalf("Redis span unexpectedly inherited active goroutine span %s", got)
 	}
 }
 

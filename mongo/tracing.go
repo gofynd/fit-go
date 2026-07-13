@@ -97,6 +97,7 @@ func commandMonitorFor(tracer *tracing.Tracer) *event.CommandMonitor {
 // started opens a client span for a command. The started event's context carries
 // the active (caller) span, so the command span links as its child.
 func (ct *commandTracer) started(ctx context.Context, e *event.CommandStartedEvent) {
+	ctx = tracing.ContextWithActiveGoroutine(ctx)
 	_, span := ct.tracer.StartSpan(ctx, "mongodb."+e.CommandName, tracing.SpanKindClient)
 	span.SetAttributes(map[string]any{
 		"db.system":    "mongodb",

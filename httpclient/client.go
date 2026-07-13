@@ -128,7 +128,7 @@ type transport struct {
 // the process-global OTel propagator when tracing is enabled, performs the call,
 // then records span status and an optional safe log line.
 func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req = req.Clone(req.Context())
+	req = req.Clone(tracing.ContextWithActiveGoroutine(req.Context()))
 	if req.Header == nil {
 		req.Header = make(http.Header)
 	}

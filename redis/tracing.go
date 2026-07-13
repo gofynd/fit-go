@@ -70,6 +70,7 @@ func (h *safeTracingHook) start(ctx context.Context, name, operation string, ext
 		),
 	}
 	opts = append(opts, extra...)
+	ctx = tracing.ContextWithActiveGoroutine(ctx)
 	return h.tracer.Start(ctx, name, opts...)
 }
 

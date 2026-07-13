@@ -13,6 +13,7 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/test/bufconn"
 
+	"github.com/gofynd/fit-go/internal/tracingtest"
 	fittracing "github.com/gofynd/fit-go/tracing"
 )
 
@@ -24,6 +25,51 @@ type tracedHealthServer struct {
 func (s *tracedHealthServer) Check(ctx context.Context, _ *healthpb.HealthCheckRequest) (*healthpb.HealthCheckResponse, error) {
 	s.seen <- oteltrace.SpanContextFromContext(ctx)
 	return &healthpb.HealthCheckResponse{Status: healthpb.HealthCheckResponse_SERVING}, nil
+}
+
+func TestMarkInstrumentationBaselineAdoptsActiveGoroutineParent(t *testing.T) {
+	tracer := tracingtest.EnabledGlobal(t)
+	activeCtx, activeSpan := tracer.StartSpan(context.Background(), "active-handler", fittracing.SpanKindServer)
+	defer activeSpan.End()
+	restore := fittracing.InjectContextIntoGoroutine(activeCtx)
+	defer restore()
+
+	base, cancel := context.WithCancel(context.Background())
+	got := markInstrumentationBaseline(base)
+	activeSC := oteltrace.SpanContextFromContext(activeCtx)
+	if gotSC := oteltrace.SpanContextFromContext(got); !gotSC.Equal(activeSC) {
+		t.Fatalf("baseline context = %v, want active parent %v", gotSC, activeSC)
+	}
+	if baseline, ok := got.Value(clientInstrumentationBaselineKey{}).(oteltrace.SpanContext); !ok || !baseline.Equal(activeSC) {
+		t.Fatalf("recorded baseline = %v, %t; want active parent %v", baseline, ok, activeSC)
+	}
+
+	cancel()
+	if got.Err() != context.Canceled {
+		t.Fatalf("baseline context error = %v, want context canceled", got.Err())
+	}
+}
+
+func TestMarkInstrumentationBaselineExplicitParentWins(t *testing.T) {
+	tracer := tracingtest.EnabledGlobal(t)
+	activeCtx, activeSpan := tracer.StartSpan(context.Background(), "active-handler", fittracing.SpanKindServer)
+	defer activeSpan.End()
+	restore := fittracing.InjectContextIntoGoroutine(activeCtx)
+	defer restore()
+
+	explicitCtx, explicitSpan := tracer.StartSpan(context.Background(), "explicit-caller", fittracing.SpanKindInternal)
+	defer explicitSpan.End()
+	got := markInstrumentationBaseline(explicitCtx)
+	explicitSC := oteltrace.SpanContextFromContext(explicitCtx)
+	if gotSC := oteltrace.SpanContextFromContext(got); !gotSC.Equal(explicitSC) {
+		t.Fatalf("baseline context = %v, want explicit parent %v", gotSC, explicitSC)
+	}
+	if activeSC := oteltrace.SpanContextFromContext(activeCtx); explicitSC.TraceID() == activeSC.TraceID() {
+		t.Fatal("test setup produced matching active and explicit traces")
+	}
+	if baseline, ok := got.Value(clientInstrumentationBaselineKey{}).(oteltrace.SpanContext); !ok || !baseline.Equal(explicitSC) {
+		t.Fatalf("recorded baseline = %v, %t; want explicit parent %v", baseline, ok, explicitSC)
+	}
 }
 
 func TestNewClientCreatesAndPropagatesGRPCSpan(t *testing.T) {

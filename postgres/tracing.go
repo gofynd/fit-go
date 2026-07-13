@@ -111,6 +111,7 @@ func safeSQL(sqlText string) string {
 }
 
 func (t *safePGXTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	ctx = tracing.ContextWithActiveGoroutine(ctx)
 	data.SQL = safeSQL(data.SQL)
 	data.Args = nil
 	return t.inner.TraceQueryStart(ctx, nil, data)
@@ -122,6 +123,7 @@ func (t *safePGXTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx
 }
 
 func (t *safePGXTracer) TraceBatchStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceBatchStartData) context.Context {
+	ctx = tracing.ContextWithActiveGoroutine(ctx)
 	if data.Batch != nil {
 		batch := &pgx.Batch{}
 		for range data.Batch.Len() {
@@ -145,6 +147,7 @@ func (t *safePGXTracer) TraceBatchEnd(ctx context.Context, _ *pgx.Conn, data pgx
 }
 
 func (t *safePGXTracer) TraceCopyFromStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceCopyFromStartData) context.Context {
+	ctx = tracing.ContextWithActiveGoroutine(ctx)
 	data.TableName = pgx.Identifier{"table"}
 	data.ColumnNames = nil
 	return t.inner.TraceCopyFromStart(ctx, nil, data)
@@ -156,6 +159,7 @@ func (t *safePGXTracer) TraceCopyFromEnd(ctx context.Context, _ *pgx.Conn, data 
 }
 
 func (t *safePGXTracer) TracePrepareStart(ctx context.Context, _ *pgx.Conn, data pgx.TracePrepareStartData) context.Context {
+	ctx = tracing.ContextWithActiveGoroutine(ctx)
 	data.Name = ""
 	data.SQL = safeSQL(data.SQL)
 	return t.inner.TracePrepareStart(ctx, nil, data)
@@ -167,6 +171,7 @@ func (t *safePGXTracer) TracePrepareEnd(ctx context.Context, _ *pgx.Conn, data p
 }
 
 func (t *safePGXTracer) TraceConnectStart(ctx context.Context, _ pgx.TraceConnectStartData) context.Context {
+	ctx = tracing.ContextWithActiveGoroutine(ctx)
 	return t.inner.TraceConnectStart(ctx, pgx.TraceConnectStartData{})
 }
 
@@ -177,6 +182,7 @@ func (t *safePGXTracer) TraceConnectEnd(ctx context.Context, data pgx.TraceConne
 }
 
 func (t *safePGXTracer) TraceAcquireStart(ctx context.Context, _ *pgxpool.Pool, data pgxpool.TraceAcquireStartData) context.Context {
+	ctx = tracing.ContextWithActiveGoroutine(ctx)
 	return t.inner.TraceAcquireStart(ctx, nil, data)
 }
 

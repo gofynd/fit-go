@@ -11,6 +11,12 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Legacy callback context continuity**: instrumented outbound HTTP, Mongo,
+  Redis, MySQL, PostgreSQL, gRPC, and explicit Kafka producer operations now
+  fill a missing parent from fit-go's same-goroutine active boundary context.
+  Explicit caller spans remain authoritative; caller values, deadlines, and
+  cancellation are preserved; baggage, sampling, and tracestate continue with
+  the adopted parent. Detached goroutines still require an explicit context.
 - **Future platform capability set**: privacy-safe gqlgen operation/resolver
   tracing (`fitgraphql`), generic OTLP/console metrics with ownership-safe
   lifecycle (`otelmetrics`), explicit worker/cron/job/task tracing boundaries,

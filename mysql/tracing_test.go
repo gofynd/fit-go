@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	"github.com/gofynd/fit-go/internal/tracingtest"
+	"github.com/gofynd/fit-go/tracing"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -61,6 +62,87 @@ type otelTestTx struct{}
 
 func (otelTestTx) Commit() error   { return nil }
 func (otelTestTx) Rollback() error { return nil }
+
+type mysqlTracingContextKey struct{}
+
+func newMySQLParentTestProvider(t *testing.T) (*sdktrace.TracerProvider, *tracetest.InMemoryExporter) {
+	t.Helper()
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithSyncer(exporter),
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+	)
+	t.Cleanup(func() {
+		if err := provider.Shutdown(context.Background()); err != nil {
+			t.Errorf("tracer provider shutdown: %v", err)
+		}
+	})
+	return provider, exporter
+}
+
+func exportedMySQLSpan(t *testing.T, exporter *tracetest.InMemoryExporter, name string) tracetest.SpanStub {
+	t.Helper()
+	for _, span := range exporter.GetSpans() {
+		if span.Name == name {
+			return span
+		}
+	}
+	t.Fatalf("span %q was not exported", name)
+	return tracetest.SpanStub{}
+}
+
+func TestPrivacyTracerStartInheritsActiveGoroutineParent(t *testing.T) {
+	provider, exporter := newMySQLParentTestProvider(t)
+	activeCtx, activeSpan := provider.Tracer("mysql-active-parent").Start(context.Background(), "active-parent")
+	defer activeSpan.End()
+	restore := tracing.InjectContextIntoGoroutine(activeCtx)
+	defer restore()
+
+	base := context.WithValue(context.Background(), mysqlTracingContextKey{}, "preserved")
+	base, cancel := context.WithCancel(base)
+	const childName = "sql.active-parent"
+	childCtx, childSpan := newPrivacyTracerProvider(provider).Tracer("mysql-parent-test").Start(base, childName)
+	childSpan.End()
+
+	if childCtx.Value(mysqlTracingContextKey{}) != "preserved" {
+		t.Fatal("base context value was not preserved")
+	}
+	cancel()
+	if !errors.Is(childCtx.Err(), context.Canceled) {
+		t.Fatalf("child context error = %v, want context.Canceled", childCtx.Err())
+	}
+
+	got := exportedMySQLSpan(t, exporter, childName)
+	wantParent := activeSpan.SpanContext()
+	if got.Parent.SpanID() != wantParent.SpanID() || got.Parent.TraceID() != wantParent.TraceID() {
+		t.Fatalf("parent = %s/%s, want active goroutine parent %s/%s",
+			got.Parent.TraceID(), got.Parent.SpanID(), wantParent.TraceID(), wantParent.SpanID())
+	}
+}
+
+func TestPrivacyTracerStartExplicitParentWins(t *testing.T) {
+	provider, exporter := newMySQLParentTestProvider(t)
+	activeCtx, activeSpan := provider.Tracer("mysql-active-parent").Start(context.Background(), "active-parent")
+	defer activeSpan.End()
+	restore := tracing.InjectContextIntoGoroutine(activeCtx)
+	defer restore()
+
+	explicitCtx, explicitSpan := provider.Tracer("mysql-explicit-parent").Start(context.Background(), "explicit-parent")
+	defer explicitSpan.End()
+	const childName = "sql.explicit-parent"
+	_, childSpan := newPrivacyTracerProvider(provider).Tracer("mysql-parent-test").Start(explicitCtx, childName)
+	childSpan.End()
+
+	got := exportedMySQLSpan(t, exporter, childName)
+	wantParent := explicitSpan.SpanContext()
+	if got.Parent.SpanID() != wantParent.SpanID() || got.Parent.TraceID() != wantParent.TraceID() {
+		t.Fatalf("parent = %s/%s, want explicit parent %s/%s",
+			got.Parent.TraceID(), got.Parent.SpanID(), wantParent.TraceID(), wantParent.SpanID())
+	}
+	if got.Parent.SpanID() == activeSpan.SpanContext().SpanID() {
+		t.Fatal("active goroutine parent overrode explicit parent")
+	}
+}
 
 func TestOpenSQLDB_InstrumentsWithoutSQLOrCredentials(t *testing.T) {
 	tracingtest.EnabledGlobal(t)

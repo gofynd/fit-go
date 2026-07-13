@@ -155,6 +155,7 @@ func InjectTraceHeaders(ctx context.Context, msg *Message) {
 	// native OTel span when present (otelgin/otelgrpc put a span in the native context
 	// only) — tracing.SpanFromContext handles that, and it is why a produce from an
 	// HTTP handler now propagates at all.
+	ctx = tracing.ContextWithActiveGoroutine(ctx)
 	if tracing.SpanFromContext(ctx) == nil {
 		return
 	}
@@ -184,6 +185,7 @@ func StartProducerSpan(ctx context.Context, topic string, messageCount int) (con
 	if tracer == nil || !tracer.IsEnabled() {
 		return ctx, nil
 	}
+	ctx = tracing.ContextWithActiveGoroutine(ctx)
 	ctx, span := tracer.StartSpan(ctx, fmt.Sprintf("send %s", topic), tracing.SpanKindProducer)
 	span.SetAttributes(map[string]any{
 		"messaging.system":           "kafka",
@@ -204,6 +206,7 @@ func startProducerMessageSpan(ctx context.Context, topic string, msg Message) (c
 		return ctx, nil
 	}
 
+	ctx = tracing.ContextWithActiveGoroutine(ctx)
 	ctx, span := tracer.StartSpan(ctx, fmt.Sprintf("send %s", topic), tracing.SpanKindProducer)
 	attrs := map[string]any{
 		"messaging.system":           "kafka",

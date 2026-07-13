@@ -69,6 +69,7 @@ func NewClient(target string, opts ...grpc.DialOption) (*grpc.ClientConn, error)
 type clientInstrumentationBaselineKey struct{}
 
 func markInstrumentationBaseline(ctx context.Context) context.Context {
+	ctx = tracing.ContextWithActiveGoroutine(ctx)
 	if _, ok := ctx.Value(clientInstrumentationBaselineKey{}).(oteltrace.SpanContext); ok {
 		return ctx
 	}

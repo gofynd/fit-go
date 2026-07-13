@@ -307,6 +307,11 @@ defer conn.Close()
 response, err := orders.NewOrdersClient(conn).GetOrder(ctx, request)
 ```
 
+An RPC context with its own span remains authoritative. When it has no span,
+the fit-go client can fill the missing parent from a fit-go consumer or worker
+boundary active on the same goroutine while retaining the supplied context's
+cancellation, deadline, and values.
+
 Code that must call the upstream `grpc.NewClient` directly should append
 `fitgrpc.TracingDialOptions()` to its dial options instead:
 
@@ -341,8 +346,9 @@ Use `ProduceCtx`, `ProduceBatchCtx`, and `ConsumeCtx` for application code. For
 batch handlers, call `kafka.ConsumeBatchCtx(consumer, handler, opts)`; it works
 with the built-in Confluent consumer and adapts alternate drivers without
 changing the base interface. The raw `Produce`, `ProduceBatch`, `Consume`, and
-`ConsumeBatch` methods are compatibility escape hatches that intentionally omit
-trace propagation.
+`ConsumeBatch` methods are compatibility escape hatches: when called in the
+same goroutine as a fit-go callback they discover its active trace, while calls
+outside a fit-go boundary start or receive an independent boundary.
 
 The Confluent driver honors the `acks` argument on every produce call. Because
 librdkafka configures acknowledgements per producer rather than per request,
@@ -450,6 +456,13 @@ defer framework.Shutdown(ctx)
 // fit.Init installs the enabled registry for fit servers and both HTTP clients.
 client := httpclient.NewHTTPClient()
 ```
+
+Instrumented outbound clients preserve an explicit request context as the
+source of truth. If it has no span while running inside a fit-go consumer or
+worker boundary, HTTP and the fit-go database/gRPC/Kafka clients adopt the
+same-goroutine active span and baggage without replacing the supplied context's
+cancellation, deadline, or values. This compatibility bridge does not cross a
+new goroutine; detached work must carry an explicit retained context.
 
 With `METRICS_DIR`, fit creates and atomically refreshes a
 node-exporter-compatible `.prom` textfile every four seconds. The deployed Node

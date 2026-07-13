@@ -25,10 +25,182 @@ import (
 	"go.opentelemetry.io/otel"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/gofynd/fit-go/internal/tracingtest"
 	"github.com/gofynd/fit-go/tracing"
 )
+
+type postgresTracingContextKey struct{}
+
+type postgresTraceStartCase struct {
+	name  string
+	start func(*safePGXTracer, context.Context) context.Context
+	end   func(*safePGXTracer, context.Context)
+}
+
+func postgresTraceStartCases() []postgresTraceStartCase {
+	return []postgresTraceStartCase{
+		{
+			name: "query",
+			start: func(tracer *safePGXTracer, ctx context.Context) context.Context {
+				return tracer.TraceQueryStart(ctx, nil, pgx.TraceQueryStartData{SQL: "SELECT 1"})
+			},
+			end: func(tracer *safePGXTracer, ctx context.Context) {
+				tracer.TraceQueryEnd(ctx, nil, pgx.TraceQueryEndData{})
+			},
+		},
+		{
+			name: "batch",
+			start: func(tracer *safePGXTracer, ctx context.Context) context.Context {
+				return tracer.TraceBatchStart(ctx, nil, pgx.TraceBatchStartData{})
+			},
+			end: func(tracer *safePGXTracer, ctx context.Context) {
+				tracer.TraceBatchEnd(ctx, nil, pgx.TraceBatchEndData{})
+			},
+		},
+		{
+			name: "copy_from",
+			start: func(tracer *safePGXTracer, ctx context.Context) context.Context {
+				return tracer.TraceCopyFromStart(ctx, nil, pgx.TraceCopyFromStartData{})
+			},
+			end: func(tracer *safePGXTracer, ctx context.Context) {
+				tracer.TraceCopyFromEnd(ctx, nil, pgx.TraceCopyFromEndData{})
+			},
+		},
+		{
+			name: "prepare",
+			start: func(tracer *safePGXTracer, ctx context.Context) context.Context {
+				return tracer.TracePrepareStart(ctx, nil, pgx.TracePrepareStartData{SQL: "SELECT 1"})
+			},
+			end: func(tracer *safePGXTracer, ctx context.Context) {
+				tracer.TracePrepareEnd(ctx, nil, pgx.TracePrepareEndData{})
+			},
+		},
+		{
+			name: "connect",
+			start: func(tracer *safePGXTracer, ctx context.Context) context.Context {
+				return tracer.TraceConnectStart(ctx, pgx.TraceConnectStartData{})
+			},
+			end: func(tracer *safePGXTracer, ctx context.Context) {
+				tracer.TraceConnectEnd(ctx, pgx.TraceConnectEndData{})
+			},
+		},
+		{
+			name: "acquire",
+			start: func(tracer *safePGXTracer, ctx context.Context) context.Context {
+				return tracer.TraceAcquireStart(ctx, nil, pgxpool.TraceAcquireStartData{})
+			},
+			end: func(tracer *safePGXTracer, ctx context.Context) {
+				tracer.TraceAcquireEnd(ctx, nil, pgxpool.TraceAcquireEndData{})
+			},
+		},
+	}
+}
+
+func newPostgresParentTestTracer(t *testing.T) (*safePGXTracer, *sdktrace.TracerProvider, *tracetest.InMemoryExporter) {
+	t.Helper()
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithSyncer(exporter),
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+	)
+	previousProvider := otel.GetTracerProvider()
+	otel.SetTracerProvider(provider)
+	t.Cleanup(func() {
+		otel.SetTracerProvider(previousProvider)
+		if err := provider.Shutdown(context.Background()); err != nil {
+			t.Errorf("tracer provider shutdown: %v", err)
+		}
+	})
+
+	queryTracer := newQueryTracer()
+	safeTracer, ok := queryTracer.(*safePGXTracer)
+	if !ok {
+		t.Fatalf("newQueryTracer returned %T, want *safePGXTracer", queryTracer)
+	}
+	return safeTracer, provider, exporter
+}
+
+func exportedPostgresSpan(t *testing.T, exporter *tracetest.InMemoryExporter, spanContext trace.SpanContext) tracetest.SpanStub {
+	t.Helper()
+	for _, span := range exporter.GetSpans() {
+		if span.SpanContext.SpanID() == spanContext.SpanID() {
+			return span
+		}
+	}
+	t.Fatalf("span %s was not exported", spanContext.SpanID())
+	return tracetest.SpanStub{}
+}
+
+func TestSafePGXTraceStartsInheritActiveGoroutineParent(t *testing.T) {
+	tracingtest.EnabledGlobal(t)
+	for _, testCase := range postgresTraceStartCases() {
+		t.Run(testCase.name, func(t *testing.T) {
+			safeTracer, provider, exporter := newPostgresParentTestTracer(t)
+			activeCtx, activeSpan := provider.Tracer("postgres-active-parent").Start(context.Background(), "active-parent")
+			defer activeSpan.End()
+			restore := tracing.InjectContextIntoGoroutine(activeCtx)
+			defer restore()
+
+			base := context.WithValue(context.Background(), postgresTracingContextKey{}, "preserved")
+			base, cancel := context.WithCancel(base)
+			operationCtx := testCase.start(safeTracer, base)
+			operationSpanContext := trace.SpanFromContext(operationCtx).SpanContext()
+			if !operationSpanContext.IsValid() {
+				t.Fatal("trace start did not create an operation span")
+			}
+			testCase.end(safeTracer, operationCtx)
+
+			if operationCtx.Value(postgresTracingContextKey{}) != "preserved" {
+				t.Fatal("base context value was not preserved")
+			}
+			cancel()
+			if !errors.Is(operationCtx.Err(), context.Canceled) {
+				t.Fatalf("operation context error = %v, want context.Canceled", operationCtx.Err())
+			}
+
+			got := exportedPostgresSpan(t, exporter, operationSpanContext)
+			wantParent := activeSpan.SpanContext()
+			if got.Parent.SpanID() != wantParent.SpanID() || got.Parent.TraceID() != wantParent.TraceID() {
+				t.Fatalf("parent = %s/%s, want active goroutine parent %s/%s",
+					got.Parent.TraceID(), got.Parent.SpanID(), wantParent.TraceID(), wantParent.SpanID())
+			}
+		})
+	}
+}
+
+func TestSafePGXTraceStartsExplicitParentWins(t *testing.T) {
+	tracingtest.EnabledGlobal(t)
+	for _, testCase := range postgresTraceStartCases() {
+		t.Run(testCase.name, func(t *testing.T) {
+			safeTracer, provider, exporter := newPostgresParentTestTracer(t)
+			activeCtx, activeSpan := provider.Tracer("postgres-active-parent").Start(context.Background(), "active-parent")
+			defer activeSpan.End()
+			restore := tracing.InjectContextIntoGoroutine(activeCtx)
+			defer restore()
+
+			explicitCtx, explicitSpan := provider.Tracer("postgres-explicit-parent").Start(context.Background(), "explicit-parent")
+			defer explicitSpan.End()
+			operationCtx := testCase.start(safeTracer, explicitCtx)
+			operationSpanContext := trace.SpanFromContext(operationCtx).SpanContext()
+			if !operationSpanContext.IsValid() {
+				t.Fatal("trace start did not create an operation span")
+			}
+			testCase.end(safeTracer, operationCtx)
+
+			got := exportedPostgresSpan(t, exporter, operationSpanContext)
+			wantParent := explicitSpan.SpanContext()
+			if got.Parent.SpanID() != wantParent.SpanID() || got.Parent.TraceID() != wantParent.TraceID() {
+				t.Fatalf("parent = %s/%s, want explicit parent %s/%s",
+					got.Parent.TraceID(), got.Parent.SpanID(), wantParent.TraceID(), wantParent.SpanID())
+			}
+			if got.Parent.SpanID() == activeSpan.SpanContext().SpanID() {
+				t.Fatal("active goroutine parent overrode explicit parent")
+			}
+		})
+	}
+}
 
 // sqlOperation must extract a PII-safe leading keyword and never the statement.
 func TestSQLOperation(t *testing.T) {

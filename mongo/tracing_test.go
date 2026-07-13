@@ -21,10 +21,51 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/event"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/gofynd/fit-go/internal/tracingtest"
 	"github.com/gofynd/fit-go/tracing"
 )
+
+func recordingMongoTracer(t *testing.T) (*tracing.Tracer, *tracetest.InMemoryExporter) {
+	t.Helper()
+	t.Setenv("OTEL_SDK_DISABLED", "false")
+
+	previousProvider := otel.GetTracerProvider()
+	previousPropagator := otel.GetTextMapPropagator()
+	exporter := tracetest.NewInMemoryExporter()
+	enabled := true
+	tracer, err := tracing.New(context.Background(), tracing.Options{
+		ServiceName:            "mongo-parent-test",
+		Enabled:                &enabled,
+		Sampler:                "always_on",
+		SpanExporter:           exporter,
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("tracing.New: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := tracer.Shutdown(context.Background()); err != nil {
+			t.Errorf("tracer shutdown: %v", err)
+		}
+		otel.SetTracerProvider(previousProvider)
+		otel.SetTextMapPropagator(previousPropagator)
+	})
+	return tracer, exporter
+}
+
+func exportedMongoSpan(t *testing.T, exporter *tracetest.InMemoryExporter, name string) tracetest.SpanStub {
+	t.Helper()
+	for _, span := range exporter.GetSpans() {
+		if span.Name == name {
+			return span
+		}
+	}
+	t.Fatalf("exported span %q not found", name)
+	return tracetest.SpanStub{}
+}
 
 // When tracing is off, no monitor is installed (zero overhead on the hot path).
 func TestCommandMonitorFor_DisabledReturnsNil(t *testing.T) {
@@ -85,6 +126,55 @@ func TestCommandTracer_Lifecycle(t *testing.T) {
 
 	// Unknown completion is a safe no-op.
 	ct.finished(999, nil)
+}
+
+func TestCommandTracer_InheritsActiveGoroutineParent(t *testing.T) {
+	tracer, exporter := recordingMongoTracer(t)
+	ct := &commandTracer{tracer: tracer, inflight: make(map[int64]inflightSpan)}
+	activeCtx, active := tracer.StartSpan(context.Background(), "active-handler", tracing.SpanKindServer)
+	defer active.End()
+	restoreActive := tracing.InjectContextIntoGoroutine(activeCtx)
+	defer restoreActive()
+
+	base, cancel := context.WithCancel(context.Background())
+	cancel()
+	ct.started(base, &event.CommandStartedEvent{
+		CommandName:  "find",
+		DatabaseName: "highbrow",
+		RequestID:    10,
+	})
+	ct.finished(10, nil)
+
+	child := exportedMongoSpan(t, exporter, "mongodb.find")
+	if got := child.Parent.SpanID().String(); got != active.SpanID() {
+		t.Fatalf("MongoDB span parent = %s, want active goroutine span %s", got, active.SpanID())
+	}
+}
+
+func TestCommandTracer_ExplicitContextParentWins(t *testing.T) {
+	tracer, exporter := recordingMongoTracer(t)
+	ct := &commandTracer{tracer: tracer, inflight: make(map[int64]inflightSpan)}
+	activeCtx, active := tracer.StartSpan(context.Background(), "active-handler", tracing.SpanKindServer)
+	defer active.End()
+	explicitCtx, explicit := tracer.StartSpan(context.Background(), "explicit-parent", tracing.SpanKindServer)
+	defer explicit.End()
+	restoreActive := tracing.InjectContextIntoGoroutine(activeCtx)
+	defer restoreActive()
+
+	ct.started(explicitCtx, &event.CommandStartedEvent{
+		CommandName:  "find",
+		DatabaseName: "highbrow",
+		RequestID:    11,
+	})
+	ct.finished(11, nil)
+
+	child := exportedMongoSpan(t, exporter, "mongodb.find")
+	if got := child.Parent.SpanID().String(); got != explicit.SpanID() {
+		t.Fatalf("MongoDB span parent = %s, want explicit span %s", got, explicit.SpanID())
+	}
+	if got := child.Parent.SpanID().String(); got == active.SpanID() {
+		t.Fatalf("MongoDB span unexpectedly inherited active goroutine span %s", got)
+	}
 }
 
 func TestMongoCommandFailureStatusDoesNotExposeServerValues(t *testing.T) {
