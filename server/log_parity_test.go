@@ -5,6 +5,7 @@ package server
 
 import (
 	"bytes"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -123,6 +124,49 @@ func TestLogRequestResponse_OriginalURLOptIn(t *testing.T) {
 	}
 	if strings.Contains(out, "topsecret") {
 		t.Fatalf("original URL mode leaked query secret: %s", out)
+	}
+}
+
+func TestLogRequestResponse_TraceClueAccessShape(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("FIT_LOG_SCHEMA", "")
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	engine := gin.New()
+	engine.Use(LogRequestResponse(LogRequestResponseConfig{Logger: logger}))
+	engine.GET("/v1/company/:company_id/ticket", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
+
+	engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/v1/company/42/ticket?limit=10&token=topsecret", nil))
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected request and response records, got %d: %s", len(lines), buf.String())
+	}
+	for _, line := range lines {
+		var record map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("decode access record: %v (%s)", err, line)
+		}
+		requestURL, _ := record["request_url"].(string)
+		if !strings.Contains(requestURL, "/v1/company/42/ticket?limit=10&token=[REDACTED]") {
+			t.Fatalf("TraceClue request_url shape is wrong: %s", line)
+		}
+		if _, ok := record["query_params"]; ok {
+			t.Fatalf("TraceClue record must not emit query_params: %s", line)
+		}
+		if _, ok := record["path_params"]; ok {
+			t.Fatalf("TraceClue record must not emit path_params: %s", line)
+		}
+		if _, ok := record["duration"]; ok {
+			t.Fatalf("TraceClue access record must not emit duration: %s", line)
+		}
+		params, ok := record["request_params"].(map[string]interface{})
+		if !ok || params["company_id"] != "42" {
+			t.Fatalf("TraceClue request_params missing route params: %s", line)
+		}
+		if strings.Contains(line, "topsecret") {
+			t.Fatalf("TraceClue request URL leaked query secret: %s", line)
+		}
 	}
 }
 

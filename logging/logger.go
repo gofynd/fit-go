@@ -55,13 +55,23 @@ type ctxKey int
 const (
 	ctxKeyTraceID ctxKey = iota
 	ctxKeySpanID
+	ctxKeyTraceFlags
 )
 
 // ContextWithTrace returns a context carrying trace_id and span_id.
 // The tracing module calls this to propagate IDs into the logger.
 func ContextWithTrace(ctx context.Context, traceID, spanID string) context.Context {
+	return ContextWithTraceFlags(ctx, traceID, spanID, 0)
+}
+
+// ContextWithTraceFlags returns a context carrying trace_id, span_id, and the
+// W3C trace flags used by the active span. Keeping the flags beside the
+// compatibility IDs lets the TraceClue log envelope preserve sampled versus
+// unsampled inbound requests even when the caller only has a fit-go context.
+func ContextWithTraceFlags(ctx context.Context, traceID, spanID string, traceFlags byte) context.Context {
 	ctx = context.WithValue(ctx, ctxKeyTraceID, traceID)
 	ctx = context.WithValue(ctx, ctxKeySpanID, spanID)
+	ctx = context.WithValue(ctx, ctxKeyTraceFlags, traceFlags)
 	return ctx
 }
 
@@ -102,8 +112,8 @@ type Schema string
 type TraceClueBodyTruncation string
 
 const (
-	// SchemaPlatform is the existing fit-go platform JSON contract and remains
-	// the default.
+	// SchemaPlatform is the explicit fit-go platform JSON contract. It remains
+	// available for callers that do not consume the legacy TraceClue envelope.
 	SchemaPlatform Schema = "platform"
 	// SchemaTraceClue emits the stdout JSON envelope used by deployed TraceClue.
 	SchemaTraceClue Schema = "traceclue"
@@ -166,7 +176,8 @@ type Options struct {
 	Service string
 
 	// Schema selects the JSON envelope. Empty falls back to FIT_LOG_SCHEMA and
-	// then SchemaPlatform. TraceClue compatibility is intentionally opt-in.
+	// then SchemaTraceClue, the global compatibility default. Set SchemaPlatform
+	// explicitly when the platform envelope is required.
 	Schema Schema
 
 	// ResourceAttributes extends the TraceClue-compatible resource object.
@@ -267,7 +278,7 @@ func New(opts Options) (*Logger, error) {
 	if opts.Schema == "" {
 		opts.Schema = Schema(strings.ToLower(strings.TrimSpace(os.Getenv("FIT_LOG_SCHEMA"))))
 		if opts.Schema == "" {
-			opts.Schema = SchemaPlatform
+			opts.Schema = SchemaTraceClue
 		}
 	}
 	if opts.Schema != SchemaPlatform && opts.Schema != SchemaTraceClue {
@@ -437,7 +448,11 @@ func (l *Logger) WithContext(ctx context.Context) *Logger {
 	}
 	if v, ok := ctx.Value(ctxKeyTraceID).(string); ok && v != "" {
 		c.traceID = v
-		c.traceFlags = 0
+		if flags, ok := ctx.Value(ctxKeyTraceFlags).(byte); ok {
+			c.traceFlags = flags
+		} else {
+			c.traceFlags = 0
+		}
 	}
 	if v, ok := ctx.Value(ctxKeySpanID).(string); ok && v != "" {
 		c.spanID = v

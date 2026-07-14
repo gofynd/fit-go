@@ -204,6 +204,11 @@ type LogRequestResponseConfig struct {
 	// query string, but values are still allowlist-redacted. The default is
 	// path-only, with redacted query params logged separately.
 	LegacyOriginalURL bool
+	// LegacyTraceClue selects the TraceClue access-log field names and shape:
+	// request_url includes a redacted query string, route values are emitted as
+	// request_params, and response duration is omitted. FIT_LOG_SCHEMA=traceclue
+	// enables the same behavior automatically when this field is false.
+	LegacyTraceClue bool
 	// MetricsRecorder is an optional callback invoked with method, route, status, and
 	// duration so that the caller can record Prometheus histograms.
 	MetricsRecorder func(method, route, status string, durationMs float64)
@@ -231,7 +236,8 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 
 	return func(c *gin.Context) {
 		path := c.Request.URL.Path
-		requestURL := requestURLForLog(c, cfg)
+		legacyTraceClue := cfg.LegacyTraceClue || traceClueLogSchemaEnabled()
+		requestURL := requestURLForLog(c, cfg, legacyTraceClue)
 
 		// Skip health/readiness probes
 		if strings.Contains(path, "/_healthz") || strings.Contains(path, "/_readyz") {
@@ -249,11 +255,15 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 			slog.String("request_url", requestURL),
 			slog.String("request_method", c.Request.Method),
 		}
-		if q := queryParams(c.Request.URL.Query()); q != nil {
-			base = append(base, slog.Any("query_params", q))
-		}
-		if p := pathParams(c.Params); p != nil {
-			base = append(base, slog.Any("path_params", p))
+		if legacyTraceClue {
+			base = append(base, slog.Any("request_params", requestParams(c.Params)))
+		} else {
+			if q := queryParams(c.Request.URL.Query()); q != nil {
+				base = append(base, slog.Any("query_params", q))
+			}
+			if p := pathParams(c.Params); p != nil {
+				base = append(base, slog.Any("path_params", p))
+			}
 		}
 		if cfg.IncludeHeaders != "" {
 			for _, h := range strings.Split(cfg.IncludeHeaders, ",") {
@@ -295,8 +305,14 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 		resAttrs := append(base[:len(base):len(base)],
 			slog.String("step", "RES"),
 			slog.Int("response_status", statusCode),
-			slog.Duration("duration", duration),
 		)
+		if !legacyTraceClue {
+			// The TraceClue formatter never added middleware duration to its
+			// request attributes. Keep duration in the platform schema, where it
+			// is useful operational metadata, without contaminating compatibility
+			// logs. Preserve the existing key for platform consumers.
+			resAttrs = append(resAttrs, slog.Duration("duration", duration))
+		}
 		l.LogAttrs(c.Request.Context(), responseLevel,
 			fmt.Sprintf("[RES] Outgoing %s response from %s", c.Request.Method, requestURL),
 			resAttrs...,
@@ -307,13 +323,18 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 // GinLogRequestResponse is an alias for LogRequestResponse for use in server.go.
 var GinLogRequestResponse = LogRequestResponse
 
-func requestURLForLog(c *gin.Context, cfg LogRequestResponseConfig) string {
-	if cfg.LegacyOriginalURL || strings.EqualFold(strings.TrimSpace(envGet("FIT_LOG_REQUEST_URL", "")), "original") {
+func requestURLForLog(c *gin.Context, cfg LogRequestResponseConfig, legacyTraceClue bool) string {
+	if cfg.LegacyOriginalURL || legacyTraceClue || strings.EqualFold(strings.TrimSpace(envGet("FIT_LOG_REQUEST_URL", "")), "original") {
 		if query := redact.Query(c.Request.URL.RawQuery, nil); query != "" {
 			return c.Request.URL.Path + "?" + query
 		}
 	}
 	return c.Request.URL.Path
+}
+
+func traceClueLogSchemaEnabled() bool {
+	schema := strings.ToLower(strings.TrimSpace(envGet("FIT_LOG_SCHEMA", "")))
+	return schema == "" || schema == "traceclue"
 }
 
 func responseLogLevel(statusCode int, cfg LogRequestResponseConfig) slog.Level {
@@ -360,6 +381,16 @@ func pathParams(ps gin.Params) map[string]string {
 		return nil
 	}
 	return out
+}
+
+// requestParams preserves the legacy TraceClue/Winston request_params field:
+// it is present as an object even when the route has no named parameters.
+func requestParams(ps gin.Params) map[string]string {
+	params := pathParams(ps)
+	if params == nil {
+		return map[string]string{}
+	}
+	return params
 }
 
 // ---------------------------------------------------------------------------

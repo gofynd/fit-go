@@ -718,6 +718,31 @@ func TestContextWithTrace(t *testing.T) {
 	}
 }
 
+func TestContextWithTraceFlags(t *testing.T) {
+	ctx := ContextWithTraceFlags(context.Background(), "trace-abc", "span-xyz", 1)
+	if got := ctx.Value(ctxKeyTraceFlags).(byte); got != 1 {
+		t.Fatalf("TraceFlags = %d, want 1", got)
+	}
+
+	var buf bytes.Buffer
+	logger, err := New(Options{
+		Schema: SchemaTraceClue,
+		Env:    "production",
+		Output: &buf,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	logger.WithContext(ctx).Info("sampled")
+	var record map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &record); err != nil {
+		t.Fatalf("decode log: %v", err)
+	}
+	if got := record["trace_flags"]; got != float64(1) {
+		t.Fatalf("trace_flags = %v, want 1", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Helper types
 // ---------------------------------------------------------------------------

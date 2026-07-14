@@ -1427,10 +1427,15 @@ func (t *Tracer) StartSpan(ctx context.Context, name string, kind SpanKind) (con
 	ctx = context.WithValue(ctx, spanIDKey, span.spanID)
 	ctx = context.WithValue(ctx, currentSpanKey, span)
 
-	// Bridge the IDs to the logging package so logger.WithContext(ctx) auto-stamps
-	// trace_id/span_id on every log line within this span — the Go equivalent of
-	// Node's OTel log-format enrichment, with no per-call wiring.
-	ctx = logging.ContextWithTrace(ctx, span.traceID, span.spanID)
+	// Bridge the IDs and W3C sampling flags to the logging package so
+	// logger.WithContext(ctx) auto-stamps the complete trace identity on every
+	// log line within this span — the Go equivalent of Node's OTel log-format
+	// enrichment, with no per-call wiring.
+	var traceFlags byte
+	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+		traceFlags = byte(sc.TraceFlags())
+	}
+	ctx = logging.ContextWithTraceFlags(ctx, span.traceID, span.spanID, traceFlags)
 
 	return ctx, span
 }

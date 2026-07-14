@@ -231,20 +231,34 @@ func TestTraceClueSchemaPreservesLegacyWarnSeverityQuirk(t *testing.T) {
 	}
 }
 
-func TestPlatformSchemaRemainsDefault(t *testing.T) {
+func TestPlatformSchemaCanBeSelectedExplicitly(t *testing.T) {
 	t.Setenv("FIT_LOG_SCHEMA", "")
 	var buf bytes.Buffer
-	logger, err := New(Options{Env: "production", Output: &buf})
+	logger, err := New(Options{Env: "production", Schema: SchemaPlatform, Output: &buf})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	logger.Info("platform")
 	record := decodeLog(t, &buf)
 	if record["level"] != "info" || record["message"] != "platform" {
-		t.Fatalf("default platform record = %v", record)
+		t.Fatalf("explicit platform record = %v", record)
 	}
 	if _, ok := record["body"]; ok {
 		t.Fatal("default logger unexpectedly switched to TraceClue schema")
+	}
+}
+
+func TestTraceClueSchemaIsGlobalDefault(t *testing.T) {
+	t.Setenv("FIT_LOG_SCHEMA", "")
+	var buf bytes.Buffer
+	logger, err := New(Options{Env: "production", Output: &buf})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	logger.Info("global-default")
+	record := decodeLog(t, &buf)
+	if record["body"] != "global-default" {
+		t.Fatalf("default body = %v, want TraceClue body", record["body"])
 	}
 }
 

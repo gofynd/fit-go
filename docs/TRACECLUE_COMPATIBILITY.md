@@ -1,7 +1,8 @@
 # TraceClue Log Compatibility
 
-`SchemaTraceClue` / `FIT_LOG_SCHEMA=traceclue` is an opt-in wire-compatibility
-mode. The normal fit-go platform schema remains the default.
+`SchemaTraceClue` / `FIT_LOG_SCHEMA=traceclue` is the global wire format
+default. The platform schema remains available through an explicit
+`SchemaPlatform` or `FIT_LOG_SCHEMA=platform` selection.
 
 ## Installed Legacy Profiles
 
@@ -24,6 +25,17 @@ characters by default, with `_meta_too_large` and `_meta_original_length`.
 The compatibility envelope preserves the deployed keys, severity-number quirk
 (`warn` and `fatal` omit it), timestamp shape, resource object, and active native
 OTel trace/span IDs.
+
+## HTTP Access Attributes
+
+`server.LogRequestResponse` follows the selected log schema. With the default
+platform schema it keeps the operational `query_params` and `path_params`
+fields and includes the existing response `duration` field. With
+`FIT_LOG_SCHEMA=traceclue`, it emits the legacy access-log shape: a redacted
+`request_url` that may include the query string, route values under
+`request_params`, and no middleware duration attribute. Query values and
+configured headers remain redacted in both modes; selecting TraceClue never
+disables the Commerce privacy boundary.
 
 ## TriggerHappy Object Messages
 

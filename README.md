@@ -391,13 +391,15 @@ logger, _ := logging.New(logging.Options{
 })
 
 logger.Info("request processed", "user_id", "u123", "duration_ms", 42)
-// {"level":"info","timestamp":"2025-01-15T10:30:00Z","message":"request processed","extra":{"user_id":"u123","duration_ms":42}}
+// TraceClue JSON: {"body":"request processed","severity_text":"info",...
+// "attributes":{"user_id":"u123","duration_ms":42},...}
 ```
 
-The platform envelope remains the default. `FIT_LOG_SCHEMA=traceclue` enables
-the legacy OTel-shaped envelope. Its default body policy matches TraceClue
-3.1.3 (`debug-only`); use `always` for TraceClue 3.0.5/2.1.x or `non-debug`
-for pyfit 1.10 queue formatting. See
+The TraceClue envelope is the global default. Set `FIT_LOG_SCHEMA=platform` or
+`SchemaPlatform` explicitly when the platform envelope is required.
+`FIT_LOG_SCHEMA=traceclue` selects it explicitly as well. Its default body
+policy matches TraceClue 3.1.3 (`debug-only`); use `always` for TraceClue
+3.0.5/2.1.x or `non-debug` for pyfit 1.10 queue formatting. See
 [TraceClue compatibility](docs/TRACECLUE_COMPATIBILITY.md).
 
 ### Tracing

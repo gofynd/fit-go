@@ -71,7 +71,7 @@ func ContextWithActiveGoroutine(base context.Context) context.Context {
 		if privateSpan, ok := active.Value(currentSpanKey).(*Span); ok && privateSpan != nil && privateSpan.SpanID() == activeSC.SpanID().String() {
 			base = context.WithValue(base, currentSpanKey, privateSpan)
 		}
-		return logging.ContextWithTrace(base, activeSC.TraceID().String(), activeSC.SpanID().String())
+		return logging.ContextWithTraceFlags(base, activeSC.TraceID().String(), activeSC.SpanID().String(), byte(activeSC.TraceFlags()))
 	}
 
 	// Tracing-disabled and compatibility-only contexts can carry fit-go's
