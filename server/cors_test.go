@@ -44,9 +44,55 @@ func TestCORS_ReflectSkipAndPreflight(t *testing.T) {
 	if w := do(http.MethodOptions, "https://x.fynd.com", ""); w.Code != http.StatusNoContent || w.Header().Get("Access-Control-Allow-Headers") != "content-type" || w.Header().Get("Access-Control-Max-Age") != "86400" {
 		t.Errorf("preflight = %d headers=%q maxage=%q", w.Code, w.Header().Get("Access-Control-Allow-Headers"), w.Header().Get("Access-Control-Max-Age"))
 	}
+	// The zero-value compatibility mode also terminates a disallowed preflight.
+	if w := do(http.MethodOptions, "https://evil.com", ""); w.Code != http.StatusNoContent {
+		t.Errorf("default disallowed preflight = %d, want 204", w.Code)
+	}
 	// X-Skip-Cors bypass
 	if w := do(http.MethodGet, "https://x.fynd.com", "true"); w.Header().Get("Access-Control-Allow-Origin") != "" {
 		t.Errorf("X-Skip-Cors must bypass")
+	}
+}
+
+func TestCORS_PassThroughDisallowedPreflight(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	allow := func(_ *gin.Context, origin string) bool { return strings.HasSuffix(origin, ".fynd.com") }
+	r := gin.New()
+	r.Use(DynamicCORS(CORSOptions{
+		AllowOrigin:                    allow,
+		AllowHeaders:                   "content-type",
+		PassThroughDisallowedPreflight: true,
+	}))
+	r.OPTIONS("/qr", func(c *gin.Context) { c.String(http.StatusTeapot, "route handled") })
+
+	do := func(origin string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodOptions, "/qr", nil)
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	for _, origin := range []string{"", "https://evil.com"} {
+		w := do(origin)
+		if w.Code != http.StatusTeapot || w.Body.String() != "route handled" {
+			t.Errorf("origin %q = (%d, %q), want route response", origin, w.Code, w.Body.String())
+		}
+		if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
+			t.Errorf("origin %q unexpectedly reflected as %q", origin, got)
+		}
+	}
+
+	// An allowed preflight retains the normal CORS short-circuit even in the
+	// pass-through mode.
+	w := do("https://x.fynd.com")
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("allowed preflight = %d, want 204", w.Code)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://x.fynd.com" {
+		t.Errorf("allowed preflight origin = %q", got)
 	}
 }
 

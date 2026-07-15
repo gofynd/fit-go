@@ -31,6 +31,11 @@ type CORSOptions struct {
 	// SkipHeader, when non-empty and present on the request with value "true", bypasses
 	// CORS for that request (legacy Sentinel's X-Skip-Cors).
 	SkipHeader string
+	// PassThroughDisallowedPreflight lets an OPTIONS request with an absent or
+	// disallowed Origin continue to the configured route/no-route handler. The
+	// zero value preserves fit-go's existing behavior of terminating every
+	// preflight with 204. Allowed preflights always terminate with 204.
+	PassThroughDisallowedPreflight bool
 }
 
 // CORS returns a gin middleware implementing dynamic, credentialed CORS. An allowed
@@ -66,6 +71,9 @@ func DynamicCORS(opts CORSOptions) gin.HandlerFunc {
 				c.Header("Access-Control-Allow-Headers", opts.AllowHeaders)
 				c.Header("Access-Control-Allow-Methods", methods)
 				c.Header("Access-Control-Max-Age", maxAgeStr)
+			} else if opts.PassThroughDisallowedPreflight {
+				c.Next()
+				return
 			}
 			c.AbortWithStatus(http.StatusNoContent)
 			return
