@@ -1051,7 +1051,7 @@ func (cc *ConfluentConsumer) processMessageGroup(
 				return nil
 			}
 			cc.logMessageFailure("kafka/confluent: message handler error", message, err)
-			continue
+			return fmt.Errorf("kafka/confluent: message handler failed: %w", err)
 		}
 
 		if err := cc.resolveMessageOffset(consumer, message, isAutoCommit, opts.CommitBeforeHandler); err != nil {

@@ -879,3 +879,54 @@ func TestConfluentConsumerSurfacesPostHandlerCommitFailures(t *testing.T) {
 		})
 	}
 }
+
+func TestConfluentConsumerStopsPartitionAfterHandlerFailure(t *testing.T) {
+	handlerErr := errors.New("handler rejected message")
+	tests := []struct {
+		name       string
+		autoCommit bool
+	}{
+		{name: "manual commit"},
+		{name: "automatic offset store", autoCommit: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			topic := "orders"
+			messages := []*ckafka.Message{
+				{TopicPartition: ckafka.TopicPartition{Topic: &topic, Partition: 2, Offset: 7}},
+				{TopicPartition: ckafka.TopicPartition{Topic: &topic, Partition: 2, Offset: 8}},
+			}
+			groups := groupConfluentBatchMessages(messages)
+			if len(groups) != 1 {
+				t.Fatalf("partition groups = %d, want 1", len(groups))
+			}
+
+			driver := &fakeConfluentConsumerDriver{}
+			consumer := newTestConfluentConsumer(test.autoCommit, driver)
+			handledOffsets := make([]int64, 0, 1)
+			err := consumer.processMessageGroup(
+				context.Background(),
+				driver,
+				groups[0],
+				func(_ context.Context, payload MessagePayload) error {
+					handledOffsets = append(handledOffsets, payload.Offset)
+					return handlerErr
+				},
+				test.autoCommit,
+				ConsumerOptions{},
+			)
+
+			if !errors.Is(err, handlerErr) {
+				t.Fatalf("processMessageGroup error = %v, want handler error", err)
+			}
+			if len(handledOffsets) != 1 || handledOffsets[0] != 7 {
+				t.Fatalf("handled offsets = %v, want only failed offset 7", handledOffsets)
+			}
+			commits, stores, _ := driver.operationCalls()
+			if commits != 0 || stores != 0 {
+				t.Fatalf("offset operations after handler failure = commits %d stores %d, want 0/0", commits, stores)
+			}
+		})
+	}
+}
