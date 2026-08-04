@@ -142,6 +142,9 @@ func (cc *ConfluentClient) Producer(config ProducerConfig) (KafkaProducer, error
 	if config.Timeout > 0 {
 		_ = pCfg.SetKey("request.timeout.ms", int(config.Timeout.Milliseconds()))
 	}
+	if config.DeliveryTimeout > 0 {
+		_ = pCfg.SetKey("message.timeout.ms", int(config.DeliveryTimeout.Milliseconds()))
+	}
 
 	if config.MaxRetries > 0 {
 		_ = pCfg.SetKey("message.send.max.retries", config.MaxRetries)

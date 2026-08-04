@@ -938,9 +938,10 @@ func TestProducerConfigOverrides(t *testing.T) {
 
 	t.Run("producer with timeout and retry settings", func(t *testing.T) {
 		producer, err := client.Producer(ProducerConfig{
-			Timeout:      15 * time.Second,
-			MaxRetries:   5,
-			RetryBackoff: 500 * time.Millisecond,
+			Timeout:         15 * time.Second,
+			DeliveryTimeout: 8 * time.Second,
+			MaxRetries:      5,
+			RetryBackoff:    500 * time.Millisecond,
 		})
 		if err != nil {
 			t.Fatalf("Producer() error = %v", err)
@@ -950,6 +951,10 @@ func TestProducerConfigOverrides(t *testing.T) {
 		timeout, _ := cp.configMap.Get("request.timeout.ms", 0)
 		if timeout != 15000 {
 			t.Errorf("request.timeout.ms = %v, want 15000", timeout)
+		}
+		deliveryTimeout, _ := cp.configMap.Get("message.timeout.ms", 0)
+		if deliveryTimeout != 8000 {
+			t.Errorf("message.timeout.ms = %v, want 8000", deliveryTimeout)
 		}
 
 		retries, _ := cp.configMap.Get("message.send.max.retries", 0)

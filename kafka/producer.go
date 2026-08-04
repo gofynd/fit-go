@@ -136,6 +136,14 @@ type ProducerConfig struct {
 	// Timeout is the maximum time to wait for a produce request.
 	Timeout time.Duration
 
+	// DeliveryTimeout caps the complete lifetime of an accepted message,
+	// including broker discovery, reconnects and retries. This maps to
+	// librdkafka's message.timeout.ms and is intentionally separate from
+	// Timeout/request.timeout.ms: KafkaJS bounds individual socket requests and
+	// its retry loop independently, while librdkafka otherwise retains an
+	// accepted message for its much longer driver default.
+	DeliveryTimeout time.Duration
+
 	// Compression overrides the client-level compression setting.
 	// Zero value inherits from the Client.
 	Compression CompressionType
