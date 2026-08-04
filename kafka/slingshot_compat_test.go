@@ -119,6 +119,45 @@ func TestKafkaJSLegacyPartitionerKnownSevenPartitionFixture(t *testing.T) {
 	require.Equal(t, 6, metadata[0].Partition, "must match KafkaJS 2.2.4 on a seven-partition topic")
 }
 
+func TestKafkaJSLegacyPartitionerKeylessRoundRobinOnBroker(t *testing.T) {
+	cluster, err := ckafka.NewMockCluster(1)
+	require.NoError(t, err)
+	t.Cleanup(cluster.Close)
+	require.NoError(t, cluster.CreateTopic("keyless-events", 3, 1))
+
+	client, err := NewConfluentClient(&Config{
+		Brokers:  []string{cluster.BootstrapServers()},
+		ClientID: "kafkajs-keyless-partitioner-fixture",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+
+	producerAPI, err := client.Producer(ProducerConfig{
+		Acks:        -1,
+		AcksSet:     true,
+		Partitioner: ProducerPartitionerKafkaJSLegacy,
+	})
+	require.NoError(t, err)
+	producer := producerAPI.(*ConfluentProducer)
+	producer.partitionSeed = func() (uint32, error) { return 0, nil }
+	require.NoError(t, producer.Connect())
+	t.Cleanup(func() { require.NoError(t, producer.Close()) })
+
+	metadata, err := producer.ProduceWithMetadata("keyless-events", []Message{
+		{Value: []byte("first"), Partition: -1},
+		{Value: []byte("second"), Partition: -1},
+		{Value: []byte("third"), Partition: -1},
+	}, -1)
+	require.NoError(t, err)
+	require.Len(t, metadata, 3)
+	partitions := make(map[int]struct{}, len(metadata))
+	for _, item := range metadata {
+		partitions[item.Partition] = struct{}{}
+	}
+	require.Equal(t, map[int]struct{}{0: {}, 1: {}, 2: {}}, partitions,
+		"seed zero must cycle through every available partition exactly once")
+}
+
 func TestProducerTraceHeaderPreservePolicyKeepsSpansAndExactHeaders(t *testing.T) {
 	tracer, exporter := enabledKafkaTracer(t)
 	ctx, parent := tracer.StartSpan(context.Background(), "slingshot-save", tracing.SpanKindInternal)

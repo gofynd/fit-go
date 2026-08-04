@@ -316,6 +316,19 @@ func TestConfluentProducer_MessageMapping(t *testing.T) {
 		}
 	})
 
+	t.Run("message with an empty but present key", func(t *testing.T) {
+		msg := Message{
+			Key:   []byte{},
+			Value: []byte("payload"),
+		}
+
+		km := buildConfluentMessage("events", msg)
+
+		if km.Key == nil || len(km.Key) != 0 {
+			t.Fatalf("Key = %#v, want a present empty key", km.Key)
+		}
+	})
+
 	t.Run("message with no headers", func(t *testing.T) {
 		msg := Message{
 			Value: []byte("payload"),

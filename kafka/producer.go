@@ -27,9 +27,8 @@ const (
 	// partitioner.
 	ProducerPartitionerDefault ProducerPartitioner = ""
 	// ProducerPartitionerKafkaJSLegacy selects librdkafka's Java-compatible
-	// murmur2_random partitioner. For keyed records this matches KafkaJS 2.2.4's
-	// legacy/default murmur2 selection. Keyless KafkaJS round-robin behavior is
-	// intentionally outside this option's compatibility guarantee.
+	// murmur2 partitioning for keyed records and KafkaJS 2.2.4's per-topic,
+	// randomly seeded round-robin selection for keyless records.
 	ProducerPartitionerKafkaJSLegacy ProducerPartitioner = "kafkajs-legacy"
 )
 

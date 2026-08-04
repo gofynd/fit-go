@@ -38,6 +38,19 @@ type fakeConfluentProducerDriver struct {
 	closeCalled chan struct{}
 }
 
+type fakeMetadataConfluentProducerDriver struct {
+	*fakeConfluentProducerDriver
+	metadataFn func(*string, bool, int) (*ckafka.Metadata, error)
+}
+
+func (f *fakeMetadataConfluentProducerDriver) GetMetadata(
+	topic *string,
+	allTopics bool,
+	timeoutMs int,
+) (*ckafka.Metadata, error) {
+	return f.metadataFn(topic, allTopics, timeoutMs)
+}
+
 func (f *fakeConfluentProducerDriver) Produce(message *ckafka.Message, deliveryChan chan ckafka.Event) error {
 	if f.produceFn == nil {
 		deliveryChan <- successfulDelivery(message, 0)
@@ -101,6 +114,80 @@ func successfulDelivery(message *ckafka.Message, offset int64) *ckafka.Message {
 		Partition: partition,
 		Offset:    ckafka.Offset(offset),
 	}}
+}
+
+func TestConfluentProducerKafkaJSLegacyKeylessRoundRobin(t *testing.T) {
+	base := &fakeConfluentProducerDriver{}
+	var producedPartitions []int32
+	base.produceFn = func(message *ckafka.Message, reports chan ckafka.Event) error {
+		producedPartitions = append(producedPartitions, message.TopicPartition.Partition)
+		reports <- successfulDelivery(message, int64(len(producedPartitions)))
+		return nil
+	}
+	driver := &fakeMetadataConfluentProducerDriver{
+		fakeConfluentProducerDriver: base,
+		metadataFn: func(topic *string, allTopics bool, timeoutMs int) (*ckafka.Metadata, error) {
+			if topic == nil || *topic != "events" {
+				t.Fatalf("metadata topic = %v, want events", topic)
+			}
+			if allTopics {
+				t.Fatal("allTopics = true, want false")
+			}
+			if timeoutMs != int(defaultProducerMetadataTimeout.Milliseconds()) {
+				t.Fatalf("metadata timeout = %d, want %d", timeoutMs, defaultProducerMetadataTimeout.Milliseconds())
+			}
+			return &ckafka.Metadata{Topics: map[string]ckafka.TopicMetadata{
+				"events": {
+					Topic: "events",
+					Partitions: []ckafka.PartitionMetadata{
+						{ID: 0, Leader: -1},
+						{ID: 1, Leader: 10},
+						{ID: 2, Leader: 11},
+					},
+				},
+			}}, nil
+		},
+	}
+	producer := newTestConfluentProducer(driver)
+	producer.partitioner = ProducerPartitionerKafkaJSLegacy
+	producer.partitionSeed = func() (uint32, error) { return 0, nil }
+
+	err := producer.Produce("events", []Message{
+		{Value: []byte("first"), Partition: -1},
+		{Value: []byte("second"), Partition: -1},
+		{Value: []byte("third"), Partition: -1},
+	}, -1)
+	if err != nil {
+		t.Fatalf("Produce() error = %v", err)
+	}
+	want := []int32{2, 1, 2}
+	if fmt.Sprint(producedPartitions) != fmt.Sprint(want) {
+		t.Fatalf("partitions = %v, want KafkaJS available-partition round robin %v", producedPartitions, want)
+	}
+}
+
+func TestConfluentProducerKafkaJSLegacyNoLeaderFallback(t *testing.T) {
+	producer := &ConfluentProducer{
+		partitionCounters: map[string]uint32{},
+		partitionSeed:     func() (uint32, error) { return 0x7fffffff, nil },
+	}
+	metadata := []ckafka.PartitionMetadata{
+		{ID: 7, Leader: -1},
+		{ID: 9, Leader: -1},
+		{ID: 12, Leader: -1},
+	}
+
+	first, err := producer.nextKafkaJSKeylessPartition("events", metadata)
+	if err != nil {
+		t.Fatalf("first partition error = %v", err)
+	}
+	second, err := producer.nextKafkaJSKeylessPartition("events", metadata)
+	if err != nil {
+		t.Fatalf("second partition error = %v", err)
+	}
+	if first != 0 || second != 1 {
+		t.Fatalf("fallback partitions = [%d %d], want KafkaJS array indexes [0 1]", first, second)
+	}
 }
 
 func TestConfluentProducerDrainsAcceptedReportsAfterDeliveryFailure(t *testing.T) {
