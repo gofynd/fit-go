@@ -188,6 +188,18 @@ func DefaultDialFunc() DialFunc {
 		if opts.MaxRetries > 0 {
 			redisOpts.MaxRetries = opts.MaxRetries
 		}
+		if opts.MinRetryBackoff > 0 {
+			redisOpts.MinRetryBackoff = opts.MinRetryBackoff
+		}
+		if opts.MaxRetryBackoff > 0 {
+			redisOpts.MaxRetryBackoff = opts.MaxRetryBackoff
+		}
+		if opts.DialerRetries > 0 {
+			redisOpts.DialerRetries = opts.DialerRetries
+		}
+		if opts.DialerRetryTimeout > 0 {
+			redisOpts.DialerRetryTimeout = opts.DialerRetryTimeout
+		}
 		if opts.PoolSize > 0 {
 			redisOpts.PoolSize = opts.PoolSize
 		}
@@ -310,6 +322,21 @@ func DefaultClusterDialFunc() ClusterDialFunc {
 		if opts.KeepAlive > 0 {
 			clusterOpts.ConnMaxIdleTime = opts.KeepAlive
 		}
+		if opts.MaxRetries > 0 {
+			clusterOpts.MaxRetries = opts.MaxRetries
+		}
+		if opts.MinRetryBackoff > 0 {
+			clusterOpts.MinRetryBackoff = opts.MinRetryBackoff
+		}
+		if opts.MaxRetryBackoff > 0 {
+			clusterOpts.MaxRetryBackoff = opts.MaxRetryBackoff
+		}
+		if opts.DialerRetries > 0 {
+			clusterOpts.DialerRetries = opts.DialerRetries
+		}
+		if opts.DialerRetryTimeout > 0 {
+			clusterOpts.DialerRetryTimeout = opts.DialerRetryTimeout
+		}
 		if opts.SlotsRefreshInterval > 0 {
 			// go-redis does not expose a direct slot refresh interval on
 			// ClusterOptions. The RouteRandomly and RouteByLatency options
@@ -392,6 +419,21 @@ func DefaultSentinelDialFunc() SentinelDialFunc {
 		}
 		if opts.KeepAlive > 0 {
 			failoverOpts.ConnMaxIdleTime = opts.KeepAlive
+		}
+		if opts.MaxRetries > 0 {
+			failoverOpts.MaxRetries = opts.MaxRetries
+		}
+		if opts.MinRetryBackoff > 0 {
+			failoverOpts.MinRetryBackoff = opts.MinRetryBackoff
+		}
+		if opts.MaxRetryBackoff > 0 {
+			failoverOpts.MaxRetryBackoff = opts.MaxRetryBackoff
+		}
+		if opts.DialerRetries > 0 {
+			failoverOpts.DialerRetries = opts.DialerRetries
+		}
+		if opts.DialerRetryTimeout > 0 {
+			failoverOpts.DialerRetryTimeout = opts.DialerRetryTimeout
 		}
 		if opts.PoolSize > 0 {
 			failoverOpts.PoolSize = opts.PoolSize

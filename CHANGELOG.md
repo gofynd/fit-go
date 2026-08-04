@@ -11,6 +11,12 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Opt-in Redis retry controls**: per-service/read-write environment settings
+  now expose go-redis command retry count/backoff separately from dial retry
+  count/backoff for standalone, cluster, and Sentinel clients. Existing callers
+  retain go-redis defaults. These controls deliberately do not claim ioredis
+  offline-queue parity: go-redis retries each command independently with
+  jittered exponential backoff and returns `redis.ErrClosed` on close.
 - **Deploy-time trace identity without mandatory new envs**: trace resources now
   infer `service.version`, `vcs.ref.head.revision`, and
   `deployment.environment.name` from existing release/Git/deployment variables

@@ -39,6 +39,16 @@
 //	REDIS_{SERVICE}_{TYPE}_CONNECTION_TIMEOUT - connect timeout in ms
 //	REDIS_{SERVICE}_{TYPE}_SOCKET_TIMEOUT - socket timeout in ms
 //	REDIS_{SERVICE}_{TYPE}_KEEP_ALIVE - keep-alive interval in ms
+//	REDIS_{SERVICE}_{TYPE}_COMMAND_MAX_RETRIES - go-redis command retry count
+//	REDIS_{SERVICE}_{TYPE}_COMMAND_MIN_RETRY_BACKOFF - minimum command retry backoff in ms
+//	REDIS_{SERVICE}_{TYPE}_COMMAND_MAX_RETRY_BACKOFF - maximum command retry backoff in ms
+//	REDIS_{SERVICE}_{TYPE}_DIALER_RETRIES - connect attempts within one command attempt
+//	REDIS_{SERVICE}_{TYPE}_DIALER_RETRY_TIMEOUT - fixed connect-attempt delay in ms
+//
+// Command retries are go-redis per-command retries with jittered exponential
+// backoff. They are not an ioredis-compatible offline queue: commands are not
+// accepted into a shared FIFO while disconnected, retry schedules are owned by
+// individual callers, and Close does not drain queued commands.
 //
 // # SSL/TLS configuration
 //
@@ -141,6 +151,22 @@ type DialOptions struct {
 	// MaxRetries is the max number of retries per command.
 	MaxRetries int
 
+	// MinRetryBackoff is go-redis's minimum jittered exponential command retry
+	// backoff. A zero value leaves the go-redis default unchanged.
+	MinRetryBackoff time.Duration
+
+	// MaxRetryBackoff is go-redis's maximum jittered exponential command retry
+	// backoff. A zero value leaves the go-redis default unchanged.
+	MaxRetryBackoff time.Duration
+
+	// DialerRetries is the number of connection attempts made while acquiring a
+	// connection for one command attempt. It is distinct from MaxRetries.
+	DialerRetries int
+
+	// DialerRetryTimeout is the fixed delay between connection attempts within
+	// one command attempt.
+	DialerRetryTimeout time.Duration
+
 	// PoolSize is the max number of connections in the pool.
 	PoolSize int
 
@@ -176,6 +202,21 @@ type ClusterDialOptions struct {
 
 	// KeepAlive is the TCP keep-alive interval.
 	KeepAlive time.Duration
+
+	// MaxRetries is the max number of go-redis command/redirect retries.
+	MaxRetries int
+
+	// MinRetryBackoff is the minimum jittered exponential retry backoff.
+	MinRetryBackoff time.Duration
+
+	// MaxRetryBackoff is the maximum jittered exponential retry backoff.
+	MaxRetryBackoff time.Duration
+
+	// DialerRetries is the number of connection attempts within one retry.
+	DialerRetries int
+
+	// DialerRetryTimeout is the fixed delay between connection attempts.
+	DialerRetryTimeout time.Duration
 
 	// SlotsRefreshInterval is the interval for refreshing cluster slots.
 	// Defaults to 5 seconds.
@@ -231,6 +272,21 @@ type SentinelDialOptions struct {
 
 	// KeepAlive is the TCP keep-alive interval.
 	KeepAlive time.Duration
+
+	// MaxRetries is the max number of go-redis command retries.
+	MaxRetries int
+
+	// MinRetryBackoff is the minimum jittered exponential command retry backoff.
+	MinRetryBackoff time.Duration
+
+	// MaxRetryBackoff is the maximum jittered exponential command retry backoff.
+	MaxRetryBackoff time.Duration
+
+	// DialerRetries is the number of connection attempts within one command retry.
+	DialerRetries int
+
+	// DialerRetryTimeout is the fixed delay between connection attempts.
+	DialerRetryTimeout time.Duration
 
 	// ReadOnly routes reads to replicas via READONLY command.
 	ReadOnly bool
@@ -617,9 +673,14 @@ type connJobEntry struct {
 
 // envPoolOpts holds pool settings read from environment variables.
 type envPoolOpts struct {
-	ConnectTimeout time.Duration
-	SocketTimeout  time.Duration
-	KeepAlive      time.Duration
+	ConnectTimeout     time.Duration
+	SocketTimeout      time.Duration
+	KeepAlive          time.Duration
+	MaxRetries         int
+	MinRetryBackoff    time.Duration
+	MaxRetryBackoff    time.Duration
+	DialerRetries      int
+	DialerRetryTimeout time.Duration
 }
 
 // dialFromURI parses the connection string and routes to the appropriate dial
@@ -656,17 +717,22 @@ func dialFromURI(
 		}
 
 		sentOpts := &SentinelDialOptions{
-			MasterName:     masterName,
-			SentinelAddrs:  make([]string, 0, len(parsed.Hosts)),
-			Password:       parsed.Password,
-			Username:       parsed.Username,
-			ClientName:     clientName,
-			TLSConfig:      tlsCfg,
-			ConnectTimeout: connectTimeout,
-			SocketTimeout:  envOpts.SocketTimeout,
-			KeepAlive:      envOpts.KeepAlive,
-			DB:             parsed.DB,
-			ReadOnly:       isReadOnly,
+			MasterName:         masterName,
+			SentinelAddrs:      make([]string, 0, len(parsed.Hosts)),
+			Password:           parsed.Password,
+			Username:           parsed.Username,
+			ClientName:         clientName,
+			TLSConfig:          tlsCfg,
+			ConnectTimeout:     connectTimeout,
+			SocketTimeout:      envOpts.SocketTimeout,
+			KeepAlive:          envOpts.KeepAlive,
+			MaxRetries:         envOpts.MaxRetries,
+			MinRetryBackoff:    envOpts.MinRetryBackoff,
+			MaxRetryBackoff:    envOpts.MaxRetryBackoff,
+			DialerRetries:      envOpts.DialerRetries,
+			DialerRetryTimeout: envOpts.DialerRetryTimeout,
+			DB:                 parsed.DB,
+			ReadOnly:           isReadOnly,
 		}
 
 		for _, h := range parsed.Hosts {
@@ -708,6 +774,11 @@ func dialFromURI(
 			ConnectTimeout:       connectTimeout,
 			SocketTimeout:        envOpts.SocketTimeout,
 			KeepAlive:            envOpts.KeepAlive,
+			MaxRetries:           envOpts.MaxRetries,
+			MinRetryBackoff:      envOpts.MinRetryBackoff,
+			MaxRetryBackoff:      envOpts.MaxRetryBackoff,
+			DialerRetries:        envOpts.DialerRetries,
+			DialerRetryTimeout:   envOpts.DialerRetryTimeout,
 			SlotsRefreshInterval: 5 * time.Second,
 			ReadOnly:             isReadOnly,
 		}
@@ -726,16 +797,21 @@ func dialFromURI(
 	}
 
 	dialOpts := &DialOptions{
-		Addr:           addr,
-		Password:       parsed.Password,
-		Username:       parsed.Username,
-		DB:             parsed.DB,
-		ClientName:     clientName,
-		TLSConfig:      tlsCfg,
-		ConnectTimeout: connectTimeout,
-		SocketTimeout:  envOpts.SocketTimeout,
-		KeepAlive:      envOpts.KeepAlive,
-		ReadOnly:       isReadOnly,
+		Addr:               addr,
+		Password:           parsed.Password,
+		Username:           parsed.Username,
+		DB:                 parsed.DB,
+		ClientName:         clientName,
+		TLSConfig:          tlsCfg,
+		ConnectTimeout:     connectTimeout,
+		SocketTimeout:      envOpts.SocketTimeout,
+		KeepAlive:          envOpts.KeepAlive,
+		MaxRetries:         envOpts.MaxRetries,
+		MinRetryBackoff:    envOpts.MinRetryBackoff,
+		MaxRetryBackoff:    envOpts.MaxRetryBackoff,
+		DialerRetries:      envOpts.DialerRetries,
+		DialerRetryTimeout: envOpts.DialerRetryTimeout,
+		ReadOnly:           isReadOnly,
 	}
 
 	return opts.Dial(ctx, dialOpts)
@@ -768,6 +844,31 @@ func getRedisEnvOptions(serviceNameUpper, connType string) envPoolOpts {
 	if v := os.Getenv(prefix + "KEEP_ALIVE"); v != "" {
 		if ms, err := strconv.Atoi(v); err == nil {
 			opts.KeepAlive = time.Duration(ms) * time.Millisecond
+		}
+	}
+	if v := os.Getenv(prefix + "COMMAND_MAX_RETRIES"); v != "" {
+		if retries, err := strconv.Atoi(v); err == nil && retries > 0 {
+			opts.MaxRetries = retries
+		}
+	}
+	if v := os.Getenv(prefix + "COMMAND_MIN_RETRY_BACKOFF"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			opts.MinRetryBackoff = time.Duration(ms) * time.Millisecond
+		}
+	}
+	if v := os.Getenv(prefix + "COMMAND_MAX_RETRY_BACKOFF"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			opts.MaxRetryBackoff = time.Duration(ms) * time.Millisecond
+		}
+	}
+	if v := os.Getenv(prefix + "DIALER_RETRIES"); v != "" {
+		if retries, err := strconv.Atoi(v); err == nil && retries > 0 {
+			opts.DialerRetries = retries
+		}
+	}
+	if v := os.Getenv(prefix + "DIALER_RETRY_TIMEOUT"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			opts.DialerRetryTimeout = time.Duration(ms) * time.Millisecond
 		}
 	}
 
