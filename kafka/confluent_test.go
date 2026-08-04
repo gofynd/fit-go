@@ -968,6 +968,22 @@ func TestProducerConfigOverrides(t *testing.T) {
 		}
 	})
 
+	t.Run("producer permits an explicit zero driver retry budget", func(t *testing.T) {
+		producer, err := client.Producer(ProducerConfig{
+			MaxRetries:    0,
+			MaxRetriesSet: true,
+		})
+		if err != nil {
+			t.Fatalf("Producer() error = %v", err)
+		}
+
+		cp := producer.(*ConfluentProducer)
+		retries, _ := cp.configMap.Get("message.send.max.retries", -1)
+		if retries != 0 {
+			t.Errorf("message.send.max.retries = %v, want explicit 0", retries)
+		}
+	})
+
 	t.Run("producer config does not mutate client config", func(t *testing.T) {
 		// Create a producer with overrides.
 		_, err := client.Producer(ProducerConfig{

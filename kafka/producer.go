@@ -150,6 +150,11 @@ type ProducerConfig struct {
 
 	// MaxRetries is the number of times a failed produce request is retried.
 	MaxRetries int
+	// MaxRetriesSet distinguishes an explicit zero-retry transport from the
+	// ProducerConfig zero value, which preserves the driver's default. This is
+	// useful for compatibility adapters that own their retry loop above the
+	// driver and must avoid multiplying two independent retry budgets.
+	MaxRetriesSet bool
 
 	// RetryBackoff is the delay between retries.
 	RetryBackoff time.Duration
