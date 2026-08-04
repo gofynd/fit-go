@@ -331,7 +331,29 @@ type ConnectionOptions struct {
 
 	// Context for connection establishment.
 	Context context.Context
+
+	// IORedisCompatibility selects the exact standalone ioredis connection
+	// lifecycle for named services. Keys are case-insensitive service names as
+	// discovered from REDIS_{SERVICE}_READ_{WRITE|ONLY}. Services not present in
+	// this map continue to use the existing go-redis dialers unchanged.
+	//
+	// The compatibility transport is deliberately fail-closed for Cluster and
+	// Sentinel URIs: their topology and replay behavior require separate proof.
+	IORedisCompatibility map[string]IORedisCompatibilityProfile
 }
+
+// IORedisCompatibilityProfile identifies a source-derived ioredis wire and
+// reconnect profile. It is a string so unsupported values fail with a useful
+// configuration error instead of silently falling back to go-redis.
+type IORedisCompatibilityProfile string
+
+const (
+	// IORedisCompatibilityV4 reproduces the shared standalone behavior of
+	// ioredis 4.x used by legacy FIT.js: eager first-ready initialization,
+	// connection-owned offline FIFO, min(attempt*50ms, 2s) reconnect delay and
+	// maxRetriesPerRequest=20. ioredis 4 does not issue CLIENT SETINFO.
+	IORedisCompatibilityV4 IORedisCompatibilityProfile = "ioredis-v4"
+)
 
 // ---------------------------------------------------------------------------
 // Client
@@ -705,9 +727,13 @@ func dialFromURI(
 	}
 
 	isReadOnly := job.connType == "read"
+	compatibilityProfile, compatibilityEnabled := ioredisCompatibilityProfile(opts, job.serviceName)
 
 	// Route: Sentinel
 	if parsed.Scheme == "redis-sentinel" {
+		if compatibilityEnabled {
+			return nil, fmt.Errorf("redis: %s compatibility for %s_%s does not support Sentinel", compatibilityProfile, job.serviceName, job.connType)
+		}
 		if opts.SentinelDial == nil {
 			return nil, fmt.Errorf("redis: sentinel connection required for %s_%s but SentinelDial not provided", job.serviceName, job.connType)
 		}
@@ -761,6 +787,9 @@ func dialFromURI(
 	// Route: Cluster (multiple hosts or sharded_db=true).
 	isCluster := len(parsed.Hosts) > 1 || parsed.Options["sharded_db"] == "true"
 	if isCluster {
+		if compatibilityEnabled {
+			return nil, fmt.Errorf("redis: %s compatibility for %s_%s does not support Cluster", compatibilityProfile, job.serviceName, job.connType)
+		}
 		if opts.ClusterDial == nil {
 			return nil, fmt.Errorf("redis: cluster connection required for %s_%s but ClusterDial not provided", job.serviceName, job.connType)
 		}
@@ -795,6 +824,20 @@ func dialFromURI(
 	if len(parsed.Hosts) > 0 {
 		addr = parsed.Hosts[0].Addr()
 	}
+	if compatibilityEnabled {
+		return dialIORedisCompatibleStandalone(ctx, compatibilityProfile, IORedisRESPOptions{
+			Addr:              addr,
+			Username:          parsed.Username,
+			Password:          parsed.Password,
+			DB:                parsed.DB,
+			ConnectionName:    clientName,
+			TLSConfig:         tlsCfg,
+			ConnectTimeout:    connectTimeout,
+			SocketTimeout:     envOpts.SocketTimeout,
+			KeepAlive:         envOpts.KeepAlive,
+			DisableClientInfo: compatibilityProfile == IORedisCompatibilityV4,
+		})
+	}
 
 	dialOpts := &DialOptions{
 		Addr:               addr,
@@ -815,6 +858,15 @@ func dialFromURI(
 	}
 
 	return opts.Dial(ctx, dialOpts)
+}
+
+func ioredisCompatibilityProfile(opts ConnectionOptions, serviceName string) (IORedisCompatibilityProfile, bool) {
+	for configuredService, profile := range opts.IORedisCompatibility {
+		if strings.EqualFold(strings.TrimSpace(configuredService), serviceName) {
+			return profile, true
+		}
+	}
+	return "", false
 }
 
 // ---------------------------------------------------------------------------
