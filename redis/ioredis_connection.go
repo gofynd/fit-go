@@ -34,7 +34,8 @@ type IORedisReply = SlingshotIORedisReply
 type IORedisRESPOptions = SlingshotIORedisRESPOptions
 
 type ioredisConnection struct {
-	client *IORedisCompatClient
+	client  *IORedisCompatClient
+	cluster bool
 }
 
 func dialIORedisCompatibleStandalone(
@@ -86,4 +87,4 @@ func (c *ioredisConnection) Raw() interface{} {
 	return c.client
 }
 
-func (c *ioredisConnection) IsCluster() bool { return false }
+func (c *ioredisConnection) IsCluster() bool { return c != nil && c.cluster }

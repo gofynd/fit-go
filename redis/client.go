@@ -337,8 +337,9 @@ type ConnectionOptions struct {
 	// discovered from REDIS_{SERVICE}_READ_{WRITE|ONLY}. Services not present in
 	// this map continue to use the existing go-redis dialers unchanged.
 	//
-	// The compatibility transport is deliberately fail-closed for Cluster and
-	// Sentinel URIs: their topology and replay behavior require separate proof.
+	// The compatibility transport owns its standalone, Sentinel, or Cluster
+	// topology instead of falling back to go-redis. This keeps the accepted
+	// command FIFO and reconnect budget connection-scoped like ioredis 4.x.
 	IORedisCompatibility map[string]IORedisCompatibilityProfile
 }
 
@@ -732,7 +733,39 @@ func dialFromURI(
 	// Route: Sentinel
 	if parsed.Scheme == "redis-sentinel" {
 		if compatibilityEnabled {
-			return nil, fmt.Errorf("redis: %s compatibility for %s_%s does not support Sentinel", compatibilityProfile, job.serviceName, job.connType)
+			masterName := parsed.Options["master"]
+			if masterName == "" {
+				return nil, fmt.Errorf("redis: master name missing for sentinel connection %s_%s", job.serviceName, job.connType)
+			}
+			if isReadOnly {
+				return nil, fmt.Errorf("redis: %s compatibility for %s_%s does not support Sentinel read replicas", compatibilityProfile, job.serviceName, job.connType)
+			}
+			sentinelAddrs := make([]string, 0, len(parsed.Hosts))
+			for _, host := range parsed.Hosts {
+				sentinelAddrs = append(sentinelAddrs, host.Addr())
+			}
+			sentinelUsername := parsed.Username
+			if value, ok := parsed.Options["sentinelusername"]; ok {
+				sentinelUsername = value
+			}
+			sentinelPassword := parsed.Password
+			if value, ok := parsed.Options["sentinelpassword"]; ok {
+				sentinelPassword = value
+			}
+			return dialIORedisCompatibleSentinel(ctx, compatibilityProfile, ioredisSentinelOptions{
+				SentinelAddrs:    sentinelAddrs,
+				MasterName:       masterName,
+				Username:         parsed.Username,
+				Password:         parsed.Password,
+				SentinelUsername: sentinelUsername,
+				SentinelPassword: sentinelPassword,
+				DB:               parsed.DB,
+				ConnectionName:   clientName,
+				TLSConfig:        tlsCfg,
+				ConnectTimeout:   connectTimeout,
+				SocketTimeout:    envOpts.SocketTimeout,
+				KeepAlive:        envOpts.KeepAlive,
+			})
 		}
 		if opts.SentinelDial == nil {
 			return nil, fmt.Errorf("redis: sentinel connection required for %s_%s but SentinelDial not provided", job.serviceName, job.connType)
@@ -788,7 +821,24 @@ func dialFromURI(
 	isCluster := len(parsed.Hosts) > 1 || parsed.Options["sharded_db"] == "true"
 	if isCluster {
 		if compatibilityEnabled {
-			return nil, fmt.Errorf("redis: %s compatibility for %s_%s does not support Cluster", compatibilityProfile, job.serviceName, job.connType)
+			if isReadOnly {
+				return nil, fmt.Errorf("redis: %s compatibility for %s_%s does not support Cluster replica reads", compatibilityProfile, job.serviceName, job.connType)
+			}
+			clusterAddrs := make([]string, 0, len(parsed.Hosts))
+			for _, host := range parsed.Hosts {
+				clusterAddrs = append(clusterAddrs, host.Addr())
+			}
+			return dialIORedisCompatibleCluster(ctx, compatibilityProfile, ioredisClusterOptions{
+				SeedAddrs:      clusterAddrs,
+				Username:       parsed.Username,
+				Password:       parsed.Password,
+				DB:             parsed.DB,
+				ConnectionName: clientName,
+				TLSConfig:      tlsCfg,
+				ConnectTimeout: connectTimeout,
+				SocketTimeout:  envOpts.SocketTimeout,
+				KeepAlive:      envOpts.KeepAlive,
+			})
 		}
 		if opts.ClusterDial == nil {
 			return nil, fmt.Errorf("redis: cluster connection required for %s_%s but ClusterDial not provided", job.serviceName, job.connType)
