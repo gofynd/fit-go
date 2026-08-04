@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -122,6 +123,17 @@ type SlingshotIORedisTransport interface {
 	// contract violation and causes the state machine to discard the transport.
 	Closed() <-chan struct{}
 	Close() error
+}
+
+// slingshotIORedisDuplexTransport is deliberately private: only the owned
+// RESP transport may opt into the ioredis write-ahead path. Third-party
+// transports continue to use the serial Exchange contract unless fit-go can
+// prove their independent write/read boundaries.
+type slingshotIORedisDuplexTransport interface {
+	SlingshotIORedisTransport
+	writeCommands(context.Context, [][]string) SlingshotIORedisExchange
+	readReply(context.Context) (SlingshotIORedisReply, error)
+	finishReplyWait()
 }
 
 // SlingshotIORedisTransportFactory creates a fully ready transport. It is
@@ -299,7 +311,13 @@ func (c *SlingshotIORedisCompatClient) SubmitPipeline(commands ...[]string) *Sli
 }
 
 func cloneSlingshotIORedisCommand(command []string) []string {
-	return append([]string(nil), command...)
+	cloned := append([]string(nil), command...)
+	if len(cloned) > 0 {
+		// ioredis Command normalizes only the command name. Arguments retain
+		// their original bytes (notably CLIENT's SETINFO/LIB-NAME tokens).
+		cloned[0] = strings.ToLower(cloned[0])
+	}
+	return cloned
 }
 
 func (c *SlingshotIORedisCompatClient) submit(commands [][]string, pipeline, quit bool) *SlingshotIORedisFuture {
@@ -340,7 +358,7 @@ func (c *SlingshotIORedisCompatClient) Quit(ctx context.Context) error {
 		return nil
 	}
 	request := &slingshotIORedisRequest{
-		commands: [][]string{{"QUIT"}},
+		commands: [][]string{{"quit"}},
 		quit:     true,
 		future:   newSlingshotIORedisFutureState(),
 	}
@@ -460,6 +478,19 @@ func (c *SlingshotIORedisCompatClient) run() {
 			c.mu.Unlock()
 		}
 
+		if duplex, ok := transport.(slingshotIORedisDuplexTransport); ok {
+			stop, sessionErr := c.runDuplexSession(duplex)
+			_ = transport.Close()
+			transport = nil
+			if stop {
+				return
+			}
+			c.setNotReady()
+			c.connectionFailed(sessionErr)
+			needsRetryDelay = true
+			continue
+		}
+
 		request := c.peek()
 		if request == nil {
 			select {
@@ -514,6 +545,204 @@ func (c *SlingshotIORedisCompatClient) run() {
 		}
 		c.connectionFailed(exchange.Error)
 		needsRetryDelay = true
+	}
+}
+
+type slingshotIORedisDuplexWriteResult struct {
+	request  *slingshotIORedisRequest
+	exchange SlingshotIORedisExchange
+}
+
+type slingshotIORedisDuplexReadResult struct {
+	reply SlingshotIORedisReply
+	err   error
+}
+
+type slingshotIORedisInFlight struct {
+	request *slingshotIORedisRequest
+	replies []SlingshotIORedisReply
+}
+
+// runDuplexSession mirrors ioredis's connection-owned command queue: writes
+// remain ordered but do not wait for earlier replies. The in-flight ledger is
+// reconciled only after the read/write failure boundary is known, so every
+// fully or partially written request without a reply is replayed after a lost
+// connection. This is what exposes duplicate execution for more than one
+// direct command on the same socket.
+func (c *SlingshotIORedisCompatClient) runDuplexSession(transport slingshotIORedisDuplexTransport) (bool, error) {
+	writeRequests := make(chan *slingshotIORedisRequest)
+	writeResults := make(chan slingshotIORedisDuplexWriteResult, 1)
+	readRequests := make(chan struct{})
+	readResults := make(chan slingshotIORedisDuplexReadResult, 1)
+	sessionCtx, cancel := context.WithCancel(c.ctx)
+	defer cancel()
+
+	go func() {
+		for {
+			select {
+			case request := <-writeRequests:
+				exchange := transport.writeCommands(sessionCtx, request.commands)
+				writeResults <- slingshotIORedisDuplexWriteResult{request: request, exchange: exchange}
+			case <-sessionCtx.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-readRequests:
+				reply, err := transport.readReply(sessionCtx)
+				readResults <- slingshotIORedisDuplexReadResult{reply: reply, err: err}
+			case <-sessionCtx.Done():
+				return
+			}
+		}
+	}()
+
+	scheduled := make(map[*slingshotIORedisRequest]bool)
+	var writing *slingshotIORedisRequest
+	var inFlight []*slingshotIORedisInFlight
+	reading := false
+
+	for {
+		var nextWrite *slingshotIORedisRequest
+		var writeRequestChannel chan *slingshotIORedisRequest
+		if writing == nil {
+			nextWrite = c.firstUnscheduled(scheduled)
+			if nextWrite != nil {
+				writeRequestChannel = writeRequests
+			}
+		}
+		var readRequestChannel chan struct{}
+		if !reading && slingshotIORedisOutstandingReplies(inFlight) > 0 {
+			readRequestChannel = readRequests
+		}
+
+		select {
+		case writeRequestChannel <- nextWrite:
+			scheduled[nextWrite] = true
+			writing = nextWrite
+		case writeResult := <-writeResults:
+			if writing == writeResult.request {
+				writing = nil
+			}
+			if writeResult.exchange.Error != nil {
+				_ = transport.Close()
+				// A reply for an earlier request can race with the later socket
+				// write failure. Preserve any reply already handed to the session
+				// before classifying the remaining ledger as uncertain.
+				if reading {
+					readResult := <-readResults
+					reading = false
+					if readResult.err == nil {
+						var stop bool
+						inFlight, stop = c.applyDuplexReply(transport, inFlight, scheduled, readResult.reply)
+						if stop {
+							return true, nil
+						}
+					}
+				}
+				c.reconcileDuplexFailure(inFlight, writeResult.request, writeResult.exchange)
+				return false, writeResult.exchange.Error
+			}
+			inFlight = append(inFlight, &slingshotIORedisInFlight{request: writeResult.request})
+		case readRequestChannel <- struct{}{}:
+			reading = true
+		case readResult := <-readResults:
+			reading = false
+			if readResult.err != nil {
+				_ = transport.Close()
+				if writing != nil {
+					writeResult := <-writeResults
+					writing = nil
+					if writeResult.exchange.Error == nil {
+						inFlight = append(inFlight, &slingshotIORedisInFlight{request: writeResult.request})
+					} else {
+						c.reconcileDuplexFailure(inFlight, writeResult.request, writeResult.exchange)
+						return false, readResult.err
+					}
+				}
+				c.reconcileDuplexFailure(inFlight, nil, SlingshotIORedisExchange{})
+				return false, readResult.err
+			}
+			if len(inFlight) == 0 {
+				_ = transport.Close()
+				return false, errors.New("Slingshot ioredis RESP returned a reply without an in-flight command")
+			}
+			var stop bool
+			inFlight, stop = c.applyDuplexReply(transport, inFlight, scheduled, readResult.reply)
+			if stop {
+				return true, nil
+			}
+		case <-c.wake:
+			continue
+		case <-c.ctx.Done():
+			return true, c.ctx.Err()
+		}
+	}
+}
+
+func (c *SlingshotIORedisCompatClient) applyDuplexReply(transport slingshotIORedisDuplexTransport, inFlight []*slingshotIORedisInFlight, scheduled map[*slingshotIORedisRequest]bool, reply SlingshotIORedisReply) ([]*slingshotIORedisInFlight, bool) {
+	entry := inFlight[0]
+	entry.replies = append(entry.replies, reply)
+	if len(entry.replies) != len(entry.request.commands) {
+		return inFlight, false
+	}
+	inFlight = inFlight[1:]
+	delete(scheduled, entry.request)
+	c.pop(entry.request)
+	var commandErr error
+	if !entry.request.pipeline && len(entry.replies) == 1 {
+		commandErr = entry.replies[0].Error
+	}
+	c.complete(entry.request, entry.replies, commandErr)
+	if slingshotIORedisOutstandingReplies(inFlight) == 0 {
+		// socketTimeout applies only while commands await replies. ioredis
+		// leaves an otherwise idle ready connection open indefinitely.
+		transport.finishReplyWait()
+	}
+	return inFlight, entry.request.quit
+}
+
+func slingshotIORedisOutstandingReplies(inFlight []*slingshotIORedisInFlight) int {
+	total := 0
+	for _, entry := range inFlight {
+		total += len(entry.request.commands) - len(entry.replies)
+	}
+	return total
+}
+
+func (c *SlingshotIORedisCompatClient) firstUnscheduled(scheduled map[*slingshotIORedisRequest]bool) *slingshotIORedisRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, request := range c.queue {
+		if !scheduled[request] {
+			return request
+		}
+	}
+	return nil
+}
+
+func (c *SlingshotIORedisCompatClient) reconcileDuplexFailure(inFlight []*slingshotIORedisInFlight, writing *slingshotIORedisRequest, writeExchange SlingshotIORedisExchange) {
+	for _, entry := range inFlight {
+		if entry.request.pipeline && len(entry.replies) > 0 {
+			replies := append([]SlingshotIORedisReply(nil), entry.replies...)
+			for len(replies) < len(entry.request.commands) {
+				replies = append(replies, SlingshotIORedisReply{Error: SlingshotIORedisAbortError{}})
+			}
+			c.pop(entry.request)
+			c.complete(entry.request, replies, nil)
+			continue
+		}
+		entry.request.replays++
+		entry.request.ambiguousReplays++
+	}
+	if writing != nil {
+		writing.replays++
+		if writeExchange.MayHaveExecuted {
+			writing.ambiguousReplays++
+		}
 	}
 }
 

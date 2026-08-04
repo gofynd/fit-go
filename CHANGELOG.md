@@ -19,9 +19,13 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   selected owned standalone RESP2 transport now supplies AUTH/SELECT/client
   metadata/INFO readiness, TLS, socket timeout, RESP parsing, and exact
   not-written/partial-write/full-write-lost-reply evidence without using
-  go-redis. It still has no environment or production wiring. Actual ioredis
-  wire evidence exposed a remaining multi-command in-flight replay difference;
-  full live fault differentials, Cluster, and Sentinel remain fail-closed gates.
+  go-redis. The owned transport has a private asynchronous write/read ledger:
+  multiple direct commands can cross one socket before earlier replies settle,
+  and every fully or partially written request in the uncertain suffix replays
+  after connection loss. Compatibility submissions also preserve ioredis's
+  lowercase command-name wire bytes. It still has no environment or production
+  wiring; full live fault differentials, Cluster, and Sentinel remain
+  fail-closed gates.
 - **Opt-in Redis retry controls**: per-service/read-write environment settings
   now expose go-redis command retry count/backoff separately from dial retry
   count/backoff for standalone, cluster, and Sentinel clients. Existing callers

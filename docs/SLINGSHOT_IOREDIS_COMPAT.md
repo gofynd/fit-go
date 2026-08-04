@@ -23,8 +23,9 @@ The legacy pins used for this implementation are:
   flushes it with `Connection is closed.` and an offline `QUIT` with an empty
   queue resolves locally.
 - ioredis runtime capture (Node 22.22.0 executing the pinned 5.11.1 package) proves
-  the actual startup wire order is `AUTH`, `SELECT`, `CLIENT SETNAME`, `CLIENT
-  SETINFO LIB-NAME`, `CLIENT SETINFO LIB-VER`, `INFO`. The asynchronous package
+  the actual startup wire order is `auth`, `select`, `client setname`, `client
+  SETINFO LIB-NAME`, `client SETINFO LIB-VER`, `info`. Command names are lowercase
+  while command arguments retain their input bytes. The asynchronous package
   metadata lookup makes the two SETINFO commands appear in the opposite order
   from a superficial reading of the promise array in `event_handler.js`.
 
@@ -39,7 +40,10 @@ The compatibility client and explicitly selected owned RESP transport provide:
 - eager, connection-owned reconnect lifecycle;
 - exact retry delays and the connection-global 21st-failure flush boundary;
 - a shared accepted-command FIFO;
-- replay of a direct command or zero-reply pipeline before later queued work;
+- ordered asynchronous writes and reads, allowing multiple direct commands to
+  reach one connection before earlier replies settle;
+- replay of the complete fully/partially-written, zero-reply uncertain set
+  before later offline work;
 - explicit `ReplayCount` and `AmbiguousReplays` when a write may have executed;
 - no replay of a pipeline suffix after one or more replies were received;
 - per-reply server errors for pipelines and rejected direct-command futures;
@@ -48,9 +52,10 @@ The compatibility client and explicitly selected owned RESP transport provide:
   `disconnect()`, and exact legacy error strings.
 - exact RESP command framing and a dedicated reader that detects idle remote
   close without competing with reply parsing;
-- `AUTH` (password and Redis 6 ACL forms), non-zero `SELECT`, `CLIENT SETNAME`,
+- `auth` (password and Redis 6 ACL forms), non-zero `select`, `client setname`,
   ioredis 5.11.1 `CLIENT SETINFO`, and `INFO` loading readiness in the captured
   runtime order;
+- ioredis command-name normalization without mutating command argument bytes;
 - ioredis's tolerated AUTH warning cases, ignored CLIENT metadata errors,
   `INFO NOPERM` readiness exception, and fail-closed FIT startup errors;
 - a 10-second default TCP/TLS connect timeout, optional mutual TLS through a
@@ -65,8 +70,10 @@ The compatibility client and explicitly selected owned RESP transport provide:
 Deterministic tests use real loopback TCP, `net.Pipe`, and a generated test TLS
 certificate for startup command order, AUTH/SELECT/INFO boundaries, INFO loading,
 TLS, socket inactivity and partial-data reset, not-written and partial-write
-faults, full-write/lost-reply, partial pipeline replies, outage recovery, FIFO
-ordering, server errors, idle close, and graceful drain. A controlled factory
+faults, full-write/lost-reply, exact two-direct-command lost-reply replay,
+prior-reply preservation when a later concurrent write fails, partial pipeline
+replies, outage recovery, FIFO ordering, server errors, idle close, and graceful
+drain. A controlled factory
 closes the 21-reconnect exhaustion case without spending the legacy 10.5-second
 delay budget. The delay function itself is pinned for all first 20 values and
 its 2-second cap.
@@ -84,21 +91,16 @@ IOREDIS_MODULE=/path/to/node_modules/ioredis \
   node redis/testdata/slingshot_ioredis_wire_probe.cjs lost-reply
 ```
 
-The script refuses any version other than `5.11.1`. The startup output is a
-positive oracle for the owned transport. The lost-reply output is intentionally
-a red oracle documenting the multi-in-flight blocker below.
+The script refuses any version other than `5.11.1`. Both outputs are positive
+oracles for the owned transport. The deterministic Go lost-reply test pins the
+same connection-indexed startup and `incr first`, `incr second`, reconnect,
+replay sequence and the same integer results, while also asserting one
+ambiguous replay on each Go future.
 
 ## Deliberate fail-closed limits
 
 The following remain registration-blocking for Slingshot:
 
-- **multiple in-flight direct commands**: actual ioredis runtime evidence shows
-  two immediately submitted `INCR` commands are both on the first connection
-  before either reply and both replay after both replies are lost. The current
-  compatibility runner waits for one request's reply before writing the next,
-  so it cannot reproduce duplicate execution of the later in-flight command.
-  Fixing this requires an asynchronous write/read request ledger, not a timing
-  or micro-batching guess;
 - live Node 22.22.0/ioredis 5.11.1 versus Go record/replay for connect loss before
   write, partial write, full write/lost reply, partial pipeline reply, recovery,
   retry exhaustion, quit during outage, and process shutdown;

@@ -203,25 +203,25 @@ func (f *SlingshotIORedisRESPTransportFactory) startup(ctx context.Context, tran
 	selectIndex := -1
 	if options.Username != "" {
 		authIndex = len(commands)
-		commands = append(commands, []string{"AUTH", options.Username, options.Password})
+		commands = append(commands, []string{"auth", options.Username, options.Password})
 	} else if options.Password != "" {
 		authIndex = len(commands)
-		commands = append(commands, []string{"AUTH", options.Password})
+		commands = append(commands, []string{"auth", options.Password})
 	}
 	if options.DB != 0 {
 		selectIndex = len(commands)
-		commands = append(commands, []string{"SELECT", strconv.Itoa(options.DB)})
+		commands = append(commands, []string{"select", strconv.Itoa(options.DB)})
 	}
 	if options.ConnectionName != "" {
-		commands = append(commands, []string{"CLIENT", "SETNAME", options.ConnectionName})
+		commands = append(commands, []string{"client", "setname", options.ConnectionName})
 	}
 	if !options.DisableClientInfo {
 		// getPackageMeta() resolves LIB-VER on a microtask while LIB-NAME is
 		// issued synchronously. The actual ioredis 5.11.1 wire order is NAME,
 		// then VER even though event_handler.js builds the promises VER-first.
 		commands = append(commands,
-			[]string{"CLIENT", "SETINFO", "LIB-NAME", "ioredis"},
-			[]string{"CLIENT", "SETINFO", "LIB-VER", slingshotIORedisLibraryVersion},
+			[]string{"client", "SETINFO", "LIB-NAME", "ioredis"},
+			[]string{"client", "SETINFO", "LIB-VER", slingshotIORedisLibraryVersion},
 		)
 	}
 	if len(commands) > 0 {
@@ -245,7 +245,7 @@ func (f *SlingshotIORedisRESPTransportFactory) startup(ctx context.Context, tran
 		return nil
 	}
 	for {
-		exchange := transport.Exchange(ctx, [][]string{{"INFO"}})
+		exchange := transport.Exchange(ctx, [][]string{{"info"}})
 		if exchange.Error != nil {
 			return exchange.Error
 		}
@@ -332,6 +332,7 @@ type slingshotIORedisRESPTransport struct {
 	closed        chan struct{}
 	closeOnce     sync.Once
 	exchangeMu    sync.Mutex
+	writeMu       sync.Mutex
 	awaitingReply atomic.Bool
 }
 
@@ -371,6 +372,33 @@ func (t *slingshotIORedisRESPTransport) Exchange(ctx context.Context, commands [
 
 	t.exchangeMu.Lock()
 	defer t.exchangeMu.Unlock()
+	exchange := t.writeCommands(ctx, commands)
+	if exchange.Error != nil {
+		return exchange
+	}
+	defer t.finishReplyWait()
+	for len(exchange.Replies) < len(commands) {
+		reply, err := t.readReply(ctx)
+		if err != nil {
+			exchange.Error = err
+			_ = t.Close()
+			return exchange
+		}
+		exchange.Replies = append(exchange.Replies, reply)
+	}
+	return exchange
+}
+
+func (t *slingshotIORedisRESPTransport) writeCommands(_ context.Context, commands [][]string) SlingshotIORedisExchange {
+	if t == nil || t.connection == nil {
+		return SlingshotIORedisExchange{WriteDisposition: SlingshotIORedisNotWritten, Error: errors.New("Slingshot ioredis RESP transport is not configured")}
+	}
+	if len(commands) == 0 {
+		return SlingshotIORedisExchange{WriteDisposition: SlingshotIORedisNotWritten, Error: errors.New("Slingshot ioredis RESP exchange is empty")}
+	}
+
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
 	wire, err := encodeSlingshotIORedisRESPCommands(commands)
 	if err != nil {
 		return SlingshotIORedisExchange{WriteDisposition: SlingshotIORedisNotWritten, Error: err}
@@ -410,52 +438,52 @@ func (t *slingshotIORedisRESPTransport) Exchange(ctx context.Context, commands [
 	}
 	exchange.NetworkBytesWritten = t.networkBytesWritten() - networkStart
 	exchange.WriteDisposition = SlingshotIORedisFullyWritten
+	return exchange
+}
+
+func (t *slingshotIORedisRESPTransport) readReply(ctx context.Context) (SlingshotIORedisReply, error) {
+	if t == nil || t.connection == nil {
+		return SlingshotIORedisReply{}, errors.New("Slingshot ioredis RESP transport is not configured")
+	}
 	t.awaitingReply.Store(true)
-	defer t.awaitingReply.Store(false)
 	if t.socketTimeout > 0 {
 		if err := t.connection.SetReadDeadline(time.Now().Add(t.socketTimeout)); err != nil {
-			exchange.Error = err
 			_ = t.Close()
-			return exchange
+			return SlingshotIORedisReply{}, err
 		}
 	}
-
-	for len(exchange.Replies) < len(commands) {
+	select {
+	case result := <-t.replies:
+		if result.err != nil {
+			return SlingshotIORedisReply{}, t.normalizeReadError(result.err)
+		}
+		return result.reply, nil
+	case <-ctx.Done():
+		_ = t.Close()
+		return SlingshotIORedisReply{}, ctx.Err()
+	case <-t.closed:
+		// The reader publishes its precise error before closing. Prefer it if
+		// already available, otherwise use the legacy close text.
 		select {
 		case result := <-t.replies:
 			if result.err != nil {
-				exchange.Error = t.normalizeReadError(result.err)
-				_ = t.Close()
-				return exchange
+				return SlingshotIORedisReply{}, t.normalizeReadError(result.err)
 			}
-			exchange.Replies = append(exchange.Replies, result.reply)
-			if t.socketTimeout > 0 && len(exchange.Replies) < len(commands) {
-				if err := t.connection.SetReadDeadline(time.Now().Add(t.socketTimeout)); err != nil {
-					exchange.Error = err
-					_ = t.Close()
-					return exchange
-				}
-			}
-		case <-ctx.Done():
-			exchange.Error = ctx.Err()
-			_ = t.Close()
-			return exchange
-		case <-t.closed:
-			// The reader publishes its precise error before closing. Prefer it
-			// if already available, otherwise use the legacy close text.
-			select {
-			case result := <-t.replies:
-				exchange.Error = t.normalizeReadError(result.err)
-			default:
-				exchange.Error = SlingshotIORedisConnectionClosedError{}
-			}
-			return exchange
+			return result.reply, nil
+		default:
+			return SlingshotIORedisReply{}, SlingshotIORedisConnectionClosedError{}
 		}
 	}
+}
+
+func (t *slingshotIORedisRESPTransport) finishReplyWait() {
+	if t == nil || t.connection == nil {
+		return
+	}
+	t.awaitingReply.Store(false)
 	if t.socketTimeout > 0 {
 		_ = t.connection.SetReadDeadline(time.Time{})
 	}
-	return exchange
 }
 
 func (t *slingshotIORedisRESPTransport) networkBytesWritten() int64 {

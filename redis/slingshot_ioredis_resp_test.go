@@ -29,6 +29,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -190,6 +191,34 @@ func TestSlingshotIORedisRESPConvenienceConstructorRemainsExplicit(t *testing.T)
 	client.Disconnect()
 }
 
+func TestSlingshotIORedisRESPSocketTimeoutDoesNotCloseIdleReadyClient(t *testing.T) {
+	var infoCalls atomic.Int32
+	server := startSlingshotRESPScenarioServer(t, nil, func(command []string) (string, bool) {
+		if strings.EqualFold(command[0], "INFO") {
+			infoCalls.Add(1)
+			return "$11\r\nloading:0\r\n\r\n", false
+		}
+		if strings.EqualFold(command[0], "PING") {
+			return "+PONG\r\n", false
+		}
+		return "+OK\r\n", false
+	})
+	defer server.stop()
+	client, err := NewSlingshotIORedisRESPCompatClient(SlingshotIORedisRESPOptions{
+		Addr: server.addr, DisableClientInfo: true, SocketTimeout: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("constructor: %v", err)
+	}
+	defer client.Disconnect()
+	assertSlingshotFutureOK(t, client.Submit("PING"), "PONG", 0, 0)
+	time.Sleep(60 * time.Millisecond)
+	assertSlingshotFutureOK(t, client.Submit("PING"), "PONG", 0, 0)
+	if got := infoCalls.Load(); got != 1 {
+		t.Fatalf("ready-check INFO calls = %d, want one connection across idle socket timeout", got)
+	}
+}
+
 func TestSlingshotIORedisRESPStartupMatchesFITJSOrderAndTolerance(t *testing.T) {
 	var infoCalls int
 	server := startSlingshotRESPScenarioServer(t, nil, func(command []string) (string, bool) {
@@ -238,12 +267,12 @@ func TestSlingshotIORedisRESPStartupMatchesFITJSOrderAndTolerance(t *testing.T) 
 		t.Fatalf("PING exchange = %+v", exchange)
 	}
 	wantCommands := [][]string{
-		{"AUTH", "legacy-user", "legacy-pass"},
-		{"SELECT", "4"},
-		{"CLIENT", "SETNAME", "uat-slingshot"},
-		{"CLIENT", "SETINFO", "LIB-NAME", "ioredis"},
-		{"CLIENT", "SETINFO", "LIB-VER", "5.11.1"},
-		{"INFO"}, {"INFO"}, {"PING"},
+		{"auth", "legacy-user", "legacy-pass"},
+		{"select", "4"},
+		{"client", "setname", "uat-slingshot"},
+		{"client", "SETINFO", "LIB-NAME", "ioredis"},
+		{"client", "SETINFO", "LIB-VER", "5.11.1"},
+		{"info"}, {"info"}, {"PING"},
 	}
 	if got := server.commandsSnapshot(); !reflect.DeepEqual(got, wantCommands) {
 		t.Fatalf("startup commands = %#v, want %#v", got, wantCommands)
@@ -482,7 +511,7 @@ func TestSlingshotIORedisRESPTLSAndQuit(t *testing.T) {
 	}
 }
 
-func TestSlingshotIORedisRESPTransportDrivesAmbiguousReplayBeforeFIFO(t *testing.T) {
+func TestSlingshotIORedisRESPTransportReplaysCompleteUnfulfilledSet(t *testing.T) {
 	var connectionNumber int
 	var mu sync.Mutex
 	server := startSlingshotRESPScenarioServer(t, nil, func(command []string) (string, bool) {
@@ -492,7 +521,63 @@ func TestSlingshotIORedisRESPTransportDrivesAmbiguousReplayBeforeFIFO(t *testing
 			connectionNumber++
 			return "$11\r\nloading:0\r\n\r\n", false
 		}
-		if connectionNumber == 1 && len(command) > 1 && command[1] == "first" {
+		if strings.EqualFold(command[0], "INCR") {
+			if connectionNumber == 1 {
+				// Withhold the first reply until the second direct command reaches the
+				// same connection, then close without either reply. This is the exact
+				// multi-in-flight boundary exposed by the pinned ioredis live oracle.
+				return "", len(command) > 1 && command[1] == "second"
+			}
+			return ":1\r\n", false
+		}
+		return "+OK\r\n", false
+	})
+	defer server.stop()
+	factory, err := NewSlingshotIORedisRESPTransportFactory(SlingshotIORedisRESPOptions{
+		Addr: server.addr, ConnectionName: "slingshot",
+	})
+	if err != nil {
+		t.Fatalf("factory: %v", err)
+	}
+	client := newFastSlingshotIORedisClient(t, factory)
+	defer client.Disconnect()
+	first := client.Submit("INCR", "first")
+	second := client.Submit("INCR", "second")
+	assertSlingshotFutureOK(t, first, int64(1), 1, 1)
+	assertSlingshotFutureOK(t, second, int64(1), 1, 1)
+	wantCommands := [][]string{
+		{"client", "setname", "slingshot"},
+		{"client", "SETINFO", "LIB-NAME", "ioredis"},
+		{"client", "SETINFO", "LIB-VER", "5.11.1"},
+		{"info"},
+		{"incr", "first"},
+		{"incr", "second"},
+		{"client", "setname", "slingshot"},
+		{"client", "SETINFO", "LIB-NAME", "ioredis"},
+		{"client", "SETINFO", "LIB-VER", "5.11.1"},
+		{"info"},
+		{"incr", "first"},
+		{"incr", "second"},
+	}
+	if got := server.commandsSnapshot(); !reflect.DeepEqual(got, wantCommands) {
+		t.Fatalf("lost-reply wire commands = %#v, want pinned ioredis oracle %#v", got, wantCommands)
+	}
+}
+
+func TestSlingshotIORedisRESPDuplexPartialPipelineAbortsUnreadSuffix(t *testing.T) {
+	var connectionNumber int
+	var mu sync.Mutex
+	server := startSlingshotRESPScenarioServer(t, nil, func(command []string) (string, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		if strings.EqualFold(command[0], "INFO") {
+			connectionNumber++
+			return "$11\r\nloading:0\r\n\r\n", false
+		}
+		if connectionNumber == 1 && strings.EqualFold(command[0], "SET") {
+			if len(command) > 1 && command[1] == "first" {
+				return "+OK\r\n", false
+			}
 			return "", true
 		}
 		return "+OK\r\n", false
@@ -506,18 +591,37 @@ func TestSlingshotIORedisRESPTransportDrivesAmbiguousReplayBeforeFIFO(t *testing
 	}
 	client := newFastSlingshotIORedisClient(t, factory)
 	defer client.Disconnect()
-	first := client.Submit("SET", "first", "1")
-	second := client.Submit("SET", "second", "2")
-	assertSlingshotFutureOK(t, first, "OK", 1, 1)
-	assertSlingshotFutureOK(t, second, "OK", 0, 0)
-	var sets []string
-	for _, command := range server.commandsSnapshot() {
-		if strings.EqualFold(command[0], "SET") {
-			sets = append(sets, command[1])
+
+	result, err := waitSlingshotFuture(t, client.SubmitPipeline(
+		[]string{"SET", "first", "1"},
+		[]string{"SET", "second", "2"},
+		[]string{"SET", "third", "3"},
+	))
+	if err != nil {
+		t.Fatalf("pipeline top-level error = %v, want nil", err)
+	}
+	if len(result.Replies) != 3 || result.Replies[0].Value != "OK" || result.Replies[0].Error != nil {
+		t.Fatalf("pipeline replies = %#v", result.Replies)
+	}
+	for index := 1; index < len(result.Replies); index++ {
+		var abort SlingshotIORedisAbortError
+		if !errors.As(result.Replies[index].Error, &abort) {
+			t.Fatalf("pipeline reply %d error = %T %v, want SlingshotIORedisAbortError", index, result.Replies[index].Error, result.Replies[index].Error)
 		}
 	}
-	if !reflect.DeepEqual(sets, []string{"first", "first", "second"}) {
-		t.Fatalf("SET order = %v", sets)
+	if result.ReplayCount != 0 || result.AmbiguousReplays != 0 {
+		t.Fatalf("pipeline replay counters = %+v, want zero", result)
+	}
+	assertSlingshotFutureOK(t, client.Submit("SET", "later", "4"), "OK", 0, 0)
+
+	var keys []string
+	for _, command := range server.commandsSnapshot() {
+		if strings.EqualFold(command[0], "SET") {
+			keys = append(keys, command[1])
+		}
+	}
+	if !reflect.DeepEqual(keys, []string{"first", "second", "later"}) {
+		t.Fatalf("pipeline failure wire keys = %v", keys)
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -96,6 +97,29 @@ func TestSlingshotIORedisLostReplyReplaysBeforeLaterFIFOItem(t *testing.T) {
 	assertSlingshotFutureOK(t, second, "OK", 0, 0)
 	if got := server.commandKeys(); strings.Join(got, ",") != "first,first,second" {
 		t.Fatalf("lost-reply replay order = %v, want [first first second]", got)
+	}
+}
+
+func TestSlingshotIORedisDuplexPreservesPriorReplyAcrossLaterWriteFailure(t *testing.T) {
+	server := startSlingshotLoopbackServer(t, "", nil)
+	defer server.stop()
+	firstTransport := newReplyBeforeWriteFailureSlingshotTransport()
+	var connections atomic.Int32
+	factory := SlingshotIORedisTransportFactoryFunc(func(ctx context.Context) (SlingshotIORedisTransport, error) {
+		if connections.Add(1) == 1 {
+			return firstTransport, nil
+		}
+		return (&slingshotLoopbackFactory{addr: server.addr}).Connect(ctx)
+	})
+	client := newFastSlingshotIORedisClient(t, factory)
+	defer client.Disconnect()
+
+	first := client.Submit("SET", "first", "1")
+	second := client.Submit("SET", "second", "2")
+	assertSlingshotFutureOK(t, first, "OK", 0, 0)
+	assertSlingshotFutureOK(t, second, "OK", 1, 1)
+	if got := server.commandKeys(); !reflect.DeepEqual(got, []string{"second"}) {
+		t.Fatalf("reconnected command keys = %v, want only uncertain second command", got)
 	}
 }
 
@@ -448,6 +472,63 @@ func (t *slingshotRESPTransport) Close() error {
 type signaledSlingshotTransport struct {
 	closed    chan struct{}
 	closeOnce sync.Once
+}
+
+type replyBeforeWriteFailureSlingshotTransport struct {
+	closed      chan struct{}
+	readStarted chan struct{}
+	releaseRead chan struct{}
+	closeOnce   sync.Once
+	readOnce    sync.Once
+	writes      atomic.Int32
+}
+
+func newReplyBeforeWriteFailureSlingshotTransport() *replyBeforeWriteFailureSlingshotTransport {
+	return &replyBeforeWriteFailureSlingshotTransport{
+		closed:      make(chan struct{}),
+		readStarted: make(chan struct{}),
+		releaseRead: make(chan struct{}),
+	}
+}
+
+func (t *replyBeforeWriteFailureSlingshotTransport) Exchange(context.Context, [][]string) SlingshotIORedisExchange {
+	return SlingshotIORedisExchange{Error: errors.New("duplex transport must not use serial Exchange")}
+}
+
+func (t *replyBeforeWriteFailureSlingshotTransport) writeCommands(_ context.Context, commands [][]string) SlingshotIORedisExchange {
+	wire, err := encodeSlingshotIORedisRESPCommands(commands)
+	if err != nil {
+		return SlingshotIORedisExchange{Error: err}
+	}
+	if t.writes.Add(1) == 1 {
+		return SlingshotIORedisExchange{
+			MayHaveExecuted: true, WriteDisposition: SlingshotIORedisFullyWritten,
+			BytesWritten: len(wire), BytesTotal: len(wire),
+		}
+	}
+	<-t.readStarted
+	return SlingshotIORedisExchange{
+		MayHaveExecuted: true, WriteDisposition: SlingshotIORedisFullyWritten,
+		BytesWritten: len(wire), BytesTotal: len(wire), Error: errors.New("later write failed"),
+	}
+}
+
+func (t *replyBeforeWriteFailureSlingshotTransport) readReply(context.Context) (SlingshotIORedisReply, error) {
+	t.readOnce.Do(func() { close(t.readStarted) })
+	<-t.releaseRead
+	return SlingshotIORedisReply{Value: "OK"}, nil
+}
+
+func (*replyBeforeWriteFailureSlingshotTransport) finishReplyWait() {}
+
+func (t *replyBeforeWriteFailureSlingshotTransport) Closed() <-chan struct{} { return t.closed }
+
+func (t *replyBeforeWriteFailureSlingshotTransport) Close() error {
+	t.closeOnce.Do(func() {
+		close(t.releaseRead)
+		close(t.closed)
+	})
+	return nil
 }
 
 func newSignaledSlingshotTransport() *signaledSlingshotTransport {
