@@ -1103,6 +1103,12 @@ func (cc *ConfluentConsumer) processMessageGroup(
 				cc.logMessageFailure("kafka/confluent: offset finalizer failed", message, finalizerErr)
 				return fmt.Errorf("kafka/confluent: offset finalizer failed: %w", finalizerErr)
 			}
+			if handlerErr == nil && opts.ResolveAfterSuccessfulFinalizer {
+				if err := cc.resolveMessageOffset(consumer, message, isAutoCommit, false); err != nil {
+					cc.logMessageFailure("kafka/confluent: post-finalizer offset resolution failed", message, err)
+					return err
+				}
+			}
 			continue
 		}
 
@@ -1708,6 +1714,8 @@ func validateConfluentConsumerOptions(
 		if opts.CommitBeforeHandler {
 			return false, 0, 0, fmt.Errorf("kafka/confluent: OffsetFinalizer cannot be combined with CommitBeforeHandler")
 		}
+	} else if opts.ResolveAfterSuccessfulFinalizer {
+		return false, 0, 0, fmt.Errorf("kafka/confluent: ResolveAfterSuccessfulFinalizer requires OffsetFinalizer")
 	}
 
 	pollTimeout := opts.PollTimeout
