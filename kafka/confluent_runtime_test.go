@@ -443,16 +443,18 @@ func TestConfluentProducerPreservesPerCallAcksCache(t *testing.T) {
 }
 
 type fakeConfluentConsumerDriver struct {
-	readFn   func(time.Duration) (*ckafka.Message, error)
-	commitFn func(*ckafka.Message) ([]ckafka.TopicPartition, error)
-	storeFn  func(*ckafka.Message) ([]ckafka.TopicPartition, error)
-	closeFn  func() error
+	readFn          func(time.Duration) (*ckafka.Message, error)
+	commitFn        func(*ckafka.Message) ([]ckafka.TopicPartition, error)
+	commitOffsetsFn func([]ckafka.TopicPartition) ([]ckafka.TopicPartition, error)
+	storeFn         func(*ckafka.Message) ([]ckafka.TopicPartition, error)
+	closeFn         func() error
 
-	mu           sync.Mutex
-	readTimeouts []time.Duration
-	commitCalls  int
-	storeCalls   int
-	closeCalls   int
+	mu                sync.Mutex
+	readTimeouts      []time.Duration
+	commitCalls       int
+	commitOffsetCalls [][]ckafka.TopicPartition
+	storeCalls        int
+	closeCalls        int
 }
 
 func (f *fakeConfluentConsumerDriver) ReadMessage(timeout time.Duration) (*ckafka.Message, error) {
@@ -475,6 +477,18 @@ func (f *fakeConfluentConsumerDriver) CommitMessage(message *ckafka.Message) ([]
 		return nil, nil
 	}
 	return commitFn(message)
+}
+
+func (f *fakeConfluentConsumerDriver) CommitOffsets(offsets []ckafka.TopicPartition) ([]ckafka.TopicPartition, error) {
+	f.mu.Lock()
+	cloned := append([]ckafka.TopicPartition(nil), offsets...)
+	f.commitOffsetCalls = append(f.commitOffsetCalls, cloned)
+	commitOffsetsFn := f.commitOffsetsFn
+	f.mu.Unlock()
+	if commitOffsetsFn == nil {
+		return offsets, nil
+	}
+	return commitOffsetsFn(offsets)
 }
 
 func (f *fakeConfluentConsumerDriver) StoreMessage(message *ckafka.Message) ([]ckafka.TopicPartition, error) {
@@ -509,6 +523,16 @@ func (f *fakeConfluentConsumerDriver) operationCalls() (commits, stores, closes 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.commitCalls, f.storeCalls, f.closeCalls
+}
+
+func (f *fakeConfluentConsumerDriver) exactOffsetCommits() [][]ckafka.TopicPartition {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	result := make([][]ckafka.TopicPartition, len(f.commitOffsetCalls))
+	for i := range f.commitOffsetCalls {
+		result[i] = append([]ckafka.TopicPartition(nil), f.commitOffsetCalls[i]...)
+	}
+	return result
 }
 
 func newTestConfluentConsumer(autoCommit bool, driver confluentConsumerDriver) *ConfluentConsumer {
@@ -877,6 +901,219 @@ func TestConfluentConsumerSurfacesPostHandlerCommitFailures(t *testing.T) {
 				t.Fatalf("Consume error = %v, want surfaced post-handler commit error", err)
 			}
 		})
+	}
+}
+
+func TestConfluentConsumerOffsetFinalizerCommitsExactCurrentOffsetAfterHandlerFailure(t *testing.T) {
+	topic := "slingshot-events"
+	message := &ckafka.Message{TopicPartition: ckafka.TopicPartition{
+		Topic:     &topic,
+		Partition: 3,
+		Offset:    41,
+	}}
+	groups := groupConfluentBatchMessages([]*ckafka.Message{message})
+	handlerErr := errors.New("handler failed")
+	driver := &fakeConfluentConsumerDriver{}
+	consumer := newTestConfluentConsumer(false, driver)
+	finalizerCalls := 0
+
+	err := consumer.processMessageGroup(
+		context.Background(),
+		driver,
+		groups[0],
+		func(context.Context, MessagePayload) error { return handlerErr },
+		false,
+		ConsumerOptions{OffsetFinalizer: func(_ context.Context, payload MessagePayload, gotHandlerErr error, commit ExactOffsetCommit) error {
+			finalizerCalls++
+			if payload.Topic != topic || payload.Partition != 3 || payload.Offset != 41 {
+				t.Fatalf("finalizer payload = %#v", payload)
+			}
+			if !errors.Is(gotHandlerErr, handlerErr) {
+				t.Fatalf("finalizer handler error = %v, want %v", gotHandlerErr, handlerErr)
+			}
+			if err := commit(payload.Offset); err != nil {
+				return err
+			}
+			return gotHandlerErr
+		}},
+	)
+	if !errors.Is(err, handlerErr) {
+		t.Fatalf("processMessageGroup error = %v, want handler error", err)
+	}
+	if finalizerCalls != 1 {
+		t.Fatalf("finalizer calls = %d, want 1", finalizerCalls)
+	}
+	exactCommits := driver.exactOffsetCommits()
+	if len(exactCommits) != 1 || len(exactCommits[0]) != 1 {
+		t.Fatalf("exact commits = %#v, want one single-offset commit", exactCommits)
+	}
+	committed := exactCommits[0][0]
+	if committed.Topic == nil || *committed.Topic != topic || committed.Partition != 3 || committed.Offset != 41 {
+		t.Fatalf("committed offset = %#v, want %s[3]@41 exactly", committed, topic)
+	}
+	commits, stores, _ := driver.operationCalls()
+	if commits != 0 || stores != 0 {
+		t.Fatalf("standard offset operations = commits %d stores %d, want 0/0", commits, stores)
+	}
+}
+
+func TestConfluentConsumerOffsetFinalizerOwnsPostCommitOrdering(t *testing.T) {
+	topic := "slingshot-events"
+	message := &ckafka.Message{TopicPartition: ckafka.TopicPartition{Topic: &topic, Partition: 0, Offset: 12}}
+	groups := groupConfluentBatchMessages([]*ckafka.Message{message})
+	var mu sync.Mutex
+	events := make([]string, 0, 4)
+	add := func(event string) {
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+	}
+	driver := &fakeConfluentConsumerDriver{commitOffsetsFn: func([]ckafka.TopicPartition) ([]ckafka.TopicPartition, error) {
+		add("commit")
+		return nil, nil
+	}}
+	consumer := newTestConfluentConsumer(false, driver)
+	err := consumer.processMessageGroup(
+		context.Background(), driver, groups[0],
+		func(context.Context, MessagePayload) error {
+			add("handler")
+			return nil
+		}, false,
+		ConsumerOptions{OffsetFinalizer: func(_ context.Context, payload MessagePayload, handlerErr error, commit ExactOffsetCommit) error {
+			add("finalizer")
+			if handlerErr != nil {
+				return handlerErr
+			}
+			if err := commit(payload.Offset); err != nil {
+				return err
+			}
+			add("post-commit")
+			return nil
+		}},
+	)
+	if err != nil {
+		t.Fatalf("processMessageGroup error = %v", err)
+	}
+	mu.Lock()
+	got := append([]string(nil), events...)
+	mu.Unlock()
+	want := []string{"handler", "finalizer", "commit", "post-commit"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+}
+
+func TestConfluentConsumerOffsetFinalizerRejectsSecondCommit(t *testing.T) {
+	topic := "slingshot-events"
+	message := &ckafka.Message{TopicPartition: ckafka.TopicPartition{Topic: &topic, Partition: 0, Offset: 12}}
+	groups := groupConfluentBatchMessages([]*ckafka.Message{message})
+	driver := &fakeConfluentConsumerDriver{}
+	consumer := newTestConfluentConsumer(false, driver)
+	err := consumer.processMessageGroup(
+		context.Background(), driver, groups[0],
+		func(context.Context, MessagePayload) error { return nil }, false,
+		ConsumerOptions{OffsetFinalizer: func(_ context.Context, payload MessagePayload, _ error, commit ExactOffsetCommit) error {
+			if err := commit(payload.Offset); err != nil {
+				return err
+			}
+			return commit(payload.Offset)
+		}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "called more than once") {
+		t.Fatalf("processMessageGroup error = %v", err)
+	}
+	if commits := driver.exactOffsetCommits(); len(commits) != 1 {
+		t.Fatalf("exact commits = %#v, want only first commit", commits)
+	}
+}
+
+func TestConfluentConsumerOffsetFinalizerCanSkipCommit(t *testing.T) {
+	topic := "slingshot-events"
+	message := &ckafka.Message{TopicPartition: ckafka.TopicPartition{Topic: &topic, Partition: 1, Offset: 9}}
+	groups := groupConfluentBatchMessages([]*ckafka.Message{message})
+	handlerErr := errors.New("before commit boundary")
+	driver := &fakeConfluentConsumerDriver{}
+	consumer := newTestConfluentConsumer(false, driver)
+
+	err := consumer.processMessageGroup(
+		context.Background(), driver, groups[0],
+		func(context.Context, MessagePayload) error { return handlerErr },
+		false,
+		ConsumerOptions{OffsetFinalizer: func(_ context.Context, _ MessagePayload, handlerErr error, _ ExactOffsetCommit) error {
+			return handlerErr
+		}},
+	)
+	if !errors.Is(err, handlerErr) {
+		t.Fatalf("processMessageGroup error = %v, want handler error", err)
+	}
+	if commits := driver.exactOffsetCommits(); len(commits) != 0 {
+		t.Fatalf("exact commits = %#v, want none", commits)
+	}
+}
+
+func TestConfluentConsumerOffsetFinalizerFailurePrecedence(t *testing.T) {
+	topic := "slingshot-events"
+	message := &ckafka.Message{TopicPartition: ckafka.TopicPartition{Topic: &topic, Partition: 1, Offset: 9}}
+	groups := groupConfluentBatchMessages([]*ckafka.Message{message})
+	handlerErr := errors.New("handler failed")
+	finalizerErr := errors.New("finalizer failed")
+	commitErr := errors.New("commit failed")
+
+	t.Run("finalizer replaces handler", func(t *testing.T) {
+		driver := &fakeConfluentConsumerDriver{}
+		consumer := newTestConfluentConsumer(false, driver)
+		err := consumer.processMessageGroup(
+			context.Background(), driver, groups[0],
+			func(context.Context, MessagePayload) error { return handlerErr }, false,
+			ConsumerOptions{OffsetFinalizer: func(context.Context, MessagePayload, error, ExactOffsetCommit) error {
+				return finalizerErr
+			}},
+		)
+		if !errors.Is(err, finalizerErr) || errors.Is(err, handlerErr) {
+			t.Fatalf("error = %v, want only finalizer error", err)
+		}
+		if commits := driver.exactOffsetCommits(); len(commits) != 0 {
+			t.Fatalf("exact commits = %#v, want none", commits)
+		}
+	})
+
+	t.Run("commit replaces handler", func(t *testing.T) {
+		driver := &fakeConfluentConsumerDriver{commitOffsetsFn: func([]ckafka.TopicPartition) ([]ckafka.TopicPartition, error) {
+			return nil, commitErr
+		}}
+		consumer := newTestConfluentConsumer(false, driver)
+		err := consumer.processMessageGroup(
+			context.Background(), driver, groups[0],
+			func(context.Context, MessagePayload) error { return handlerErr }, false,
+			ConsumerOptions{OffsetFinalizer: func(_ context.Context, payload MessagePayload, _ error, commit ExactOffsetCommit) error {
+				return commit(payload.Offset)
+			}},
+		)
+		if !errors.Is(err, commitErr) || errors.Is(err, handlerErr) {
+			t.Fatalf("error = %v, want only commit error", err)
+		}
+	})
+}
+
+func TestConfluentConsumerOffsetFinalizerOptionValidation(t *testing.T) {
+	finalizer := func(context.Context, MessagePayload, error, ExactOffsetCommit) error {
+		return nil
+	}
+	autoCommit := true
+	if _, _, _, err := validateConfluentConsumerOptions(false, ConsumerOptions{
+		AutoCommit: &autoCommit, OffsetFinalizer: finalizer,
+	}, time.Millisecond); err == nil || !strings.Contains(err.Error(), "requires manual commit") {
+		t.Fatalf("auto-commit validation error = %v", err)
+	}
+	manualCommit := false
+	if _, _, _, err := validateConfluentConsumerOptions(false, ConsumerOptions{
+		AutoCommit: &manualCommit, CommitBeforeHandler: true, OffsetFinalizer: finalizer,
+	}, time.Millisecond); err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+		t.Fatalf("commit-before validation error = %v", err)
+	}
+	consumer := newTestConfluentConsumer(false, &fakeConfluentConsumerDriver{})
+	if err := consumer.ConsumeBatch(func(BatchPayload) error { return nil }, ConsumerOptions{OffsetFinalizer: finalizer}); err == nil || !strings.Contains(err.Error(), "message consumption") {
+		t.Fatalf("batch validation error = %v", err)
 	}
 }
 

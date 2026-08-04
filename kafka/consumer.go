@@ -62,6 +62,21 @@ type MessageHandler func(payload MessagePayload) error
 // consumer-side trace correlation.
 type MessageHandlerCtx func(ctx context.Context, payload MessagePayload) error
 
+// ExactOffsetCommit commits the supplied offset exactly. Unlike CommitMessage,
+// it does not advance the value to the next offset. An OffsetFinalizer receives
+// one callback per message and may invoke it at most once.
+type ExactOffsetCommit func(offset int64) error
+
+// OffsetFinalizer owns an advanced manual-offset boundary after a message
+// handler returns. handlerErr is the unmodified handler result. The finalizer
+// may skip the commit, await commit(exactOffset), perform post-commit work, and
+// then return the outcome whose precedence the legacy runtime requires.
+//
+// This hook exists for compatibility consumers whose behavior cannot be
+// represented by automatic commit, commit-after-success or CommitBeforeHandler.
+// New consumers should normally use the standard modes.
+type OffsetFinalizer func(ctx context.Context, payload MessagePayload, handlerErr error, commit ExactOffsetCommit) error
+
 // BatchHandler processes a batch of consumed messages.
 // Return an error to signal processing failure.
 type BatchHandler func(payload BatchPayload) error
@@ -200,6 +215,13 @@ type ConsumerOptions struct {
 	// legacy at-most-once consumers whose handlers perform non-idempotent external
 	// side effects. It is ignored when auto-commit is enabled.
 	CommitBeforeHandler bool
+
+	// OffsetFinalizer is an opt-in exact manual-offset boundary for message-mode
+	// consumers. It runs once after every handler return, including failures, and
+	// may invoke its exact-offset commit callback at most once. It requires manual
+	// commit and cannot be combined with CommitBeforeHandler. Batch consumption
+	// rejects this option.
+	OffsetFinalizer OffsetFinalizer
 
 	// PartitionsConsumedConcurrently is the requested number of partitions
 	// processed concurrently. Default: 1 (sequential). The Confluent driver keeps

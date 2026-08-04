@@ -22,6 +22,7 @@ package kafka
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -766,6 +767,7 @@ type ConfluentConsumer struct {
 type confluentConsumerDriver interface {
 	ReadMessage(timeout time.Duration) (*ckafka.Message, error)
 	CommitMessage(message *ckafka.Message) ([]ckafka.TopicPartition, error)
+	CommitOffsets(offsets []ckafka.TopicPartition) ([]ckafka.TopicPartition, error)
 	StoreMessage(message *ckafka.Message) ([]ckafka.TopicPartition, error)
 	Close() error
 }
@@ -941,6 +943,11 @@ func toPartitionAssignments(parts []ckafka.TopicPartition) []PartitionAssignment
 type confluentMessageHandler func(context.Context, MessagePayload) error
 type confluentBatchHandler func(context.Context, BatchPayload) error
 
+type exactOffsetCommitError struct{ err error }
+
+func (e *exactOffsetCommitError) Error() string { return e.err.Error() }
+func (e *exactOffsetCommitError) Unwrap() error { return e.err }
+
 // Consume processes messages with automatic KafkaJS-like consumer tracing. The
 // span context is active for same-goroutine FIT helpers even though the raw
 // handler signature remains source compatible.
@@ -1046,12 +1053,44 @@ func (cc *ConfluentConsumer) processMessageGroup(
 			}
 		}
 
-		if err := handler(ctx, payload); err != nil {
+		handlerErr := handler(ctx, payload)
+		if opts.OffsetFinalizer != nil {
+			commitCalled := false
+			commitExact := func(exact int64) error {
+				if commitCalled {
+					return fmt.Errorf("kafka/confluent: exact offset commit callback called more than once")
+				}
+				commitCalled = true
+				offset := message.TopicPartition
+				offset.Offset = ckafka.Offset(exact)
+				if _, err := consumer.CommitOffsets([]ckafka.TopicPartition{offset}); err != nil {
+					return &exactOffsetCommitError{err: err}
+				}
+				return nil
+			}
+			finalizerErr := opts.OffsetFinalizer(ctx, payload, handlerErr, commitExact)
+			if finalizerErr != nil {
+				var commitErr *exactOffsetCommitError
+				if errors.As(finalizerErr, &commitErr) {
+					cc.logMessageFailure("kafka/confluent: exact offset commit failed", message, finalizerErr)
+					return fmt.Errorf("kafka/confluent: exact offset commit failed: %w", finalizerErr)
+				}
+				if handlerErr != nil && errors.Is(finalizerErr, handlerErr) {
+					cc.logMessageFailure("kafka/confluent: message handler error", message, finalizerErr)
+					return fmt.Errorf("kafka/confluent: message handler failed: %w", finalizerErr)
+				}
+				cc.logMessageFailure("kafka/confluent: offset finalizer failed", message, finalizerErr)
+				return fmt.Errorf("kafka/confluent: offset finalizer failed: %w", finalizerErr)
+			}
+			continue
+		}
+
+		if handlerErr != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
-			cc.logMessageFailure("kafka/confluent: message handler error", message, err)
-			return fmt.Errorf("kafka/confluent: message handler failed: %w", err)
+			cc.logMessageFailure("kafka/confluent: message handler error", message, handlerErr)
+			return fmt.Errorf("kafka/confluent: message handler failed: %w", handlerErr)
 		}
 
 		if err := cc.resolveMessageOffset(consumer, message, isAutoCommit, opts.CommitBeforeHandler); err != nil {
@@ -1066,6 +1105,9 @@ func (cc *ConfluentConsumer) ConsumeBatch(handler BatchHandler, opts ConsumerOpt
 	if handler == nil {
 		return fmt.Errorf("kafka/confluent: batch handler is nil")
 	}
+	if opts.OffsetFinalizer != nil {
+		return fmt.Errorf("kafka/confluent: OffsetFinalizer is supported only for message consumption")
+	}
 	return cc.consumeBatches(func(ctx context.Context, payload BatchPayload) error {
 		return runTracedBatchHandler(ctx, payload, func(_ context.Context, traced BatchPayload) error {
 			return handler(traced)
@@ -1076,6 +1118,9 @@ func (cc *ConfluentConsumer) ConsumeBatch(handler BatchHandler, opts ConsumerOpt
 func (cc *ConfluentConsumer) ConsumeBatchCtx(handler BatchHandlerCtx, opts ConsumerOptions) error {
 	if handler == nil {
 		return fmt.Errorf("kafka/confluent: batch handler is nil")
+	}
+	if opts.OffsetFinalizer != nil {
+		return fmt.Errorf("kafka/confluent: OffsetFinalizer is supported only for message consumption")
 	}
 	return cc.consumeBatches(func(ctx context.Context, payload BatchPayload) error {
 		return runTracedBatchHandler(ctx, payload, handler)
@@ -1623,6 +1668,15 @@ func validateConfluentConsumerOptions(
 	if opts.MaxRecords < 0 {
 		return false, 0, 0, fmt.Errorf("kafka/confluent: MaxRecords must not be negative")
 	}
+	effectiveAutoCommit := resolveAutoCommit(configAutoCommit, opts.AutoCommit)
+	if opts.OffsetFinalizer != nil {
+		if effectiveAutoCommit {
+			return false, 0, 0, fmt.Errorf("kafka/confluent: OffsetFinalizer requires manual commit")
+		}
+		if opts.CommitBeforeHandler {
+			return false, 0, 0, fmt.Errorf("kafka/confluent: OffsetFinalizer cannot be combined with CommitBeforeHandler")
+		}
+	}
 
 	pollTimeout := opts.PollTimeout
 	if pollTimeout == 0 {
@@ -1632,5 +1686,5 @@ func validateConfluentConsumerOptions(
 	if concurrency == 0 {
 		concurrency = 1
 	}
-	return resolveAutoCommit(configAutoCommit, opts.AutoCommit), pollTimeout, concurrency, nil
+	return effectiveAutoCommit, pollTimeout, concurrency, nil
 }
