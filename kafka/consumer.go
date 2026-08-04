@@ -112,10 +112,18 @@ type ConsumerConfig struct {
 	// GroupID is the consumer group identifier (required).
 	GroupID string
 
+	// Backend selects the consumer implementation. The zero value retains the
+	// production Confluent/librdkafka backend. KafkaJSCompatible is an explicit
+	// migration-only backend whose group protocol name matches KafkaJS 2.x's
+	// literal "RoundRobinAssigner", allowing old and new members to overlap in
+	// one group during a rolling cutover.
+	Backend ConsumerBackend
+
 	// PartitionAssignmentStrategy selects the group protocol assignor advertised
-	// to Kafka. Empty preserves the driver default. Use "roundrobin" when a Go
-	// consumer must roll alongside KafkaJS, whose default member protocol is the
-	// round-robin assigner; mixed assignor lists otherwise fail the group join.
+	// to Kafka. Empty preserves the driver default. Librdkafka's "roundrobin"
+	// protocol is not wire-compatible with KafkaJS 2.x's literal
+	// "RoundRobinAssigner" protocol name; use ConsumerBackendKafkaJSCompatible
+	// for a mixed-runtime rolling cutover.
 	PartitionAssignmentStrategy string
 
 	// SessionTimeout is the timeout for detecting consumer failures within
@@ -179,6 +187,16 @@ type ConsumerConfig struct {
 	// this consumer during a group rebalance. Optional.
 	OnPartitionsRevoked func([]PartitionAssignment)
 }
+
+// ConsumerBackend selects a fit-go Kafka consumer implementation. Producers
+// are unaffected: selecting a consumer backend never changes the client's
+// producer driver or wire behavior.
+type ConsumerBackend uint8
+
+const (
+	ConsumerBackendConfluent ConsumerBackend = iota
+	ConsumerBackendKafkaJSCompatible
+)
 
 // PartitionAssignment identifies a single topic-partition assigned to or revoked
 // from a consumer during a rebalance.

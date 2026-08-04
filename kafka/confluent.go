@@ -199,6 +199,12 @@ func (cc *ConfluentClient) Consumer(config ConsumerConfig) (KafkaConsumer, error
 	if config.GroupID == "" {
 		return nil, fmt.Errorf("kafka/confluent: consumer group ID is required")
 	}
+	if config.Backend == ConsumerBackendKafkaJSCompatible {
+		return newKafkaJSCompatibleConsumer(cc.brokers, cc.fitCfg, config, cc.logger)
+	}
+	if config.Backend != ConsumerBackendConfluent {
+		return nil, fmt.Errorf("kafka: unsupported consumer backend %d", config.Backend)
+	}
 
 	// Clone the base config for consumer-specific overrides.
 	cCfg := cloneConfigMap(cc.baseCfg)

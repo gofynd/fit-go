@@ -11,6 +11,11 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **KafkaJS-compatible rolling consumer backend**: an explicit
+  `ConsumerBackendKafkaJSCompatible` opt-in uses KafkaJS 2.x's literal
+  `RoundRobinAssigner` group protocol while retaining fit-go's message, batch,
+  tracing, offset-finalizer, TLS, and SASL APIs. The existing
+  Confluent/librdkafka producer and default consumer are unchanged.
 - **Fail-closed Slingshot ioredis state machine**: a separate, explicitly
   constructed compatibility client now models ioredis 5.11.1's connection-wide
   offline FIFO, exact reconnect curve and 20-retry flush boundary, replay-before-
