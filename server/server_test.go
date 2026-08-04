@@ -464,6 +464,26 @@ func TestRequestID(t *testing.T) {
 	})
 }
 
+func TestInitCanDisableRequestIDWithoutChangingDefault(t *testing.T) {
+	t.Setenv("SERVER_TYPE", "platform")
+	router := http.NewServeMux()
+	router.HandleFunc("/probe", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	disabled := false
+	server := New(Config{Port: "0", RequestID: &disabled})
+	if err := server.Init(map[ServerType]http.Handler{ServerTypePlatform: router}, nil, nil); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	server.App.ServeHTTP(recorder, request)
+	if got := recorder.Header().Get("X-Request-ID"); got != "" {
+		t.Fatalf("X-Request-ID = %q, want absent", got)
+	}
+}
+
 func TestCORS(t *testing.T) {
 	t.Run("default config", func(t *testing.T) {
 		r := gin.New()

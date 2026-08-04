@@ -81,6 +81,11 @@ type Config struct {
 	// (X-Content-Type-Options, X-Frame-Options, etc.). Defaults to true.
 	SecureHeaders *bool
 
+	// RequestID controls whether to forward/generate X-Request-ID and attach it
+	// to request context. Defaults to true. Set false only for compatibility
+	// with pinned legacy servers which had no request-ID middleware.
+	RequestID *bool
+
 	// HealthChecker is the health checker used by /_healthz and /_readyz routes.
 	// If nil, the package-level globalHealthChecker is used.
 	HealthChecker HealthChecker
@@ -201,7 +206,13 @@ func (s *Server) Init(
 	// NOTE: this is an ENHANCEMENT beyond legacy fit.js — the Node fit server had
 	// no request-id middleware, and fit/axios only logged a per-call UUID (it did
 	// not propagate an x-request-id header). Additive and harmless.
-	root.Use(RequestID())
+	requestID := true
+	if s.cfg.RequestID != nil {
+		requestID = *s.cfg.RequestID
+	}
+	if requestID {
+		root.Use(RequestID())
+	}
 
 	// Per-request OpenTelemetry server span. Self-gated: a no-op passthrough when
 	// TRACING_ENABLED is off (default), so there is no added latency unless tracing
