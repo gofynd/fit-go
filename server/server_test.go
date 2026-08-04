@@ -1098,7 +1098,7 @@ func TestLegacyStaticHealthRoutesPreserveFitJSBytes(t *testing.T) {
 	engine := gin.New()
 	RegisterLegacyStaticHealthRoutes(engine)
 
-	for _, path := range []string{"/_healthz", "/_readyz"} {
+	for _, path := range []string{"/_healthz", "/_readyz", "/_HEALTHZ/", "/_READYZ/"} {
 		t.Run(path, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
@@ -1108,7 +1108,30 @@ func TestLegacyStaticHealthRoutesPreserveFitJSBytes(t *testing.T) {
 			if got := recorder.Body.String(); got != `{"ok":"ok"}` {
 				t.Fatalf("GET %s body = %q, want exact fit.js body", path, got)
 			}
+			wantHeaders := map[string]string{
+				"Content-Type":   "application/json; charset=utf-8",
+				"Content-Length": "11",
+				"ETag":           `W/"b-2F/2BWc0KYbtLqL5U2Kv5B6uQUQ"`,
+				"X-Powered-By":   "Express",
+			}
+			for name, want := range wantHeaders {
+				if got := recorder.Header().Get(name); got != want {
+					t.Fatalf("GET %s %s = %q, want %q", path, name, got, want)
+				}
+			}
 		})
+	}
+
+	for _, path := range []string{"/_healthz", "/_READYZ/"} {
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodHead, path, nil))
+		if recorder.Code != http.StatusOK || recorder.Body.Len() != 0 {
+			t.Fatalf("HEAD %s = %d body %q", path, recorder.Code, recorder.Body.String())
+		}
+		if recorder.Header().Get("Content-Length") != "11" ||
+			recorder.Header().Get("ETag") != `W/"b-2F/2BWc0KYbtLqL5U2Kv5B6uQUQ"` {
+			t.Fatalf("HEAD %s headers = %#v", path, recorder.Header())
+		}
 	}
 }
 
