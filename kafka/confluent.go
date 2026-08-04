@@ -164,6 +164,9 @@ func (cc *ConfluentClient) Producer(config ProducerConfig) (KafkaProducer, error
 	if config.TraceHeaderPolicy != ProducerTraceHeadersInject && config.TraceHeaderPolicy != ProducerTraceHeadersPreserve {
 		return nil, fmt.Errorf("kafka/confluent: unsupported producer trace header policy %d", config.TraceHeaderPolicy)
 	}
+	if config.ClosePolicy != ProducerCloseWaitForDelivery && config.ClosePolicy != ProducerCloseKafkaJSDisconnect {
+		return nil, fmt.Errorf("kafka/confluent: unsupported producer close policy %d", config.ClosePolicy)
+	}
 
 	return &ConfluentProducer{
 		configMap:         pCfg,
@@ -172,6 +175,7 @@ func (cc *ConfluentClient) Producer(config ProducerConfig) (KafkaProducer, error
 		configuredAcks:    configuredAcks,
 		idempotent:        config.IdempotentProducer,
 		traceHeaders:      config.TraceHeaderPolicy,
+		closePolicy:       config.ClosePolicy,
 		partitioner:       config.Partitioner,
 		producers:         make(map[int]confluentProducerDriver),
 		partitionCounters: make(map[string]uint32),
@@ -302,6 +306,7 @@ type ConfluentProducer struct {
 	configuredAcks int
 	idempotent     bool
 	traceHeaders   ProducerTraceHeaderPolicy
+	closePolicy    ProducerClosePolicy
 	partitioner    ProducerPartitioner
 	newProducer    func(*ckafka.ConfigMap) (confluentProducerDriver, error)
 
@@ -551,6 +556,14 @@ func (cp *ConfluentProducer) Close() error {
 			unique[producer] = struct{}{}
 		}
 	}
+	if cp.closePolicy == ProducerCloseKafkaJSDisconnect {
+		cp.closeErr = nil
+		close(done)
+		cp.mu.Unlock()
+		go cp.finishKafkaJSDisconnect(unique, timeout)
+		cp.logger.Info("kafka/confluent: producer disconnected")
+		return nil
+	}
 	cp.mu.Unlock()
 
 	result := make(chan error, 1)
@@ -582,6 +595,15 @@ func (cp *ConfluentProducer) Close() error {
 		cp.logger.Info("kafka/confluent: producer closed")
 	}
 	return closeErr
+}
+
+func (cp *ConfluentProducer) finishKafkaJSDisconnect(
+	producers map[confluentProducerDriver]struct{},
+	timeout time.Duration,
+) {
+	if err := cp.finishClose(producers, timeout); err != nil {
+		cp.logger.Warn("kafka/confluent: producer background disconnect incomplete", "error", redact.ErrorMessage(err))
+	}
 }
 
 func (cp *ConfluentProducer) finishClose(producers map[confluentProducerDriver]struct{}, timeout time.Duration) error {

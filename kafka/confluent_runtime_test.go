@@ -333,6 +333,70 @@ func TestConfluentProducerCloseWaitsForActiveDeliveryDrain(t *testing.T) {
 	<-closeCalled
 }
 
+func TestConfluentProducerKafkaJSDisconnectReturnsBeforeAcceptedDelivery(t *testing.T) {
+	accepted := make(chan struct{})
+	releaseDelivery := make(chan struct{})
+	driverClosed := make(chan struct{})
+	driver := &fakeConfluentProducerDriver{closeCalled: driverClosed}
+	driver.produceFn = func(message *ckafka.Message, reports chan ckafka.Event) error {
+		close(accepted)
+		go func() {
+			<-releaseDelivery
+			reports <- successfulDelivery(message, 1)
+		}()
+		return nil
+	}
+	producer := newTestConfluentProducer(driver)
+	producer.closePolicy = ProducerCloseKafkaJSDisconnect
+
+	produceResult := make(chan error, 1)
+	go func() {
+		produceResult <- producer.Produce("orders", []Message{{Value: []byte("one")}}, -1)
+	}()
+	<-accepted
+
+	started := time.Now()
+	if err := producer.Close(); err != nil {
+		t.Fatalf("KafkaJS-compatible Close error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 250*time.Millisecond {
+		t.Fatalf("KafkaJS-compatible Close took %s, want immediate return", elapsed)
+	}
+	select {
+	case <-driverClosed:
+		t.Fatal("driver closed before accepted delivery drained")
+	default:
+	}
+
+	close(releaseDelivery)
+	if err := <-produceResult; err != nil {
+		t.Fatalf("accepted produce error = %v", err)
+	}
+	select {
+	case <-driverClosed:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("driver was not closed after accepted delivery drained")
+	}
+}
+
+func TestConfluentProducerClosePolicyDefaultsAndValidation(t *testing.T) {
+	client, err := NewConfluentClient(&Config{Brokers: []string{"localhost:9092"}})
+	if err != nil {
+		t.Fatalf("NewConfluentClient: %v", err)
+	}
+	producer, err := client.Producer(ProducerConfig{})
+	if err != nil {
+		t.Fatalf("default producer: %v", err)
+	}
+	if got := producer.(*ConfluentProducer).closePolicy; got != ProducerCloseWaitForDelivery {
+		t.Fatalf("default close policy = %d, want synchronous delivery drain", got)
+	}
+	_, err = client.Producer(ProducerConfig{ClosePolicy: ProducerClosePolicy(255)})
+	if err == nil || err.Error() != "kafka/confluent: unsupported producer close policy 255" {
+		t.Fatalf("unknown close policy error = %v", err)
+	}
+}
+
 func TestConfluentProducerCloseReportsUndeliveredFlushCount(t *testing.T) {
 	driver := &fakeConfluentProducerDriver{flushRemaining: 3}
 	producer := newTestConfluentProducer(driver)

@@ -17,6 +17,19 @@ package kafka
 
 import "time"
 
+// ProducerClosePolicy controls what Close waits for after it stops accepting
+// new produce calls. The zero value preserves fit-go's synchronous bounded
+// delivery drain.
+type ProducerClosePolicy uint8
+
+const (
+	ProducerCloseWaitForDelivery ProducerClosePolicy = iota
+	// ProducerCloseKafkaJSDisconnect returns after admission is stopped while
+	// already accepted deliveries and driver teardown complete in the
+	// background, matching KafkaJS producer.disconnect startup-failure behavior.
+	ProducerCloseKafkaJSDisconnect
+)
+
 // ProducerPartitioner selects the driver partitioning strategy for records
 // without an explicit partition. The zero value preserves the driver's
 // existing default.
@@ -147,4 +160,8 @@ type ProducerConfig struct {
 	// spans are still created when headers are preserved. Zero preserves fit-go's
 	// existing automatic injection behavior.
 	TraceHeaderPolicy ProducerTraceHeaderPolicy
+
+	// ClosePolicy is opt-in. Its zero value retains the existing fit-go close
+	// contract for every caller that does not request KafkaJS compatibility.
+	ClosePolicy ProducerClosePolicy
 }
