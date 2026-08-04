@@ -252,10 +252,12 @@ type SlingshotIORedisCompatClient struct {
 	factory SlingshotIORedisTransportFactory
 	policy  slingshotIORedisPolicy
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	wake   chan struct{}
-	done   chan struct{}
+	ctx            context.Context
+	cancel         context.CancelFunc
+	wake           chan struct{}
+	done           chan struct{}
+	firstReady     chan struct{}
+	firstReadyOnce sync.Once
 
 	mu            sync.Mutex
 	queue         []*slingshotIORedisRequest
@@ -264,6 +266,7 @@ type SlingshotIORedisCompatClient struct {
 	closed        bool
 	ready         bool
 	retryAttempts int
+	firstReadyErr error
 }
 
 // NewSlingshotIORedisCompatClient starts the eager connection/reconnect loop.
@@ -272,6 +275,27 @@ type SlingshotIORedisCompatClient struct {
 // exist.
 func NewSlingshotIORedisCompatClient(factory SlingshotIORedisTransportFactory) (*SlingshotIORedisCompatClient, error) {
 	return newSlingshotIORedisCompatClient(factory, defaultSlingshotIORedisPolicy())
+}
+
+// NewSlingshotIORedisCompatClientReady is the opt-in Slingshot role bootstrap
+// boundary. It returns only after the first transport completes its startup
+// handshake. The first connection/startup error is returned immediately, like
+// FIT.js waitForRedisConnectionReady, and the client is disconnected before an
+// error is returned so a failed role boot cannot leak a reconnect loop.
+// Existing constructors remain asynchronous and unchanged.
+func NewSlingshotIORedisCompatClientReady(ctx context.Context, factory SlingshotIORedisTransportFactory) (*SlingshotIORedisCompatClient, error) {
+	if ctx == nil {
+		return nil, errors.New("Slingshot ioredis first-ready context is required")
+	}
+	client, err := NewSlingshotIORedisCompatClient(factory)
+	if err != nil {
+		return nil, err
+	}
+	if err := client.WaitForFirstReady(ctx); err != nil {
+		client.Disconnect()
+		return nil, err
+	}
+	return client, nil
 }
 
 func newSlingshotIORedisCompatClient(factory SlingshotIORedisTransportFactory, policy slingshotIORedisPolicy) (*SlingshotIORedisCompatClient, error) {
@@ -283,15 +307,47 @@ func newSlingshotIORedisCompatClient(factory SlingshotIORedisTransportFactory, p
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	client := &SlingshotIORedisCompatClient{
-		factory: factory,
-		policy:  policy,
-		ctx:     ctx,
-		cancel:  cancel,
-		wake:    make(chan struct{}, 1),
-		done:    make(chan struct{}),
+		factory:    factory,
+		policy:     policy,
+		ctx:        ctx,
+		cancel:     cancel,
+		wake:       make(chan struct{}, 1),
+		done:       make(chan struct{}),
+		firstReady: make(chan struct{}),
 	}
 	go client.run()
 	return client, nil
+}
+
+// WaitForFirstReady observes the first connection/startup result. It does not
+// stop the client when the caller context ends; the role-safe Ready constructor
+// above owns that cleanup. Once successful, later reconnects use the existing
+// ioredis-compatible lifecycle and do not change this immutable result.
+func (c *SlingshotIORedisCompatClient) WaitForFirstReady(ctx context.Context) error {
+	if c == nil || c.firstReady == nil {
+		return errors.New("Slingshot ioredis client is not configured")
+	}
+	if ctx == nil {
+		return errors.New("Slingshot ioredis first-ready context is required")
+	}
+	select {
+	case <-c.firstReady:
+		c.mu.Lock()
+		err := c.firstReadyErr
+		c.mu.Unlock()
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *SlingshotIORedisCompatClient) settleFirstReady(err error) {
+	c.firstReadyOnce.Do(func() {
+		c.mu.Lock()
+		c.firstReadyErr = err
+		c.mu.Unlock()
+		close(c.firstReady)
+	})
 }
 
 // Submit accepts one command into the shared FIFO.
@@ -410,6 +466,7 @@ func (c *SlingshotIORedisCompatClient) Disconnect() {
 	}
 	c.disconnecting = true
 	c.mu.Unlock()
+	c.settleFirstReady(SlingshotIORedisConnectionClosedError{})
 	c.cancel()
 	c.signal()
 	<-c.done
@@ -460,13 +517,16 @@ func (c *SlingshotIORedisCompatClient) run() {
 				if err == nil {
 					err = errors.New("Slingshot ioredis transport factory returned nil transport")
 				}
+				c.settleFirstReady(err)
 				c.connectionFailed(err)
 				needsRetryDelay = true
 				continue
 			}
 			if connected.Closed() == nil {
 				_ = connected.Close()
-				c.connectionFailed(errors.New("Slingshot ioredis transport returned nil close signal"))
+				err := errors.New("Slingshot ioredis transport returned nil close signal")
+				c.settleFirstReady(err)
+				c.connectionFailed(err)
 				needsRetryDelay = true
 				continue
 			}
@@ -476,6 +536,7 @@ func (c *SlingshotIORedisCompatClient) run() {
 			c.ready = true
 			c.retryAttempts = 0
 			c.mu.Unlock()
+			c.settleFirstReady(nil)
 		}
 
 		if duplex, ok := transport.(slingshotIORedisDuplexTransport); ok {
@@ -828,6 +889,7 @@ func (c *SlingshotIORedisCompatClient) finishClosed(err error) {
 	requests := c.queue
 	c.queue = nil
 	c.mu.Unlock()
+	c.settleFirstReady(err)
 	for _, request := range requests {
 		c.complete(request, nil, err)
 	}

@@ -124,6 +124,18 @@ func NewSlingshotIORedisRESPCompatClient(options SlingshotIORedisRESPOptions) (*
 	return NewSlingshotIORedisCompatClient(factory)
 }
 
+// NewSlingshotIORedisRESPCompatClientReady is the opt-in, role-safe constructor
+// for Slingshot boot. It preserves the asynchronous constructor for every
+// existing caller while matching FIT.js's first ready-or-error initialization
+// promise and cleaning up the reconnect loop on failure or cancellation.
+func NewSlingshotIORedisRESPCompatClientReady(ctx context.Context, options SlingshotIORedisRESPOptions) (*SlingshotIORedisCompatClient, error) {
+	factory, err := NewSlingshotIORedisRESPTransportFactory(options)
+	if err != nil {
+		return nil, err
+	}
+	return NewSlingshotIORedisCompatClientReady(ctx, factory)
+}
+
 func (f *SlingshotIORedisRESPTransportFactory) Connect(ctx context.Context) (SlingshotIORedisTransport, error) {
 	if f == nil {
 		return nil, errors.New("Slingshot ioredis RESP transport factory is not configured")

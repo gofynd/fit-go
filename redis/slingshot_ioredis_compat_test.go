@@ -54,6 +54,203 @@ func TestSlingshotIORedisLockedDefaults(t *testing.T) {
 	}
 }
 
+func TestSlingshotIORedisFirstReadyRejectsFirstErrorAndStopsReconnect(t *testing.T) {
+	want := errors.New("initial Redis unavailable")
+	var attempts atomic.Int32
+	client, err := NewSlingshotIORedisCompatClientReady(context.Background(), SlingshotIORedisTransportFactoryFunc(func(context.Context) (SlingshotIORedisTransport, error) {
+		attempts.Add(1)
+		return nil, want
+	}))
+	if client != nil || !errors.Is(err, want) {
+		t.Fatalf("first-ready result = (%v, %v), want (nil, %v)", client, err, want)
+	}
+	time.Sleep(75 * time.Millisecond)
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("attempts after rejected role boot = %d, want 1", got)
+	}
+}
+
+func TestSlingshotIORedisFirstReadyWaitsForDelayedSuccess(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	transport := newSignaledSlingshotTransport()
+	factory := SlingshotIORedisTransportFactoryFunc(func(ctx context.Context) (SlingshotIORedisTransport, error) {
+		close(started)
+		select {
+		case <-release:
+			return transport, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	})
+	result := make(chan *SlingshotIORedisCompatClient, 1)
+	failures := make(chan error, 1)
+	go func() {
+		client, err := NewSlingshotIORedisCompatClientReady(context.Background(), factory)
+		result <- client
+		failures <- err
+	}()
+	<-started
+	select {
+	case <-result:
+		t.Fatal("first-ready constructor returned before delayed transport was ready")
+	default:
+	}
+	close(release)
+	client := <-result
+	if err := <-failures; err != nil || client == nil {
+		t.Fatalf("delayed first-ready result = (%v, %v)", client, err)
+	}
+	client.Disconnect()
+}
+
+func TestSlingshotIORedisFirstReadyContextCancellationCleansLoop(t *testing.T) {
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	var once sync.Once
+	factory := SlingshotIORedisTransportFactoryFunc(func(ctx context.Context) (SlingshotIORedisTransport, error) {
+		once.Do(func() { close(started) })
+		<-ctx.Done()
+		close(stopped)
+		return nil, ctx.Err()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		client, err := NewSlingshotIORedisCompatClientReady(ctx, factory)
+		if client != nil {
+			client.Disconnect()
+		}
+		result <- err
+	}()
+	<-started
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled first-ready error = %v, want context.Canceled", err)
+	}
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled first-ready factory goroutine did not stop")
+	}
+}
+
+func TestSlingshotIORedisFirstReadySuccessKeepsReconnectLifecycle(t *testing.T) {
+	server := startSlingshotLoopbackServer(t, "", nil)
+	defer server.stop()
+	first := newSignaledSlingshotTransport()
+	var calls atomic.Int32
+	factory := SlingshotIORedisTransportFactoryFunc(func(ctx context.Context) (SlingshotIORedisTransport, error) {
+		if calls.Add(1) == 1 {
+			return first, nil
+		}
+		return (&slingshotLoopbackFactory{addr: server.addr}).Connect(ctx)
+	})
+	client, err := NewSlingshotIORedisCompatClientReady(context.Background(), factory)
+	if err != nil {
+		t.Fatalf("NewSlingshotIORedisCompatClientReady: %v", err)
+	}
+	defer client.Disconnect()
+	first.signalRemoteClose()
+	waitForSlingshotCondition(t, time.Second, func() bool { return calls.Load() >= 2 })
+	future := client.Submit("SET", "after-first-ready", "1")
+	assertSlingshotFutureOK(t, future, "OK", 0, 0)
+	if calls.Load() < 2 {
+		t.Fatalf("factory calls = %d, want reconnect after first-ready", calls.Load())
+	}
+}
+
+func TestSlingshotIORedisFirstReadyConcurrentWaitersObserveImmutableResult(t *testing.T) {
+	transport := newSignaledSlingshotTransport()
+	client, err := NewSlingshotIORedisCompatClient(SlingshotIORedisTransportFactoryFunc(func(context.Context) (SlingshotIORedisTransport, error) {
+		return transport, nil
+	}))
+	if err != nil {
+		t.Fatalf("NewSlingshotIORedisCompatClient: %v", err)
+	}
+	defer client.Disconnect()
+
+	const waiters = 32
+	results := make(chan error, waiters)
+	var group sync.WaitGroup
+	for range waiters {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			results <- client.WaitForFirstReady(context.Background())
+		}()
+	}
+	group.Wait()
+	close(results)
+	for waiterErr := range results {
+		if waiterErr != nil {
+			t.Fatalf("concurrent first-ready waiter error = %v", waiterErr)
+		}
+	}
+	if err := client.WaitForFirstReady(context.Background()); err != nil {
+		t.Fatalf("repeated first-ready waiter error = %v", err)
+	}
+}
+
+func TestSlingshotIORedisFirstReadyWaiterCancellationDoesNotStopClient(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	transport := newSignaledSlingshotTransport()
+	client, err := NewSlingshotIORedisCompatClient(SlingshotIORedisTransportFactoryFunc(func(ctx context.Context) (SlingshotIORedisTransport, error) {
+		close(started)
+		select {
+		case <-release:
+			return transport, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}))
+	if err != nil {
+		t.Fatalf("NewSlingshotIORedisCompatClient: %v", err)
+	}
+	defer client.Disconnect()
+	<-started
+	waitCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := client.WaitForFirstReady(waitCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled observer error = %v, want context.Canceled", err)
+	}
+	close(release)
+	if err := client.WaitForFirstReady(context.Background()); err != nil {
+		t.Fatalf("client did not become ready after observer cancellation: %v", err)
+	}
+}
+
+func TestSlingshotIORedisDisconnectBeforeFirstReadySettlesAllWaiters(t *testing.T) {
+	started := make(chan struct{})
+	client, err := NewSlingshotIORedisCompatClient(SlingshotIORedisTransportFactoryFunc(func(ctx context.Context) (SlingshotIORedisTransport, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}))
+	if err != nil {
+		t.Fatalf("NewSlingshotIORedisCompatClient: %v", err)
+	}
+	<-started
+
+	const waiters = 32
+	results := make(chan error, waiters)
+	for range waiters {
+		go func() { results <- client.WaitForFirstReady(context.Background()) }()
+	}
+	client.Disconnect()
+	for range waiters {
+		var closed SlingshotIORedisConnectionClosedError
+		if waiterErr := <-results; !errors.As(waiterErr, &closed) {
+			t.Fatalf("disconnect-before-ready waiter error = %v, want connection closed", waiterErr)
+		}
+	}
+	var closed SlingshotIORedisConnectionClosedError
+	if err := client.WaitForFirstReady(context.Background()); !errors.As(err, &closed) {
+		t.Fatalf("repeated disconnect-before-ready error = %v, want connection closed", err)
+	}
+}
+
 func TestSlingshotIORedisSharedOfflineFIFORecoversOnLoopback(t *testing.T) {
 	addr := reserveSlingshotLoopbackAddr(t)
 	var attempts atomic.Int32
