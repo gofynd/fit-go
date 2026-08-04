@@ -230,6 +230,17 @@ func startProducerMessageSpan(ctx context.Context, topic string, msg Message) (c
 // TopicMessages and Message slices are not rebuilt: values, keys, partitions,
 // timestamps and caller headers retain their original representation.
 func startProducerMessageSpans(ctx context.Context, topicMessages []TopicMessages) []*tracing.Span {
+	return startProducerMessageSpansWithPolicy(ctx, topicMessages, ProducerTraceHeadersInject)
+}
+
+// startProducerMessageSpansWithPolicy preserves producer span creation while
+// allowing compatibility callers to suppress only automatic record-header
+// injection. Preserve mode never removes or rewrites caller-owned headers.
+func startProducerMessageSpansWithPolicy(
+	ctx context.Context,
+	topicMessages []TopicMessages,
+	policy ProducerTraceHeaderPolicy,
+) []*tracing.Span {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -244,7 +255,9 @@ func startProducerMessageSpans(ctx context.Context, topicMessages []TopicMessage
 			if span == nil {
 				continue
 			}
-			InjectTraceHeaders(spanCtx, &topicMessages[i].Messages[j])
+			if policy == ProducerTraceHeadersInject {
+				InjectTraceHeaders(spanCtx, &topicMessages[i].Messages[j])
+			}
 			spans = append(spans, span)
 		}
 	}
@@ -267,7 +280,17 @@ func produceTopicMessagesWithTrace(
 	acks int,
 	produce func([]TopicMessages, int) error,
 ) error {
-	spans := startProducerMessageSpans(ctx, topicMessages)
+	return produceTopicMessagesWithTracePolicy(ctx, topicMessages, acks, ProducerTraceHeadersInject, produce)
+}
+
+func produceTopicMessagesWithTracePolicy(
+	ctx context.Context,
+	topicMessages []TopicMessages,
+	acks int,
+	policy ProducerTraceHeaderPolicy,
+	produce func([]TopicMessages, int) error,
+) error {
+	spans := startProducerMessageSpansWithPolicy(ctx, topicMessages, policy)
 	err := produce(topicMessages, acks)
 	endProducerMessageSpans(spans, err)
 	return err

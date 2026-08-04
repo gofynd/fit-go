@@ -17,6 +17,35 @@ package kafka
 
 import "time"
 
+// ProducerPartitioner selects the driver partitioning strategy for records
+// without an explicit partition. The zero value preserves the driver's
+// existing default.
+type ProducerPartitioner string
+
+const (
+	// ProducerPartitionerDefault preserves librdkafka's configured/default
+	// partitioner.
+	ProducerPartitionerDefault ProducerPartitioner = ""
+	// ProducerPartitionerKafkaJSLegacy selects librdkafka's Java-compatible
+	// murmur2_random partitioner. For keyed records this matches KafkaJS 2.2.4's
+	// legacy/default murmur2 selection. Keyless KafkaJS round-robin behavior is
+	// intentionally outside this option's compatibility guarantee.
+	ProducerPartitionerKafkaJSLegacy ProducerPartitioner = "kafkajs-legacy"
+)
+
+// ProducerTraceHeaderPolicy controls automatic trace propagation performed by
+// fit-go producer entry points. The zero value preserves the existing behavior.
+type ProducerTraceHeaderPolicy uint8
+
+const (
+	// ProducerTraceHeadersInject creates producer spans and injects configured
+	// propagation headers into each record.
+	ProducerTraceHeadersInject ProducerTraceHeaderPolicy = iota
+	// ProducerTraceHeadersPreserve creates the same producer spans but leaves
+	// caller-provided record headers byte-for-byte unchanged.
+	ProducerTraceHeadersPreserve
+)
+
 // ---------------------------------------------------------------------------
 // Message types
 // ---------------------------------------------------------------------------
@@ -104,4 +133,19 @@ type ProducerConfig struct {
 
 	// RetryBackoff is the delay between retries.
 	RetryBackoff time.Duration
+
+	// RetryBackoffMax is the maximum retry delay. It is separate from
+	// RetryBackoff because librdkafka defaults retry.backoff.max.ms to one
+	// second, which otherwise caps larger explicitly configured initial delays.
+	// Zero preserves librdkafka's default.
+	RetryBackoffMax time.Duration
+
+	// Partitioner optionally selects a compatibility partitioner. Zero preserves
+	// the existing librdkafka default.
+	Partitioner ProducerPartitioner
+
+	// TraceHeaderPolicy controls only automatic record-header injection. Producer
+	// spans are still created when headers are preserved. Zero preserves fit-go's
+	// existing automatic injection behavior.
+	TraceHeaderPolicy ProducerTraceHeaderPolicy
 }

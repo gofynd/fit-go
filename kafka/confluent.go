@@ -148,6 +148,20 @@ func (cc *ConfluentClient) Producer(config ProducerConfig) (KafkaProducer, error
 	if config.RetryBackoff > 0 {
 		_ = pCfg.SetKey("retry.backoff.ms", int(config.RetryBackoff.Milliseconds()))
 	}
+	if config.RetryBackoffMax > 0 {
+		_ = pCfg.SetKey("retry.backoff.max.ms", int(config.RetryBackoffMax.Milliseconds()))
+	}
+
+	partitioner, err := confluentPartitioner(config.Partitioner)
+	if err != nil {
+		return nil, err
+	}
+	if partitioner != "" {
+		_ = pCfg.SetKey("partitioner", partitioner)
+	}
+	if config.TraceHeaderPolicy != ProducerTraceHeadersInject && config.TraceHeaderPolicy != ProducerTraceHeadersPreserve {
+		return nil, fmt.Errorf("kafka/confluent: unsupported producer trace header policy %d", config.TraceHeaderPolicy)
+	}
 
 	return &ConfluentProducer{
 		configMap:      pCfg,
@@ -155,6 +169,7 @@ func (cc *ConfluentClient) Producer(config ProducerConfig) (KafkaProducer, error
 		brokers:        cc.brokers,
 		configuredAcks: configuredAcks,
 		idempotent:     config.IdempotentProducer,
+		traceHeaders:   config.TraceHeaderPolicy,
 		producers:      make(map[int]confluentProducerDriver),
 	}, nil
 }
@@ -281,6 +296,7 @@ type ConfluentProducer struct {
 	brokers        []string
 	configuredAcks int
 	idempotent     bool
+	traceHeaders   ProducerTraceHeaderPolicy
 	newProducer    func(*ckafka.ConfigMap) (confluentProducerDriver, error)
 
 	mu        sync.Mutex
@@ -336,12 +352,15 @@ const defaultProducerCloseTimeout = 15 * time.Second
 
 // Produce sends messages to a single topic. Raw calls retain KafkaJS-like
 // automatic tracing by adopting FIT's active goroutine context when one exists.
+// ProducerTraceHeadersPreserve leaves record headers untouched while retaining
+// the producer spans.
 func (cp *ConfluentProducer) Produce(topic string, messages []Message, acks int) error {
 	ctx := automaticProducerContext()
-	return produceTopicMessagesWithTrace(
+	return produceTopicMessagesWithTracePolicy(
 		ctx,
 		[]TopicMessages{{Topic: topic, Messages: messages}},
 		acks,
+		cp.traceHeaders,
 		func(traced []TopicMessages, tracedAcks int) error {
 			_, err := cp.produceWithMetadata(ctx, topic, traced[0].Messages, tracedAcks)
 			return err
@@ -357,7 +376,7 @@ func (cp *ConfluentProducer) Produce(topic string, messages []Message, acks int)
 func (cp *ConfluentProducer) ProduceWithMetadata(topic string, messages []Message, acks int) ([]RecordMetadata, error) {
 	ctx := automaticProducerContext()
 	topicMessages := []TopicMessages{{Topic: topic, Messages: messages}}
-	spans := startProducerMessageSpans(ctx, topicMessages)
+	spans := startProducerMessageSpansWithPolicy(ctx, topicMessages, cp.traceHeaders)
 	metadata, err := cp.produceWithMetadata(ctx, topic, topicMessages[0].Messages, acks)
 	endProducerMessageSpans(spans, err)
 	return metadata, err
@@ -400,7 +419,7 @@ func (cp *ConfluentProducer) produceWithMetadata(ctx context.Context, topic stri
 // ProduceBatch sends messages to multiple topics in one call.
 func (cp *ConfluentProducer) ProduceBatch(topicMessages []TopicMessages, acks int) error {
 	ctx := automaticProducerContext()
-	return produceTopicMessagesWithTrace(ctx, topicMessages, acks, func(traced []TopicMessages, tracedAcks int) error {
+	return produceTopicMessagesWithTracePolicy(ctx, topicMessages, acks, cp.traceHeaders, func(traced []TopicMessages, tracedAcks int) error {
 		return cp.produceBatch(ctx, traced, tracedAcks)
 	})
 }
@@ -434,17 +453,19 @@ func (cp *ConfluentProducer) produceBatch(ctx context.Context, topicMessages []T
 	return nil
 }
 
-// ProduceCtx is the canonical producer path. It creates and injects one producer
-// span per message, matching KafkaJS instrumentation, then performs the same raw
-// broker operation with the caller's acks value.
+// ProduceCtx is the canonical producer path. It creates one producer span per
+// message, matching KafkaJS instrumentation, and injects propagation headers
+// unless ProducerTraceHeadersPreserve was selected. It then performs the same
+// raw broker operation with the caller's acks value.
 func (cp *ConfluentProducer) ProduceCtx(ctx context.Context, topic string, messages []Message, acks int) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return produceTopicMessagesWithTrace(
+	return produceTopicMessagesWithTracePolicy(
 		ctx,
 		[]TopicMessages{{Topic: topic, Messages: messages}},
 		acks,
+		cp.traceHeaders,
 		func(traced []TopicMessages, tracedAcks int) error {
 			_, err := cp.produceWithMetadata(ctx, topic, traced[0].Messages, tracedAcks)
 			return err
@@ -452,14 +473,14 @@ func (cp *ConfluentProducer) ProduceCtx(ctx context.Context, topic string, messa
 	)
 }
 
-// ProduceCtxWithMetadata is ProduceWithMetadata with a producer span + per-message
-// traceparent injection.
+// ProduceCtxWithMetadata is ProduceWithMetadata with a producer span and the
+// configured per-message trace-header policy.
 func (cp *ConfluentProducer) ProduceCtxWithMetadata(ctx context.Context, topic string, messages []Message, acks int) ([]RecordMetadata, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	topicMessages := []TopicMessages{{Topic: topic, Messages: messages}}
-	spans := startProducerMessageSpans(ctx, topicMessages)
+	spans := startProducerMessageSpansWithPolicy(ctx, topicMessages, cp.traceHeaders)
 	md, err := cp.produceWithMetadata(ctx, topic, topicMessages[0].Messages, acks)
 	endProducerMessageSpans(spans, err)
 	return md, err
@@ -472,7 +493,7 @@ func (cp *ConfluentProducer) ProduceBatchCtx(ctx context.Context, topicMessages 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return produceTopicMessagesWithTrace(ctx, topicMessages, acks, func(traced []TopicMessages, tracedAcks int) error {
+	return produceTopicMessagesWithTracePolicy(ctx, topicMessages, acks, cp.traceHeaders, func(traced []TopicMessages, tracedAcks int) error {
 		return cp.produceBatch(ctx, traced, tracedAcks)
 	})
 }
@@ -1533,6 +1554,17 @@ func mapCompressionToString(ct CompressionType) string {
 		return "zstd"
 	default:
 		return "none"
+	}
+}
+
+func confluentPartitioner(partitioner ProducerPartitioner) (string, error) {
+	switch partitioner {
+	case ProducerPartitionerDefault:
+		return "", nil
+	case ProducerPartitionerKafkaJSLegacy:
+		return "murmur2_random", nil
+	default:
+		return "", fmt.Errorf("kafka/confluent: unsupported producer partitioner %q", partitioner)
 	}
 }
 
