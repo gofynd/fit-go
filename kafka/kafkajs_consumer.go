@@ -41,7 +41,7 @@ type kafkaJSCompatibleConsumer struct {
 
 	mu        sync.Mutex
 	client    *kgo.Client
-	topics    []string
+	topics    []TopicConfig
 	cancelRun context.CancelFunc
 	runDone   chan struct{}
 	closed    bool
@@ -99,7 +99,7 @@ func (c *kafkaJSCompatibleConsumer) Connect(topics []TopicConfig) error {
 		return fmt.Errorf("kafka/kafkajs: consumer group connect failed: %w", err)
 	}
 	c.client = client
-	c.topics = names
+	c.topics = append([]TopicConfig(nil), topics...)
 	c.logger.Info("kafka/kafkajs: consumer connected",
 		"groupId", c.config.GroupID,
 		"topics", strings.Join(names, ","),
@@ -278,7 +278,7 @@ func (c *kafkaJSCompatibleConsumer) consumeMessages(handler kafkaJSMessageHandle
 	for {
 		fetches, err := pollKafkaJSRecords(ctx, client, pollTimeout, maxRecords)
 		if err != nil {
-			return err
+			return c.prepareTransientRunRetry(client, err)
 		}
 		if ctx.Err() != nil {
 			return nil
@@ -293,7 +293,7 @@ func (c *kafkaJSCompatibleConsumer) consumeMessages(handler kafkaJSMessageHandle
 			return nil
 		}); err != nil {
 			client.AllowRebalance()
-			return err
+			return c.prepareTransientRunRetry(client, err)
 		}
 		client.AllowRebalance()
 	}
@@ -520,7 +520,7 @@ func (c *kafkaJSCompatibleConsumer) consumeBatches(handler kafkaJSBatchHandler, 
 	for {
 		fetches, err := pollKafkaJSRecords(ctx, client, pollTimeout, maxRecords)
 		if err != nil {
-			return err
+			return c.prepareTransientRunRetry(client, err)
 		}
 		if ctx.Err() != nil {
 			return nil
@@ -552,7 +552,7 @@ func (c *kafkaJSCompatibleConsumer) consumeBatches(handler kafkaJSBatchHandler, 
 			return resolveKafkaJSRecord(ctx, client, last, isAutoCommit)
 		}); err != nil {
 			client.AllowRebalance()
-			return err
+			return c.prepareTransientRunRetry(client, err)
 		}
 		client.AllowRebalance()
 	}
@@ -565,8 +565,26 @@ func (c *kafkaJSCompatibleConsumer) beginRun() (*kgo.Client, context.Context, fu
 		return nil, nil, nil, fmt.Errorf("kafka/kafkajs: consumer is closed")
 	}
 	if c.client == nil {
-		c.mu.Unlock()
-		return nil, nil, nil, fmt.Errorf("kafka/kafkajs: consumer is not connected")
+		if len(c.topics) == 0 {
+			c.mu.Unlock()
+			return nil, nil, nil, fmt.Errorf("kafka/kafkajs: consumer is not connected")
+		}
+		opts, err := c.clientOptions(c.topics)
+		if err != nil {
+			c.mu.Unlock()
+			return nil, nil, nil, fmt.Errorf("kafka/kafkajs: rebuild consumer options: %w", err)
+		}
+		client, err := kgo.NewClient(opts...)
+		if err != nil {
+			c.mu.Unlock()
+			return nil, nil, nil, fmt.Errorf("kafka/kafkajs: reconnect consumer group: %w", err)
+		}
+		c.client = client
+		c.logger.Info("kafka/kafkajs: consumer reconnected after transient run failure",
+			"groupId", c.config.GroupID,
+			"topics", strings.Join(topicNames(c.topics), ","),
+			"protocol", "RoundRobinAssigner",
+		)
 	}
 	if c.runDone != nil {
 		c.mu.Unlock()
@@ -588,6 +606,34 @@ func (c *kafkaJSCompatibleConsumer) beginRun() (*kgo.Client, context.Context, fu
 		c.mu.Unlock()
 	}
 	return client, ctx, finish, nil
+}
+
+// prepareTransientRunRetry discards the current franz-go client only for the
+// exported transient boundary. Polling advances franz-go's in-memory fetch
+// position before the handler's synchronous offset commit. Re-entering Consume
+// on that same client after a broker outage would therefore skip the failed
+// record even though the broker has no committed next offset. KafkaJS restarts
+// its runner from the group commit in this situation. Closing this client and
+// lazily rebuilding it in beginRun gives the caller the same replay boundary
+// without retrying permanent protocol or handler failures.
+func (c *kafkaJSCompatibleConsumer) prepareTransientRunRetry(runClient *kgo.Client, err error) error {
+	if !IsTransientConsumerError(err) || runClient == nil {
+		return err
+	}
+
+	c.mu.Lock()
+	if c.closed || c.client != runClient {
+		c.mu.Unlock()
+		return err
+	}
+	c.client = nil
+	c.mu.Unlock()
+
+	// Close stops heartbeats and releases the old assignment before the outer
+	// retry starts a new group member. kgo.Close is safe without a live broker
+	// and prevents a stale member from delaying recovery by a session timeout.
+	runClient.Close()
+	return err
 }
 
 func (c *kafkaJSCompatibleConsumer) Close() error {

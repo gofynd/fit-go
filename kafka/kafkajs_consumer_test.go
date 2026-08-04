@@ -54,6 +54,66 @@ func TestNewTransientConsumerErrorPreservesCauseAndIdentity(t *testing.T) {
 	}
 }
 
+func TestKafkaJSTransientRunFailureRebuildsClientFromCommittedBoundary(t *testing.T) {
+	logger, err := logging.New(logging.Options{Level: "info"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer := &kafkaJSCompatibleConsumer{
+		brokers: []string{"127.0.0.1:1"},
+		fitCfg:  &Config{ClientID: "test"},
+		config:  ConsumerConfig{GroupID: "group", AutoCommit: false},
+		logger:  logger,
+		topics:  []TopicConfig{{Topic: "discounts"}},
+	}
+	opts, err := consumer.clientOptions(consumer.topics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := kgo.NewClient(opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer.client = original
+
+	cause := errors.New("broker transport unavailable")
+	marked := NewTransientConsumerError(cause)
+	if got := consumer.prepareTransientRunRetry(original, marked); got != marked {
+		t.Fatalf("prepare error = %v, want original transient wrapper", got)
+	}
+	if consumer.client != nil {
+		t.Fatal("transient run failure retained the advanced franz-go client")
+	}
+
+	rebuilt, _, finish, err := consumer.beginRun()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rebuilt == nil || rebuilt == original || consumer.client != rebuilt {
+		t.Fatalf("rebuilt client = %p, original = %p, stored = %p", rebuilt, original, consumer.client)
+	}
+	finish()
+	if err := consumer.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestKafkaJSPermanentRunFailureRetainsClient(t *testing.T) {
+	client, err := kgo.NewClient(kgo.SeedBrokers("127.0.0.1:1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	consumer := &kafkaJSCompatibleConsumer{client: client}
+	want := errors.New("handler rejected message")
+	if got := consumer.prepareTransientRunRetry(client, want); got != want {
+		t.Fatalf("prepare error = %v, want permanent error identity", got)
+	}
+	if consumer.client != client {
+		t.Fatal("permanent failure discarded a healthy client")
+	}
+}
+
 func TestKafkaJSRoundRobinBalancerChangesOnlyProtocolName(t *testing.T) {
 	base := kgo.RoundRobinBalancer()
 	candidate := kafkaJSRoundRobinBalancer{GroupBalancer: base}
