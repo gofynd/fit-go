@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 	"github.com/twmb/franz-go/pkg/sasl"
@@ -308,7 +310,9 @@ func pollKafkaJSRecords(ctx context.Context, client *kgo.Client, timeout time.Du
 		if errors.Is(fetchErr.Err, context.DeadlineExceeded) || errors.Is(fetchErr.Err, context.Canceled) {
 			continue
 		}
-		return fetches, fmt.Errorf("kafka/kafkajs: consume error: %w", fetchErr.Err)
+		return fetches, classifyKafkaJSTransientConsumerError(
+			fmt.Errorf("kafka/kafkajs: consume error: %w", fetchErr.Err),
+		)
 	}
 	return fetches, nil
 }
@@ -374,7 +378,9 @@ func (c *kafkaJSCompatibleConsumer) processRecord(
 	payload := kafkaJSPayload(record)
 	if !isAutoCommit && opts.CommitBeforeHandler {
 		if err := client.CommitRecords(ctx, record); err != nil {
-			return fmt.Errorf("kafka/kafkajs: pre-handler commit failed: %w", err)
+			return classifyKafkaJSTransientConsumerError(
+				fmt.Errorf("kafka/kafkajs: pre-handler commit failed: %w", err),
+			)
 		}
 	}
 	handlerErr := handler(ctx, payload)
@@ -423,7 +429,9 @@ func resolveKafkaJSRecord(ctx context.Context, client *kgo.Client, record *kgo.R
 		return nil
 	}
 	if err := client.CommitRecords(ctx, record); err != nil {
-		return fmt.Errorf("kafka/kafkajs: post-handler commit failed: %w", err)
+		return classifyKafkaJSTransientConsumerError(
+			fmt.Errorf("kafka/kafkajs: post-handler commit failed: %w", err),
+		)
 	}
 	return nil
 }
@@ -447,9 +455,29 @@ func commitKafkaJSExact(ctx context.Context, client *kgo.Client, record *kgo.Rec
 		}
 	})
 	if commitErr != nil {
-		return fmt.Errorf("kafka/kafkajs: exact offset commit failed: %w", commitErr)
+		return classifyKafkaJSTransientConsumerError(
+			fmt.Errorf("kafka/kafkajs: exact offset commit failed: %w", commitErr),
+		)
 	}
 	return nil
+}
+
+// classifyKafkaJSTransientConsumerError turns only transport and Kafka
+// protocol retry classes into the exported typed boundary. Permanent broker
+// responses (authorization, invalid topic/config, oversized records) retain
+// their original error identity and continue to fail fast in callers.
+func classifyKafkaJSTransientConsumerError(err error) error {
+	if err == nil || IsTransientConsumerError(err) || errors.Is(err, context.Canceled) {
+		return err
+	}
+	if kerr.IsRetriable(err) || errors.Is(err, context.DeadlineExceeded) {
+		return &TransientConsumerError{cause: err}
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) {
+		return &TransientConsumerError{cause: err}
+	}
+	return err
 }
 
 func (c *kafkaJSCompatibleConsumer) ConsumeBatch(handler BatchHandler, opts ConsumerOptions) error {
@@ -509,7 +537,9 @@ func (c *kafkaJSCompatibleConsumer) consumeBatches(handler kafkaJSBatchHandler, 
 			last := group[len(group)-1]
 			if !isAutoCommit && opts.CommitBeforeHandler {
 				if err := client.CommitRecords(ctx, last); err != nil {
-					return fmt.Errorf("kafka/kafkajs: pre-handler batch commit failed: %w", err)
+					return classifyKafkaJSTransientConsumerError(
+						fmt.Errorf("kafka/kafkajs: pre-handler batch commit failed: %w", err),
+					)
 				}
 			}
 			payload := BatchPayload{Topic: last.Topic, Partition: int(last.Partition), Messages: messages, FirstOffset: group[0].Offset, LastOffset: last.Offset}

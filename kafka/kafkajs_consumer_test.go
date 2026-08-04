@@ -1,14 +1,44 @@
 package kafka
 
 import (
+	"errors"
+	"fmt"
+	"net"
 	"reflect"
 	"testing"
 
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"github.com/twmb/franz-go/pkg/kmsg"
 
 	"github.com/gofynd/fit-go/logging"
 )
+
+func TestKafkaJSTransientConsumerErrorClassification(t *testing.T) {
+	networkCause := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	tests := []struct {
+		name      string
+		err       error
+		transient bool
+	}{
+		{name: "dial failure", err: fmt.Errorf("post-handler commit failed: %w", networkCause), transient: true},
+		{name: "retriable protocol failure", err: fmt.Errorf("commit failed: %w", kerr.CoordinatorNotAvailable), transient: true},
+		{name: "permanent protocol failure", err: fmt.Errorf("commit failed: %w", kerr.GroupAuthorizationFailed), transient: false},
+		{name: "handler failure", err: errors.New("validation failed"), transient: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyKafkaJSTransientConsumerError(tc.err)
+			isTransient := IsTransientConsumerError(got)
+			if isTransient != tc.transient {
+				t.Fatalf("IsTransientConsumerError(%v) = %v, want %v", got, isTransient, tc.transient)
+			}
+			if !errors.Is(got, tc.err) {
+				t.Fatalf("classified error no longer unwraps to original: %v", got)
+			}
+		})
+	}
+}
 
 func TestKafkaJSRoundRobinBalancerChangesOnlyProtocolName(t *testing.T) {
 	base := kgo.RoundRobinBalancer()

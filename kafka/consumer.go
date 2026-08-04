@@ -17,6 +17,7 @@ package kafka
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -66,6 +67,29 @@ type MessageHandlerCtx func(ctx context.Context, payload MessagePayload) error
 // it does not advance the value to the next offset. An OffsetFinalizer receives
 // one callback per message and may invoke it at most once.
 type ExactOffsetCommit func(offset int64) error
+
+// TransientConsumerError identifies a broker transport or retriable Kafka
+// protocol failure from a running consumer. Callers may use
+// IsTransientConsumerError to restart the consume loop without treating a
+// temporary broker outage as a fatal application error.
+//
+// The concrete cause remains available through errors.Is/errors.As. Handler
+// errors are never converted to this type: the marker is reserved for
+// consumer transport boundaries owned by fit-go.
+type TransientConsumerError struct {
+	cause error
+}
+
+func (e *TransientConsumerError) Error() string { return e.cause.Error() }
+func (e *TransientConsumerError) Unwrap() error { return e.cause }
+
+// IsTransientConsumerError reports whether err contains a fit-go consumer
+// transport failure that is safe for an application to retry. It deliberately
+// relies on a typed boundary rather than error-message matching.
+func IsTransientConsumerError(err error) bool {
+	var transient *TransientConsumerError
+	return errors.As(err, &transient)
+}
 
 // OffsetFinalizer owns an advanced manual-offset boundary after a message
 // handler returns. handlerErr is the unmodified handler result. The finalizer
