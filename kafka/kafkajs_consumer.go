@@ -114,7 +114,16 @@ func (c *kafkaJSCompatibleConsumer) clientOptions(topics []TopicConfig) ([]kgo.O
 		kgo.ConsumeTopics(topicNames(topics)...),
 		kgo.Balancers(kafkaJSRoundRobinBalancer{kgo.RoundRobinBalancer()}),
 		kgo.BlockRebalanceOnPoll(),
-		kgo.AutoCommitMarks(),
+	}
+	// Manual consumers must disable franz-go's background auto-commit loop.
+	// AutoCommitMarks only changes which offsets that loop commits; on its own
+	// it does not turn the loop off and can advance a polled-but-unhandled
+	// record. Promotions uses OffsetFinalizer and exact synchronous commits, so
+	// this option is required for at-least-once parity with KafkaJS eachBatch.
+	if !c.config.AutoCommit {
+		opts = append(opts, kgo.DisableAutoCommit())
+	} else {
+		opts = append(opts, kgo.AutoCommitMarks())
 	}
 	if topics[0].FromBeginning {
 		opts = append(opts, kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()))

@@ -5,6 +5,9 @@ import (
 	"testing"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
+
+	"github.com/gofynd/fit-go/logging"
 )
 
 func TestKafkaJSRoundRobinBalancerChangesOnlyProtocolName(t *testing.T) {
@@ -20,6 +23,67 @@ func TestKafkaJSRoundRobinBalancerChangesOnlyProtocolName(t *testing.T) {
 	}
 	if candidate.IsCooperative() != base.IsCooperative() {
 		t.Fatal("KafkaJS wrapper changed eager/cooperative semantics")
+	}
+}
+
+func TestKafkaJSRoundRobinBalancerMatchesMultiMemberMultiPartitionPlan(t *testing.T) {
+	base := kgo.RoundRobinBalancer()
+	candidate := kafkaJSRoundRobinBalancer{GroupBalancer: base}
+	members := []kmsg.JoinGroupResponseMember{
+		{MemberID: "legacy-kafkajs", ProtocolMetadata: base.JoinGroupMetadata([]string{"discount-a", "discount-b"}, nil, 1)},
+		{MemberID: "metroplex-go", ProtocolMetadata: candidate.JoinGroupMetadata([]string{"discount-a", "discount-b"}, nil, 1)},
+	}
+	baseBalancer, baseTopics, err := base.MemberBalancer(members)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateBalancer, candidateTopics, err := candidate.MemberBalancer(members)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(candidateTopics, baseTopics) {
+		t.Fatalf("topics = %#v, want %#v", candidateTopics, baseTopics)
+	}
+	partitions := map[string]int32{"discount-a": 3, "discount-b": 2}
+	basePlan, err := baseBalancer.(interface {
+		BalanceOrError(map[string]int32) (kgo.IntoSyncAssignment, error)
+	}).BalanceOrError(partitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidatePlan, err := candidateBalancer.(interface {
+		BalanceOrError(map[string]int32) (kgo.IntoSyncAssignment, error)
+	}).BalanceOrError(partitions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := candidatePlan.IntoSyncAssignment(), basePlan.IntoSyncAssignment(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("assignment = %#v, want %#v", got, want)
+	}
+}
+
+func TestKafkaJSCompatibleManualConsumerDisablesBackgroundAutoCommit(t *testing.T) {
+	logger, err := logging.New(logging.Options{Level: "info"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumer := &kafkaJSCompatibleConsumer{
+		brokers: []string{"127.0.0.1:1"},
+		fitCfg:  &Config{ClientID: "test"},
+		config:  ConsumerConfig{GroupID: "group", AutoCommit: false},
+		logger:  logger,
+	}
+	opts, err := consumer.clientOptions([]TopicConfig{{Topic: "discounts"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := kgo.NewClient(opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if disabled, ok := client.OptValue(kgo.DisableAutoCommit).(bool); !ok || !disabled {
+		t.Fatalf("DisableAutoCommit = %#v; manual mode could background-commit an unhandled record", client.OptValue(kgo.DisableAutoCommit))
 	}
 }
 
