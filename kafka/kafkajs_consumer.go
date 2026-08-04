@@ -471,11 +471,11 @@ func classifyKafkaJSTransientConsumerError(err error) error {
 		return err
 	}
 	if kerr.IsRetriable(err) || errors.Is(err, context.DeadlineExceeded) {
-		return &TransientConsumerError{cause: err}
+		return NewTransientConsumerError(err)
 	}
 	var networkErr net.Error
 	if errors.As(err, &networkErr) {
-		return &TransientConsumerError{cause: err}
+		return NewTransientConsumerError(err)
 	}
 	return err
 }

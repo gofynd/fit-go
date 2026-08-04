@@ -40,6 +40,20 @@ func TestKafkaJSTransientConsumerErrorClassification(t *testing.T) {
 	}
 }
 
+func TestNewTransientConsumerErrorPreservesCauseAndIdentity(t *testing.T) {
+	cause := errors.New("broker transport unavailable")
+	marked := NewTransientConsumerError(cause)
+	if !IsTransientConsumerError(marked) || !errors.Is(marked, cause) {
+		t.Fatalf("marked error = %v, want transient wrapper preserving cause", marked)
+	}
+	if got := NewTransientConsumerError(marked); got != marked {
+		t.Fatal("marking an existing transient error changed its identity")
+	}
+	if got := NewTransientConsumerError(nil); got != nil {
+		t.Fatalf("nil cause = %v, want nil", got)
+	}
+}
+
 func TestKafkaJSRoundRobinBalancerChangesOnlyProtocolName(t *testing.T) {
 	base := kgo.RoundRobinBalancer()
 	candidate := kafkaJSRoundRobinBalancer{GroupBalancer: base}

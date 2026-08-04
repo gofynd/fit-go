@@ -83,6 +83,17 @@ type TransientConsumerError struct {
 func (e *TransientConsumerError) Error() string { return e.cause.Error() }
 func (e *TransientConsumerError) Unwrap() error { return e.cause }
 
+// NewTransientConsumerError marks cause as a retryable running-consumer
+// transport failure. Driver adapters should call this only after classifying
+// the underlying network or Kafka protocol error. A nil cause remains nil and
+// an already-marked error is returned unchanged.
+func NewTransientConsumerError(cause error) error {
+	if cause == nil || IsTransientConsumerError(cause) {
+		return cause
+	}
+	return &TransientConsumerError{cause: cause}
+}
+
 // IsTransientConsumerError reports whether err contains a fit-go consumer
 // transport failure that is safe for an application to retry. It deliberately
 // relies on a typed boundary rather than error-message matching.
