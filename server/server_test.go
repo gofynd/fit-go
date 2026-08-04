@@ -1038,6 +1038,25 @@ func TestHealthAndReadinessCanUseIndependentCheckers(t *testing.T) {
 	}
 }
 
+func TestLegacyStaticHealthRoutesPreserveFitJSBytes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	RegisterLegacyStaticHealthRoutes(engine)
+
+	for _, path := range []string{"/_healthz", "/_readyz"} {
+		t.Run(path, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("GET %s = %d, want 200", path, recorder.Code)
+			}
+			if got := recorder.Body.String(); got != `{"ok":"ok"}` {
+				t.Fatalf("GET %s body = %q, want exact fit.js body", path, got)
+			}
+		})
+	}
+}
+
 func TestProfileRoutesControlTheProvidedProfiler(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	profiler := profiling.New(profiling.Config{

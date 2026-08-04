@@ -79,6 +79,16 @@ func RegisterHealthRoutes(engine *gin.Engine) {
 	RegisterHealthRoutesWithCheckers(engine, nil, nil)
 }
 
+// RegisterLegacyStaticHealthRoutes registers the legacy fit.js static health
+// contract.  Some Node services expose these probes as an unconditional 200
+// with exactly {"ok":"ok"}; they do not run dependency checks and clients
+// observe the absence of fit-go's status field.  Keep this separate from the
+// default health routes so existing Go services retain their current behavior.
+func RegisterLegacyStaticHealthRoutes(engine *gin.Engine) {
+	engine.GET("/_healthz", legacyStaticHealthHandler())
+	engine.GET("/_readyz", legacyStaticHealthHandler())
+}
+
 // RegisterHealthRoutesWithCheckers registers independent liveness and
 // readiness checkers. A nil health checker uses the package default; a nil
 // readiness checker reuses the selected health checker for fit.js compatibility.
@@ -116,5 +126,13 @@ func healthHandler(checker HealthChecker) gin.HandlerFunc {
 			"status": "healthy",
 			"ok":     "ok",
 		})
+	}
+}
+
+func legacyStaticHealthHandler() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Do not use c.JSON here: this is a byte-level compatibility mode for
+		// fit.js services whose health endpoint returned this exact object.
+		c.Data(http.StatusOK, "application/json; charset=utf-8", []byte(`{"ok":"ok"}`))
 	}
 }

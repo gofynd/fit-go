@@ -89,6 +89,12 @@ type Config struct {
 	// preserving fit.js behavior while allowing pyfit-style independent readiness.
 	ReadinessChecker HealthChecker
 
+	// LegacyStaticHealthResponse preserves the fit.js static probe contract for
+	// services that always returned HTTP 200 with exactly {"ok":"ok"}. When
+	// enabled, /_healthz and /_readyz intentionally do not invoke the configured
+	// health checkers. Defaults to false for every existing fit-go caller.
+	LegacyStaticHealthResponse bool
+
 	// Profiler owns the profiling routes registered by this server. When nil,
 	// the process default installed by fit.Init is used.
 	Profiler *profiling.Profiler
@@ -255,7 +261,11 @@ func (s *Server) Init(
 	}
 
 	// 2. Register health routes (before service routes)
-	RegisterHealthRoutesWithCheckers(root, s.cfg.HealthChecker, s.cfg.ReadinessChecker)
+	if s.cfg.LegacyStaticHealthResponse {
+		RegisterLegacyStaticHealthRoutes(root)
+	} else {
+		RegisterHealthRoutesWithCheckers(root, s.cfg.HealthChecker, s.cfg.ReadinessChecker)
+	}
 
 	// 3. Register profiling routes if enabled
 	if s.cfg.Profiler != nil && s.cfg.Profiler.GetConfig().Enabled {
