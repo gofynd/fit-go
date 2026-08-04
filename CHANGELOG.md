@@ -11,6 +11,14 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Fail-closed Slingshot ioredis state machine**: a separate, explicitly
+  constructed compatibility client now models ioredis 5.11.1's connection-wide
+  offline FIFO, exact reconnect curve and 20-retry flush boundary, replay-before-
+  offline ordering, lost-reply duplicate risk, partial-pipeline abort behavior,
+  Promise-like settlement, and quit/disconnect boundaries. It has no automatic
+  go-redis transport or environment wiring: production use remains blocked until
+  a standalone transport can prove partial-write disposition and live Node/Go
+  differentials; Cluster and Sentinel remain out of scope.
 - **Opt-in Redis retry controls**: per-service/read-write environment settings
   now expose go-redis command retry count/backoff separately from dial retry
   count/backoff for standalone, cluster, and Sentinel clients. Existing callers
