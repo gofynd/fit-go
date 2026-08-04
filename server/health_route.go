@@ -105,9 +105,13 @@ func RegisterLegacyStaticHealthRoutes(engine *gin.Engine) {
 		c.Abort()
 	})
 	engine.GET("/_healthz", legacyStaticHealthHandler())
+	engine.GET("/_healthz/", legacyStaticHealthHandler())
 	engine.GET("/_readyz", legacyStaticHealthHandler())
+	engine.GET("/_readyz/", legacyStaticHealthHandler())
 	engine.HEAD("/_healthz", legacyStaticHealthHandler())
+	engine.HEAD("/_healthz/", legacyStaticHealthHandler())
 	engine.HEAD("/_readyz", legacyStaticHealthHandler())
+	engine.HEAD("/_readyz/", legacyStaticHealthHandler())
 }
 
 // RegisterHealthRoutesWithCheckers registers independent liveness and
@@ -159,6 +163,17 @@ func legacyStaticHealthHandler() gin.HandlerFunc {
 		c.Header("Content-Type", "application/json; charset=utf-8")
 		c.Header("Content-Length", strconv.Itoa(len(body)))
 		c.Header("ETag", `W/"b-2F/2BWc0KYbtLqL5U2Kv5B6uQUQ"`)
+		// Express/http emits persistent-connection response headers for HTTP/1.1
+		// unless the request explicitly asks to close the connection. net/http
+		// normally owns these transport headers and omits them from ResponseWriter,
+		// so the opt-in legacy boundary must supply the bytes clients observed.
+		c.Header("Keep-Alive", "")
+		if c.Request.Close || strings.EqualFold(c.GetHeader("Connection"), "close") {
+			c.Header("Connection", "close")
+		} else {
+			c.Header("Connection", "keep-alive")
+			c.Header("Keep-Alive", "timeout=5")
+		}
 		if c.Request.Method == http.MethodHead {
 			c.Status(http.StatusOK)
 			return
