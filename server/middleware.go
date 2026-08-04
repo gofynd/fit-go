@@ -212,6 +212,10 @@ type LogRequestResponseConfig struct {
 	// MetricsRecorder is an optional callback invoked with method, route, status, and
 	// duration so that the caller can record Prometheus histograms.
 	MetricsRecorder func(method, route, status string, durationMs float64)
+	// DisableLogging suppresses the REQ/RES access-log pair while retaining the
+	// middleware's metrics callback. The default is false for compatibility with
+	// all existing fit-go callers.
+	DisableLogging bool
 }
 
 // ResponseLogSeverityMode controls response log levels for LogRequestResponse.
@@ -274,11 +278,13 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 		}
 
 		// Full-slice cap so REQ/RES appends each allocate — no shared-backing aliasing.
-		reqAttrs := append(base[:len(base):len(base)], slog.String("step", "REQ"))
-		l.LogAttrs(c.Request.Context(), slog.LevelInfo,
-			fmt.Sprintf("[REQ] Incoming %s request for %s", c.Request.Method, requestURL),
-			reqAttrs...,
-		)
+		if !cfg.DisableLogging {
+			reqAttrs := append(base[:len(base):len(base)], slog.String("step", "REQ"))
+			l.LogAttrs(c.Request.Context(), slog.LevelInfo,
+				fmt.Sprintf("[REQ] Incoming %s request for %s", c.Request.Method, requestURL),
+				reqAttrs...,
+			)
+		}
 
 		c.Next()
 
@@ -301,22 +307,24 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 
 		// Legacy default: single info level. Services that migrated from fit.js v2.9
 		// status-based logging can opt in with ResponseLogSeverityStatusBased.
-		responseLevel := responseLogLevel(statusCode, cfg)
-		resAttrs := append(base[:len(base):len(base)],
-			slog.String("step", "RES"),
-			slog.Int("response_status", statusCode),
-		)
-		if !legacyTraceClue {
-			// The TraceClue formatter never added middleware duration to its
-			// request attributes. Keep duration in the platform schema, where it
-			// is useful operational metadata, without contaminating compatibility
-			// logs. Preserve the existing key for platform consumers.
-			resAttrs = append(resAttrs, slog.Duration("duration", duration))
+		if !cfg.DisableLogging {
+			responseLevel := responseLogLevel(statusCode, cfg)
+			resAttrs := append(base[:len(base):len(base)],
+				slog.String("step", "RES"),
+				slog.Int("response_status", statusCode),
+			)
+			if !legacyTraceClue {
+				// The TraceClue formatter never added middleware duration to its
+				// request attributes. Keep duration in the platform schema, where it
+				// is useful operational metadata, without contaminating compatibility
+				// logs. Preserve the existing key for platform consumers.
+				resAttrs = append(resAttrs, slog.Duration("duration", duration))
+			}
+			l.LogAttrs(c.Request.Context(), responseLevel,
+				fmt.Sprintf("[RES] Outgoing %s response from %s", c.Request.Method, requestURL),
+				resAttrs...,
+			)
 		}
-		l.LogAttrs(c.Request.Context(), responseLevel,
-			fmt.Sprintf("[RES] Outgoing %s response from %s", c.Request.Method, requestURL),
-			resAttrs...,
-		)
 	}
 }
 

@@ -86,6 +86,12 @@ type Config struct {
 	// with pinned legacy servers which had no request-ID middleware.
 	RequestID *bool
 
+	// RequestLogging controls whether the server emits the fit-go REQ/RES access
+	// log pair. Defaults to true. Metrics are still recorded when this is false,
+	// allowing a legacy service without access logs to preserve its Prometheus
+	// observability without adding a new log contract.
+	RequestLogging *bool
+
 	// HealthChecker is the health checker used by /_healthz and /_readyz routes.
 	// If nil, the package-level globalHealthChecker is used.
 	HealthChecker HealthChecker
@@ -238,10 +244,15 @@ func (s *Server) Init(
 			metricsRecorder = registry.ServerRecorderFunc()
 		}
 	}
+	requestLogging := true
+	if s.cfg.RequestLogging != nil {
+		requestLogging = *s.cfg.RequestLogging
+	}
 	root.Use(GinLogRequestResponse(LogRequestResponseConfig{
 		Logger:          s.logger,
 		IncludeHeaders:  coalesce(s.cfg.IncludeHeadersInLog, os.Getenv("INCLUDE_HEADERS_IN_LOG")),
 		MetricsRecorder: metricsRecorder,
+		DisableLogging:  !requestLogging,
 	}))
 
 	// CORS (dynamic, callback-based). Installed engine-level AFTER logging but BEFORE

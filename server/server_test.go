@@ -484,6 +484,41 @@ func TestInitCanDisableRequestIDWithoutChangingDefault(t *testing.T) {
 	}
 }
 
+func TestInitCanDisableRequestLoggingWhileRetainingMetrics(t *testing.T) {
+	t.Setenv("SERVER_TYPE", "platform")
+	var logBuffer bytes.Buffer
+	metricsCalls := 0
+	router := http.NewServeMux()
+	router.HandleFunc("/probe", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	disabled := false
+	server := New(Config{
+		Port:           "0",
+		Logger:         slog.New(slog.NewJSONHandler(&logBuffer, nil)),
+		RequestLogging: &disabled,
+		MetricsRecorder: func(_, _, _ string, _ float64) {
+			metricsCalls++
+		},
+	})
+	if err := server.Init(map[ServerType]http.Handler{ServerTypePlatform: router}, nil, nil); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	server.App.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNoContent)
+	}
+	if strings.Contains(logBuffer.String(), "[REQ]") || strings.Contains(logBuffer.String(), "[RES]") {
+		t.Fatalf("request logs must be absent when disabled: %s", logBuffer.String())
+	}
+	if metricsCalls != 1 {
+		t.Fatalf("metrics calls = %d, want 1", metricsCalls)
+	}
+}
+
 func TestCORS(t *testing.T) {
 	t.Run("default config", func(t *testing.T) {
 		r := gin.New()
