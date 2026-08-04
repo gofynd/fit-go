@@ -15,10 +15,13 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   constructed compatibility client now models ioredis 5.11.1's connection-wide
   offline FIFO, exact reconnect curve and 20-retry flush boundary, replay-before-
   offline ordering, lost-reply duplicate risk, partial-pipeline abort behavior,
-  Promise-like settlement, and quit/disconnect boundaries. It has no automatic
-  go-redis transport or environment wiring: production use remains blocked until
-  a standalone transport can prove partial-write disposition and live Node/Go
-  differentials; Cluster and Sentinel remain out of scope.
+  Promise-like settlement, and quit/disconnect boundaries. An explicitly
+  selected owned standalone RESP2 transport now supplies AUTH/SELECT/client
+  metadata/INFO readiness, TLS, socket timeout, RESP parsing, and exact
+  not-written/partial-write/full-write-lost-reply evidence without using
+  go-redis. It still has no environment or production wiring. Actual ioredis
+  wire evidence exposed a remaining multi-command in-flight replay difference;
+  full live fault differentials, Cluster, and Sentinel remain fail-closed gates.
 - **Opt-in Redis retry controls**: per-service/read-write environment settings
   now expose go-redis command retry count/backoff separately from dial retry
   count/backoff for standalone, cluster, and Sentinel clients. Existing callers

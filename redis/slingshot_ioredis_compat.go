@@ -81,8 +81,32 @@ type SlingshotIORedisReply struct {
 type SlingshotIORedisExchange struct {
 	Replies         []SlingshotIORedisReply
 	MayHaveExecuted bool
-	Error           error
+	// WriteDisposition is populated by the owned RESP transport. Custom
+	// transports written before the owned transport was added may leave it at
+	// SlingshotIORedisWriteUnknown; the compatibility state machine continues
+	// to use MayHaveExecuted as its replay decision for that reason.
+	WriteDisposition SlingshotIORedisWriteDisposition
+	BytesWritten     int
+	BytesTotal       int
+	// NetworkBytesWritten counts bytes accepted by the underlying socket for
+	// this exchange. For TLS it counts ciphertext, while BytesWritten counts
+	// encoded RESP plaintext.
+	NetworkBytesWritten int64
+	Error               error
 }
+
+// SlingshotIORedisWriteDisposition records how much of an encoded command
+// batch crossed the socket boundary before an exchange failed. It separates a
+// definitely unwritten request from partial-write ambiguity and a complete
+// write whose reply was lost.
+type SlingshotIORedisWriteDisposition uint8
+
+const (
+	SlingshotIORedisWriteUnknown SlingshotIORedisWriteDisposition = iota
+	SlingshotIORedisNotWritten
+	SlingshotIORedisPartiallyWritten
+	SlingshotIORedisFullyWritten
+)
 
 // SlingshotIORedisTransport is one ready standalone Redis connection. Connect
 // readiness, authentication, database selection, TLS and RESP parsing belong

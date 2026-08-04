@@ -22,6 +22,11 @@ The legacy pins used for this implementation are:
 - ioredis `built/Redis.js`: offline commands share one FIFO; `disconnect()`
   flushes it with `Connection is closed.` and an offline `QUIT` with an empty
   queue resolves locally.
+- ioredis runtime capture (Node 22.22.0 executing the pinned 5.11.1 package) proves
+  the actual startup wire order is `AUTH`, `SELECT`, `CLIENT SETNAME`, `CLIENT
+  SETINFO LIB-NAME`, `CLIENT SETINFO LIB-VER`, `INFO`. The asynchronous package
+  metadata lookup makes the two SETINFO commands appear in the opposite order
+  from a superficial reading of the promise array in `event_handler.js`.
 
 These semantics are not equivalent to go-redis command retries. go-redis owns
 retry state per command and does not expose whether a failed operation was not
@@ -29,7 +34,7 @@ written, partially written, or fully written with its reply lost.
 
 ## Implemented and tested
 
-The compatibility client provides:
+The compatibility client and explicitly selected owned RESP transport provide:
 
 - eager, connection-owned reconnect lifecycle;
 - exact retry delays and the connection-global 21st-failure flush boundary;
@@ -41,32 +46,76 @@ The compatibility client provides:
 - waiter cancellation that does not cancel an accepted command;
 - ordered `QUIT` drain, immediate offline empty-queue `QUIT`, immediate
   `disconnect()`, and exact legacy error strings.
+- exact RESP command framing and a dedicated reader that detects idle remote
+  close without competing with reply parsing;
+- `AUTH` (password and Redis 6 ACL forms), non-zero `SELECT`, `CLIENT SETNAME`,
+  ioredis 5.11.1 `CLIENT SETINFO`, and `INFO` loading readiness in the captured
+  runtime order;
+- ioredis's tolerated AUTH warning cases, ignored CLIENT metadata errors,
+  `INFO NOPERM` readiness exception, and fail-closed FIT startup errors;
+- a 10-second default TCP/TLS connect timeout, optional mutual TLS through a
+  caller-owned `tls.Config`, TCP no-delay/keepalive, and optional socket
+  inactivity timeout reset on every partial data read;
+- RESP2 simple strings, errors, integers, bulk strings/nulls, and nested
+  arrays/nulls;
+- explicit `NotWritten`, `PartiallyWritten`, and `FullyWritten` dispositions,
+  RESP plaintext byte counts, underlying socket byte counts (ciphertext under
+  TLS), prefix replies, and conservative duplicate-execution exposure.
 
-Deterministic tests use real loopback TCP connections for outage recovery,
-lost-reply replay, FIFO ordering, partial pipeline replies, server errors, and
-graceful drain. A controlled factory closes the 21-reconnect exhaustion case
-without spending the legacy 10.5-second delay budget. The delay function itself
-is pinned for all first 20 values and its 2-second cap. Tests are source-derived
-regression evidence; they do not by themselves certify a production transport.
+Deterministic tests use real loopback TCP, `net.Pipe`, and a generated test TLS
+certificate for startup command order, AUTH/SELECT/INFO boundaries, INFO loading,
+TLS, socket inactivity and partial-data reset, not-written and partial-write
+faults, full-write/lost-reply, partial pipeline replies, outage recovery, FIFO
+ordering, server errors, idle close, and graceful drain. A controlled factory
+closes the 21-reconnect exhaustion case without spending the legacy 10.5-second
+delay budget. The delay function itself is pinned for all first 20 values and
+its 2-second cap.
+
+`NewSlingshotIORedisRESPCompatClient` is additive and explicit. It does not read
+FIT Redis environment variables, resolve GSM references, modify `InitDefault`,
+or replace any existing fit-go connection.
+
+The checked-in runtime oracle can be replayed against an installed pinned copy:
+
+```sh
+IOREDIS_MODULE=/path/to/node_modules/ioredis \
+  node redis/testdata/slingshot_ioredis_wire_probe.cjs startup
+IOREDIS_MODULE=/path/to/node_modules/ioredis \
+  node redis/testdata/slingshot_ioredis_wire_probe.cjs lost-reply
+```
+
+The script refuses any version other than `5.11.1`. The startup output is a
+positive oracle for the owned transport. The lost-reply output is intentionally
+a red oracle documenting the multi-in-flight blocker below.
 
 ## Deliberate fail-closed limits
 
-fit-go does not provide a built-in transport factory for this state machine.
-The caller must supply a `SlingshotIORedisTransportFactory` whose transport
-returns explicit `MayHaveExecuted` and partial replies. An automatic adapter over
-`*redis.Client` would have to guess those values and is therefore intentionally
-absent.
-
 The following remain registration-blocking for Slingshot:
 
-- an owned standalone RESP transport with authentication, database selection,
-  TLS, INFO ready-check/loading behavior, socket timeout, and the exact FIT.js
-  startup error boundary;
+- **multiple in-flight direct commands**: actual ioredis runtime evidence shows
+  two immediately submitted `INCR` commands are both on the first connection
+  before either reply and both replay after both replies are lost. The current
+  compatibility runner waits for one request's reply before writing the next,
+  so it cannot reproduce duplicate execution of the later in-flight command.
+  Fixing this requires an asynchronous write/read request ledger, not a timing
+  or micro-batching guess;
 - live Node 22.22.0/ioredis 5.11.1 versus Go record/replay for connect loss before
   write, partial write, full write/lost reply, partial pipeline reply, recovery,
   retry exhaustion, quit during outage, and process shutdown;
+- exact post-ready SELECT-error behavior on reconnect (FIT rejects an initial
+  SELECT error, while ioredis logs a later SELECT error and can still become
+  ready); the transport currently fails closed on every SELECT error;
+- command-level ioredis transformations and modes not used by the raw transport
+  contract, including Buffer-returning commands, HGETALL object transforms,
+  transactions, blocking commands, Pub/Sub, monitor mode, RESP3, and Unix
+  sockets, must be inventoried against actual Slingshot call sites before the
+  client can be treated as a general ioredis replacement;
+- TLS fault injection must verify partial TLS-record and lost-reply disposition
+  against the deployed proxy/Redis stack; the transport exposes underlying
+  ciphertext progress but deterministic tests currently cover successful TLS;
 - actual Slingshot module boot wiring for both `slingshot.write` and
-  `slingshot_domain.write`, plus health, tracing, logging, and Sentry behavior;
+  `slingshot_domain.write`, URI/GSM/env precedence, client names, health,
+  tracing, logging, Sentry behavior, and FIT's shutdown log/error sequence;
 - Redis Cluster and Sentinel queue/failover behavior.
 
 Until those gates close, use of this API is an implementation aid, not a parity
