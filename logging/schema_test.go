@@ -95,6 +95,29 @@ func TestTraceClueSchemaGoldenAndNativeChildCorrelation(t *testing.T) {
 	}
 }
 
+func TestTraceClueSchemaCanOmitEnvironmentResourceForPinnedLegacyRuntime(t *testing.T) {
+	var buf bytes.Buffer
+	logger, err := New(Options{
+		Env:                     "production",
+		Service:                 "galvatron-proof",
+		Schema:                  SchemaTraceClue,
+		Output:                  &buf,
+		OmitEnvironmentResource: true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	logger.Info("env-proof")
+	resource := decodeLog(t, &buf)["resource"].(map[string]interface{})
+	if _, exists := resource["deployment.environment"]; exists {
+		t.Fatalf("deployment.environment must be absent: %v", resource)
+	}
+	if resource["service.name"] != "galvatron-proof" {
+		t.Fatalf("service.name = %v", resource["service.name"])
+	}
+}
+
 func TestTriggerHappyObjectMessageGolden(t *testing.T) {
 	tests := []struct {
 		name    string

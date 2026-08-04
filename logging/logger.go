@@ -172,6 +172,13 @@ type Options struct {
 	// In non-production environments, colorized output is written to stderr.
 	Env string
 
+	// OmitEnvironmentResource removes deployment.environment from the
+	// TraceClue resource. It is an opt-in compatibility switch for pinned
+	// TraceClue versions which never emitted that resource attribute. The
+	// default remains false so existing fit-go callers keep their current
+	// resource schema.
+	OmitEnvironmentResource bool
+
 	// Service is an optional service name included in every log entry.
 	Service string
 
@@ -358,8 +365,10 @@ func traceClueResource(opts Options) map[string]interface{} {
 		"telemetry.sdk.language": "go",
 		"telemetry.sdk.name":     "opentelemetry",
 		"telemetry.sdk.version":  sdk.Version(),
-		"deployment.environment": opts.Env,
 		"pathname":               "",
+	}
+	if !opts.OmitEnvironmentResource {
+		resource["deployment.environment"] = opts.Env
 	}
 	for k, v := range opts.ResourceAttributes {
 		resource[k] = v
