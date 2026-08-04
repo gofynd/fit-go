@@ -112,6 +112,12 @@ type ConsumerConfig struct {
 	// GroupID is the consumer group identifier (required).
 	GroupID string
 
+	// PartitionAssignmentStrategy selects the group protocol assignor advertised
+	// to Kafka. Empty preserves the driver default. Use "roundrobin" when a Go
+	// consumer must roll alongside KafkaJS, whose default member protocol is the
+	// round-robin assigner; mixed assignor lists otherwise fail the group join.
+	PartitionAssignmentStrategy string
+
 	// SessionTimeout is the timeout for detecting consumer failures within
 	// the group. Default: 30s.
 	SessionTimeout time.Duration

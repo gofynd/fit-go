@@ -210,6 +210,9 @@ func (cc *ConfluentClient) Consumer(config ConsumerConfig) (KafkaConsumer, error
 	delete(*cCfg, "compression.type")
 
 	_ = cCfg.SetKey("group.id", config.GroupID)
+	if config.PartitionAssignmentStrategy != "" {
+		_ = cCfg.SetKey("partition.assignment.strategy", config.PartitionAssignmentStrategy)
+	}
 
 	if config.SessionTimeout > 0 {
 		_ = cCfg.SetKey("session.timeout.ms", int(config.SessionTimeout.Milliseconds()))

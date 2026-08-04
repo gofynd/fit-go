@@ -426,17 +426,18 @@ func TestConfluentConsumer_TopicConfig(t *testing.T) {
 		}
 
 		consumerCfg := ConsumerConfig{
-			GroupID:              "test-group",
-			SessionTimeout:       45 * time.Second,
-			HeartbeatInterval:    5 * time.Second,
-			RebalanceTimeout:     120 * time.Second,
-			MaxPollInterval:      3 * time.Minute,
-			MaxBytesPerPartition: 2 << 20, // 2 MB
-			MinBytes:             512,
-			MaxBytes:             20 << 20, // 20 MB
-			MaxWaitTime:          10 * time.Second,
-			AutoCommit:           true,
-			AutoCommitInterval:   10 * time.Second,
+			GroupID:                     "test-group",
+			PartitionAssignmentStrategy: "roundrobin",
+			SessionTimeout:              45 * time.Second,
+			HeartbeatInterval:           5 * time.Second,
+			RebalanceTimeout:            120 * time.Second,
+			MaxPollInterval:             3 * time.Minute,
+			MaxBytesPerPartition:        2 << 20, // 2 MB
+			MinBytes:                    512,
+			MaxBytes:                    20 << 20, // 20 MB
+			MaxWaitTime:                 10 * time.Second,
+			AutoCommit:                  true,
+			AutoCommitInterval:          10 * time.Second,
 		}
 
 		consumer, err := client.Consumer(consumerCfg)
@@ -452,6 +453,10 @@ func TestConfluentConsumer_TopicConfig(t *testing.T) {
 		groupID, _ := cc.configMap.Get("group.id", "")
 		if groupID != "test-group" {
 			t.Errorf("group.id = %q, want 'test-group'", groupID)
+		}
+		assignmentStrategy, _ := cc.configMap.Get("partition.assignment.strategy", "")
+		if assignmentStrategy != "roundrobin" {
+			t.Errorf("partition.assignment.strategy = %q, want roundrobin", assignmentStrategy)
 		}
 
 		sessionTimeout, _ := cc.configMap.Get("session.timeout.ms", 0)
