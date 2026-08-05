@@ -77,6 +77,27 @@ type Message struct {
 	Timestamp time.Time
 }
 
+// NewMessage creates a keyless message whose partition is selected by the
+// configured producer partitioner. Message's zero value still means explicit
+// partition 0 for backward compatibility; callers that want automatic
+// partitioning should use this constructor.
+func NewMessage(value []byte) Message {
+	return Message{Value: value, Partition: -1}
+}
+
+// NewKeyedMessage creates a keyed message whose partition is selected by the
+// configured producer partitioner. A present empty key remains distinct from a
+// missing key, matching KafkaJS.
+func NewKeyedMessage(key, value []byte) Message {
+	return Message{Key: key, Value: value, Partition: -1}
+}
+
+// NewPartitionedMessage creates a message with an explicit partition override,
+// including partition 0.
+func NewPartitionedMessage(partition int, value []byte) Message {
+	return Message{Value: value, Partition: partition}
+}
+
 // TopicMessages groups messages destined for a single topic.
 // Used by ProduceBatch to send to multiple topics in one call.
 // Mirrors the TopicMessages interface.

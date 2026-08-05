@@ -233,6 +233,33 @@ func TestConfluentClient_ConfigFromEnv(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestConfluentProducer_MessageMapping(t *testing.T) {
+	t.Run("message constructors preserve partition intent", func(t *testing.T) {
+		value := []byte("payload")
+		key := []byte("entity-42")
+
+		keyless := NewMessage(value)
+		if keyless.Partition != -1 || keyless.Key != nil || string(keyless.Value) != string(value) {
+			t.Fatalf("NewMessage() = %#v, want keyless automatic partition", keyless)
+		}
+
+		keyed := NewKeyedMessage(key, value)
+		if keyed.Partition != -1 || string(keyed.Key) != string(key) || string(keyed.Value) != string(value) {
+			t.Fatalf("NewKeyedMessage() = %#v, want keyed automatic partition", keyed)
+		}
+
+		explicit := NewPartitionedMessage(0, value)
+		if explicit.Partition != 0 || explicit.Key != nil || string(explicit.Value) != string(value) {
+			t.Fatalf("NewPartitionedMessage() = %#v, want explicit partition zero", explicit)
+		}
+
+		if got := buildConfluentMessage("events", Message{Value: value}).TopicPartition.Partition; got != 0 {
+			t.Fatalf("literal zero-value partition = %d, want explicit partition zero", got)
+		}
+		if got := buildConfluentMessage("events", keyless).TopicPartition.Partition; got != ckafka.PartitionAny {
+			t.Fatalf("automatic message partition = %d, want PartitionAny", got)
+		}
+	})
+
 	t.Run("basic message", func(t *testing.T) {
 		msg := Message{
 			Key:   []byte("partition-key"),
