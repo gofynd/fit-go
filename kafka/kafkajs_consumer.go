@@ -261,6 +261,8 @@ func (c *kafkaJSCompatibleConsumer) ConsumeCtx(handler MessageHandlerCtx, opts C
 
 type kafkaJSMessageHandler func(context.Context, MessagePayload) error
 
+var errKafkaJSUnresolvedRecordRewound = errors.New("kafka/kafkajs: unresolved record rewound")
+
 func (c *kafkaJSCompatibleConsumer) consumeMessages(handler kafkaJSMessageHandler, opts ConsumerOptions) error {
 	isAutoCommit, pollTimeout, concurrency, err := validateConfluentConsumerOptions(c.config.AutoCommit, opts, 100*time.Millisecond)
 	if err != nil {
@@ -291,7 +293,13 @@ func (c *kafkaJSCompatibleConsumer) consumeMessages(handler kafkaJSMessageHandle
 				}
 			}
 			return nil
-		}); err != nil {
+		}); errors.Is(err, errKafkaJSUnresolvedRecordRewound) {
+			// SetOffsets below has restored the failed record's physical offset.
+			// End this poll batch so records after it are not observed before its
+			// KafkaJS-style marker redelivery.
+			client.AllowRebalance()
+			continue
+		} else if err != nil {
 			client.AllowRebalance()
 			return c.prepareTransientRunRetry(client, err)
 		}
@@ -399,6 +407,12 @@ func (c *kafkaJSCompatibleConsumer) processRecord(
 		}
 		if handlerErr == nil && opts.ResolveAfterSuccessfulFinalizer {
 			return resolveKafkaJSRecord(ctx, client, c.config.GroupID, record, isAutoCommit, opts.NullOffsetCommitMetadata)
+		}
+		if handlerErr != nil && opts.RedeliverUnresolvedFinalizer {
+			client.SetOffsets(map[string]map[int32]kgo.EpochOffset{
+				record.Topic: {record.Partition: {Epoch: record.LeaderEpoch, Offset: record.Offset}},
+			})
+			return errKafkaJSUnresolvedRecordRewound
 		}
 		return nil
 	}

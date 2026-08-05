@@ -298,6 +298,15 @@ type ConsumerOptions struct {
 	// metadata. It requires OffsetFinalizer.
 	NullOffsetCommitMetadata bool
 
+	// RedeliverUnresolvedFinalizer rewinds the KafkaJS-compatible consumer to the
+	// current physical record when OffsetFinalizer succeeds after a handler
+	// failure without resolving that record. KafkaJS eachBatch immediately polls
+	// such an unresolved offset again in the same process; franz-go otherwise
+	// retains its already-advanced fetch position until a group rejoin. This is a
+	// narrow migration compatibility option, ignored by other consumer backends
+	// and unless OffsetFinalizer is configured.
+	RedeliverUnresolvedFinalizer bool
+
 	// PartitionsConsumedConcurrently is the requested number of partitions
 	// processed concurrently. Default: 1 (sequential). The Confluent driver keeps
 	// records from one topic-partition ordered and runs independent partition groups
