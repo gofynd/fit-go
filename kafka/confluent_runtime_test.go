@@ -1197,6 +1197,56 @@ func TestConfluentConsumerOffsetFinalizerCanResolveAfterExactCommitOnSuccess(t *
 	}
 }
 
+func TestConfluentConsumerOffsetFinalizerCanClearKafkaJSCommitMetadata(t *testing.T) {
+	topic := "galvatron-events"
+	memberID := "galvatron-main-server-1234"
+	message := &ckafka.Message{TopicPartition: ckafka.TopicPartition{
+		Topic: &topic, Partition: 2, Offset: 17, Metadata: &memberID,
+	}}
+	groups := groupConfluentBatchMessages([]*ckafka.Message{message})
+	commits := make([]ckafka.TopicPartition, 0, 2)
+	driver := &fakeConfluentConsumerDriver{
+		commitOffsetsFn: func(offsets []ckafka.TopicPartition) ([]ckafka.TopicPartition, error) {
+			commits = append(commits, offsets[0])
+			return offsets, nil
+		},
+		commitFn: func(*ckafka.Message) ([]ckafka.TopicPartition, error) {
+			t.Fatal("KafkaJS null-metadata compatibility used CommitMessage")
+			return nil, nil
+		},
+	}
+	consumer := newTestConfluentConsumer(false, driver)
+
+	err := consumer.processMessageGroup(
+		context.Background(), driver, groups[0],
+		func(context.Context, MessagePayload) error { return nil }, false,
+		ConsumerOptions{
+			OffsetFinalizer: func(_ context.Context, payload MessagePayload, handlerErr error, commit ExactOffsetCommit) error {
+				if handlerErr != nil {
+					return handlerErr
+				}
+				return commit(payload.Offset)
+			},
+			ResolveAfterSuccessfulFinalizer: true,
+			NullOffsetCommitMetadata:        true,
+		},
+	)
+	if err != nil {
+		t.Fatalf("processMessageGroup error = %v", err)
+	}
+	if len(commits) != 2 {
+		t.Fatalf("commit count = %d, want exact and resolved", len(commits))
+	}
+	for index, commit := range commits {
+		if commit.Metadata != nil {
+			t.Fatalf("commit[%d] metadata = %q, want nil", index, *commit.Metadata)
+		}
+	}
+	if commits[0].Offset != 17 || commits[1].Offset != 18 {
+		t.Fatalf("commit offsets = [%d %d], want [17 18]", commits[0].Offset, commits[1].Offset)
+	}
+}
+
 func TestConfluentConsumerOffsetFinalizerDoesNotResolveSuppressedHandlerFailure(t *testing.T) {
 	topic := "galvatron-events"
 	message := &ckafka.Message{TopicPartition: ckafka.TopicPartition{Topic: &topic, Partition: 2, Offset: 17}}
@@ -1343,6 +1393,11 @@ func TestConfluentConsumerOffsetFinalizerOptionValidation(t *testing.T) {
 		ResolveAfterSuccessfulFinalizer: true,
 	}, time.Millisecond); err == nil || !strings.Contains(err.Error(), "requires OffsetFinalizer") {
 		t.Fatalf("resolve-after validation error = %v", err)
+	}
+	if _, _, _, err := validateConfluentConsumerOptions(false, ConsumerOptions{
+		NullOffsetCommitMetadata: true,
+	}, time.Millisecond); err == nil || !strings.Contains(err.Error(), "requires OffsetFinalizer") {
+		t.Fatalf("null-metadata validation error = %v", err)
 	}
 }
 

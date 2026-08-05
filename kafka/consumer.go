@@ -290,6 +290,14 @@ type ConsumerOptions struct {
 	// ignored unless OffsetFinalizer is set.
 	ResolveAfterSuccessfulFinalizer bool
 
+	// NullOffsetCommitMetadata clears the Kafka offset-commit metadata on both
+	// commits owned by OffsetFinalizer compatibility mode. KafkaJS commits null
+	// metadata for its explicit current-offset commit and its subsequent resolved
+	// N+1 commit, while librdkafka's CommitMessage may attach the member id. This
+	// is deliberately opt-in so existing fit-go consumers keep their driver-native
+	// metadata. It requires OffsetFinalizer.
+	NullOffsetCommitMetadata bool
+
 	// PartitionsConsumedConcurrently is the requested number of partitions
 	// processed concurrently. Default: 1 (sequential). The Confluent driver keeps
 	// records from one topic-partition ordered and runs independent partition groups

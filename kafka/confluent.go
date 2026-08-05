@@ -1137,6 +1137,9 @@ func (cc *ConfluentConsumer) processMessageGroup(
 				commitCalled = true
 				offset := message.TopicPartition
 				offset.Offset = ckafka.Offset(exact)
+				if opts.NullOffsetCommitMetadata {
+					offset.Metadata = nil
+				}
 				if _, err := consumer.CommitOffsets([]ckafka.TopicPartition{offset}); err != nil {
 					return &exactOffsetCommitError{err: err}
 				}
@@ -1157,7 +1160,18 @@ func (cc *ConfluentConsumer) processMessageGroup(
 				return fmt.Errorf("kafka/confluent: offset finalizer failed: %w", finalizerErr)
 			}
 			if handlerErr == nil && opts.ResolveAfterSuccessfulFinalizer {
-				if err := cc.resolveMessageOffset(consumer, message, isAutoCommit, false); err != nil {
+				var err error
+				if opts.NullOffsetCommitMetadata {
+					resolved := message.TopicPartition
+					resolved.Offset++
+					resolved.Metadata = nil
+					if _, commitErr := consumer.CommitOffsets([]ckafka.TopicPartition{resolved}); commitErr != nil {
+						err = fmt.Errorf("kafka/confluent: post-handler commit failed: %w", commitErr)
+					}
+				} else {
+					err = cc.resolveMessageOffset(consumer, message, isAutoCommit, false)
+				}
+				if err != nil {
 					cc.logMessageFailure("kafka/confluent: post-finalizer offset resolution failed", message, err)
 					return err
 				}
@@ -1877,8 +1891,13 @@ func validateConfluentConsumerOptions(
 		if opts.CommitBeforeHandler {
 			return false, 0, 0, fmt.Errorf("kafka/confluent: OffsetFinalizer cannot be combined with CommitBeforeHandler")
 		}
-	} else if opts.ResolveAfterSuccessfulFinalizer {
-		return false, 0, 0, fmt.Errorf("kafka/confluent: ResolveAfterSuccessfulFinalizer requires OffsetFinalizer")
+	} else {
+		if opts.ResolveAfterSuccessfulFinalizer {
+			return false, 0, 0, fmt.Errorf("kafka/confluent: ResolveAfterSuccessfulFinalizer requires OffsetFinalizer")
+		}
+		if opts.NullOffsetCommitMetadata {
+			return false, 0, 0, fmt.Errorf("kafka/confluent: NullOffsetCommitMetadata requires OffsetFinalizer")
+		}
 	}
 
 	pollTimeout := opts.PollTimeout
