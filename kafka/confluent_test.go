@@ -965,9 +965,11 @@ func TestProducerConfigOverrides(t *testing.T) {
 
 	t.Run("producer with timeout and retry settings", func(t *testing.T) {
 		producer, err := client.Producer(ProducerConfig{
-			Timeout:      15 * time.Second,
-			MaxRetries:   5,
-			RetryBackoff: 500 * time.Millisecond,
+			Timeout:         15 * time.Second,
+			MetadataTimeout: 2 * time.Second,
+			MetadataMaxAge:  time.Minute,
+			MaxRetries:      5,
+			RetryBackoff:    500 * time.Millisecond,
 		})
 		if err != nil {
 			t.Fatalf("Producer() error = %v", err)
@@ -978,6 +980,12 @@ func TestProducerConfigOverrides(t *testing.T) {
 		if timeout != 15000 {
 			t.Errorf("request.timeout.ms = %v, want 15000", timeout)
 		}
+		if cp.metadataTimeout != 2*time.Second {
+			t.Errorf("metadata timeout = %v, want 2s", cp.metadataTimeout)
+		}
+		if cp.metadataMaxAge != time.Minute {
+			t.Errorf("metadata max age = %v, want 1m", cp.metadataMaxAge)
+		}
 
 		retries, _ := cp.configMap.Get("message.send.max.retries", 0)
 		if retries != 5 {
@@ -987,6 +995,26 @@ func TestProducerConfigOverrides(t *testing.T) {
 		backoff, _ := cp.configMap.Get("retry.backoff.ms", 0)
 		if backoff != 500 {
 			t.Errorf("retry.backoff.ms = %v, want 500", backoff)
+		}
+	})
+
+	t.Run("producer rejects negative metadata durations", func(t *testing.T) {
+		if _, err := client.Producer(ProducerConfig{MetadataTimeout: -time.Second}); err == nil {
+			t.Fatal("Producer() accepted a negative metadata timeout")
+		}
+		if _, err := client.Producer(ProducerConfig{MetadataMaxAge: -time.Second}); err == nil {
+			t.Fatal("Producer() accepted a negative metadata max age")
+		}
+	})
+
+	t.Run("request timeout does not implicitly change metadata timeout", func(t *testing.T) {
+		producer, err := client.Producer(ProducerConfig{Timeout: time.Second})
+		if err != nil {
+			t.Fatalf("Producer() error = %v", err)
+		}
+		cp := producer.(*ConfluentProducer)
+		if cp.metadataTimeout != 0 {
+			t.Fatalf("metadata timeout = %v, want zero/default when only request timeout is set", cp.metadataTimeout)
 		}
 	})
 

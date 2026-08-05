@@ -223,12 +223,11 @@ type ConsumerOptions struct {
 	// rejects this option.
 	OffsetFinalizer OffsetFinalizer
 
-	// ResolveAfterSuccessfulFinalizer opts an OffsetFinalizer consumer back into
-	// the normal post-handler offset resolution after the finalizer succeeds, but
-	// only when the handler itself succeeded. This narrow compatibility hook
-	// preserves runtimes that first commit the physical record offset explicitly
-	// and then let their consumer framework resolve/commit the next offset. It is
-	// ignored unless OffsetFinalizer is set.
+	// ResolveAfterSuccessfulFinalizer performs a second, synchronous broker
+	// commit of the next offset after the finalizer and handler succeed. Despite
+	// its name, it does not merely resolve local consumer state and is not exact
+	// legacy Slingshot parity: Slingshot commits only the physical current offset.
+	// It is ignored unless OffsetFinalizer is set.
 	ResolveAfterSuccessfulFinalizer bool
 
 	// PartitionsConsumedConcurrently is the requested number of partitions

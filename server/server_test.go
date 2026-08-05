@@ -1135,6 +1135,63 @@ func TestLegacyStaticHealthRoutesPreserveFitJSBytes(t *testing.T) {
 	}
 }
 
+func TestLegacyStaticHealthRoutesPreserveExpressConditionalRequests(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	RegisterLegacyStaticHealthRoutes(engine)
+	legacyETag := `W/"b-2F/2BWc0KYbtLqL5U2Kv5B6uQUQ"`
+
+	for _, test := range []struct {
+		name         string
+		method       string
+		ifNoneMatch  string
+		cacheControl string
+		modified     string
+		wantStatus   int
+	}{
+		{name: "weak match", method: http.MethodGet, ifNoneMatch: legacyETag, wantStatus: http.StatusNotModified},
+		{name: "strong match", method: http.MethodGet, ifNoneMatch: strings.TrimPrefix(legacyETag, "W/"), wantStatus: http.StatusNotModified},
+		{name: "token list", method: http.MethodGet, ifNoneMatch: `"other", ` + legacyETag, wantStatus: http.StatusNotModified},
+		{name: "wildcard", method: http.MethodHead, ifNoneMatch: "*", wantStatus: http.StatusNotModified},
+		{name: "mismatch", method: http.MethodGet, ifNoneMatch: `W/"different"`, wantStatus: http.StatusOK},
+		{name: "reload remains stale", method: http.MethodGet, ifNoneMatch: legacyETag, cacheControl: "max-age=0, no-cache", wantStatus: http.StatusOK},
+		{name: "fresh package no-cache token is case sensitive", method: http.MethodGet, ifNoneMatch: legacyETag, cacheControl: "No-Cache", wantStatus: http.StatusNotModified},
+		{name: "if modified since remains stale without last modified", method: http.MethodGet, ifNoneMatch: legacyETag, modified: "Wed, 21 Oct 2015 07:28:00 GMT", wantStatus: http.StatusOK},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, "/_healthz", nil)
+			if test.ifNoneMatch != "" {
+				request.Header.Set("If-None-Match", test.ifNoneMatch)
+			}
+			if test.cacheControl != "" {
+				request.Header.Set("Cache-Control", test.cacheControl)
+			}
+			if test.modified != "" {
+				request.Header.Set("If-Modified-Since", test.modified)
+			}
+			recorder := httptest.NewRecorder()
+			engine.ServeHTTP(recorder, request)
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d", recorder.Code, test.wantStatus)
+			}
+			if recorder.Header().Get("ETag") != legacyETag || recorder.Header().Get("X-Powered-By") != "Express" {
+				t.Fatalf("compatibility headers = %#v", recorder.Header())
+			}
+			if test.wantStatus == http.StatusNotModified {
+				if recorder.Body.Len() != 0 {
+					t.Fatalf("304 body = %q, want empty", recorder.Body.String())
+				}
+				if got := recorder.Header().Get("Content-Type"); got != "" {
+					t.Fatalf("304 Content-Type = %q, want absent", got)
+				}
+				if got := recorder.Header().Get("Content-Length"); got != "" {
+					t.Fatalf("304 Content-Length = %q, want absent", got)
+				}
+			}
+		})
+	}
+}
+
 func TestProfileRoutesControlTheProvidedProfiler(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	profiler := profiling.New(profiling.Config{

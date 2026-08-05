@@ -144,6 +144,17 @@ type ProducerConfig struct {
 	// Timeout is the maximum time to wait for a produce request.
 	Timeout time.Duration
 
+	// MetadataTimeout bounds a broker metadata lookup performed by compatibility
+	// partitioners. Zero uses the KafkaJS-compatible default of 30 seconds. It is
+	// deliberately separate from Timeout so changing request delivery behavior
+	// cannot accidentally make metadata discovery unbounded or overly aggressive.
+	MetadataTimeout time.Duration
+
+	// MetadataMaxAge controls how long compatibility partitioners reuse topic
+	// metadata. Zero uses KafkaJS's five-minute default. Metadata is refreshed
+	// after expiry and invalidated after topology-related broker errors.
+	MetadataMaxAge time.Duration
+
 	// Compression overrides the client-level compression setting.
 	// Zero value inherits from the Client.
 	Compression CompressionType
