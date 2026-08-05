@@ -293,7 +293,7 @@ type ConsumerOptions struct {
 	// NullOffsetCommitMetadata clears the Kafka offset-commit metadata on both
 	// commits owned by OffsetFinalizer compatibility mode. KafkaJS commits null
 	// metadata for its explicit current-offset commit and its subsequent resolved
-	// N+1 commit, while librdkafka's CommitMessage may attach the member id. This
+	// N+1 commit, while franz-go and librdkafka attach the member id by default. This
 	// is deliberately opt-in so existing fit-go consumers keep their driver-native
 	// metadata. It requires OffsetFinalizer.
 	NullOffsetCommitMetadata bool

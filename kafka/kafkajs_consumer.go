@@ -391,14 +391,14 @@ func (c *kafkaJSCompatibleConsumer) processRecord(
 				return fmt.Errorf("kafka/kafkajs: exact offset commit callback called more than once")
 			}
 			commitCalled = true
-			return commitKafkaJSExact(ctx, client, record, exact)
+			return commitKafkaJSExact(ctx, client, c.config.GroupID, record, exact, opts.NullOffsetCommitMetadata)
 		}
 		finalizerErr := opts.OffsetFinalizer(ctx, payload, handlerErr, commitExact)
 		if finalizerErr != nil {
 			return finalizerErr
 		}
 		if handlerErr == nil && opts.ResolveAfterSuccessfulFinalizer {
-			return resolveKafkaJSRecord(ctx, client, record, isAutoCommit)
+			return resolveKafkaJSRecord(ctx, client, c.config.GroupID, record, isAutoCommit, opts.NullOffsetCommitMetadata)
 		}
 		return nil
 	}
@@ -408,7 +408,7 @@ func (c *kafkaJSCompatibleConsumer) processRecord(
 	if !isAutoCommit && opts.CommitBeforeHandler {
 		return nil
 	}
-	return resolveKafkaJSRecord(ctx, client, record, isAutoCommit)
+	return resolveKafkaJSRecord(ctx, client, c.config.GroupID, record, isAutoCommit, false)
 }
 
 func kafkaJSPayload(record *kgo.Record) MessagePayload {
@@ -423,10 +423,20 @@ func kafkaJSPayload(record *kgo.Record) MessagePayload {
 	}
 }
 
-func resolveKafkaJSRecord(ctx context.Context, client *kgo.Client, record *kgo.Record, auto bool) error {
+func resolveKafkaJSRecord(
+	ctx context.Context,
+	client *kgo.Client,
+	groupID string,
+	record *kgo.Record,
+	auto bool,
+	nullMetadata bool,
+) error {
 	if auto {
 		client.MarkCommitRecords(record)
 		return nil
+	}
+	if nullMetadata {
+		return commitKafkaJSExact(ctx, client, groupID, record, record.Offset+1, true)
 	}
 	if err := client.CommitRecords(ctx, record); err != nil {
 		return classifyKafkaJSTransientConsumerError(
@@ -436,7 +446,30 @@ func resolveKafkaJSRecord(ctx context.Context, client *kgo.Client, record *kgo.R
 	return nil
 }
 
-func commitKafkaJSExact(ctx context.Context, client *kgo.Client, record *kgo.Record, exact int64) error {
+func commitKafkaJSExact(
+	ctx context.Context,
+	client *kgo.Client,
+	groupID string,
+	record *kgo.Record,
+	exact int64,
+	nullMetadata bool,
+) error {
+	if nullMetadata {
+		memberID, generation := client.GroupMetadata()
+		request := newKafkaJSOffsetCommitRequest(groupID, memberID, generation, record, exact)
+		response, err := request.RequestWith(ctx, client)
+		if err != nil {
+			return classifyKafkaJSTransientConsumerError(
+				fmt.Errorf("kafka/kafkajs: exact offset commit failed: %w", err),
+			)
+		}
+		if err := kafkaJSOffsetCommitResponseError(response); err != nil {
+			return classifyKafkaJSTransientConsumerError(
+				fmt.Errorf("kafka/kafkajs: exact offset commit failed: %w", err),
+			)
+		}
+		return nil
+	}
 	offsets := map[string]map[int32]kgo.EpochOffset{
 		record.Topic: {record.Partition: {Epoch: -1, Offset: exact}},
 	}
@@ -458,6 +491,43 @@ func commitKafkaJSExact(ctx context.Context, client *kgo.Client, record *kgo.Rec
 		return classifyKafkaJSTransientConsumerError(
 			fmt.Errorf("kafka/kafkajs: exact offset commit failed: %w", commitErr),
 		)
+	}
+	return nil
+}
+
+func newKafkaJSOffsetCommitRequest(
+	groupID string,
+	memberID string,
+	generation int32,
+	record *kgo.Record,
+	offset int64,
+) *kmsg.OffsetCommitRequest {
+	request := kmsg.NewPtrOffsetCommitRequest()
+	request.Group = groupID
+	request.Generation = generation
+	request.MemberID = memberID
+	topic := kmsg.NewOffsetCommitRequestTopic()
+	topic.Topic = record.Topic
+	partition := kmsg.NewOffsetCommitRequestTopicPartition()
+	partition.Partition = record.Partition
+	partition.Offset = offset
+	partition.LeaderEpoch = -1
+	partition.Metadata = nil
+	topic.Partitions = append(topic.Partitions, partition)
+	request.Topics = append(request.Topics, topic)
+	return request
+}
+
+func kafkaJSOffsetCommitResponseError(response *kmsg.OffsetCommitResponse) error {
+	if response == nil {
+		return fmt.Errorf("broker returned an empty offset commit response")
+	}
+	for _, topic := range response.Topics {
+		for _, partition := range topic.Partitions {
+			if partition.ErrorCode != 0 {
+				return fmt.Errorf("broker rejected exact offset commit with error code %d", partition.ErrorCode)
+			}
+		}
 	}
 	return nil
 }
@@ -549,7 +619,7 @@ func (c *kafkaJSCompatibleConsumer) consumeBatches(handler kafkaJSBatchHandler, 
 			if !isAutoCommit && opts.CommitBeforeHandler {
 				return nil
 			}
-			return resolveKafkaJSRecord(ctx, client, last, isAutoCommit)
+			return resolveKafkaJSRecord(ctx, client, c.config.GroupID, last, isAutoCommit, false)
 		}); err != nil {
 			client.AllowRebalance()
 			return c.prepareTransientRunRetry(client, err)

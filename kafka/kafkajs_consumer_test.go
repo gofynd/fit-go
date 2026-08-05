@@ -40,6 +40,48 @@ func TestKafkaJSTransientConsumerErrorClassification(t *testing.T) {
 	}
 }
 
+func TestKafkaJSNullMetadataOffsetCommitRequest(t *testing.T) {
+	record := &kgo.Record{Topic: "discount-events", Partition: 3, Offset: 41}
+	request := newKafkaJSOffsetCommitRequest(
+		"galvatron-basic-group-1",
+		"metroplex-member",
+		7,
+		record,
+		42,
+	)
+	if request.Group != "galvatron-basic-group-1" || request.MemberID != "metroplex-member" || request.Generation != 7 {
+		t.Fatalf("group identity = %#v", request)
+	}
+	if len(request.Topics) != 1 || request.Topics[0].Topic != record.Topic || len(request.Topics[0].Partitions) != 1 {
+		t.Fatalf("topics = %#v", request.Topics)
+	}
+	partition := request.Topics[0].Partitions[0]
+	if partition.Partition != record.Partition || partition.Offset != 42 || partition.LeaderEpoch != -1 {
+		t.Fatalf("partition = %#v", partition)
+	}
+	if partition.Metadata != nil {
+		t.Fatalf("metadata = %q, want null", *partition.Metadata)
+	}
+}
+
+func TestKafkaJSNullMetadataOffsetCommitResponseValidation(t *testing.T) {
+	if err := kafkaJSOffsetCommitResponseError(nil); err == nil {
+		t.Fatal("nil response was accepted")
+	}
+	response := kmsg.NewPtrOffsetCommitResponse()
+	response.Topics = append(response.Topics, kmsg.OffsetCommitResponseTopic{
+		Topic:      "discount-events",
+		Partitions: []kmsg.OffsetCommitResponseTopicPartition{{Partition: 3}},
+	})
+	if err := kafkaJSOffsetCommitResponseError(response); err != nil {
+		t.Fatalf("successful response: %v", err)
+	}
+	response.Topics[0].Partitions[0].ErrorCode = int16(kerr.IllegalGeneration.Code)
+	if err := kafkaJSOffsetCommitResponseError(response); err == nil {
+		t.Fatal("broker partition error was accepted")
+	}
+}
+
 func TestNewTransientConsumerErrorPreservesCauseAndIdentity(t *testing.T) {
 	cause := errors.New("broker transport unavailable")
 	marked := NewTransientConsumerError(cause)
