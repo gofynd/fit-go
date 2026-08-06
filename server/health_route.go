@@ -159,10 +159,11 @@ func legacyStaticHealthHandler() gin.HandlerFunc {
 		// Do not use c.JSON here: this is a byte-level compatibility mode for
 		// fit.js services whose health endpoint returned this exact object.
 		body := []byte(`{"ok":"ok"}`)
+		etag := `W/"b-2F/2BWc0KYbtLqL5U2Kv5B6uQUQ"`
 		c.Header("X-Powered-By", "Express")
 		c.Header("Content-Type", "application/json; charset=utf-8")
 		c.Header("Content-Length", strconv.Itoa(len(body)))
-		c.Header("ETag", `W/"b-2F/2BWc0KYbtLqL5U2Kv5B6uQUQ"`)
+		c.Header("ETag", etag)
 		// Express/http emits persistent-connection response headers for HTTP/1.1
 		// unless the request explicitly asks to close the connection. net/http
 		// normally owns these transport headers and omits them from ResponseWriter,
@@ -174,10 +175,56 @@ func legacyStaticHealthHandler() gin.HandlerFunc {
 			c.Header("Connection", "keep-alive")
 			c.Header("Keep-Alive", "timeout=5")
 		}
+		if legacyExpressResponseIsFresh(c.Request, etag) {
+			// Express strips entity headers when res.send changes a fresh GET/HEAD
+			// response to 304, while retaining ETag and X-Powered-By.
+			c.Writer.Header().Del("Content-Type")
+			c.Writer.Header().Del("Content-Length")
+			c.Writer.Header().Del("Transfer-Encoding")
+			c.Status(http.StatusNotModified)
+			return
+		}
 		if c.Request.Method == http.MethodHead {
 			c.Status(http.StatusOK)
 			return
 		}
 		c.Data(http.StatusOK, "application/json; charset=utf-8", body)
 	}
+}
+
+func legacyExpressResponseIsFresh(request *http.Request, responseETag string) bool {
+	if request == nil {
+		return false
+	}
+	noneMatch := request.Header.Get("If-None-Match")
+	modifiedSince := request.Header.Get("If-Modified-Since")
+	if noneMatch == "" && modifiedSince == "" {
+		return false
+	}
+	for _, directive := range strings.Split(request.Header.Get("Cache-Control"), ",") {
+		if strings.TrimSpace(directive) == "no-cache" {
+			return false
+		}
+	}
+	if noneMatch != "" && noneMatch != "*" {
+		matched := false
+		for _, candidate := range strings.Split(noneMatch, ",") {
+			// fresh@0.5.x trims ASCII spaces here, not arbitrary whitespace.
+			candidate = strings.Trim(candidate, " ")
+			if candidate == responseETag || candidate == "W/"+responseETag || "W/"+candidate == responseETag {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	// The static response has no Last-Modified header. The fresh package used by
+	// Express therefore treats every If-Modified-Since request as stale, even
+	// when If-None-Match matched.
+	if modifiedSince != "" {
+		return false
+	}
+	return true
 }

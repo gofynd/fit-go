@@ -116,6 +116,15 @@ func successfulDelivery(message *ckafka.Message, offset int64) *ckafka.Message {
 	}}
 }
 
+func metadataForTopic(topic string, partitions ...ckafka.PartitionMetadata) *ckafka.Metadata {
+	return &ckafka.Metadata{Topics: map[string]ckafka.TopicMetadata{
+		topic: {
+			Topic:      topic,
+			Partitions: partitions,
+		},
+	}}
+}
+
 func TestConfluentProducerKafkaJSLegacyKeylessRoundRobin(t *testing.T) {
 	base := &fakeConfluentProducerDriver{}
 	var producedPartitions []int32
@@ -163,6 +172,271 @@ func TestConfluentProducerKafkaJSLegacyKeylessRoundRobin(t *testing.T) {
 	want := []int32{2, 1, 2}
 	if fmt.Sprint(producedPartitions) != fmt.Sprint(want) {
 		t.Fatalf("partitions = %v, want KafkaJS available-partition round robin %v", producedPartitions, want)
+	}
+}
+
+func TestConfluentProducerKafkaJSLegacyCachesMetadataPerTopic(t *testing.T) {
+	base := &fakeConfluentProducerDriver{}
+	metadataCalls := make(map[string]int)
+	driver := &fakeMetadataConfluentProducerDriver{
+		fakeConfluentProducerDriver: base,
+		metadataFn: func(topic *string, _ bool, _ int) (*ckafka.Metadata, error) {
+			metadataCalls[*topic]++
+			return metadataForTopic(*topic, ckafka.PartitionMetadata{ID: 0, Leader: 10}), nil
+		},
+	}
+	producer := newTestConfluentProducer(driver)
+	producer.partitioner = ProducerPartitionerKafkaJSLegacy
+	producer.partitionSeed = func() (uint32, error) { return 0, nil }
+
+	for range 3 {
+		if err := producer.Produce("events", []Message{NewMessage([]byte("value"))}, -1); err != nil {
+			t.Fatalf("Produce(events) error = %v", err)
+		}
+	}
+	if err := producer.Produce("audit", []Message{NewMessage([]byte("value"))}, -1); err != nil {
+		t.Fatalf("Produce(audit) error = %v", err)
+	}
+	if metadataCalls["events"] != 1 || metadataCalls["audit"] != 1 {
+		t.Fatalf("metadata calls = %#v, want one lookup per topic", metadataCalls)
+	}
+}
+
+func TestConfluentProducerKafkaJSLegacyMetadataExpiresAtKafkaJSMaxAge(t *testing.T) {
+	base := &fakeConfluentProducerDriver{}
+	metadataCalls := 0
+	driver := &fakeMetadataConfluentProducerDriver{
+		fakeConfluentProducerDriver: base,
+		metadataFn: func(topic *string, _ bool, _ int) (*ckafka.Metadata, error) {
+			metadataCalls++
+			return metadataForTopic(*topic, ckafka.PartitionMetadata{ID: 0, Leader: 10}), nil
+		},
+	}
+	producer := newTestConfluentProducer(driver)
+	producer.partitioner = ProducerPartitionerKafkaJSLegacy
+	producer.partitionSeed = func() (uint32, error) { return 0, nil }
+	clock := time.Date(2026, time.August, 5, 0, 0, 0, 0, time.UTC)
+	producer.metadataNow = func() time.Time { return clock }
+
+	produce := func() {
+		t.Helper()
+		if err := producer.Produce("events", []Message{NewMessage([]byte("value"))}, -1); err != nil {
+			t.Fatalf("Produce() error = %v", err)
+		}
+	}
+	produce()
+	clock = clock.Add(defaultProducerMetadataMaxAge - time.Nanosecond)
+	produce()
+	if metadataCalls != 1 {
+		t.Fatalf("metadata calls before expiry = %d, want 1", metadataCalls)
+	}
+	clock = clock.Add(2 * time.Nanosecond)
+	produce()
+	if metadataCalls != 2 {
+		t.Fatalf("metadata calls after expiry = %d, want 2", metadataCalls)
+	}
+}
+
+func TestConfluentProducerKafkaJSLegacyRefreshFailurePreservesLastHealthyCacheEntry(t *testing.T) {
+	base := &fakeConfluentProducerDriver{}
+	metadataCalls := 0
+	driver := &fakeMetadataConfluentProducerDriver{
+		fakeConfluentProducerDriver: base,
+		metadataFn: func(topic *string, _ bool, _ int) (*ckafka.Metadata, error) {
+			metadataCalls++
+			if metadataCalls == 2 {
+				return nil, errors.New("metadata temporarily unavailable")
+			}
+			return metadataForTopic(*topic, ckafka.PartitionMetadata{ID: 0, Leader: 10}), nil
+		},
+	}
+	producer := newTestConfluentProducer(driver)
+	producer.partitioner = ProducerPartitionerKafkaJSLegacy
+	producer.partitionSeed = func() (uint32, error) { return 0, nil }
+	clock := time.Date(2026, time.August, 5, 0, 0, 0, 0, time.UTC)
+	producer.metadataNow = func() time.Time { return clock }
+
+	if err := producer.Produce("events", []Message{NewMessage([]byte("first"))}, -1); err != nil {
+		t.Fatalf("initial Produce() error = %v", err)
+	}
+	producer.metadataMu.Lock()
+	wantCached := clonePartitionMetadata(producer.metadataCache["events"].partitions)
+	producer.metadataMu.Unlock()
+	clock = clock.Add(defaultProducerMetadataMaxAge)
+	if err := producer.Produce("events", []Message{NewMessage([]byte("refresh"))}, -1); err == nil {
+		t.Fatal("expired cache refresh succeeded, want metadata failure")
+	}
+	producer.metadataMu.Lock()
+	gotCached := clonePartitionMetadata(producer.metadataCache["events"].partitions)
+	producer.metadataMu.Unlock()
+	if fmt.Sprint(gotCached) != fmt.Sprint(wantCached) {
+		t.Fatalf("cache after refresh failure = %v, want last healthy %v", gotCached, wantCached)
+	}
+	if err := producer.Produce("events", []Message{NewMessage([]byte("retry"))}, -1); err != nil {
+		t.Fatalf("retry Produce() error = %v", err)
+	}
+	if metadataCalls != 3 {
+		t.Fatalf("metadata calls = %d, want initial, failed refresh, successful retry", metadataCalls)
+	}
+}
+
+func TestConfluentProducerKafkaJSLegacyCoalescesConcurrentMetadataRefresh(t *testing.T) {
+	base := &fakeConfluentProducerDriver{}
+	metadataStarted := make(chan struct{})
+	releaseMetadata := make(chan struct{})
+	var startOnce sync.Once
+	metadataCalls := 0
+	var callsMu sync.Mutex
+	driver := &fakeMetadataConfluentProducerDriver{
+		fakeConfluentProducerDriver: base,
+		metadataFn: func(topic *string, _ bool, _ int) (*ckafka.Metadata, error) {
+			callsMu.Lock()
+			metadataCalls++
+			callsMu.Unlock()
+			startOnce.Do(func() { close(metadataStarted) })
+			<-releaseMetadata
+			return metadataForTopic(*topic, ckafka.PartitionMetadata{ID: 0, Leader: 10}), nil
+		},
+	}
+	producer := newTestConfluentProducer(driver)
+	producer.partitioner = ProducerPartitionerKafkaJSLegacy
+
+	const callers = 24
+	start := make(chan struct{})
+	errs := make(chan error, callers)
+	for range callers {
+		go func() {
+			<-start
+			_, err := producer.kafkaJSPartitionMetadata(context.Background(), driver, "events")
+			errs <- err
+		}()
+	}
+	close(start)
+	<-metadataStarted
+	close(releaseMetadata)
+	for range callers {
+		if err := <-errs; err != nil {
+			t.Fatalf("metadata lookup error = %v", err)
+		}
+	}
+	callsMu.Lock()
+	gotCalls := metadataCalls
+	callsMu.Unlock()
+	if gotCalls != 1 {
+		t.Fatalf("metadata calls = %d, want one coalesced lookup", gotCalls)
+	}
+}
+
+func TestConfluentProducerKafkaJSLegacyMetadataWaitHonorsContext(t *testing.T) {
+	base := &fakeConfluentProducerDriver{}
+	metadataStarted := make(chan struct{})
+	releaseMetadata := make(chan struct{})
+	driver := &fakeMetadataConfluentProducerDriver{
+		fakeConfluentProducerDriver: base,
+		metadataFn: func(topic *string, _ bool, _ int) (*ckafka.Metadata, error) {
+			close(metadataStarted)
+			<-releaseMetadata
+			return metadataForTopic(*topic, ckafka.PartitionMetadata{ID: 0, Leader: 10}), nil
+		},
+	}
+	producer := newTestConfluentProducer(driver)
+	producer.partitioner = ProducerPartitionerKafkaJSLegacy
+	ownerDone := make(chan error, 1)
+	go func() {
+		_, err := producer.kafkaJSPartitionMetadata(context.Background(), driver, "events")
+		ownerDone <- err
+	}()
+	<-metadataStarted
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := producer.kafkaJSPartitionMetadata(ctx, driver, "events"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("waiting metadata error = %v, want context.Canceled", err)
+	}
+	close(releaseMetadata)
+	if err := <-ownerDone; err != nil {
+		t.Fatalf("owner metadata lookup error = %v", err)
+	}
+}
+
+func TestConfluentProducerKafkaJSLegacyBatchReusesMetadataForDuplicateTopic(t *testing.T) {
+	base := &fakeConfluentProducerDriver{}
+	metadataCalls := 0
+	driver := &fakeMetadataConfluentProducerDriver{
+		fakeConfluentProducerDriver: base,
+		metadataFn: func(topic *string, _ bool, _ int) (*ckafka.Metadata, error) {
+			metadataCalls++
+			return metadataForTopic(*topic, ckafka.PartitionMetadata{ID: 0, Leader: 10}), nil
+		},
+	}
+	producer := newTestConfluentProducer(driver)
+	producer.partitioner = ProducerPartitionerKafkaJSLegacy
+	producer.partitionSeed = func() (uint32, error) { return 0, nil }
+
+	err := producer.ProduceBatch([]TopicMessages{
+		{Topic: "events", Messages: []Message{NewMessage([]byte("one"))}},
+		{Topic: "events", Messages: []Message{NewMessage([]byte("two"))}},
+	}, -1)
+	if err != nil {
+		t.Fatalf("ProduceBatch() error = %v", err)
+	}
+	if metadataCalls != 1 {
+		t.Fatalf("metadata calls = %d, want 1", metadataCalls)
+	}
+}
+
+func TestConfluentProducerKafkaJSLegacyInvalidatesMetadataAfterTopologyError(t *testing.T) {
+	base := &fakeConfluentProducerDriver{}
+	metadataCalls := 0
+	produceCalls := 0
+	base.produceFn = func(message *ckafka.Message, reports chan ckafka.Event) error {
+		produceCalls++
+		delivery := successfulDelivery(message, int64(produceCalls))
+		if produceCalls == 1 {
+			delivery.TopicPartition.Error = ckafka.NewError(ckafka.ErrNotLeaderForPartition, "leader moved", false)
+		}
+		reports <- delivery
+		return nil
+	}
+	driver := &fakeMetadataConfluentProducerDriver{
+		fakeConfluentProducerDriver: base,
+		metadataFn: func(topic *string, _ bool, _ int) (*ckafka.Metadata, error) {
+			metadataCalls++
+			return metadataForTopic(*topic, ckafka.PartitionMetadata{ID: 0, Leader: 10}), nil
+		},
+	}
+	producer := newTestConfluentProducer(driver)
+	producer.partitioner = ProducerPartitionerKafkaJSLegacy
+	producer.partitionSeed = func() (uint32, error) { return 0, nil }
+
+	if err := producer.Produce("events", []Message{NewMessage([]byte("first"))}, -1); err == nil {
+		t.Fatal("first Produce() succeeded, want topology delivery failure")
+	}
+	if err := producer.Produce("events", []Message{NewMessage([]byte("second"))}, -1); err != nil {
+		t.Fatalf("second Produce() error = %v", err)
+	}
+	if metadataCalls != 2 {
+		t.Fatalf("metadata calls = %d, want refresh after topology error", metadataCalls)
+	}
+}
+
+func TestConfluentProducerKafkaJSLegacySkipsMetadataForKeyedAndExplicitMessages(t *testing.T) {
+	base := &fakeConfluentProducerDriver{}
+	driver := &fakeMetadataConfluentProducerDriver{
+		fakeConfluentProducerDriver: base,
+		metadataFn: func(*string, bool, int) (*ckafka.Metadata, error) {
+			t.Fatal("GetMetadata called for keyed or explicitly partitioned messages")
+			return nil, nil
+		},
+	}
+	producer := newTestConfluentProducer(driver)
+	producer.partitioner = ProducerPartitionerKafkaJSLegacy
+
+	if err := producer.Produce("events", []Message{
+		NewKeyedMessage([]byte("key"), []byte("keyed")),
+		NewPartitionedMessage(0, []byte("explicit")),
+	}, -1); err != nil {
+		t.Fatalf("Produce() error = %v", err)
 	}
 }
 

@@ -233,6 +233,33 @@ func TestConfluentClient_ConfigFromEnv(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestConfluentProducer_MessageMapping(t *testing.T) {
+	t.Run("message constructors preserve partition intent", func(t *testing.T) {
+		value := []byte("payload")
+		key := []byte("entity-42")
+
+		keyless := NewMessage(value)
+		if keyless.Partition != -1 || keyless.Key != nil || string(keyless.Value) != string(value) {
+			t.Fatalf("NewMessage() = %#v, want keyless automatic partition", keyless)
+		}
+
+		keyed := NewKeyedMessage(key, value)
+		if keyed.Partition != -1 || string(keyed.Key) != string(key) || string(keyed.Value) != string(value) {
+			t.Fatalf("NewKeyedMessage() = %#v, want keyed automatic partition", keyed)
+		}
+
+		explicit := NewPartitionedMessage(0, value)
+		if explicit.Partition != 0 || explicit.Key != nil || string(explicit.Value) != string(value) {
+			t.Fatalf("NewPartitionedMessage() = %#v, want explicit partition zero", explicit)
+		}
+
+		if got := buildConfluentMessage("events", Message{Value: value}).TopicPartition.Partition; got != 0 {
+			t.Fatalf("literal zero-value partition = %d, want explicit partition zero", got)
+		}
+		if got := buildConfluentMessage("events", keyless).TopicPartition.Partition; got != ckafka.PartitionAny {
+			t.Fatalf("automatic message partition = %d, want PartitionAny", got)
+		}
+	})
+
 	t.Run("basic message", func(t *testing.T) {
 		msg := Message{
 			Key:   []byte("partition-key"),
@@ -945,6 +972,8 @@ func TestProducerConfigOverrides(t *testing.T) {
 		producer, err := client.Producer(ProducerConfig{
 			Timeout:         15 * time.Second,
 			DeliveryTimeout: 8 * time.Second,
+			MetadataTimeout: 2 * time.Second,
+			MetadataMaxAge:  time.Minute,
 			MaxRetries:      5,
 			RetryBackoff:    500 * time.Millisecond,
 		})
@@ -960,6 +989,12 @@ func TestProducerConfigOverrides(t *testing.T) {
 		deliveryTimeout, _ := cp.configMap.Get("message.timeout.ms", 0)
 		if deliveryTimeout != 8000 {
 			t.Errorf("message.timeout.ms = %v, want 8000", deliveryTimeout)
+		}
+		if cp.metadataTimeout != 2*time.Second {
+			t.Errorf("metadata timeout = %v, want 2s", cp.metadataTimeout)
+		}
+		if cp.metadataMaxAge != time.Minute {
+			t.Errorf("metadata max age = %v, want 1m", cp.metadataMaxAge)
 		}
 
 		retries, _ := cp.configMap.Get("message.send.max.retries", 0)
@@ -986,6 +1021,26 @@ func TestProducerConfigOverrides(t *testing.T) {
 		retries, _ := cp.configMap.Get("message.send.max.retries", -1)
 		if retries != 0 {
 			t.Errorf("message.send.max.retries = %v, want explicit 0", retries)
+		}
+	})
+
+	t.Run("producer rejects negative metadata durations", func(t *testing.T) {
+		if _, err := client.Producer(ProducerConfig{MetadataTimeout: -time.Second}); err == nil {
+			t.Fatal("Producer() accepted a negative metadata timeout")
+		}
+		if _, err := client.Producer(ProducerConfig{MetadataMaxAge: -time.Second}); err == nil {
+			t.Fatal("Producer() accepted a negative metadata max age")
+		}
+	})
+
+	t.Run("request timeout does not implicitly change metadata timeout", func(t *testing.T) {
+		producer, err := client.Producer(ProducerConfig{Timeout: time.Second})
+		if err != nil {
+			t.Fatalf("Producer() error = %v", err)
+		}
+		cp := producer.(*ConfluentProducer)
+		if cp.metadataTimeout != 0 {
+			t.Fatalf("metadata timeout = %v, want zero/default when only request timeout is set", cp.metadataTimeout)
 		}
 	})
 
