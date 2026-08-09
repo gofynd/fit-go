@@ -896,8 +896,8 @@ func (c *SlingshotIORedisCompatClient) complete(request *slingshotIORedisRequest
 		ReplayCount:      request.replays,
 		AmbiguousReplays: request.ambiguousReplays,
 	}
-	request.future.settle(slingshotIORedisCompletion{result: result, err: err})
 	finishIORedisCompatibilitySpan(request.span, replies, err)
+	request.future.settle(slingshotIORedisCompletion{result: result, err: err})
 }
 
 func (c *SlingshotIORedisCompatClient) finishClosed(err error) {
