@@ -57,7 +57,7 @@ func (c *ioredisConnection) Ping(ctx context.Context) error {
 	if c == nil || c.client == nil {
 		return errors.New("redis: ioredis compatibility client is not configured")
 	}
-	result, err := c.client.Submit("PING").Wait(ctx)
+	result, err := c.client.SubmitContext(ctx, "PING").Wait(ctx)
 	if err != nil {
 		return err
 	}

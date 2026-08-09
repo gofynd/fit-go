@@ -19,10 +19,12 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 
 	goredis "github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
@@ -44,6 +46,34 @@ func recordingRedisProvider(t *testing.T) (*sdktrace.TracerProvider, *tracetest.
 		}
 	})
 	return provider, exporter
+}
+
+func recordingRedisTracer(t *testing.T) (*tracing.Tracer, *tracetest.InMemoryExporter) {
+	t.Helper()
+	t.Setenv("OTEL_SDK_DISABLED", "false")
+
+	previousProvider := otel.GetTracerProvider()
+	previousPropagator := otel.GetTextMapPropagator()
+	exporter := tracetest.NewInMemoryExporter()
+	enabled := true
+	tracer, err := tracing.New(context.Background(), tracing.Options{
+		ServiceName:            "ioredis-compatibility-test",
+		Enabled:                &enabled,
+		Sampler:                "always_on",
+		SpanExporter:           exporter,
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("tracing.New: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := tracer.Shutdown(context.Background()); err != nil {
+			t.Errorf("tracer shutdown: %v", err)
+		}
+		otel.SetTracerProvider(previousProvider)
+		otel.SetTextMapPropagator(previousPropagator)
+	})
+	return tracer, exporter
 }
 
 func exportedRedisSpan(t *testing.T, exporter *tracetest.InMemoryExporter, name string) tracetest.SpanStub {
@@ -292,5 +322,95 @@ func assertRedisSpanContainsNoCanaries(t *testing.T, span tracetest.SpanStub, ca
 		for _, attr := range event.Attributes {
 			check("event attribute "+string(attr.Key), attr.Value.Emit())
 		}
+	}
+}
+
+type tracedIORedisTransport struct {
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func (t *tracedIORedisTransport) Exchange(_ context.Context, commands [][]string) SlingshotIORedisExchange {
+	replies := make([]SlingshotIORedisReply, len(commands))
+	for index, command := range commands {
+		if len(command) > 0 && command[0] == "get" {
+			replies[index].Error = errors.New("redis failure contains private-key-canary")
+			continue
+		}
+		replies[index].Value = "OK"
+	}
+	return SlingshotIORedisExchange{Replies: replies}
+}
+
+func (t *tracedIORedisTransport) Closed() <-chan struct{} { return t.closed }
+
+func (t *tracedIORedisTransport) Close() error {
+	t.closeOnce.Do(func() { close(t.closed) })
+	return nil
+}
+
+func TestIORedisCompatibilitySpansAreParentedAndPrivacySafe(t *testing.T) {
+	tracer, exporter := recordingRedisTracer(t)
+	restoreGlobal := tracing.SetGlobal(tracer)
+	t.Cleanup(restoreGlobal)
+
+	transport := &tracedIORedisTransport{closed: make(chan struct{})}
+	client, err := NewSlingshotIORedisCompatClientReady(
+		context.Background(),
+		SlingshotIORedisTransportFactoryFunc(func(context.Context) (SlingshotIORedisTransport, error) {
+			return transport, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewSlingshotIORedisCompatClientReady: %v", err)
+	}
+	defer client.Disconnect()
+
+	parentCtx, parent := tracer.StartSpan(context.Background(), "ioredis-parent", tracing.SpanKindInternal)
+	const (
+		keyCanary   = "private-key-canary"
+		valueCanary = "private-value-canary"
+	)
+	if _, err := client.SubmitContext(parentCtx, "SET", keyCanary, valueCanary).Wait(context.Background()); err != nil {
+		t.Fatalf("SubmitContext SET: %v", err)
+	}
+	result, err := client.SubmitPipelineContext(
+		parentCtx,
+		[]string{"GET", keyCanary},
+		[]string{"SET", keyCanary, valueCanary},
+	).Wait(context.Background())
+	if err != nil {
+		t.Fatalf("SubmitPipelineContext: %v", err)
+	}
+	if len(result.Replies) != 2 || result.Replies[0].Error == nil {
+		t.Fatalf("pipeline replies = %+v, want first Redis reply error", result.Replies)
+	}
+	parent.End()
+
+	setSpan := exportedRedisSpan(t, exporter, "set")
+	pipelineSpan := exportedRedisSpan(t, exporter, "redis.pipeline")
+	for _, span := range []tracetest.SpanStub{setSpan, pipelineSpan} {
+		if got := span.Parent.SpanID().String(); got != parent.SpanID() {
+			t.Fatalf("span %q parent = %s, want %s", span.Name, got, parent.SpanID())
+		}
+		assertRedisSpanContainsNoCanaries(t, span, []string{keyCanary, valueCanary})
+	}
+	if setSpan.Status.Code == codes.Error {
+		t.Fatalf("successful command status = %v, want non-error", setSpan.Status)
+	}
+	if pipelineSpan.Status.Code != codes.Error || pipelineSpan.Status.Description != "redis operation failed" {
+		t.Fatalf("pipeline status = %+v, want generic Redis failure", pipelineSpan.Status)
+	}
+	if len(pipelineSpan.Events) != 0 {
+		t.Fatalf("pipeline exported backend error event: %+v", pipelineSpan.Events)
+	}
+	batchSize := int64(0)
+	for _, attr := range pipelineSpan.Attributes {
+		if string(attr.Key) == "db.operation.batch.size" {
+			batchSize = attr.Value.AsInt64()
+		}
+	}
+	if batchSize != 2 {
+		t.Fatalf("pipeline batch size = %d, want 2", batchSize)
 	}
 }

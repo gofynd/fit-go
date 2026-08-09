@@ -111,7 +111,11 @@ func safeRedisCommandVerb(cmd goredis.Cmder) string {
 	if cmd == nil {
 		return "redis.command"
 	}
-	verb := strings.ToLower(strings.TrimSpace(cmd.Name()))
+	return safeRedisCommandName(cmd.Name())
+}
+
+func safeRedisCommandName(command string) string {
+	verb := strings.ToLower(strings.TrimSpace(command))
 	if verb == "" || len(verb) > 64 {
 		return "redis.command"
 	}
@@ -122,6 +126,45 @@ func safeRedisCommandVerb(cmd goredis.Cmder) string {
 		return "redis.command"
 	}
 	return verb
+}
+
+func startIORedisCompatibilitySpan(ctx context.Context, commands [][]string, pipeline bool) trace.Span {
+	t := tracing.Global()
+	if t == nil || !t.IsEnabled() {
+		return nil
+	}
+	hook := newSafeTracingHook(otel.GetTracerProvider())
+	if pipeline {
+		_, span := hook.start(
+			ctx,
+			"redis.pipeline",
+			"pipeline",
+			trace.WithAttributes(semconv.DBOperationBatchSize(len(commands))),
+		)
+		return span
+	}
+	verb := "redis.command"
+	if len(commands) == 1 && len(commands[0]) > 0 {
+		verb = safeRedisCommandName(commands[0][0])
+	}
+	_, span := hook.start(ctx, verb, verb)
+	return span
+}
+
+func finishIORedisCompatibilitySpan(span trace.Span, replies []SlingshotIORedisReply, err error) {
+	if span == nil {
+		return
+	}
+	if err == nil {
+		for _, reply := range replies {
+			if reply.Error != nil {
+				err = reply.Error
+				break
+			}
+		}
+	}
+	setRedisSpanStatus(span, err)
+	span.End()
 }
 
 func (h *safeTracingHook) ProcessPipelineHook(next goredis.ProcessPipelineHook) goredis.ProcessPipelineHook {

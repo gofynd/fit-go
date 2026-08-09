@@ -21,6 +21,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 // SlingshotIORedisMaxRetriesPerRequest is the locked ioredis 5.11.1 default
@@ -216,6 +218,7 @@ type slingshotIORedisRequest struct {
 	replays          int
 	ambiguousReplays int
 	future           *slingshotIORedisFutureState
+	span             trace.Span
 }
 
 type slingshotIORedisPolicy struct {
@@ -352,18 +355,32 @@ func (c *SlingshotIORedisCompatClient) settleFirstReady(err error) {
 
 // Submit accepts one command into the shared FIFO.
 func (c *SlingshotIORedisCompatClient) Submit(command ...string) *SlingshotIORedisFuture {
-	return c.submit([][]string{cloneSlingshotIORedisCommand(command)}, false, false)
+	return c.SubmitContext(context.Background(), command...)
+}
+
+// SubmitContext accepts one command and parents its optional tracing span to
+// ctx. Command execution remains detached from caller cancellation, matching
+// the JavaScript Promise semantics of Submit and Wait.
+func (c *SlingshotIORedisCompatClient) SubmitContext(ctx context.Context, command ...string) *SlingshotIORedisFuture {
+	return c.submit(ctx, [][]string{cloneSlingshotIORedisCommand(command)}, false, false)
 }
 
 // SubmitPipeline accepts an ordered pipeline as one FIFO item. Redis reply
 // errors are returned per reply. Transport failure before any reply causes a
 // complete replay; failure after a prefix of replies aborts only the suffix.
 func (c *SlingshotIORedisCompatClient) SubmitPipeline(commands ...[]string) *SlingshotIORedisFuture {
+	return c.SubmitPipelineContext(context.Background(), commands...)
+}
+
+// SubmitPipelineContext is the context-aware counterpart of SubmitPipeline.
+// It creates one privacy-safe pipeline span and does not transfer ctx
+// cancellation into the accepted FIFO item.
+func (c *SlingshotIORedisCompatClient) SubmitPipelineContext(ctx context.Context, commands ...[]string) *SlingshotIORedisFuture {
 	cloned := make([][]string, len(commands))
 	for index := range commands {
 		cloned[index] = cloneSlingshotIORedisCommand(commands[index])
 	}
-	return c.submit(cloned, true, false)
+	return c.submit(ctx, cloned, true, false)
 }
 
 func cloneSlingshotIORedisCommand(command []string) []string {
@@ -376,7 +393,7 @@ func cloneSlingshotIORedisCommand(command []string) []string {
 	return cloned
 }
 
-func (c *SlingshotIORedisCompatClient) submit(commands [][]string, pipeline, quit bool) *SlingshotIORedisFuture {
+func (c *SlingshotIORedisCompatClient) submit(ctx context.Context, commands [][]string, pipeline, quit bool) *SlingshotIORedisFuture {
 	if c == nil {
 		return completedSlingshotIORedisFuture(SlingshotIORedisResult{}, SlingshotIORedisConnectionClosedError{})
 	}
@@ -393,11 +410,14 @@ func (c *SlingshotIORedisCompatClient) submit(commands [][]string, pipeline, qui
 		pipeline: pipeline,
 		quit:     quit,
 		future:   newSlingshotIORedisFutureState(),
+		span:     startIORedisCompatibilitySpan(ctx, commands, pipeline),
 	}
 	c.mu.Lock()
 	if c.closed || c.closing || c.disconnecting {
 		c.mu.Unlock()
-		return completedSlingshotIORedisFuture(SlingshotIORedisResult{}, SlingshotIORedisConnectionClosedError{})
+		closedErr := SlingshotIORedisConnectionClosedError{}
+		c.complete(request, nil, closedErr)
+		return &SlingshotIORedisFuture{state: request.future}
 	}
 	c.queue = append(c.queue, request)
 	c.mu.Unlock()
@@ -417,15 +437,18 @@ func (c *SlingshotIORedisCompatClient) Quit(ctx context.Context) error {
 		commands: [][]string{{"quit"}},
 		quit:     true,
 		future:   newSlingshotIORedisFutureState(),
+		span:     startIORedisCompatibilitySpan(ctx, [][]string{{"quit"}}, false),
 	}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
+		finishIORedisCompatibilitySpan(request.span, nil, nil)
 		return nil
 	}
 	if c.closing || c.disconnecting {
 		done := c.done
 		c.mu.Unlock()
+		finishIORedisCompatibilitySpan(request.span, nil, nil)
 		select {
 		case <-done:
 			return nil
@@ -437,9 +460,7 @@ func (c *SlingshotIORedisCompatClient) Quit(ctx context.Context) error {
 	if len(c.queue) == 0 && !c.ready {
 		c.disconnecting = true
 		c.mu.Unlock()
-		request.future.settle(slingshotIORedisCompletion{result: SlingshotIORedisResult{
-			Replies: []SlingshotIORedisReply{{Value: "OK"}},
-		}})
+		c.complete(request, []SlingshotIORedisReply{{Value: "OK"}}, nil)
 		c.cancel()
 		c.signal()
 		return nil
@@ -876,6 +897,7 @@ func (c *SlingshotIORedisCompatClient) complete(request *slingshotIORedisRequest
 		AmbiguousReplays: request.ambiguousReplays,
 	}
 	request.future.settle(slingshotIORedisCompletion{result: result, err: err})
+	finishIORedisCompatibilitySpan(request.span, replies, err)
 }
 
 func (c *SlingshotIORedisCompatClient) finishClosed(err error) {
