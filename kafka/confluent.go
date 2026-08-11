@@ -162,6 +162,12 @@ func (cc *ConfluentClient) Producer(config ProducerConfig) (KafkaProducer, error
 	if config.RetryBackoffMax > 0 {
 		_ = pCfg.SetKey("retry.backoff.max.ms", int(config.RetryBackoffMax.Milliseconds()))
 	}
+	if config.ReconnectBackoff > 0 {
+		_ = pCfg.SetKey("reconnect.backoff.ms", int(config.ReconnectBackoff.Milliseconds()))
+	}
+	if config.ReconnectBackoffMax > 0 {
+		_ = pCfg.SetKey("reconnect.backoff.max.ms", int(config.ReconnectBackoffMax.Milliseconds()))
+	}
 
 	partitioner, err := confluentPartitioner(config.Partitioner)
 	if err != nil {

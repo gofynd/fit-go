@@ -970,12 +970,15 @@ func TestProducerConfigOverrides(t *testing.T) {
 
 	t.Run("producer with timeout and retry settings", func(t *testing.T) {
 		producer, err := client.Producer(ProducerConfig{
-			Timeout:         15 * time.Second,
-			DeliveryTimeout: 8 * time.Second,
-			MetadataTimeout: 2 * time.Second,
-			MetadataMaxAge:  time.Minute,
-			MaxRetries:      5,
-			RetryBackoff:    500 * time.Millisecond,
+			Timeout:             15 * time.Second,
+			DeliveryTimeout:     8 * time.Second,
+			MetadataTimeout:     2 * time.Second,
+			MetadataMaxAge:      time.Minute,
+			MaxRetries:          5,
+			RetryBackoff:        500 * time.Millisecond,
+			RetryBackoffMax:     2 * time.Second,
+			ReconnectBackoff:    300 * time.Millisecond,
+			ReconnectBackoffMax: time.Second,
 		})
 		if err != nil {
 			t.Fatalf("Producer() error = %v", err)
@@ -1005,6 +1008,34 @@ func TestProducerConfigOverrides(t *testing.T) {
 		backoff, _ := cp.configMap.Get("retry.backoff.ms", 0)
 		if backoff != 500 {
 			t.Errorf("retry.backoff.ms = %v, want 500", backoff)
+		}
+		backoffMax, _ := cp.configMap.Get("retry.backoff.max.ms", 0)
+		if backoffMax != 2000 {
+			t.Errorf("retry.backoff.max.ms = %v, want 2000", backoffMax)
+		}
+		reconnectBackoff, _ := cp.configMap.Get("reconnect.backoff.ms", 0)
+		if reconnectBackoff != 300 {
+			t.Errorf("reconnect.backoff.ms = %v, want 300", reconnectBackoff)
+		}
+		reconnectBackoffMax, _ := cp.configMap.Get("reconnect.backoff.max.ms", 0)
+		if reconnectBackoffMax != 1000 {
+			t.Errorf("reconnect.backoff.max.ms = %v, want 1000", reconnectBackoffMax)
+		}
+	})
+
+	t.Run("producer reconnect defaults remain inherited", func(t *testing.T) {
+		producer, err := client.Producer(ProducerConfig{})
+		if err != nil {
+			t.Fatalf("Producer() error = %v", err)
+		}
+		cp := producer.(*ConfluentProducer)
+		reconnectBackoff, _ := cp.configMap.Get("reconnect.backoff.ms", nil)
+		if reconnectBackoff != nil {
+			t.Errorf("reconnect.backoff.ms = %v, want inherited default", reconnectBackoff)
+		}
+		reconnectBackoffMax, _ := cp.configMap.Get("reconnect.backoff.max.ms", nil)
+		if reconnectBackoffMax != nil {
+			t.Errorf("reconnect.backoff.max.ms = %v, want inherited default", reconnectBackoffMax)
 		}
 	})
 

@@ -197,6 +197,19 @@ type ProducerConfig struct {
 	// Zero preserves librdkafka's default.
 	RetryBackoffMax time.Duration
 
+	// ReconnectBackoff is the initial delay before reconnecting a broker after
+	// a connection failure. It maps to librdkafka's reconnect.backoff.ms and is
+	// intentionally separate from message retry backoff. Zero preserves the
+	// driver default.
+	ReconnectBackoff time.Duration
+
+	// ReconnectBackoffMax caps the exponential delay between broker reconnect
+	// attempts. It maps to librdkafka's reconnect.backoff.max.ms. Keeping this
+	// producer-scoped lets callers bound transient recovery without changing
+	// every client created from the shared fit-go Kafka configuration. Zero
+	// preserves the driver default.
+	ReconnectBackoffMax time.Duration
+
 	// Partitioner optionally selects a compatibility partitioner. Zero preserves
 	// the existing librdkafka default.
 	Partitioner ProducerPartitioner
