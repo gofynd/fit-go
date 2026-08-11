@@ -151,7 +151,10 @@ type ConsumerConfig struct {
 	// production Confluent/librdkafka backend. KafkaJSCompatible is an explicit
 	// migration-only backend whose group protocol name matches KafkaJS 2.x's
 	// literal "RoundRobinAssigner", allowing old and new members to overlap in
-	// one group during a rolling cutover.
+	// one group during a rolling cutover. All members in such a mixed group must
+	// subscribe to the same topic set. franz-go and KafkaJS intentionally differ
+	// in how their round-robin assigners treat heterogeneous subscriptions, so a
+	// group with per-member topic interests is outside this compatibility mode.
 	Backend ConsumerBackend
 
 	// PartitionAssignmentStrategy selects the group protocol assignor advertised
@@ -201,10 +204,17 @@ type ConsumerConfig struct {
 	// Default: 5s.
 	AutoCommitInterval time.Duration
 
-	// MaxPollInterval is the maximum delay between consumer poll invocations.
-	// If the consumer does not poll within this interval, the broker considers
-	// it dead and triggers a rebalance. Default: 5m (300s).
-	// Mirrors Kafka's max.poll.interval.ms.
+	// MaxPollInterval is the maximum delay between consumer poll invocations for
+	// the Confluent/librdkafka backend. If the consumer does not poll within this
+	// interval, librdkafka leaves the group and triggers a rebalance. Default: 5m
+	// (300s). Mirrors Kafka's max.poll.interval.ms.
+	//
+	// The KafkaJS-compatible franz-go backend intentionally does not apply this
+	// option: neither franz-go nor legacy KafkaJS exposes librdkafka's local
+	// max-poll watchdog. That backend uses background heartbeats together with
+	// SessionTimeout and RebalanceTimeout instead. MaxPollInterval must never be
+	// translated to RebalanceTimeout because that would change JoinGroup wire
+	// behavior and make mixed KafkaJS/franz-go rebalances wait longer.
 	MaxPollInterval time.Duration
 
 	// AutoCreateTopics, when true, best-effort creates any subscribed topics that

@@ -1,12 +1,17 @@
 package kafka
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -39,6 +44,718 @@ func TestKafkaJSCompatibleUnresolvedFinalizerMultiRecordLive(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			runKafkaJSUnresolvedMultiRecordFixture(t, broker, test.redeliver, test.want)
 		})
+	}
+}
+
+// TestKafkaJSCompatibleCloseDrainsInFlightHandlerLive proves the shutdown
+// ordering required by BlockRebalanceOnPoll. Close must cancel the handler but
+// retain the assignment until that handler reaches its offset boundary; only
+// then may it allow the final rebalance and close the client.
+func TestKafkaJSCompatibleCloseDrainsInFlightHandlerLive(t *testing.T) {
+	broker := strings.TrimSpace(os.Getenv("FIT_GO_KAFKA_RUNTIME_BROKER"))
+	if broker == "" {
+		t.Skip("set FIT_GO_KAFKA_RUNTIME_BROKER to a disposable Kafka broker")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	topic := "fit-go-close-drain-" + suffix
+	group := "fit-go-close-drain-group-" + suffix
+
+	admin, err := confluentKafka.NewAdminClient(&confluentKafka.ConfigMap{"bootstrap.servers": broker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	results, err := admin.CreateTopics(ctx, []confluentKafka.TopicSpecification{{
+		Topic: topic, NumPartitions: 1, ReplicationFactor: 1,
+	}})
+	admin.Close()
+	if err != nil || len(results) != 1 || (results[0].Error.Code() != confluentKafka.ErrNoError && results[0].Error.Code() != confluentKafka.ErrTopicAlreadyExists) {
+		t.Fatalf("create topic: results=%#v err=%v", results, err)
+	}
+
+	producer, err := kgo.NewClient(kgo.SeedBrokers(broker))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := producer.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte("drain-me")}).FirstErr(); err != nil {
+		producer.Close()
+		t.Fatalf("produce fixture: %v", err)
+	}
+	producer.Close()
+
+	logger, err := logging.New(logging.Options{Level: "error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRevoked := make(chan []PartitionAssignment, 4)
+	consumerConfig := DefaultConsumerConfig(group)
+	consumerConfig.Backend = ConsumerBackendKafkaJSCompatible
+	consumerConfig.AutoCommit = false
+	consumerConfig.OnPartitionsRevoked = func(revoked []PartitionAssignment) {
+		firstRevoked <- append([]PartitionAssignment(nil), revoked...)
+	}
+	consumer, err := newKafkaJSCompatibleConsumer([]string{broker}, &Config{ClientID: "fit-go-close-drain-test"}, consumerConfig, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := consumer.Connect([]TopicConfig{{Topic: topic, FromBeginning: true}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = consumer.Close() })
+
+	handlerStarted := make(chan struct{})
+	handlerCanceled := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	var releaseHandlerOnce sync.Once
+	release := func() { releaseHandlerOnce.Do(func() { close(releaseHandler) }) }
+	t.Cleanup(release)
+	consumeDone := make(chan error, 1)
+	go func() {
+		consumeDone <- consumer.ConsumeCtx(func(handlerCtx context.Context, payload MessagePayload) error {
+			if string(payload.Value) != "drain-me" {
+				return fmt.Errorf("unexpected payload %q", payload.Value)
+			}
+			close(handlerStarted)
+			<-handlerCtx.Done()
+			close(handlerCanceled)
+			<-releaseHandler
+			return handlerCtx.Err()
+		}, ConsumerOptions{PollTimeout: 100 * time.Millisecond, MaxRecords: 1})
+	}()
+
+	select {
+	case <-handlerStarted:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for the handler to start")
+	}
+
+	// A second member starts the rebalance while the first member's poll gate is
+	// held by the blocked handler. The peer must not receive the partition, and
+	// the first member must not revoke it, until that handler reaches its offset
+	// boundary.
+	peerAssigned := make(chan []PartitionAssignment, 4)
+	peerConfig := DefaultConsumerConfig(group)
+	peerConfig.Backend = ConsumerBackendKafkaJSCompatible
+	peerConfig.AutoCommit = false
+	peerConfig.OnPartitionsAssigned = func(assigned []PartitionAssignment) {
+		peerAssigned <- append([]PartitionAssignment(nil), assigned...)
+	}
+	peer, err := newKafkaJSCompatibleConsumer([]string{broker}, &Config{ClientID: "fit-go-close-drain-peer"}, peerConfig, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.Connect([]TopicConfig{{Topic: topic, FromBeginning: true}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = peer.Close() })
+	peerConsumeDone := make(chan error, 1)
+	go func() {
+		peerConsumeDone <- peer.ConsumeCtx(func(context.Context, MessagePayload) error { return nil }, ConsumerOptions{
+			PollTimeout: 100 * time.Millisecond,
+			MaxRecords:  1,
+		})
+	}()
+	waitForKafkaJSRuntimeGroupMembers(t, ctx, broker, group, 2)
+	assertNoKafkaJSRuntimeRebalance(t, firstRevoked, peerAssigned, 300*time.Millisecond)
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- consumer.Close() }()
+	select {
+	case <-handlerCanceled:
+	case <-ctx.Done():
+		t.Fatal("Close did not cancel the in-flight handler")
+	}
+	assertNoKafkaJSRuntimeRebalance(t, firstRevoked, peerAssigned, 300*time.Millisecond)
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before the in-flight handler drained: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+
+	firstFinalRevocation := waitForKafkaJSRuntimePartitions(t, ctx, firstRevoked, topic, 1)
+	if firstFinalRevocation[0].Partition != 0 {
+		t.Fatalf("first consumer revoked partition %d, want 0", firstFinalRevocation[0].Partition)
+	}
+	peerFinalAssignment := waitForKafkaJSRuntimePartitions(t, ctx, peerAssigned, topic, 1)
+	if peerFinalAssignment[0].Partition != 0 {
+		t.Fatalf("peer received partition %d, want 0", peerFinalAssignment[0].Partition)
+	}
+
+	select {
+	case err := <-consumeDone:
+		if err != nil {
+			t.Fatalf("Consume returned a shutdown error: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("consumer run did not finish after handler release")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Close did not finish after handler release")
+	}
+	if err := peer.Close(); err != nil {
+		t.Fatalf("close peer: %v", err)
+	}
+	select {
+	case err := <-peerConsumeDone:
+		if err != nil {
+			t.Fatalf("peer consumer shutdown: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("peer consumer did not stop")
+	}
+}
+
+// TestKafkaJSCompatibleNullOffsetCommitMetadataLive exercises the supported
+// franz-go pre-commit hook used for KafkaJS's null offset metadata. It proves
+// that an exact N+1 finalizer commit reaches the coordinator with nil metadata,
+// rather than relying only on a request-construction unit test.
+func TestKafkaJSCompatibleNullOffsetCommitMetadataLive(t *testing.T) {
+	broker := strings.TrimSpace(os.Getenv("FIT_GO_KAFKA_RUNTIME_BROKER"))
+	if broker == "" {
+		t.Skip("set FIT_GO_KAFKA_RUNTIME_BROKER to a disposable Kafka broker")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	topic := "fit-go-null-offset-metadata-" + suffix
+	group := "fit-go-null-offset-metadata-group-" + suffix
+	createKafkaJSRuntimeTopic(t, ctx, broker, topic, 1)
+
+	producer, err := kgo.NewClient(kgo.SeedBrokers(broker))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := producer.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte("commit-me")}).FirstErr(); err != nil {
+		producer.Close()
+		t.Fatalf("produce fixture: %v", err)
+	}
+	producer.Close()
+
+	logger, err := logging.New(logging.Options{Level: "error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	consumerConfig := DefaultConsumerConfig(group)
+	consumerConfig.Backend = ConsumerBackendKafkaJSCompatible
+	consumerConfig.AutoCommit = false
+	consumer, err := newKafkaJSCompatibleConsumer([]string{broker}, &Config{ClientID: "fit-go-null-offset-metadata-test"}, consumerConfig, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := consumer.Connect([]TopicConfig{{Topic: topic, FromBeginning: true}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = consumer.Close() })
+
+	finalized := make(chan int64, 1)
+	consumeDone := make(chan error, 1)
+	manualCommit := false
+	go func() {
+		consumeDone <- consumer.ConsumeCtx(func(_ context.Context, payload MessagePayload) error {
+			if string(payload.Value) != "commit-me" {
+				return fmt.Errorf("unexpected payload %q", payload.Value)
+			}
+			return nil
+		}, ConsumerOptions{
+			AutoCommit: &manualCommit,
+			OffsetFinalizer: func(_ context.Context, payload MessagePayload, handlerErr error, commit ExactOffsetCommit) error {
+				if handlerErr != nil {
+					return handlerErr
+				}
+				exact := payload.Offset + 1
+				if err := commit(exact); err != nil {
+					return err
+				}
+				finalized <- exact
+				return nil
+			},
+			NullOffsetCommitMetadata: true,
+			PollTimeout:              100 * time.Millisecond,
+			MaxRecords:               1,
+		})
+	}()
+
+	var wantOffset int64
+	select {
+	case wantOffset = <-finalized:
+	case err := <-consumeDone:
+		t.Fatalf("consumer ended before exact commit: %v", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for exact commit")
+	}
+	committed := waitForKafkaJSCommittedTopicPartition(t, ctx, broker, group, topic, wantOffset)
+	if committed.Metadata != nil {
+		t.Fatalf("committed metadata = %q, want nil", *committed.Metadata)
+	}
+
+	if err := consumer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-consumeDone:
+		if err != nil {
+			t.Fatalf("consumer shutdown: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("consumer did not stop")
+	}
+}
+
+// TestKafkaJSCompatibleMixedLegacyGroupLive runs the actual legacy KafkaJS
+// round-robin assigner and the franz-go compatibility backend in one classic
+// consumer group. It proves join, split assignment, rebalance, and leave using
+// the literal protocol that must remain compatible during a Node-to-Go rollout.
+func TestKafkaJSCompatibleMixedLegacyGroupLive(t *testing.T) {
+	broker := strings.TrimSpace(os.Getenv("FIT_GO_KAFKA_RUNTIME_BROKER"))
+	kafkaJSModule := strings.TrimSpace(os.Getenv("FIT_GO_KAFKAJS_NODE_MODULE"))
+	expectedVersion := strings.TrimSpace(os.Getenv("FIT_GO_KAFKAJS_EXPECTED_VERSION"))
+	if broker == "" || kafkaJSModule == "" || expectedVersion == "" {
+		t.Skip("set FIT_GO_KAFKA_RUNTIME_BROKER, FIT_GO_KAFKAJS_NODE_MODULE, and FIT_GO_KAFKAJS_EXPECTED_VERSION for the mixed-client test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	t.Run("legacy_node_member_leads", func(t *testing.T) {
+		runKafkaJSMixedLegacyGroupFixture(t, ctx, broker, kafkaJSModule, expectedVersion, false)
+	})
+	t.Run("migrated_go_member_leads", func(t *testing.T) {
+		runKafkaJSMixedLegacyGroupFixture(t, ctx, broker, kafkaJSModule, expectedVersion, true)
+	})
+}
+
+func runKafkaJSMixedLegacyGroupFixture(
+	t *testing.T,
+	ctx context.Context,
+	broker string,
+	kafkaJSModule string,
+	expectedVersion string,
+	goLeads bool,
+) {
+	t.Helper()
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	topic := "fit-go-mixed-kafkajs-" + suffix
+	group := "fit-go-mixed-kafkajs-group-" + suffix
+	createKafkaJSRuntimeTopic(t, ctx, broker, topic, 4)
+
+	goAssignments := make(chan []PartitionAssignment, 8)
+	goRevocations := make(chan []PartitionAssignment, 8)
+	startGo := func() (KafkaConsumer, <-chan error) {
+		logger, err := logging.New(logging.Options{Level: "error"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		consumerConfig := DefaultConsumerConfig(group)
+		consumerConfig.Backend = ConsumerBackendKafkaJSCompatible
+		consumerConfig.AutoCommit = false
+		consumerConfig.OnPartitionsAssigned = func(assigned []PartitionAssignment) {
+			goAssignments <- append([]PartitionAssignment(nil), assigned...)
+		}
+		consumerConfig.OnPartitionsRevoked = func(revoked []PartitionAssignment) {
+			goRevocations <- append([]PartitionAssignment(nil), revoked...)
+		}
+		consumer, err := newKafkaJSCompatibleConsumer([]string{broker}, &Config{ClientID: "franz-go-live-test"}, consumerConfig, logger)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := consumer.Connect([]TopicConfig{{Topic: topic, FromBeginning: true}}); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = consumer.Close() })
+		consumeDone := make(chan error, 1)
+		go func() {
+			consumeDone <- consumer.ConsumeCtx(func(context.Context, MessagePayload) error { return nil }, ConsumerOptions{
+				PollTimeout: 100 * time.Millisecond,
+				MaxRecords:  1,
+			})
+		}()
+		return consumer, consumeDone
+	}
+
+	if !goLeads {
+		node := startLegacyKafkaJSRuntimeProcess(t, ctx, broker, group, topic, kafkaJSModule)
+		node.waitForVersion(t, ctx, expectedVersion)
+		_ = node.waitForPartitions(t, ctx, topic, 4)
+
+		consumer, consumeDone := startGo()
+		goSplit := waitForKafkaJSRuntimePartitions(t, ctx, goAssignments, topic, 2)
+		nodeSplit := node.waitForPartitions(t, ctx, topic, 2)
+		assertKafkaJSMixedPartitionCoverage(t, topic, nodeSplit, goSplit)
+
+		closeKafkaJSRuntimeConsumer(t, ctx, consumer, consumeDone)
+		_ = node.waitForPartitions(t, ctx, topic, 4)
+		stopLegacyKafkaJSRuntimeProcess(t, node)
+		return
+	}
+
+	consumer, consumeDone := startGo()
+	_ = waitForKafkaJSRuntimePartitions(t, ctx, goAssignments, topic, 4)
+
+	node := startLegacyKafkaJSRuntimeProcess(t, ctx, broker, group, topic, kafkaJSModule)
+	node.waitForVersion(t, ctx, expectedVersion)
+	// The pre-existing Go member must acknowledge revocation of its original
+	// four-partition assignment before the group settles into a 2+2 split.
+	_ = waitForKafkaJSRuntimePartitions(t, ctx, goRevocations, topic, 4)
+	goSplit := waitForKafkaJSRuntimePartitions(t, ctx, goAssignments, topic, 2)
+	nodeSplit := node.waitForPartitions(t, ctx, topic, 2)
+	assertKafkaJSMixedPartitionCoverage(t, topic, nodeSplit, goSplit)
+
+	stopLegacyKafkaJSRuntimeProcess(t, node)
+	_ = waitForKafkaJSRuntimePartitions(t, ctx, goAssignments, topic, 4)
+	closeKafkaJSRuntimeConsumer(t, ctx, consumer, consumeDone)
+}
+
+const legacyKafkaJSRuntimeScript = `
+const path = require('path');
+const modulePath = process.env.KAFKAJS_MODULE;
+const { Kafka, logLevel, PartitionAssigners } = require(modulePath);
+const { version } = require(path.join(modulePath, 'package.json'));
+process.stdout.write(JSON.stringify({ type: 'version', version }) + '\n');
+const consumer = new Kafka({
+  clientId: 'legacy-kafkajs-live-test',
+  brokers: [process.env.BROKER],
+  logLevel: logLevel.NOTHING,
+}).consumer({
+  groupId: process.env.GROUP,
+  partitionAssigners: [PartitionAssigners.roundRobin],
+});
+let stopping = false;
+async function stop() {
+  if (stopping) return;
+  stopping = true;
+  await consumer.disconnect();
+  process.exit(0);
+}
+process.on('SIGTERM', () => { stop().catch(error => { console.error(error); process.exit(1); }); });
+consumer.on(consumer.events.GROUP_JOIN, event => {
+  process.stdout.write(JSON.stringify({ type: 'assignment', assignment: event.payload.memberAssignment }) + '\n');
+});
+(async () => {
+  await consumer.connect();
+  await consumer.subscribe({ topic: process.env.TOPIC, fromBeginning: true });
+  await consumer.run({ eachMessage: async () => {} });
+})().catch(error => { console.error(error); process.exit(1); });
+`
+
+type legacyKafkaJSRuntimeEvent struct {
+	Type       string             `json:"type"`
+	Version    string             `json:"version"`
+	Assignment map[string][]int32 `json:"assignment"`
+}
+
+type legacyKafkaJSRuntimeProcess struct {
+	command *exec.Cmd
+	events  chan legacyKafkaJSRuntimeEvent
+	done    chan struct{}
+	scanErr chan error
+	stderr  bytes.Buffer
+
+	waitMu   sync.Mutex
+	waitErr  error
+	stopOnce sync.Once
+	stopErr  error
+}
+
+func startLegacyKafkaJSRuntimeProcess(
+	t *testing.T,
+	ctx context.Context,
+	broker string,
+	group string,
+	topic string,
+	kafkaJSModule string,
+) *legacyKafkaJSRuntimeProcess {
+	t.Helper()
+	command := exec.CommandContext(ctx, "node", "-e", legacyKafkaJSRuntimeScript)
+	command.Env = append(os.Environ(),
+		"BROKER="+broker,
+		"GROUP="+group,
+		"TOPIC="+topic,
+		"KAFKAJS_MODULE="+kafkaJSModule,
+	)
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	process := &legacyKafkaJSRuntimeProcess{
+		command: command,
+		events:  make(chan legacyKafkaJSRuntimeEvent, 32),
+		done:    make(chan struct{}),
+		scanErr: make(chan error, 1),
+	}
+	command.Stderr = &process.stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 1024), 1024*1024)
+		for scanner.Scan() {
+			var event legacyKafkaJSRuntimeEvent
+			if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+				continue
+			}
+			select {
+			case process.events <- event:
+			case <-ctx.Done():
+				process.scanErr <- ctx.Err()
+				close(process.events)
+				return
+			}
+		}
+		process.scanErr <- scanner.Err()
+		close(process.events)
+	}()
+	go func() {
+		err := command.Wait()
+		process.waitMu.Lock()
+		process.waitErr = err
+		process.waitMu.Unlock()
+		close(process.done)
+	}()
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = process.stop(cleanupCtx)
+	})
+	return process
+}
+
+func (p *legacyKafkaJSRuntimeProcess) waitForVersion(t *testing.T, ctx context.Context, want string) {
+	t.Helper()
+	for {
+		event := p.nextEvent(t, ctx)
+		if event.Type != "version" {
+			continue
+		}
+		if event.Version != want {
+			t.Fatalf("legacy KafkaJS version = %q, want explicitly audited version %q", event.Version, want)
+		}
+		return
+	}
+}
+
+func (p *legacyKafkaJSRuntimeProcess) waitForPartitions(t *testing.T, ctx context.Context, topic string, want int) map[string][]int32 {
+	t.Helper()
+	for {
+		event := p.nextEvent(t, ctx)
+		if event.Type == "assignment" && len(event.Assignment[topic]) == want {
+			return event.Assignment
+		}
+	}
+}
+
+func (p *legacyKafkaJSRuntimeProcess) nextEvent(t *testing.T, ctx context.Context) legacyKafkaJSRuntimeEvent {
+	t.Helper()
+	select {
+	case event, ok := <-p.events:
+		if ok {
+			return event
+		}
+		var scannerErr error
+		select {
+		case scannerErr = <-p.scanErr:
+		default:
+		}
+		var processErr error
+		var stderr string
+		select {
+		case <-p.done:
+			processErr = p.waitResult()
+			stderr = p.stderr.String()
+		default:
+		}
+		t.Fatalf("legacy KafkaJS event stream closed: process=%v scanner=%v stderr=%q", processErr, scannerErr, stderr)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for legacy KafkaJS event: %v", ctx.Err())
+	}
+	return legacyKafkaJSRuntimeEvent{}
+}
+
+func (p *legacyKafkaJSRuntimeProcess) waitResult() error {
+	p.waitMu.Lock()
+	defer p.waitMu.Unlock()
+	return p.waitErr
+}
+
+func (p *legacyKafkaJSRuntimeProcess) stop(ctx context.Context) error {
+	p.stopOnce.Do(func() {
+		select {
+		case <-p.done:
+			p.stopErr = p.waitResult()
+			return
+		default:
+		}
+		if err := p.command.Process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			p.stopErr = fmt.Errorf("signal legacy KafkaJS process: %w", err)
+			_ = p.command.Process.Kill()
+			<-p.done
+			return
+		}
+		select {
+		case <-p.done:
+			p.stopErr = p.waitResult()
+		case <-ctx.Done():
+			_ = p.command.Process.Kill()
+			<-p.done
+			p.stopErr = fmt.Errorf("stop legacy KafkaJS process: %w", ctx.Err())
+		}
+	})
+	return p.stopErr
+}
+
+func stopLegacyKafkaJSRuntimeProcess(t *testing.T, process *legacyKafkaJSRuntimeProcess) {
+	t.Helper()
+	stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := process.stop(stopCtx); err != nil {
+		t.Fatalf("legacy KafkaJS shutdown: %v; stderr=%q", err, process.stderr.String())
+	}
+}
+
+func closeKafkaJSRuntimeConsumer(t *testing.T, ctx context.Context, consumer KafkaConsumer, consumeDone <-chan error) {
+	t.Helper()
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- consumer.Close() }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("close franz-go consumer: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("franz-go consumer close timed out")
+	}
+	select {
+	case err := <-consumeDone:
+		if err != nil {
+			t.Fatalf("franz-go consumer shutdown: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("franz-go consumer run did not stop")
+	}
+}
+
+func assertKafkaJSMixedPartitionCoverage(
+	t *testing.T,
+	topic string,
+	nodeAssignment map[string][]int32,
+	goAssignment []PartitionAssignment,
+) {
+	t.Helper()
+	seen := make(map[int32]string, 4)
+	for _, partition := range nodeAssignment[topic] {
+		if partition < 0 || partition >= 4 {
+			t.Fatalf("legacy KafkaJS received invalid partition %d", partition)
+		}
+		seen[partition] = "node"
+	}
+	for _, assignment := range goAssignment {
+		if assignment.Topic != topic {
+			continue
+		}
+		if assignment.Partition < 0 || assignment.Partition >= 4 {
+			t.Fatalf("franz-go received invalid partition %d", assignment.Partition)
+		}
+		if owner, exists := seen[assignment.Partition]; exists {
+			t.Fatalf("partition %d assigned to both %s and franz-go", assignment.Partition, owner)
+		}
+		seen[assignment.Partition] = "go"
+	}
+	if len(nodeAssignment[topic]) != 2 || len(goAssignment) != 2 || len(seen) != 4 {
+		t.Fatalf("mixed group must have a disjoint 2+2 split across four partitions: node=%v go=%v coverage=%v", nodeAssignment[topic], goAssignment, seen)
+	}
+}
+
+func createKafkaJSRuntimeTopic(t *testing.T, ctx context.Context, broker string, topic string, partitions int) {
+	t.Helper()
+	admin, err := confluentKafka.NewAdminClient(&confluentKafka.ConfigMap{"bootstrap.servers": broker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	results, err := admin.CreateTopics(ctx, []confluentKafka.TopicSpecification{{
+		Topic: topic, NumPartitions: partitions, ReplicationFactor: 1,
+	}})
+	admin.Close()
+	if err != nil || len(results) != 1 || (results[0].Error.Code() != confluentKafka.ErrNoError && results[0].Error.Code() != confluentKafka.ErrTopicAlreadyExists) {
+		t.Fatalf("create topic: results=%#v err=%v", results, err)
+	}
+}
+
+func waitForKafkaJSRuntimePartitions(
+	t *testing.T,
+	ctx context.Context,
+	events <-chan []PartitionAssignment,
+	topic string,
+	want int,
+) []PartitionAssignment {
+	t.Helper()
+	for {
+		select {
+		case assignments := <-events:
+			matching := make([]PartitionAssignment, 0, len(assignments))
+			for _, assignment := range assignments {
+				if assignment.Topic == topic {
+					matching = append(matching, assignment)
+				}
+			}
+			if len(matching) == want {
+				return matching
+			}
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for %d partitions on %s: %v", want, topic, ctx.Err())
+		}
+	}
+}
+
+func assertNoKafkaJSRuntimeRebalance(
+	t *testing.T,
+	revocations <-chan []PartitionAssignment,
+	peerAssignments <-chan []PartitionAssignment,
+	duration time.Duration,
+) {
+	t.Helper()
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case revoked := <-revocations:
+		t.Fatalf("first consumer revoked while its handler was still blocked: %#v", revoked)
+	case assigned := <-peerAssignments:
+		t.Fatalf("peer received an assignment while the first handler was still blocked: %#v", assigned)
+	case <-timer.C:
+	}
+}
+
+func waitForKafkaJSRuntimeGroupMembers(
+	t *testing.T,
+	ctx context.Context,
+	broker string,
+	group string,
+	want int,
+) {
+	t.Helper()
+	admin, err := confluentKafka.NewAdminClient(&confluentKafka.ConfigMap{"bootstrap.servers": broker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	for {
+		result, describeErr := admin.DescribeConsumerGroups(ctx, []string{group})
+		if describeErr == nil && len(result.ConsumerGroupDescriptions) == 1 {
+			description := result.ConsumerGroupDescriptions[0]
+			if description.Error.Code() == confluentKafka.ErrNoError && len(description.Members) >= want {
+				return
+			}
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("consumer group %s did not expose %d joined members: result=%#v err=%v", group, want, result, describeErr)
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 }
 
@@ -160,6 +877,18 @@ func runKafkaJSUnresolvedMultiRecordFixture(t *testing.T, broker string, redeliv
 
 func waitForKafkaJSCommittedOffset(t *testing.T, ctx context.Context, broker, group, topic string, want int64) {
 	t.Helper()
+	_ = waitForKafkaJSCommittedTopicPartition(t, ctx, broker, group, topic, want)
+}
+
+func waitForKafkaJSCommittedTopicPartition(
+	t *testing.T,
+	ctx context.Context,
+	broker string,
+	group string,
+	topic string,
+	want int64,
+) confluentKafka.TopicPartition {
+	t.Helper()
 	reader, err := confluentKafka.NewConsumer(&confluentKafka.ConfigMap{
 		"bootstrap.servers":  broker,
 		"group.id":           group,
@@ -172,7 +901,7 @@ func waitForKafkaJSCommittedOffset(t *testing.T, ctx context.Context, broker, gr
 	for {
 		partitions, commitErr := reader.Committed([]confluentKafka.TopicPartition{{Topic: &topic, Partition: 0}}, 2000)
 		if commitErr == nil && len(partitions) == 1 && int64(partitions[0].Offset) == want {
-			return
+			return partitions[0]
 		}
 		select {
 		case <-ctx.Done():

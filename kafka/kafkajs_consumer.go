@@ -46,6 +46,7 @@ type kafkaJSCompatibleConsumer struct {
 	runDone   chan struct{}
 	closed    bool
 	closeErr  error
+	closeDone chan struct{}
 }
 
 func newKafkaJSCompatibleConsumer(
@@ -273,6 +274,10 @@ func (c *kafkaJSCompatibleConsumer) consumeMessages(handler kafkaJSMessageHandle
 		return err
 	}
 	defer finish()
+	// Every successful PollRecords call blocks group rebalances until the
+	// current records have reached their handler/offset boundary. Release that
+	// gate on every return path before finish signals Close that the run ended.
+	defer client.AllowRebalance()
 	maxRecords := opts.MaxRecords
 	if maxRecords <= 0 {
 		maxRecords = concurrency
@@ -298,9 +303,17 @@ func (c *kafkaJSCompatibleConsumer) consumeMessages(handler kafkaJSMessageHandle
 			// End this poll batch so records after it are not observed before its
 			// KafkaJS-style marker redelivery.
 			client.AllowRebalance()
+			if ctx.Err() != nil {
+				return nil
+			}
 			continue
 		} else if err != nil {
 			client.AllowRebalance()
+			if isKafkaJSRunCancellation(ctx, err) {
+				// Shutdown cancellation deliberately leaves the current record
+				// unresolved so the next group member can replay it.
+				return nil
+			}
 			return c.prepareTransientRunRetry(client, err)
 		}
 		client.AllowRebalance()
@@ -399,14 +412,14 @@ func (c *kafkaJSCompatibleConsumer) processRecord(
 				return fmt.Errorf("kafka/kafkajs: exact offset commit callback called more than once")
 			}
 			commitCalled = true
-			return commitKafkaJSExact(ctx, client, c.config.GroupID, record, exact, opts.NullOffsetCommitMetadata)
+			return commitKafkaJSExact(ctx, client, record, exact, opts.NullOffsetCommitMetadata)
 		}
 		finalizerErr := opts.OffsetFinalizer(ctx, payload, handlerErr, commitExact)
 		if finalizerErr != nil {
 			return finalizerErr
 		}
 		if handlerErr == nil && opts.ResolveAfterSuccessfulFinalizer {
-			return resolveKafkaJSRecord(ctx, client, c.config.GroupID, record, isAutoCommit, opts.NullOffsetCommitMetadata)
+			return resolveKafkaJSRecord(ctx, client, record, isAutoCommit, opts.NullOffsetCommitMetadata)
 		}
 		if handlerErr != nil && opts.RedeliverUnresolvedFinalizer {
 			client.SetOffsets(map[string]map[int32]kgo.EpochOffset{
@@ -422,7 +435,7 @@ func (c *kafkaJSCompatibleConsumer) processRecord(
 	if !isAutoCommit && opts.CommitBeforeHandler {
 		return nil
 	}
-	return resolveKafkaJSRecord(ctx, client, c.config.GroupID, record, isAutoCommit, false)
+	return resolveKafkaJSRecord(ctx, client, record, isAutoCommit, false)
 }
 
 func kafkaJSPayload(record *kgo.Record) MessagePayload {
@@ -440,7 +453,6 @@ func kafkaJSPayload(record *kgo.Record) MessagePayload {
 func resolveKafkaJSRecord(
 	ctx context.Context,
 	client *kgo.Client,
-	groupID string,
 	record *kgo.Record,
 	auto bool,
 	nullMetadata bool,
@@ -450,7 +462,7 @@ func resolveKafkaJSRecord(
 		return nil
 	}
 	if nullMetadata {
-		return commitKafkaJSExact(ctx, client, groupID, record, record.Offset+1, true)
+		return commitKafkaJSExact(ctx, client, record, record.Offset+1, true)
 	}
 	if err := client.CommitRecords(ctx, record); err != nil {
 		return classifyKafkaJSTransientConsumerError(
@@ -463,26 +475,12 @@ func resolveKafkaJSRecord(
 func commitKafkaJSExact(
 	ctx context.Context,
 	client *kgo.Client,
-	groupID string,
 	record *kgo.Record,
 	exact int64,
 	nullMetadata bool,
 ) error {
 	if nullMetadata {
-		memberID, generation := client.GroupMetadata()
-		request := newKafkaJSOffsetCommitRequest(groupID, memberID, generation, record, exact)
-		response, err := request.RequestWith(ctx, client)
-		if err != nil {
-			return classifyKafkaJSTransientConsumerError(
-				fmt.Errorf("kafka/kafkajs: exact offset commit failed: %w", err),
-			)
-		}
-		if err := kafkaJSOffsetCommitResponseError(response); err != nil {
-			return classifyKafkaJSTransientConsumerError(
-				fmt.Errorf("kafka/kafkajs: exact offset commit failed: %w", err),
-			)
-		}
-		return nil
+		ctx = kgo.PreCommitFnContext(ctx, clearKafkaJSOffsetCommitMetadata)
 	}
 	offsets := map[string]map[int32]kgo.EpochOffset{
 		record.Topic: {record.Partition: {Epoch: -1, Offset: exact}},
@@ -490,15 +488,8 @@ func commitKafkaJSExact(
 	var commitErr error
 	client.CommitOffsetsSync(ctx, offsets, func(_ *kgo.Client, _ *kmsg.OffsetCommitRequest, response *kmsg.OffsetCommitResponse, err error) {
 		commitErr = err
-		if commitErr == nil && response != nil {
-			for _, topic := range response.Topics {
-				for _, partition := range topic.Partitions {
-					if partition.ErrorCode != 0 {
-						commitErr = fmt.Errorf("broker rejected exact offset commit with error code %d", partition.ErrorCode)
-						return
-					}
-				}
-			}
+		if commitErr == nil {
+			commitErr = kafkaJSOffsetCommitResponseError(response)
 		}
 	})
 	if commitErr != nil {
@@ -509,27 +500,21 @@ func commitKafkaJSExact(
 	return nil
 }
 
-func newKafkaJSOffsetCommitRequest(
-	groupID string,
-	memberID string,
-	generation int32,
-	record *kgo.Record,
-	offset int64,
-) *kmsg.OffsetCommitRequest {
-	request := kmsg.NewPtrOffsetCommitRequest()
-	request.Group = groupID
-	request.Generation = generation
-	request.MemberID = memberID
-	topic := kmsg.NewOffsetCommitRequestTopic()
-	topic.Topic = record.Topic
-	partition := kmsg.NewOffsetCommitRequestTopicPartition()
-	partition.Partition = record.Partition
-	partition.Offset = offset
-	partition.LeaderEpoch = -1
-	partition.Metadata = nil
-	topic.Partitions = append(topic.Partitions, partition)
-	request.Topics = append(request.Topics, topic)
-	return request
+// clearKafkaJSOffsetCommitMetadata is installed through franz-go's supported
+// pre-commit hook instead of issuing a raw OffsetCommitRequest. This preserves
+// KafkaJS's null metadata while retaining franz-go's coordinator routing,
+// serialized commit ordering, topic-ID population, and v9 fallback for brokers
+// where OffsetCommit v10 cannot safely address the topic by ID.
+func clearKafkaJSOffsetCommitMetadata(request *kmsg.OffsetCommitRequest) error {
+	if request == nil {
+		return fmt.Errorf("kafka/kafkajs: offset commit request is nil")
+	}
+	for topicIndex := range request.Topics {
+		for partitionIndex := range request.Topics[topicIndex].Partitions {
+			request.Topics[topicIndex].Partitions[partitionIndex].Metadata = nil
+		}
+	}
+	return nil
 }
 
 func kafkaJSOffsetCommitResponseError(response *kmsg.OffsetCommitResponse) error {
@@ -539,7 +524,12 @@ func kafkaJSOffsetCommitResponseError(response *kmsg.OffsetCommitResponse) error
 	for _, topic := range response.Topics {
 		for _, partition := range topic.Partitions {
 			if partition.ErrorCode != 0 {
-				return fmt.Errorf("broker rejected exact offset commit with error code %d", partition.ErrorCode)
+				return fmt.Errorf(
+					"broker rejected exact offset commit for topic %q partition %d: %w",
+					topic.Topic,
+					partition.Partition,
+					kerr.ErrorForCode(partition.ErrorCode),
+				)
 			}
 		}
 	}
@@ -597,6 +587,7 @@ func (c *kafkaJSCompatibleConsumer) consumeBatches(handler kafkaJSBatchHandler, 
 		return err
 	}
 	defer finish()
+	defer client.AllowRebalance()
 	maxRecords := opts.MaxRecords
 	if maxRecords <= 0 {
 		maxRecords = 100
@@ -633,13 +624,30 @@ func (c *kafkaJSCompatibleConsumer) consumeBatches(handler kafkaJSBatchHandler, 
 			if !isAutoCommit && opts.CommitBeforeHandler {
 				return nil
 			}
-			return resolveKafkaJSRecord(ctx, client, c.config.GroupID, last, isAutoCommit, false)
+			return resolveKafkaJSRecord(ctx, client, last, isAutoCommit, false)
 		}); err != nil {
 			client.AllowRebalance()
+			if isKafkaJSRunCancellation(ctx, err) {
+				// Do not turn an expected shutdown cancellation into a pod
+				// failure. The uncommitted batch remains replayable.
+				return nil
+			}
 			return c.prepareTransientRunRetry(client, err)
 		}
 		client.AllowRebalance()
 	}
+}
+
+// isKafkaJSRunCancellation distinguishes an expected shutdown error from a
+// real handler, finalizer, or commit failure that merely happened at the same
+// time as shutdown. Only an error wrapping the run context's own terminal
+// error is suppressed; unrelated processing failures must remain visible.
+func isKafkaJSRunCancellation(ctx context.Context, err error) bool {
+	if ctx == nil || err == nil {
+		return false
+	}
+	runErr := ctx.Err()
+	return runErr != nil && errors.Is(err, runErr)
 }
 
 func (c *kafkaJSCompatibleConsumer) beginRun() (*kgo.Client, context.Context, func(), error) {
@@ -713,32 +721,52 @@ func (c *kafkaJSCompatibleConsumer) prepareTransientRunRetry(runClient *kgo.Clie
 	c.client = nil
 	c.mu.Unlock()
 
-	// Close stops heartbeats and releases the old assignment before the outer
-	// retry starts a new group member. kgo.Close is safe without a live broker
-	// and prevents a stale member from delaying recovery by a session timeout.
-	runClient.Close()
+	// A PollRecords call may still hold BlockRebalanceOnPoll's gate on this
+	// early error path. Allowing the rebalance while closing prevents recovery
+	// from deadlocking before the outer retry can create a new group member.
+	runClient.CloseAllowingRebalance()
 	return err
 }
 
 func (c *kafkaJSCompatibleConsumer) Close() error {
 	c.mu.Lock()
 	if c.closed {
+		done := c.closeDone
+		c.mu.Unlock()
+		if done != nil {
+			<-done
+		}
+		c.mu.Lock()
 		err := c.closeErr
 		c.mu.Unlock()
 		return err
 	}
 	c.closed = true
-	client, cancel, done := c.client, c.cancelRun, c.runDone
+	closeDone := make(chan struct{})
+	c.closeDone = closeDone
+	client, cancel, runDone := c.client, c.cancelRun, c.runDone
 	c.mu.Unlock()
+
 	if cancel != nil {
 		cancel()
 	}
+	// Let in-flight handlers observe cancellation and reach their offset
+	// boundary before the assignment is released. Both consume loops defer
+	// AllowRebalance before they signal runDone, so this wait cannot retain a
+	// stale BlockRebalanceOnPoll gate after the run has finished.
+	if runDone != nil {
+		<-runDone
+	}
 	if client != nil {
-		client.Close()
+		client.CloseAllowingRebalance()
 	}
-	if done != nil {
-		<-done
+	if c.logger != nil {
+		c.logger.Info("kafka/kafkajs: consumer closed", "groupId", c.config.GroupID)
 	}
-	c.logger.Info("kafka/kafkajs: consumer closed", "groupId", c.config.GroupID)
-	return nil
+
+	c.mu.Lock()
+	err := c.closeErr
+	close(closeDone)
+	c.mu.Unlock()
+	return err
 }

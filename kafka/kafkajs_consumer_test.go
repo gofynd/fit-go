@@ -1,11 +1,13 @@
 package kafka
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -40,27 +42,33 @@ func TestKafkaJSTransientConsumerErrorClassification(t *testing.T) {
 	}
 }
 
-func TestKafkaJSNullMetadataOffsetCommitRequest(t *testing.T) {
-	record := &kgo.Record{Topic: "discount-events", Partition: 3, Offset: 41}
-	request := newKafkaJSOffsetCommitRequest(
-		"galvatron-basic-group-1",
-		"metroplex-member",
-		7,
-		record,
-		42,
-	)
-	if request.Group != "galvatron-basic-group-1" || request.MemberID != "metroplex-member" || request.Generation != 7 {
-		t.Fatalf("group identity = %#v", request)
+func TestKafkaJSNullMetadataOffsetCommitHookPreservesRequest(t *testing.T) {
+	metadata := "metroplex-member"
+	request := kmsg.NewPtrOffsetCommitRequest()
+	request.Group = "galvatron-basic-group-1"
+	request.Generation = 7
+	request.MemberID = metadata
+	request.Topics = append(request.Topics, kmsg.OffsetCommitRequestTopic{
+		Topic: "discount-events",
+		Partitions: []kmsg.OffsetCommitRequestTopicPartition{{
+			Partition: 3, Offset: 42, LeaderEpoch: -1, Metadata: &metadata,
+		}},
+	})
+	if err := clearKafkaJSOffsetCommitMetadata(request); err != nil {
+		t.Fatal(err)
 	}
-	if len(request.Topics) != 1 || request.Topics[0].Topic != record.Topic || len(request.Topics[0].Partitions) != 1 {
-		t.Fatalf("topics = %#v", request.Topics)
+	if request.Group != "galvatron-basic-group-1" || request.MemberID != "metroplex-member" || request.Generation != 7 {
+		t.Fatalf("group identity changed: %#v", request)
 	}
 	partition := request.Topics[0].Partitions[0]
-	if partition.Partition != record.Partition || partition.Offset != 42 || partition.LeaderEpoch != -1 {
-		t.Fatalf("partition = %#v", partition)
+	if partition.Partition != 3 || partition.Offset != 42 || partition.LeaderEpoch != -1 {
+		t.Fatalf("partition changed: %#v", partition)
 	}
 	if partition.Metadata != nil {
 		t.Fatalf("metadata = %q, want null", *partition.Metadata)
+	}
+	if err := clearKafkaJSOffsetCommitMetadata(nil); err == nil {
+		t.Fatal("nil request was accepted")
 	}
 }
 
@@ -76,10 +84,28 @@ func TestKafkaJSNullMetadataOffsetCommitResponseValidation(t *testing.T) {
 	if err := kafkaJSOffsetCommitResponseError(response); err != nil {
 		t.Fatalf("successful response: %v", err)
 	}
-	response.Topics[0].Partitions[0].ErrorCode = int16(kerr.IllegalGeneration.Code)
-	if err := kafkaJSOffsetCommitResponseError(response); err == nil {
-		t.Fatal("broker partition error was accepted")
-	}
+
+	t.Run("retriable coordinator error retains Kafka identity", func(t *testing.T) {
+		response.Topics[0].Partitions[0].ErrorCode = int16(kerr.CoordinatorNotAvailable.Code)
+		err := kafkaJSOffsetCommitResponseError(response)
+		if !errors.Is(err, kerr.CoordinatorNotAvailable) {
+			t.Fatalf("response error = %v, want CoordinatorNotAvailable identity", err)
+		}
+		if classified := classifyKafkaJSTransientConsumerError(err); !IsTransientConsumerError(classified) {
+			t.Fatalf("coordinator error was not classified transient: %v", classified)
+		}
+	})
+
+	t.Run("permanent authorization error retains Kafka identity", func(t *testing.T) {
+		response.Topics[0].Partitions[0].ErrorCode = int16(kerr.GroupAuthorizationFailed.Code)
+		err := kafkaJSOffsetCommitResponseError(response)
+		if !errors.Is(err, kerr.GroupAuthorizationFailed) {
+			t.Fatalf("response error = %v, want GroupAuthorizationFailed identity", err)
+		}
+		if classified := classifyKafkaJSTransientConsumerError(err); IsTransientConsumerError(classified) {
+			t.Fatalf("authorization error was incorrectly classified transient: %v", classified)
+		}
+	})
 }
 
 func TestNewTransientConsumerErrorPreservesCauseAndIdentity(t *testing.T) {
@@ -230,6 +256,105 @@ func TestKafkaJSCompatibleManualConsumerDisablesBackgroundAutoCommit(t *testing.
 	defer client.Close()
 	if disabled, ok := client.OptValue(kgo.DisableAutoCommit).(bool); !ok || !disabled {
 		t.Fatalf("DisableAutoCommit = %#v; manual mode could background-commit an unhandled record", client.OptValue(kgo.DisableAutoCommit))
+	}
+}
+
+func TestKafkaJSCompatibleConsumerKeepsRebalanceTimeoutIndependentFromMaxPollInterval(t *testing.T) {
+	logger, err := logging.New(logging.Options{Level: "info"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRebalanceTimeout := 73 * time.Second
+	consumer := &kafkaJSCompatibleConsumer{
+		brokers: []string{"127.0.0.1:1"},
+		fitCfg:  &Config{ClientID: "test"},
+		config: ConsumerConfig{
+			GroupID:          "group",
+			AutoCommit:       false,
+			RebalanceTimeout: wantRebalanceTimeout,
+			MaxPollInterval:  17 * time.Minute,
+		},
+		logger: logger,
+	}
+	opts, err := consumer.clientOptions([]TopicConfig{{Topic: "discounts"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := kgo.NewClient(opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if got := client.OptValue(kgo.RebalanceTimeout); got != wantRebalanceTimeout {
+		t.Fatalf("RebalanceTimeout = %#v, want %v; MaxPollInterval must not alter the KafkaJS JoinGroup timeout", got, wantRebalanceTimeout)
+	}
+}
+
+func TestKafkaJSCompatibleCloseWaitsForRunAndConcurrentCallers(t *testing.T) {
+	logger, err := logging.New(logging.Options{Level: "info"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := kgo.NewClient(kgo.SeedBrokers("127.0.0.1:1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	consumer := &kafkaJSCompatibleConsumer{
+		client:    client,
+		cancelRun: cancelRun,
+		runDone:   runDone,
+		config:    ConsumerConfig{GroupID: "group"},
+		logger:    logger,
+	}
+
+	first := make(chan error, 1)
+	second := make(chan error, 1)
+	go func() { first <- consumer.Close() }()
+	select {
+	case <-runCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Close did not cancel the active run")
+	}
+	select {
+	case err := <-first:
+		t.Fatalf("Close returned before the active run drained: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	go func() { second <- consumer.Close() }()
+	select {
+	case err := <-second:
+		t.Fatalf("concurrent Close returned before the first close completed: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(runDone)
+	for name, result := range map[string]<-chan error{"first": first, "second": second} {
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("%s Close: %v", name, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s Close did not complete after the run drained", name)
+		}
+	}
+}
+
+func TestKafkaJSRunCancellationDoesNotHideConcurrentProcessingFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if !isKafkaJSRunCancellation(ctx, fmt.Errorf("handler stopped: %w", context.Canceled)) {
+		t.Fatal("wrapped run cancellation must be treated as a clean shutdown")
+	}
+	if isKafkaJSRunCancellation(ctx, errors.New("database write failed")) {
+		t.Fatal("a real processing failure racing shutdown must remain visible")
+	}
+	if isKafkaJSRunCancellation(context.Background(), context.Canceled) {
+		t.Fatal("a cancellation error without a canceled run must remain visible")
 	}
 }
 
