@@ -61,6 +61,10 @@ type SlingshotIORedisRESPOptions struct {
 	DisableClientInfo   bool
 	DisableReadyCheck   bool
 	MaxLoadingRetryTime time.Duration
+	// clientInfoLibraryVersion is selected only by a source-pinned compatibility
+	// profile. Direct Slingshot constructors leave it empty and retain the locked
+	// ioredis 5.11.1 default.
+	clientInfoLibraryVersion string
 
 	// DialContext is an explicit test/custom-network seam. nil uses net.Dialer.
 	// Supplying it does not disable TLS; TLS is still negotiated over the
@@ -107,6 +111,9 @@ func NewSlingshotIORedisRESPTransportFactory(options SlingshotIORedisRESPOptions
 	}
 	if options.MaxLoadingRetryTime == 0 {
 		options.MaxLoadingRetryTime = slingshotIORedisDefaultLoadingRetry
+	}
+	if options.clientInfoLibraryVersion == "" {
+		options.clientInfoLibraryVersion = slingshotIORedisLibraryVersion
 	}
 	if options.readyWait == nil {
 		options.readyWait = waitSlingshotIORedisRESPReady
@@ -233,7 +240,7 @@ func (f *SlingshotIORedisRESPTransportFactory) startup(ctx context.Context, tran
 		// then VER even though event_handler.js builds the promises VER-first.
 		commands = append(commands,
 			[]string{"client", "SETINFO", "LIB-NAME", "ioredis"},
-			[]string{"client", "SETINFO", "LIB-VER", slingshotIORedisLibraryVersion},
+			[]string{"client", "SETINFO", "LIB-VER", options.clientInfoLibraryVersion},
 		)
 	}
 	if len(commands) > 0 {

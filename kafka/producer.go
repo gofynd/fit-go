@@ -28,6 +28,14 @@ const (
 	// already accepted deliveries and driver teardown complete in the
 	// background, matching KafkaJS producer.disconnect startup-failure behavior.
 	ProducerCloseKafkaJSDisconnect
+	// ProducerCloseKafkaJSAwaitDelivery stops admission, waits boundedly for
+	// accepted produce calls and their delivery reports, and then closes the
+	// driver without requiring a separate broker-responsive Flush round trip.
+	// This matches callers such as legacy Galvatron that await KafkaJS
+	// producer.disconnect after their in-flight work has reached its delivery
+	// boundary. If the bound expires, Close reports the outstanding accepted
+	// count while the ordered drain and driver cleanup continue in the background.
+	ProducerCloseKafkaJSAwaitDelivery
 )
 
 // ProducerPartitioner selects the driver partitioning strategy for records

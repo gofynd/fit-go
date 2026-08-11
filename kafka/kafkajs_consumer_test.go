@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +17,124 @@ import (
 
 	"github.com/gofynd/fit-go/logging"
 )
+
+type fakeKafkaJSConsumerClient struct {
+	mu sync.Mutex
+
+	pollFn          func(context.Context, int) kgo.Fetches
+	commitRecordsFn func(context.Context, ...*kgo.Record) error
+
+	pollCalls           int
+	allowRebalanceCalls int
+	closeCalls          int
+	markedOffsets       []int64
+	exactOffsets        []int64
+	setOffsetsCalls     int
+}
+
+func (f *fakeKafkaJSConsumerClient) PollRecords(ctx context.Context, maxRecords int) kgo.Fetches {
+	f.mu.Lock()
+	f.pollCalls++
+	f.mu.Unlock()
+	if f.pollFn != nil {
+		return f.pollFn(ctx, maxRecords)
+	}
+	<-ctx.Done()
+	return kgo.NewErrFetch(ctx.Err())
+}
+
+func (f *fakeKafkaJSConsumerClient) pollCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pollCalls
+}
+
+func (f *fakeKafkaJSConsumerClient) AllowRebalance() {
+	f.mu.Lock()
+	f.allowRebalanceCalls++
+	f.mu.Unlock()
+}
+
+func (f *fakeKafkaJSConsumerClient) CommitRecords(ctx context.Context, records ...*kgo.Record) error {
+	if f.commitRecordsFn != nil {
+		return f.commitRecordsFn(ctx, records...)
+	}
+	f.mu.Lock()
+	for _, record := range records {
+		f.exactOffsets = append(f.exactOffsets, record.Offset+1)
+	}
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *fakeKafkaJSConsumerClient) MarkCommitRecords(records ...*kgo.Record) {
+	f.mu.Lock()
+	for _, record := range records {
+		f.markedOffsets = append(f.markedOffsets, record.Offset+1)
+	}
+	f.mu.Unlock()
+}
+
+func (f *fakeKafkaJSConsumerClient) SetOffsets(map[string]map[int32]kgo.EpochOffset) {
+	f.mu.Lock()
+	f.setOffsetsCalls++
+	f.mu.Unlock()
+}
+
+func (f *fakeKafkaJSConsumerClient) CommitOffsetsSync(
+	_ context.Context,
+	offsets map[string]map[int32]kgo.EpochOffset,
+	onDone func(*kgo.Client, *kmsg.OffsetCommitRequest, *kmsg.OffsetCommitResponse, error),
+) {
+	f.mu.Lock()
+	for _, partitions := range offsets {
+		for _, offset := range partitions {
+			f.exactOffsets = append(f.exactOffsets, offset.Offset)
+		}
+	}
+	f.mu.Unlock()
+	onDone(nil, nil, kmsg.NewPtrOffsetCommitResponse(), nil)
+}
+
+func (f *fakeKafkaJSConsumerClient) CloseAllowingRebalance() {
+	f.mu.Lock()
+	f.closeCalls++
+	f.mu.Unlock()
+}
+
+func (f *fakeKafkaJSConsumerClient) snapshot() (allowRebalances, closes int, marked, exact []int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.allowRebalanceCalls, f.closeCalls,
+		append([]int64(nil), f.markedOffsets...), append([]int64(nil), f.exactOffsets...)
+}
+
+func kafkaJSTestFetch(record *kgo.Record) kgo.Fetches {
+	return kgo.Fetches{{Topics: []kgo.FetchTopic{{
+		Topic: record.Topic,
+		Partitions: []kgo.FetchPartition{{
+			Partition: record.Partition,
+			Records:   []*kgo.Record{record},
+		}},
+	}}}}
+}
+
+func newKafkaJSLifecycleTestConsumer(t *testing.T, client kafkaJSConsumerClient, policy ConsumerShutdownPolicy) *kafkaJSCompatibleConsumer {
+	t.Helper()
+	logger, err := logging.New(logging.Options{Level: "error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &kafkaJSCompatibleConsumer{
+		client: client,
+		config: ConsumerConfig{
+			GroupID:        "kafkajs-shutdown-test",
+			AutoCommit:     false,
+			ShutdownPolicy: policy,
+		},
+		logger: logger,
+	}
+}
 
 func TestKafkaJSTransientConsumerErrorClassification(t *testing.T) {
 	networkCause := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
@@ -153,7 +273,7 @@ func TestKafkaJSTransientRunFailureRebuildsClientFromCommittedBoundary(t *testin
 		t.Fatal("transient run failure retained the advanced franz-go client")
 	}
 
-	rebuilt, _, finish, err := consumer.beginRun()
+	rebuilt, _, _, finish, err := consumer.beginRun()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,6 +460,323 @@ func TestKafkaJSCompatibleCloseWaitsForRunAndConcurrentCallers(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatalf("%s Close did not complete after the run drained", name)
 		}
+	}
+}
+
+func TestKafkaJSCompatibleDefaultShutdownCancelsInFlightHandler(t *testing.T) {
+	record := &kgo.Record{Topic: "discounts", Partition: 0, Offset: 7, Value: []byte("work")}
+	var pollOnce sync.Once
+	client := &fakeKafkaJSConsumerClient{}
+	client.pollFn = func(ctx context.Context, _ int) kgo.Fetches {
+		var fetches kgo.Fetches
+		pollOnce.Do(func() { fetches = kafkaJSTestFetch(record) })
+		if fetches != nil {
+			return fetches
+		}
+		<-ctx.Done()
+		return kgo.NewErrFetch(ctx.Err())
+	}
+	consumer := newKafkaJSLifecycleTestConsumer(t, client, ConsumerShutdownCancelInFlight)
+
+	handlerStarted := make(chan struct{})
+	handlerCanceled := make(chan struct{})
+	consumeDone := make(chan error, 1)
+	go func() {
+		consumeDone <- consumer.ConsumeCtx(func(ctx context.Context, _ MessagePayload) error {
+			close(handlerStarted)
+			<-ctx.Done()
+			close(handlerCanceled)
+			return ctx.Err()
+		}, ConsumerOptions{PollTimeout: time.Second, MaxRecords: 1})
+	}()
+
+	select {
+	case <-handlerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not start")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- consumer.Close() }()
+	select {
+	case <-handlerCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("default shutdown did not cancel the in-flight handler")
+	}
+	select {
+	case err := <-consumeDone:
+		if err != nil {
+			t.Fatalf("ConsumeCtx: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("consume run did not stop after handler cancellation")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not finish")
+	}
+
+	allowRebalances, closes, _, exact := client.snapshot()
+	if allowRebalances == 0 {
+		t.Fatal("shutdown did not release BlockRebalanceOnPoll")
+	}
+	if closes != 1 {
+		t.Fatalf("client closes = %d, want 1", closes)
+	}
+	if len(exact) != 0 {
+		t.Fatalf("canceled record committed offsets %v", exact)
+	}
+}
+
+func TestKafkaJSCompatibleDrainShutdownCompletesMarkerFinalizerAndCommits(t *testing.T) {
+	record := &kgo.Record{Topic: "discounts", Partition: 2, Offset: 17, Value: []byte("work")}
+	var pollOnce sync.Once
+	client := &fakeKafkaJSConsumerClient{}
+	client.pollFn = func(ctx context.Context, _ int) kgo.Fetches {
+		var fetches kgo.Fetches
+		pollOnce.Do(func() { fetches = kafkaJSTestFetch(record) })
+		if fetches != nil {
+			return fetches
+		}
+		<-ctx.Done()
+		return kgo.NewErrFetch(ctx.Err())
+	}
+	consumer := newKafkaJSLifecycleTestConsumer(t, client, ConsumerShutdownDrainInFlight)
+
+	markerWritten := make(chan struct{})
+	handlerCanceled := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	finalizerFinished := make(chan struct{})
+	consumeDone := make(chan error, 1)
+	go func() {
+		consumeDone <- consumer.ConsumeCtx(func(ctx context.Context, _ MessagePayload) error {
+			// Models Galvatron's Redis SETEX marker-before-work boundary.
+			close(markerWritten)
+			select {
+			case <-ctx.Done():
+				close(handlerCanceled)
+				return ctx.Err()
+			case <-releaseHandler:
+				return nil
+			}
+		}, ConsumerOptions{
+			PollTimeout: time.Second,
+			MaxRecords:  1,
+			OffsetFinalizer: func(_ context.Context, payload MessagePayload, handlerErr error, commit ExactOffsetCommit) error {
+				if handlerErr != nil {
+					return handlerErr
+				}
+				if err := commit(payload.Offset); err != nil {
+					return err
+				}
+				close(finalizerFinished)
+				return nil
+			},
+			ResolveAfterSuccessfulFinalizer: true,
+			NullOffsetCommitMetadata:        true,
+		})
+	}()
+
+	select {
+	case <-markerWritten:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not reach the marker boundary")
+	}
+	firstClose := make(chan error, 1)
+	secondClose := make(chan error, 1)
+	go func() { firstClose <- consumer.Close() }()
+	go func() { secondClose <- consumer.Close() }()
+	select {
+	case <-handlerCanceled:
+		t.Fatal("drain shutdown canceled admitted handler work")
+	case err := <-firstClose:
+		t.Fatalf("Close returned before admitted work completed: %v", err)
+	case err := <-secondClose:
+		t.Fatalf("concurrent Close returned before admitted work completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseHandler)
+	select {
+	case <-finalizerFinished:
+	case <-time.After(time.Second):
+		t.Fatal("drain shutdown did not finish the finalizer commit")
+	}
+	for name, result := range map[string]<-chan error{"first": firstClose, "second": secondClose, "consume": consumeDone} {
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("%s result: %v", name, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s did not finish", name)
+		}
+	}
+
+	allowRebalances, closes, _, exact := client.snapshot()
+	if allowRebalances == 0 {
+		t.Fatal("drain shutdown did not release BlockRebalanceOnPoll")
+	}
+	if closes != 1 {
+		t.Fatalf("client closes = %d, want 1", closes)
+	}
+	if want := []int64{17, 18}; !reflect.DeepEqual(exact, want) {
+		t.Fatalf("exact offset commits = %v, want %v", exact, want)
+	}
+	if polls := client.pollCount(); polls != 1 {
+		t.Fatalf("drain shutdown poll calls = %d, want 1; shutdown admitted another poll", polls)
+	}
+	if err := consumer.Close(); err != nil {
+		t.Fatalf("repeated Close: %v", err)
+	}
+	_, closes, _, _ = client.snapshot()
+	if closes != 1 {
+		t.Fatalf("repeated Close closed client %d times, want 1", closes)
+	}
+}
+
+func TestKafkaJSCompatibleDrainShutdownDoesNotHangWhileIdle(t *testing.T) {
+	pollStarted := make(chan struct{})
+	var pollStartedOnce sync.Once
+	client := &fakeKafkaJSConsumerClient{}
+	client.pollFn = func(ctx context.Context, _ int) kgo.Fetches {
+		pollStartedOnce.Do(func() { close(pollStarted) })
+		<-ctx.Done()
+		return kgo.NewErrFetch(ctx.Err())
+	}
+	consumer := newKafkaJSLifecycleTestConsumer(t, client, ConsumerShutdownDrainInFlight)
+
+	consumeDone := make(chan error, 1)
+	go func() {
+		consumeDone <- consumer.ConsumeCtx(func(context.Context, MessagePayload) error {
+			t.Error("idle consumer unexpectedly invoked its handler")
+			return nil
+		}, ConsumerOptions{PollTimeout: time.Hour, MaxRecords: 1})
+	}()
+	select {
+	case <-pollStarted:
+	case <-time.After(time.Second):
+		t.Fatal("consumer did not enter PollRecords")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- consumer.Close() }()
+	for name, result := range map[string]<-chan error{"close": closeDone, "consume": consumeDone} {
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("%s result: %v", name, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s hung while the consumer was idle", name)
+		}
+	}
+	allowRebalances, closes, _, _ := client.snapshot()
+	if allowRebalances == 0 || closes != 1 {
+		t.Fatalf("shutdown lifecycle = allowRebalance %d, closes %d; want >=1/1", allowRebalances, closes)
+	}
+}
+
+func TestKafkaJSCompatibleShutdownHandlesRecordReturnedByActivePollPerPolicy(t *testing.T) {
+	tests := []struct {
+		name       string
+		policy     ConsumerShutdownPolicy
+		wantHandle bool
+		wantCommit []int64
+	}{
+		{
+			name:   "default cancellation leaves record replayable",
+			policy: ConsumerShutdownCancelInFlight,
+		},
+		{
+			name:       "drain completes record from already active poll",
+			policy:     ConsumerShutdownDrainInFlight,
+			wantHandle: true,
+			wantCommit: []int64{10},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			record := &kgo.Record{Topic: "discounts", Partition: 0, Offset: 9, Value: []byte("buffered")}
+			pollStarted := make(chan struct{})
+			var pollOnce sync.Once
+			client := &fakeKafkaJSConsumerClient{}
+			client.pollFn = func(ctx context.Context, _ int) kgo.Fetches {
+				var fetches kgo.Fetches
+				pollOnce.Do(func() {
+					close(pollStarted)
+					<-ctx.Done()
+					fetches = kafkaJSTestFetch(record)
+				})
+				if fetches != nil {
+					return fetches
+				}
+				<-ctx.Done()
+				return kgo.NewErrFetch(ctx.Err())
+			}
+			consumer := newKafkaJSLifecycleTestConsumer(t, client, test.policy)
+			handled := make(chan struct{})
+			consumeDone := make(chan error, 1)
+			go func() {
+				consumeDone <- consumer.ConsumeCtx(func(context.Context, MessagePayload) error {
+					close(handled)
+					return nil
+				}, ConsumerOptions{PollTimeout: time.Hour, MaxRecords: 1})
+			}()
+			select {
+			case <-pollStarted:
+			case <-time.After(time.Second):
+				t.Fatal("consumer did not start its first poll")
+			}
+
+			if err := consumer.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			select {
+			case err := <-consumeDone:
+				if err != nil {
+					t.Fatalf("ConsumeCtx: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("consume run did not finish")
+			}
+
+			wasHandled := false
+			select {
+			case <-handled:
+				wasHandled = true
+			default:
+			}
+			if wasHandled != test.wantHandle {
+				t.Fatalf("handler called = %v, want %v", wasHandled, test.wantHandle)
+			}
+			_, _, _, exact := client.snapshot()
+			if !reflect.DeepEqual(exact, test.wantCommit) {
+				t.Fatalf("committed offsets = %v, want %v", exact, test.wantCommit)
+			}
+			if polls := client.pollCount(); polls != 1 {
+				t.Fatalf("poll calls = %d, want 1", polls)
+			}
+		})
+	}
+}
+
+func TestKafkaJSCompatibleRejectsUnknownShutdownPolicy(t *testing.T) {
+	logger, err := logging.New(logging.Options{Level: "error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = newKafkaJSCompatibleConsumer(
+		[]string{"127.0.0.1:1"},
+		&Config{ClientID: "test"},
+		ConsumerConfig{GroupID: "group", ShutdownPolicy: ConsumerShutdownPolicy(255)},
+		logger,
+	)
+	if err == nil || !strings.Contains(err.Error(), "unsupported shutdown policy") {
+		t.Fatalf("unknown shutdown policy error = %v", err)
 	}
 }
 

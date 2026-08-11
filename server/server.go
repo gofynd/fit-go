@@ -59,8 +59,17 @@ type Config struct {
 	// ReadTimeout is the maximum duration for reading the entire request.
 	ReadTimeout time.Duration
 
+	// ReadHeaderTimeout is the maximum duration for reading request headers.
+	// A zero value preserves net/http's existing behavior of using ReadTimeout.
+	ReadHeaderTimeout time.Duration
+
 	// WriteTimeout is the maximum duration before timing out writes of the response.
 	WriteTimeout time.Duration
+
+	// DisableWriteTimeout explicitly disables the response write deadline. It is
+	// opt-in because a zero WriteTimeout retains fit-go's existing 30-second
+	// default. When set, it takes precedence over WriteTimeout.
+	DisableWriteTimeout bool
 
 	// IdleTimeout is the maximum amount of time to wait for the next request
 	// when keep-alives are enabled.
@@ -143,7 +152,9 @@ func New(cfg Config) *Server {
 	if cfg.ReadTimeout == 0 {
 		cfg.ReadTimeout = 30 * time.Second
 	}
-	if cfg.WriteTimeout == 0 {
+	if cfg.DisableWriteTimeout {
+		cfg.WriteTimeout = 0
+	} else if cfg.WriteTimeout == 0 {
 		cfg.WriteTimeout = 30 * time.Second
 	}
 	if cfg.IdleTimeout == 0 {
@@ -344,13 +355,7 @@ func (s *Server) Start() error {
 	}
 
 	addr := net.JoinHostPort("", port)
-	s.server = &http.Server{
-		Addr:         addr,
-		Handler:      s.App,
-		ReadTimeout:  s.cfg.ReadTimeout,
-		WriteTimeout: s.cfg.WriteTimeout,
-		IdleTimeout:  s.cfg.IdleTimeout,
-	}
+	s.server = s.buildHTTPServer(addr)
 	s.mu.Unlock()
 
 	s.logger.Info("Server started", "addr", "http://localhost:"+port)
@@ -359,6 +364,17 @@ func (s *Server) Start() error {
 		return nil
 	}
 	return err
+}
+
+func (s *Server) buildHTTPServer(addr string) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           s.App,
+		ReadTimeout:       s.cfg.ReadTimeout,
+		ReadHeaderTimeout: s.cfg.ReadHeaderTimeout,
+		WriteTimeout:      s.cfg.WriteTimeout,
+		IdleTimeout:       s.cfg.IdleTimeout,
+	}
 }
 
 // Shutdown gracefully shuts down the server.

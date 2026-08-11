@@ -72,6 +72,107 @@ func TestInitIORedisV4CompatibilityIsServiceScoped(t *testing.T) {
 	}
 }
 
+func TestInitFIT401IORedis582CompatibilityStandaloneClientInfo(t *testing.T) {
+	restore := isolateRedisEnvironment(t)
+	defer restore()
+
+	server := startSlingshotRESPScenarioServer(t, nil, ioredis582MetadataRejectingHandler)
+	defer server.stop()
+	t.Setenv("REDIS_ORBIS_READ_WRITE", "redis://"+server.addr+"/0")
+
+	client, err := Init(ConnectionOptions{
+		Context: context.Background(),
+		Dial:    mockDial,
+		IORedisCompatibility: map[string]IORedisCompatibilityProfile{
+			"orbis": IORedisCompatibilityFIT401IORedis582,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Init standalone: %v", err)
+	}
+	defer client.Close()
+	if err := client.Service("orbis").Write.Ping(context.Background()); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+	assertIORedis582ClientInfo(t, server.commandsSnapshot(), 1)
+}
+
+func TestInitFIT401IORedis582CompatibilitySentinelClientInfo(t *testing.T) {
+	restore := isolateRedisEnvironment(t)
+	defer restore()
+
+	master := startSlingshotRESPScenarioServer(t, nil, ioredis582MetadataRejectingHandler)
+	defer master.stop()
+	sentinel := startSlingshotRESPScenarioServer(t, nil, func(command []string) (string, bool) {
+		if len(command) > 0 && strings.EqualFold(command[0], "SENTINEL") {
+			if len(command) != 3 || !strings.EqualFold(command[1], "get-master-addr-by-name") || command[2] != "galvatron-main" {
+				return "-ERR unexpected sentinel command\r\n", false
+			}
+			masterHost, masterPort := splitTopologyAddress(t, master.addr)
+			return encodeTopologyRESP([]any{masterHost, int64(masterPort)}), false
+		}
+		return ioredis582MetadataRejectingHandler(command)
+	})
+	defer sentinel.stop()
+	t.Setenv("REDIS_ORBIS_READ_WRITE", "redis-sentinel://"+sentinel.addr+"/0?master=galvatron-main")
+
+	client, err := Init(ConnectionOptions{
+		Context: context.Background(),
+		Dial:    mockDial,
+		IORedisCompatibility: map[string]IORedisCompatibilityProfile{
+			"orbis": IORedisCompatibilityFIT401IORedis582,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Init Sentinel: %v", err)
+	}
+	defer client.Close()
+	if err := client.Service("orbis").Write.Ping(context.Background()); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+	assertIORedis582ClientInfo(t, sentinel.commandsSnapshot(), 1)
+	assertIORedis582ClientInfo(t, master.commandsSnapshot(), 1)
+}
+
+func TestInitFIT401IORedis582CompatibilityClusterClientInfo(t *testing.T) {
+	restore := isolateRedisEnvironment(t)
+	defer restore()
+
+	var server *slingshotRESPScenarioServer
+	server = startSlingshotRESPScenarioServer(t, nil, func(command []string) (string, bool) {
+		if len(command) > 0 && strings.EqualFold(command[0], "CLUSTER") {
+			if len(command) != 2 || !strings.EqualFold(command[1], "slots") {
+				return "-ERR unexpected cluster command\r\n", false
+			}
+			host, port := splitTopologyAddress(t, server.addr)
+			return encodeTopologyRESP([]any{
+				[]any{int64(0), int64(16383), []any{host, int64(port), "node-a"}},
+			}), false
+		}
+		return ioredis582MetadataRejectingHandler(command)
+	})
+	defer server.stop()
+	t.Setenv("REDIS_ORBIS_READ_WRITE", "redis://"+server.addr+"/0?sharded_db=true")
+
+	client, err := Init(ConnectionOptions{
+		Context: context.Background(),
+		Dial:    mockDial,
+		IORedisCompatibility: map[string]IORedisCompatibilityProfile{
+			"orbis": IORedisCompatibilityFIT401IORedis582,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Init Cluster: %v", err)
+	}
+	defer client.Close()
+	if err := client.Service("orbis").Write.Ping(context.Background()); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+	// Cluster startup opens one connection for slot discovery and another for
+	// the data node, so both must carry the source-pinned identity.
+	assertIORedis582ClientInfo(t, server.commandsSnapshot(), 2)
+}
+
 func TestInitIORedisV4CompatibilityRejectsReplicaTopologies(t *testing.T) {
 	tests := []struct {
 		name string
@@ -444,6 +545,46 @@ func topologyCommandCount(commands [][]string, want ...string) int {
 		}
 	}
 	return count
+}
+
+func ioredis582MetadataRejectingHandler(command []string) (string, bool) {
+	if len(command) == 0 {
+		return "-ERR empty command\r\n", false
+	}
+	switch strings.ToUpper(command[0]) {
+	case "CLIENT":
+		if len(command) >= 2 && strings.EqualFold(command[1], "SETINFO") {
+			// Redis versions before 7.2 reject SETINFO. ioredis 5 ignores these
+			// reply errors and continues its startup sequence.
+			return "-ERR unknown subcommand 'SETINFO'\r\n", false
+		}
+		return "+OK\r\n", false
+	case "INFO":
+		return "$11\r\nloading:0\r\n\r\n", false
+	case "PING":
+		return "+PONG\r\n", false
+	default:
+		return "+OK\r\n", false
+	}
+}
+
+func assertIORedis582ClientInfo(t *testing.T, commands [][]string, wantConnections int) {
+	t.Helper()
+	if got := topologyCommandCount(commands, "CLIENT", "SETINFO", "LIB-NAME", "ioredis"); got != wantConnections {
+		t.Fatalf("CLIENT SETINFO LIB-NAME count = %d, want %d; commands = %#v", got, wantConnections, commands)
+	}
+	if got := topologyCommandCount(commands, "CLIENT", "SETINFO", "LIB-VER", "5.8.2"); got != wantConnections {
+		t.Fatalf("CLIENT SETINFO LIB-VER 5.8.2 count = %d, want %d; commands = %#v", got, wantConnections, commands)
+	}
+	versionCommands := 0
+	for _, command := range commands {
+		if len(command) == 4 && strings.EqualFold(command[0], "CLIENT") && strings.EqualFold(command[1], "SETINFO") && strings.EqualFold(command[2], "LIB-VER") {
+			versionCommands++
+		}
+	}
+	if versionCommands != wantConnections {
+		t.Fatalf("all CLIENT SETINFO LIB-VER count = %d, want only %d source-pinned commands; commands = %#v", versionCommands, wantConnections, commands)
+	}
 }
 
 func TestInitIORedisV4CompatibilityQueuesAcrossOutageAfterWaitCancellation(t *testing.T) {

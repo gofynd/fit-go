@@ -1263,8 +1263,14 @@ func TestNew(t *testing.T) {
 		if s.cfg.ReadTimeout != 30*time.Second {
 			t.Errorf("ReadTimeout = %v, want 30s", s.cfg.ReadTimeout)
 		}
+		if s.cfg.ReadHeaderTimeout != 0 {
+			t.Errorf("ReadHeaderTimeout = %v, want zero to preserve the ReadTimeout fallback", s.cfg.ReadHeaderTimeout)
+		}
 		if s.cfg.WriteTimeout != 30*time.Second {
 			t.Errorf("WriteTimeout = %v, want 30s", s.cfg.WriteTimeout)
+		}
+		if s.cfg.DisableWriteTimeout {
+			t.Error("DisableWriteTimeout = true, want false")
 		}
 		if s.cfg.IdleTimeout != 120*time.Second {
 			t.Errorf("IdleTimeout = %v, want 120s", s.cfg.IdleTimeout)
@@ -1274,14 +1280,96 @@ func TestNew(t *testing.T) {
 	t.Run("custom config", func(t *testing.T) {
 		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 		s := New(Config{
-			Logger:       logger,
-			ReadTimeout:  60 * time.Second,
-			WriteTimeout: 60 * time.Second,
-			IdleTimeout:  300 * time.Second,
+			Logger:            logger,
+			ReadTimeout:       60 * time.Second,
+			ReadHeaderTimeout: 15 * time.Second,
+			WriteTimeout:      60 * time.Second,
+			IdleTimeout:       300 * time.Second,
 		})
 
 		if s.cfg.ReadTimeout != 60*time.Second {
 			t.Errorf("ReadTimeout = %v, want 60s", s.cfg.ReadTimeout)
+		}
+		if s.cfg.ReadHeaderTimeout != 15*time.Second {
+			t.Errorf("ReadHeaderTimeout = %v, want 15s", s.cfg.ReadHeaderTimeout)
+		}
+		if s.cfg.WriteTimeout != 60*time.Second {
+			t.Errorf("WriteTimeout = %v, want 60s", s.cfg.WriteTimeout)
+		}
+		if s.cfg.IdleTimeout != 300*time.Second {
+			t.Errorf("IdleTimeout = %v, want 300s", s.cfg.IdleTimeout)
+		}
+	})
+
+	t.Run("write timeout explicitly disabled", func(t *testing.T) {
+		s := New(Config{
+			WriteTimeout:        60 * time.Second,
+			DisableWriteTimeout: true,
+		})
+
+		if s.cfg.WriteTimeout != 0 {
+			t.Errorf("WriteTimeout = %v, want disabled", s.cfg.WriteTimeout)
+		}
+		if !s.cfg.DisableWriteTimeout {
+			t.Error("DisableWriteTimeout = false, want true")
+		}
+	})
+}
+
+func TestServerBuildHTTPServerTimeouts(t *testing.T) {
+	t.Run("default values preserve existing net http behavior", func(t *testing.T) {
+		s := New(Config{})
+		s.App = http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+		httpServer := s.buildHTTPServer(":0")
+
+		if httpServer.ReadTimeout != 30*time.Second {
+			t.Errorf("ReadTimeout = %v, want 30s", httpServer.ReadTimeout)
+		}
+		if httpServer.ReadHeaderTimeout != 0 {
+			t.Errorf("ReadHeaderTimeout = %v, want zero", httpServer.ReadHeaderTimeout)
+		}
+		if httpServer.WriteTimeout != 30*time.Second {
+			t.Errorf("WriteTimeout = %v, want 30s", httpServer.WriteTimeout)
+		}
+		if httpServer.IdleTimeout != 120*time.Second {
+			t.Errorf("IdleTimeout = %v, want 120s", httpServer.IdleTimeout)
+		}
+	})
+
+	t.Run("custom values reach net http", func(t *testing.T) {
+		s := New(Config{
+			ReadTimeout:       5 * time.Minute,
+			ReadHeaderTimeout: time.Minute,
+			WriteTimeout:      2 * time.Minute,
+			IdleTimeout:       5 * time.Second,
+		})
+		s.App = http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+		httpServer := s.buildHTTPServer(":0")
+
+		if httpServer.ReadTimeout != 5*time.Minute {
+			t.Errorf("ReadTimeout = %v, want 5m", httpServer.ReadTimeout)
+		}
+		if httpServer.ReadHeaderTimeout != time.Minute {
+			t.Errorf("ReadHeaderTimeout = %v, want 1m", httpServer.ReadHeaderTimeout)
+		}
+		if httpServer.WriteTimeout != 2*time.Minute {
+			t.Errorf("WriteTimeout = %v, want 2m", httpServer.WriteTimeout)
+		}
+		if httpServer.IdleTimeout != 5*time.Second {
+			t.Errorf("IdleTimeout = %v, want 5s", httpServer.IdleTimeout)
+		}
+	})
+
+	t.Run("write timeout disable takes precedence", func(t *testing.T) {
+		s := New(Config{
+			WriteTimeout:        time.Minute,
+			DisableWriteTimeout: true,
+		})
+		s.App = http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+		httpServer := s.buildHTTPServer(":0")
+
+		if httpServer.WriteTimeout != 0 {
+			t.Errorf("WriteTimeout = %v, want disabled", httpServer.WriteTimeout)
 		}
 	})
 }

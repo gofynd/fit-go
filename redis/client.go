@@ -354,6 +354,14 @@ const (
 	// connection-owned offline FIFO, min(attempt*50ms, 2s) reconnect delay and
 	// maxRetriesPerRequest=20. ioredis 4 does not issue CLIENT SETINFO.
 	IORedisCompatibilityV4 IORedisCompatibilityProfile = "ioredis-v4"
+
+	// IORedisCompatibilityFIT401IORedis582 pins the Redis wire identity used by
+	// the live Galvatron FIT.js 4.0.1 dependency tree. It keeps the existing
+	// ioredis-compatible reconnect/offline FIFO policy, but sends the ioredis 5
+	// startup metadata with the exact nested package version. Keep this profile
+	// explicit: a generic ioredis 5 identity would silently drift for services
+	// whose lockfiles resolve a different patch version.
+	IORedisCompatibilityFIT401IORedis582 IORedisCompatibilityProfile = "fit-4.0.1-ioredis-5.8.2"
 )
 
 // ---------------------------------------------------------------------------
@@ -876,16 +884,15 @@ func dialFromURI(
 	}
 	if compatibilityEnabled {
 		return dialIORedisCompatibleStandalone(ctx, compatibilityProfile, IORedisRESPOptions{
-			Addr:              addr,
-			Username:          parsed.Username,
-			Password:          parsed.Password,
-			DB:                parsed.DB,
-			ConnectionName:    clientName,
-			TLSConfig:         tlsCfg,
-			ConnectTimeout:    connectTimeout,
-			SocketTimeout:     envOpts.SocketTimeout,
-			KeepAlive:         envOpts.KeepAlive,
-			DisableClientInfo: compatibilityProfile == IORedisCompatibilityV4,
+			Addr:           addr,
+			Username:       parsed.Username,
+			Password:       parsed.Password,
+			DB:             parsed.DB,
+			ConnectionName: clientName,
+			TLSConfig:      tlsCfg,
+			ConnectTimeout: connectTimeout,
+			SocketTimeout:  envOpts.SocketTimeout,
+			KeepAlive:      envOpts.KeepAlive,
 		})
 	}
 

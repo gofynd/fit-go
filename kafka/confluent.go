@@ -179,7 +179,9 @@ func (cc *ConfluentClient) Producer(config ProducerConfig) (KafkaProducer, error
 	if config.TraceHeaderPolicy != ProducerTraceHeadersInject && config.TraceHeaderPolicy != ProducerTraceHeadersPreserve {
 		return nil, fmt.Errorf("kafka/confluent: unsupported producer trace header policy %d", config.TraceHeaderPolicy)
 	}
-	if config.ClosePolicy != ProducerCloseWaitForDelivery && config.ClosePolicy != ProducerCloseKafkaJSDisconnect {
+	if config.ClosePolicy != ProducerCloseWaitForDelivery &&
+		config.ClosePolicy != ProducerCloseKafkaJSDisconnect &&
+		config.ClosePolicy != ProducerCloseKafkaJSAwaitDelivery {
 		return nil, fmt.Errorf("kafka/confluent: unsupported producer close policy %d", config.ClosePolicy)
 	}
 
@@ -573,9 +575,11 @@ func (cp *ConfluentProducer) ProduceBatchCtx(ctx context.Context, topicMessages 
 }
 
 // Close stops admission immediately and bounds how long the caller waits for
-// accepted delivery reports, flush, and driver shutdown. If the deadline is
-// reached, the same ordered shutdown continues in the background; a driver is
-// never closed while an accepted delivery report is still being drained.
+// accepted delivery reports and policy-specific driver shutdown. The default
+// policy includes Flush; KafkaJS compatibility policies define their narrower
+// disconnect boundaries explicitly. If the deadline is reached, the same
+// ordered shutdown continues in the background; a driver is never closed while
+// an accepted delivery report is still being drained.
 func (cp *ConfluentProducer) Close() error {
 	cp.mu.Lock()
 	if cp.closeDone != nil {
@@ -618,6 +622,10 @@ func (cp *ConfluentProducer) Close() error {
 
 	result := make(chan error, 1)
 	go func() {
+		if cp.closePolicy == ProducerCloseKafkaJSAwaitDelivery {
+			result <- cp.finishKafkaJSAwaitedDelivery(unique)
+			return
+		}
 		result <- cp.finishClose(unique, timeout)
 	}()
 
@@ -645,6 +653,37 @@ func (cp *ConfluentProducer) Close() error {
 		cp.logger.Info("kafka/confluent: producer closed")
 	}
 	return closeErr
+}
+
+// finishKafkaJSAwaitedDelivery models an awaited KafkaJS disconnect without
+// making an additional Flush call the success oracle. Every accepted fit-go
+// delivery already owns a drainer and keeps inFlight non-zero until its report
+// is consumed. Waiting on that boundary therefore proves there is no report
+// left for Flush to dispatch before driver Close invalidates resources.
+//
+// Close applies the external time bound. If it expires, this function remains
+// in the background and closes the drivers only after the outstanding drainers
+// finish, so timeout reporting never introduces a close-versus-delivery race.
+func (cp *ConfluentProducer) finishKafkaJSAwaitedDelivery(
+	producers map[confluentProducerDriver]struct{},
+) error {
+	cp.inFlight.Wait()
+	remaining := cp.pendingReports.Load()
+	for producer := range producers {
+		producer.Close()
+	}
+
+	cp.mu.Lock()
+	cp.producer = nil
+	cp.producers = nil
+	cp.mu.Unlock()
+	if remaining != 0 {
+		return fmt.Errorf(
+			"kafka/confluent: producer close left %d accepted delivery report(s) unresolved after drain",
+			remaining,
+		)
+	}
+	return nil
 }
 
 func (cp *ConfluentProducer) finishKafkaJSDisconnect(

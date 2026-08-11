@@ -27,36 +27,43 @@ import (
 )
 
 type ioredisSentinelOptions struct {
-	SentinelAddrs    []string
-	MasterName       string
-	Username         string
-	Password         string
-	SentinelUsername string
-	SentinelPassword string
-	DB               int
-	ConnectionName   string
-	TLSConfig        *tls.Config
-	ConnectTimeout   time.Duration
-	SocketTimeout    time.Duration
-	KeepAlive        time.Duration
+	SentinelAddrs            []string
+	MasterName               string
+	Username                 string
+	Password                 string
+	SentinelUsername         string
+	SentinelPassword         string
+	DB                       int
+	ConnectionName           string
+	TLSConfig                *tls.Config
+	ConnectTimeout           time.Duration
+	SocketTimeout            time.Duration
+	KeepAlive                time.Duration
+	DisableClientInfo        bool
+	clientInfoLibraryVersion string
 }
 
 type ioredisClusterOptions struct {
-	SeedAddrs      []string
-	Username       string
-	Password       string
-	DB             int
-	ConnectionName string
-	TLSConfig      *tls.Config
-	ConnectTimeout time.Duration
-	SocketTimeout  time.Duration
-	KeepAlive      time.Duration
+	SeedAddrs                []string
+	Username                 string
+	Password                 string
+	DB                       int
+	ConnectionName           string
+	TLSConfig                *tls.Config
+	ConnectTimeout           time.Duration
+	SocketTimeout            time.Duration
+	KeepAlive                time.Duration
+	DisableClientInfo        bool
+	clientInfoLibraryVersion string
 }
 
 func dialIORedisCompatibleSentinel(ctx context.Context, profile IORedisCompatibilityProfile, options ioredisSentinelOptions) (Connection, error) {
-	if profile != IORedisCompatibilityV4 {
-		return nil, fmt.Errorf("redis: unsupported ioredis compatibility profile %q", profile)
+	resolved, err := resolveIORedisRESPCompatibilityProfile(profile)
+	if err != nil {
+		return nil, err
 	}
+	options.DisableClientInfo = resolved.disableClientInfo
+	options.clientInfoLibraryVersion = resolved.clientInfoLibraryVersion
 	factory := &ioredisSentinelFactory{options: options}
 	client, err := NewSlingshotIORedisCompatClientReady(ctx, factory)
 	if err != nil {
@@ -76,15 +83,16 @@ func (f *ioredisSentinelFactory) Connect(ctx context.Context) (SlingshotIORedisT
 	var failures []string
 	for _, address := range f.options.SentinelAddrs {
 		sentinel, err := connectIORedisRESP(ctx, IORedisRESPOptions{
-			Addr:              address,
-			Username:          f.options.SentinelUsername,
-			Password:          f.options.SentinelPassword,
-			ConnectionName:    f.options.ConnectionName,
-			TLSConfig:         f.options.TLSConfig,
-			ConnectTimeout:    f.options.ConnectTimeout,
-			SocketTimeout:     f.options.SocketTimeout,
-			KeepAlive:         f.options.KeepAlive,
-			DisableClientInfo: true,
+			Addr:                     address,
+			Username:                 f.options.SentinelUsername,
+			Password:                 f.options.SentinelPassword,
+			ConnectionName:           f.options.ConnectionName,
+			TLSConfig:                f.options.TLSConfig,
+			ConnectTimeout:           f.options.ConnectTimeout,
+			SocketTimeout:            f.options.SocketTimeout,
+			KeepAlive:                f.options.KeepAlive,
+			DisableClientInfo:        f.options.DisableClientInfo,
+			clientInfoLibraryVersion: f.options.clientInfoLibraryVersion,
 		})
 		if err != nil {
 			failures = append(failures, address+": "+err.Error())
@@ -110,16 +118,17 @@ func (f *ioredisSentinelFactory) Connect(ctx context.Context) (SlingshotIORedisT
 			continue
 		}
 		return connectIORedisRESP(ctx, IORedisRESPOptions{
-			Addr:              masterAddress,
-			Username:          f.options.Username,
-			Password:          f.options.Password,
-			DB:                f.options.DB,
-			ConnectionName:    f.options.ConnectionName,
-			TLSConfig:         f.options.TLSConfig,
-			ConnectTimeout:    f.options.ConnectTimeout,
-			SocketTimeout:     f.options.SocketTimeout,
-			KeepAlive:         f.options.KeepAlive,
-			DisableClientInfo: true,
+			Addr:                     masterAddress,
+			Username:                 f.options.Username,
+			Password:                 f.options.Password,
+			DB:                       f.options.DB,
+			ConnectionName:           f.options.ConnectionName,
+			TLSConfig:                f.options.TLSConfig,
+			ConnectTimeout:           f.options.ConnectTimeout,
+			SocketTimeout:            f.options.SocketTimeout,
+			KeepAlive:                f.options.KeepAlive,
+			DisableClientInfo:        f.options.DisableClientInfo,
+			clientInfoLibraryVersion: f.options.clientInfoLibraryVersion,
 		})
 	}
 	return nil, fmt.Errorf("redis: no Sentinel could resolve master %q: %s", f.options.MasterName, strings.Join(failures, "; "))
@@ -142,9 +151,12 @@ func ioredisSentinelMasterAddress(value any) (string, error) {
 }
 
 func dialIORedisCompatibleCluster(ctx context.Context, profile IORedisCompatibilityProfile, options ioredisClusterOptions) (Connection, error) {
-	if profile != IORedisCompatibilityV4 {
-		return nil, fmt.Errorf("redis: unsupported ioredis compatibility profile %q", profile)
+	resolved, err := resolveIORedisRESPCompatibilityProfile(profile)
+	if err != nil {
+		return nil, err
 	}
+	options.DisableClientInfo = resolved.disableClientInfo
+	options.clientInfoLibraryVersion = resolved.clientInfoLibraryVersion
 	factory := &ioredisClusterFactory{options: options}
 	client, err := NewSlingshotIORedisCompatClientReady(ctx, factory)
 	if err != nil {
@@ -194,16 +206,17 @@ func (f *ioredisClusterFactory) Connect(ctx context.Context) (SlingshotIORedisTr
 
 func (f *ioredisClusterFactory) connectNode(ctx context.Context, address string) (SlingshotIORedisTransport, error) {
 	return connectIORedisRESP(ctx, IORedisRESPOptions{
-		Addr:              address,
-		Username:          f.options.Username,
-		Password:          f.options.Password,
-		DB:                f.options.DB,
-		ConnectionName:    f.options.ConnectionName,
-		TLSConfig:         f.options.TLSConfig,
-		ConnectTimeout:    f.options.ConnectTimeout,
-		SocketTimeout:     f.options.SocketTimeout,
-		KeepAlive:         f.options.KeepAlive,
-		DisableClientInfo: true,
+		Addr:                     address,
+		Username:                 f.options.Username,
+		Password:                 f.options.Password,
+		DB:                       f.options.DB,
+		ConnectionName:           f.options.ConnectionName,
+		TLSConfig:                f.options.TLSConfig,
+		ConnectTimeout:           f.options.ConnectTimeout,
+		SocketTimeout:            f.options.SocketTimeout,
+		KeepAlive:                f.options.KeepAlive,
+		DisableClientInfo:        f.options.DisableClientInfo,
+		clientInfoLibraryVersion: f.options.clientInfoLibraryVersion,
 	})
 }
 

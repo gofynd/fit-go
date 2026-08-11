@@ -231,6 +231,18 @@ type ConsumerConfig struct {
 	// OnPartitionsRevoked, if set, is invoked before partitions are revoked from
 	// this consumer during a group rebalance. Optional.
 	OnPartitionsRevoked func([]PartitionAssignment)
+
+	// ShutdownPolicy selects how the KafkaJS-compatible backend stops an active
+	// consume run. The zero value preserves fit-go's existing behavior: cancel
+	// the in-flight handler context, wait for it to return, then close the group
+	// member. ConsumerShutdownDrainInFlight instead stops new polling while
+	// allowing records already returned by PollRecords to finish their handler,
+	// finalizer, and offset-commit boundary before the client is closed.
+	//
+	// This option is ignored by the Confluent backend. Drain mode is deliberately
+	// opt-in because handlers that do not have a bounded completion path can make
+	// Close wait indefinitely, just as an awaited KafkaJS disconnect can.
+	ShutdownPolicy ConsumerShutdownPolicy
 }
 
 // ConsumerBackend selects a fit-go Kafka consumer implementation. Producers
@@ -241,6 +253,22 @@ type ConsumerBackend uint8
 const (
 	ConsumerBackendConfluent ConsumerBackend = iota
 	ConsumerBackendKafkaJSCompatible
+)
+
+// ConsumerShutdownPolicy controls the active-run shutdown boundary of the
+// KafkaJS-compatible consumer. Existing consumers retain cancel-in-flight
+// semantics unless they explicitly opt in to draining.
+type ConsumerShutdownPolicy uint8
+
+const (
+	// ConsumerShutdownCancelInFlight cancels the handler context before waiting
+	// for the active run to return. This is the backward-compatible default.
+	ConsumerShutdownCancelInFlight ConsumerShutdownPolicy = iota
+
+	// ConsumerShutdownDrainInFlight stops new polling/admission, lets the current
+	// polled records finish all handler/finalizer/commit work, and only then closes
+	// the consumer. Handlers must therefore have their own bounded completion.
+	ConsumerShutdownDrainInFlight
 )
 
 // PartitionAssignment identifies a single topic-partition assigned to or revoked

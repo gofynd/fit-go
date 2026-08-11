@@ -116,6 +116,18 @@ func successfulDelivery(message *ckafka.Message, offset int64) *ckafka.Message {
 	}}
 }
 
+func waitForConfluentPendingReports(t *testing.T, producer *ConfluentProducer, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if got := producer.pendingReports.Load(); got == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("pending delivery reports = %d, want %d", producer.pendingReports.Load(), want)
+}
+
 func metadataForTopic(topic string, partitions ...ckafka.PartitionMetadata) *ckafka.Metadata {
 	return &ckafka.Metadata{Topics: map[string]ckafka.TopicMetadata{
 		topic: {
@@ -653,6 +665,178 @@ func TestConfluentProducerKafkaJSDisconnectReturnsBeforeAcceptedDelivery(t *test
 	}
 }
 
+func TestConfluentProducerKafkaJSAwaitDeliverySkipsUnresponsiveFlushWhenIdle(t *testing.T) {
+	flushStarted := make(chan struct{})
+	releaseFlush := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseFlush) }) }
+	t.Cleanup(release)
+
+	driver := &fakeConfluentProducerDriver{}
+	driver.flushFn = func(int) int {
+		close(flushStarted)
+		<-releaseFlush
+		return 0
+	}
+	producer := newTestConfluentProducer(driver)
+	producer.closePolicy = ProducerCloseKafkaJSAwaitDelivery
+	producer.closeTimeout = 50 * time.Millisecond
+
+	started := time.Now()
+	if err := producer.Close(); err != nil {
+		t.Fatalf("awaited KafkaJS Close: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 250*time.Millisecond {
+		t.Fatalf("awaited KafkaJS Close took %s with no pending reports", elapsed)
+	}
+	select {
+	case <-flushStarted:
+		t.Fatal("awaited KafkaJS Close called Flush with no pending reports")
+	default:
+	}
+	flushCalls, closeCalls := driver.calls()
+	if flushCalls != 0 || closeCalls != 1 {
+		t.Fatalf("driver calls = flush %d close %d, want 0/1", flushCalls, closeCalls)
+	}
+	if err := producer.Produce("orders", []Message{{Value: []byte("late")}}, -1); err == nil || !strings.Contains(err.Error(), "producer is closed") {
+		t.Fatalf("post-close Produce error = %v, want admission rejected", err)
+	}
+}
+
+func TestConfluentProducerKafkaJSAwaitDeliveryDrainsBeforeConcurrentCloseReturns(t *testing.T) {
+	accepted := make(chan struct{})
+	releaseDelivery := make(chan struct{})
+	driverClosed := make(chan struct{})
+	driver := &fakeConfluentProducerDriver{closeCalled: driverClosed}
+	driver.produceFn = func(message *ckafka.Message, reports chan ckafka.Event) error {
+		close(accepted)
+		go func() {
+			<-releaseDelivery
+			reports <- successfulDelivery(message, 3)
+		}()
+		return nil
+	}
+	producer := newTestConfluentProducer(driver)
+	producer.closePolicy = ProducerCloseKafkaJSAwaitDelivery
+	producer.closeTimeout = time.Second
+
+	produceResult := make(chan error, 1)
+	go func() {
+		produceResult <- producer.Produce("orders", []Message{{Value: []byte("one")}}, -1)
+	}()
+	<-accepted
+	waitForConfluentPendingReports(t, producer, 1)
+
+	firstClose := make(chan error, 1)
+	secondClose := make(chan error, 1)
+	go func() { firstClose <- producer.Close() }()
+	go func() { secondClose <- producer.Close() }()
+	select {
+	case err := <-firstClose:
+		t.Fatalf("first Close returned before delivery: %v", err)
+	case err := <-secondClose:
+		t.Fatalf("second Close returned before delivery: %v", err)
+	case <-driverClosed:
+		t.Fatal("driver closed before accepted delivery drained")
+	case <-time.After(30 * time.Millisecond):
+	}
+	flushCalls, closeCalls := driver.calls()
+	if flushCalls != 0 || closeCalls != 0 {
+		t.Fatalf("pre-delivery driver calls = flush %d close %d, want 0/0", flushCalls, closeCalls)
+	}
+
+	close(releaseDelivery)
+	if err := <-produceResult; err != nil {
+		t.Fatalf("Produce: %v", err)
+	}
+	for name, result := range map[string]<-chan error{"first": firstClose, "second": secondClose} {
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("%s Close: %v", name, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s Close did not finish after delivery", name)
+		}
+	}
+	select {
+	case <-driverClosed:
+	case <-time.After(time.Second):
+		t.Fatal("driver did not close after delivery drain")
+	}
+	if err := producer.Close(); err != nil {
+		t.Fatalf("repeated Close: %v", err)
+	}
+	flushCalls, closeCalls = driver.calls()
+	if flushCalls != 0 || closeCalls != 1 {
+		t.Fatalf("final driver calls = flush %d close %d, want 0/1", flushCalls, closeCalls)
+	}
+}
+
+func TestConfluentProducerKafkaJSAwaitDeliveryTimeoutReportsPendingAndCleansUp(t *testing.T) {
+	accepted := make(chan struct{})
+	releaseDelivery := make(chan struct{})
+	driverClosed := make(chan struct{})
+	driver := &fakeConfluentProducerDriver{closeCalled: driverClosed}
+	driver.produceFn = func(message *ckafka.Message, reports chan ckafka.Event) error {
+		close(accepted)
+		go func() {
+			<-releaseDelivery
+			reports <- successfulDelivery(message, 5)
+		}()
+		return nil
+	}
+	producer := newTestConfluentProducer(driver)
+	producer.closePolicy = ProducerCloseKafkaJSAwaitDelivery
+	producer.closeTimeout = 35 * time.Millisecond
+
+	produceResult := make(chan error, 1)
+	go func() {
+		produceResult <- producer.Produce("orders", []Message{{Value: []byte("one")}}, -1)
+	}()
+	<-accepted
+	waitForConfluentPendingReports(t, producer, 1)
+
+	started := time.Now()
+	closeErr := producer.Close()
+	if closeErr == nil || !strings.Contains(closeErr.Error(), "1 accepted delivery report(s) outstanding") {
+		t.Fatalf("Close error = %v, want accurate pending-report timeout", closeErr)
+	}
+	if elapsed := time.Since(started); elapsed >= 250*time.Millisecond {
+		t.Fatalf("Close took %s, want bounded return", elapsed)
+	}
+	if secondErr := producer.Close(); secondErr == nil || secondErr.Error() != closeErr.Error() {
+		t.Fatalf("second Close = %v, want idempotent %v", secondErr, closeErr)
+	}
+	flushCalls, closeCalls := driver.calls()
+	if flushCalls != 0 || closeCalls != 0 {
+		t.Fatalf("timed-out driver calls = flush %d close %d, want 0/0", flushCalls, closeCalls)
+	}
+	select {
+	case <-driverClosed:
+		t.Fatal("driver closed while a delivery report was outstanding")
+	default:
+	}
+
+	close(releaseDelivery)
+	if err := <-produceResult; err != nil {
+		t.Fatalf("Produce: %v", err)
+	}
+	select {
+	case <-driverClosed:
+	case <-time.After(time.Second):
+		t.Fatal("background cleanup did not close the driver after delivery")
+	}
+	waitForConfluentPendingReports(t, producer, 0)
+	if thirdErr := producer.Close(); thirdErr == nil || thirdErr.Error() != closeErr.Error() {
+		t.Fatalf("post-cleanup Close = %v, want cached %v", thirdErr, closeErr)
+	}
+	flushCalls, closeCalls = driver.calls()
+	if flushCalls != 0 || closeCalls != 1 {
+		t.Fatalf("cleanup driver calls = flush %d close %d, want 0/1", flushCalls, closeCalls)
+	}
+}
+
 func TestConfluentProducerClosePolicyDefaultsAndValidation(t *testing.T) {
 	client, err := NewConfluentClient(&Config{Brokers: []string{"localhost:9092"}})
 	if err != nil {
@@ -664,6 +848,9 @@ func TestConfluentProducerClosePolicyDefaultsAndValidation(t *testing.T) {
 	}
 	if got := producer.(*ConfluentProducer).closePolicy; got != ProducerCloseWaitForDelivery {
 		t.Fatalf("default close policy = %d, want synchronous delivery drain", got)
+	}
+	if _, err = client.Producer(ProducerConfig{ClosePolicy: ProducerCloseKafkaJSAwaitDelivery}); err != nil {
+		t.Fatalf("awaited KafkaJS close policy: %v", err)
 	}
 	_, err = client.Producer(ProducerConfig{ClosePolicy: ProducerClosePolicy(255)})
 	if err == nil || err.Error() != "kafka/confluent: unsupported producer close policy 255" {

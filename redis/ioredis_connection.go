@@ -38,13 +38,39 @@ type ioredisConnection struct {
 	cluster bool
 }
 
+type ioredisRESPCompatibilityProfile struct {
+	disableClientInfo        bool
+	clientInfoLibraryVersion string
+}
+
+func resolveIORedisRESPCompatibilityProfile(profile IORedisCompatibilityProfile) (ioredisRESPCompatibilityProfile, error) {
+	switch profile {
+	case IORedisCompatibilityV4:
+		return ioredisRESPCompatibilityProfile{disableClientInfo: true}, nil
+	case IORedisCompatibilityFIT401IORedis582:
+		return ioredisRESPCompatibilityProfile{clientInfoLibraryVersion: "5.8.2"}, nil
+	default:
+		return ioredisRESPCompatibilityProfile{}, fmt.Errorf("redis: unsupported ioredis compatibility profile %q", profile)
+	}
+}
+
+func applyIORedisRESPCompatibilityProfile(profile IORedisCompatibilityProfile, options *IORedisRESPOptions) error {
+	resolved, err := resolveIORedisRESPCompatibilityProfile(profile)
+	if err != nil {
+		return err
+	}
+	options.DisableClientInfo = resolved.disableClientInfo
+	options.clientInfoLibraryVersion = resolved.clientInfoLibraryVersion
+	return nil
+}
+
 func dialIORedisCompatibleStandalone(
 	ctx context.Context,
 	profile IORedisCompatibilityProfile,
 	options IORedisRESPOptions,
 ) (Connection, error) {
-	if profile != IORedisCompatibilityV4 {
-		return nil, fmt.Errorf("redis: unsupported ioredis compatibility profile %q", profile)
+	if err := applyIORedisRESPCompatibilityProfile(profile, &options); err != nil {
+		return nil, err
 	}
 	client, err := NewSlingshotIORedisRESPCompatClientReady(ctx, options)
 	if err != nil {
