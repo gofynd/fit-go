@@ -330,8 +330,8 @@ type tracedIORedisTransport struct {
 	closeOnce sync.Once
 }
 
-func (t *tracedIORedisTransport) Exchange(_ context.Context, commands [][]string) SlingshotIORedisExchange {
-	replies := make([]SlingshotIORedisReply, len(commands))
+func (t *tracedIORedisTransport) Exchange(_ context.Context, commands [][]string) IORedisExchange {
+	replies := make([]IORedisReply, len(commands))
 	for index, command := range commands {
 		if len(command) > 0 && command[0] == "get" {
 			replies[index].Error = errors.New("redis failure contains private-key-canary")
@@ -339,7 +339,7 @@ func (t *tracedIORedisTransport) Exchange(_ context.Context, commands [][]string
 		}
 		replies[index].Value = "OK"
 	}
-	return SlingshotIORedisExchange{Replies: replies}
+	return IORedisExchange{Replies: replies}
 }
 
 func (t *tracedIORedisTransport) Closed() <-chan struct{} { return t.closed }
@@ -355,14 +355,14 @@ func TestIORedisCompatibilitySpansAreParentedAndPrivacySafe(t *testing.T) {
 	t.Cleanup(restoreGlobal)
 
 	transport := &tracedIORedisTransport{closed: make(chan struct{})}
-	client, err := NewSlingshotIORedisCompatClientReady(
+	client, err := NewIORedisCompatClientReady(
 		context.Background(),
-		SlingshotIORedisTransportFactoryFunc(func(context.Context) (SlingshotIORedisTransport, error) {
+		IORedisTransportFactoryFunc(func(context.Context) (IORedisTransport, error) {
 			return transport, nil
 		}),
 	)
 	if err != nil {
-		t.Fatalf("NewSlingshotIORedisCompatClientReady: %v", err)
+		t.Fatalf("NewIORedisCompatClientReady: %v", err)
 	}
 	defer client.Disconnect()
 

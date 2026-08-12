@@ -150,7 +150,7 @@ func TestProfilerConfig(t *testing.T) {
 	})
 
 	t.Run("application name with explicit deployment name", func(t *testing.T) {
-		t.Setenv("PROJECT_NAME", "commerce")
+		t.Setenv("PROJECT_NAME", "example")
 		t.Setenv("DEPLOYMENT_NAME", "api-server")
 		t.Setenv("DEPLOYMENT_TYPE", "server")
 
@@ -161,8 +161,19 @@ func TestProfilerConfig(t *testing.T) {
 		p.Start()
 		defer p.Stop()
 
-		if p.GetApplicationName() != "commerce-api-server-Server" {
-			t.Errorf("Expected 'commerce-api-server-Server', got %s", p.GetApplicationName())
+		if p.GetApplicationName() != "example-api-server-Server" {
+			t.Errorf("Expected 'example-api-server-Server', got %s", p.GetApplicationName())
+		}
+	})
+
+	t.Run("empty deployment type uses server", func(t *testing.T) {
+		t.Setenv("PROJECT_NAME", "example")
+		t.Setenv("DEPLOYMENT_NAME", "api")
+		t.Setenv("DEPLOYMENT_TYPE", "")
+
+		p := New(Config{})
+		if got := p.buildAppName(); got != "example-api-Server" {
+			t.Fatalf("application name = %q, want %q", got, "example-api-Server")
 		}
 	})
 

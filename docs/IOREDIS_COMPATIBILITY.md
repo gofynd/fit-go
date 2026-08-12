@@ -1,18 +1,15 @@
-# Slingshot ioredis 5.11.1 compatibility boundary
+# ioredis compatibility boundary
 
-`redis.SlingshotIORedisCompatClient` is a strictly opt-in state machine for the
-Redis outage behavior used by legacy Slingshot. It is not part of
+`redis.IORedisCompatClient` is a strictly opt-in state machine for the
+Redis outage behavior observed in ioredis 4.x and 5.x. It is not part of
 `redis.InitDefault`, is not selected by an environment variable, and changes no
 existing service default.
 
-## Source contract
+## Reference contract
 
-The legacy pins used for this implementation are:
+The reference pins used for this implementation are:
 
-- Slingshot `package-lock.json`: ioredis `5.11.1` and FIT.js `4.0.1` at commit
-  `a2b5f344a89c5452a1fc67162bf1de6c51e6575a`.
-- FIT.js `dist/redis/index.js`: ordinary standalone Slingshot connections pass
-  FIT options into `new Redis(connectionString, commonConnectionOptions)`.
+- ioredis `5.11.1` is the default v5 runtime oracle.
 - ioredis `built/redis/RedisOptions.js`: `enableOfflineQueue: true`,
   `maxRetriesPerRequest: 20`, and `retryStrategy(times) = min(times * 50, 2000)`.
 - ioredis `built/redis/event_handler.js`: one retry counter belongs to the
@@ -78,7 +75,7 @@ closes the 21-reconnect exhaustion case without spending the legacy 10.5-second
 delay budget. The delay function itself is pinned for all first 20 values and
 its 2-second cap.
 
-`NewSlingshotIORedisRESPCompatClient` is additive and explicit. It does not read
+`NewIORedisRESPCompatClient` is additive and explicit. It does not read
 FIT Redis environment variables, resolve GSM references, modify `InitDefault`,
 or replace any existing fit-go connection.
 
@@ -86,9 +83,9 @@ The checked-in runtime oracle can be replayed against an installed pinned copy:
 
 ```sh
 IOREDIS_MODULE=/path/to/node_modules/ioredis \
-  node redis/testdata/slingshot_ioredis_wire_probe.cjs startup
+  node redis/testdata/ioredis_wire_probe.cjs startup
 IOREDIS_MODULE=/path/to/node_modules/ioredis \
-  node redis/testdata/slingshot_ioredis_wire_probe.cjs lost-reply
+  node redis/testdata/ioredis_wire_probe.cjs lost-reply
 ```
 
 The script refuses any version other than `5.11.1`. Both outputs are positive
@@ -99,7 +96,7 @@ ambiguous replay on each Go future.
 
 ## Deliberate fail-closed limits
 
-The following remain registration-blocking for Slingshot:
+The following remain adoption gates:
 
 - live Node 22.22.0/ioredis 5.11.1 versus Go record/replay for connect loss before
   write, partial write, full write/lost reply, partial pipeline reply, recovery,
@@ -107,18 +104,17 @@ The following remain registration-blocking for Slingshot:
 - exact post-ready SELECT-error behavior on reconnect (FIT rejects an initial
   SELECT error, while ioredis logs a later SELECT error and can still become
   ready); the transport currently fails closed on every SELECT error;
-- command-level ioredis transformations and modes not used by the raw transport
+- command-level transformations and modes not used by the raw transport
   contract, including Buffer-returning commands, HGETALL object transforms,
   transactions, blocking commands, Pub/Sub, monitor mode, RESP3, and Unix
-  sockets, must be inventoried against actual Slingshot call sites before the
+  sockets, must be inventoried against actual application call sites before the
   client can be treated as a general ioredis replacement;
 - TLS fault injection must verify partial TLS-record and lost-reply disposition
   against the deployed proxy/Redis stack; the transport exposes underlying
   ciphertext progress but deterministic tests currently cover successful TLS;
-- actual Slingshot module boot wiring for both `slingshot.write` and
-  `slingshot_domain.write`, URI/GSM/env precedence, client names, health,
-  tracing, logging, Sentry behavior, and FIT's shutdown log/error sequence;
+- application boot wiring, URI/GSM/environment precedence, client names,
+  health, tracing, logging, error reporting, and shutdown ordering;
 - Redis Cluster and Sentinel queue/failover behavior.
 
 Until those gates close, use of this API is an implementation aid, not a parity
-claim, and the Slingshot production role must remain unregistered.
+claim, and production adoption must remain explicit.

@@ -22,8 +22,8 @@
 // - OTLP export to an OpenTelemetry collector
 //
 // The package is observability-backend neutral. Deployments choose the backend
-// behind their OpenTelemetry collector; Commerce currently routes traces to
-// Grafana Tempo. Tempo configuration and credentials do not belong in fit-go.
+// behind their OpenTelemetry collector. Backend configuration and credentials
+// do not belong in fit-go.
 //
 // gRPC instrumentation is explicit through fit-go's grpc helpers. Deployed pyfit
 // installed grpcio as an optional runtime but did not install an OTel gRPC
@@ -789,7 +789,7 @@ func IsPropagationField(name string, propagator propagation.TextMapPropagator) b
 //
 // Process command arguments and owner are deliberately excluded even though the
 // legacy Node detector emitted them: command lines can contain credentials and the
-// Commerce telemetry contract forbids secret/PII export.
+// fit-go's telemetry contract forbids secret/PII export.
 //
 // Resource detectors can return useful partial resources together with errors.
 // Those errors are reported to the OTel error handler but do not disable tracing.

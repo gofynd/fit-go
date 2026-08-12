@@ -200,14 +200,18 @@ type LogRequestResponseConfig struct {
 	// for fit.js/pyfit parity. Use ResponseLogSeverityStatusBased for services that
 	// intentionally want 4xx=WARN and 5xx=ERROR.
 	ResponseLogSeverity ResponseLogSeverityMode
-	// LegacyOriginalURL keeps the legacy request_url field shape by appending the
-	// query string, but values are still allowlist-redacted. The default is
-	// path-only, with redacted query params logged separately.
+	// IncludeQueryInRequestURL appends the redacted query string to request_url.
+	IncludeQueryInRequestURL bool
+	// LegacyOriginalURL is retained for source compatibility.
+	// Deprecated: use IncludeQueryInRequestURL.
 	LegacyOriginalURL bool
-	// LegacyTraceClue selects the TraceClue access-log field names and shape:
+	// TraceClueAccessLog selects the TraceClue access-log field names and shape:
 	// request_url includes a redacted query string, route values are emitted as
 	// request_params, and response duration is omitted. FIT_LOG_SCHEMA=traceclue
 	// enables the same behavior automatically when this field is false.
+	TraceClueAccessLog bool
+	// LegacyTraceClue is retained for source compatibility.
+	// Deprecated: use TraceClueAccessLog.
 	LegacyTraceClue bool
 	// MetricsRecorder is an optional callback invoked with method, route, status, and
 	// duration so that the caller can record Prometheus histograms.
@@ -240,8 +244,8 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 
 	return func(c *gin.Context) {
 		path := c.Request.URL.Path
-		legacyTraceClue := cfg.LegacyTraceClue || traceClueLogSchemaEnabled()
-		requestURL := requestURLForLog(c, cfg, legacyTraceClue)
+		traceClueAccessLog := cfg.TraceClueAccessLog || cfg.LegacyTraceClue || traceClueLogSchemaEnabled()
+		requestURL := requestURLForLog(c, cfg, traceClueAccessLog)
 
 		// Skip health/readiness probes
 		if strings.Contains(path, "/_healthz") || strings.Contains(path, "/_readyz") {
@@ -252,14 +256,14 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 		start := time.Now()
 
 		// Preserve the legacy field names and REQ/RES duplication, but enforce the
-		// Commerce telemetry boundary: arbitrary query values and credential headers
+		// privacy-safe telemetry boundary: arbitrary query values and credential headers
 		// are never emitted. Pagination/sort controls remain visible through the
 		// shared allowlist so logs retain operational value without carrying PII.
 		base := []slog.Attr{
 			slog.String("request_url", requestURL),
 			slog.String("request_method", c.Request.Method),
 		}
-		if legacyTraceClue {
+		if traceClueAccessLog {
 			base = append(base, slog.Any("request_params", requestParams(c.Params)))
 		} else {
 			if q := queryParams(c.Request.URL.Query()); q != nil {
@@ -313,7 +317,7 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 				slog.String("step", "RES"),
 				slog.Int("response_status", statusCode),
 			)
-			if !legacyTraceClue {
+			if !traceClueAccessLog {
 				// The TraceClue formatter never added middleware duration to its
 				// request attributes. Keep duration in the platform schema, where it
 				// is useful operational metadata, without contaminating compatibility
@@ -331,8 +335,8 @@ func LogRequestResponse(cfg LogRequestResponseConfig) gin.HandlerFunc {
 // GinLogRequestResponse is an alias for LogRequestResponse for use in server.go.
 var GinLogRequestResponse = LogRequestResponse
 
-func requestURLForLog(c *gin.Context, cfg LogRequestResponseConfig, legacyTraceClue bool) string {
-	if cfg.LegacyOriginalURL || legacyTraceClue || strings.EqualFold(strings.TrimSpace(envGet("FIT_LOG_REQUEST_URL", "")), "original") {
+func requestURLForLog(c *gin.Context, cfg LogRequestResponseConfig, traceClueAccessLog bool) string {
+	if cfg.IncludeQueryInRequestURL || cfg.LegacyOriginalURL || traceClueAccessLog || strings.EqualFold(strings.TrimSpace(envGet("FIT_LOG_REQUEST_URL", "")), "original") {
 		if query := redact.Query(c.Request.URL.RawQuery, nil); query != "" {
 			return c.Request.URL.Path + "?" + query
 		}

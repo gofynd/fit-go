@@ -1,7 +1,7 @@
 # Observability Transport and Metrics Parity
 
 This tracker covers the fit-go transport, metrics, database telemetry privacy,
-and test-race lane of the Commerce legacy FIT migration. Legacy runtime behavior
+and test-race lane of FIT runtime migrations. Legacy runtime behavior
 remains the reference unless the platform privacy contract requires a stricter
 boundary.
 
@@ -23,7 +23,7 @@ boundary.
 | FG-32 | TraceClue UTF-16 truncation | Implemented | `go test ./logging` |
 | FG-33 | Public span-status description redaction | Implemented | `go test ./tracing -run PublicSpanStatus` |
 | FG-34 | FIT/health shutdown and clean reinitialization | Implemented | `go test -race . ./health` |
-| FG-35 | TriggerHappy object-message log mapping | Implemented with privacy improvement | `go test ./logging -run TriggerHappyObjectMessageGolden` |
+| FG-35 | Winston object-message log mapping | Implemented with privacy improvement | `go test ./logging -run LegacyObjectMessageGolden` |
 | FG-36 | Privacy-safe gqlgen operation/resolver tracing | Implemented with payload-capture prohibition | `go test ./fitgraphql` |
 | FG-37 | Generic OTel meter provider, OTLP/console exporters, and restart-safe instrument routing | Implemented, opt-in | `go test -race . ./otelmetrics` |
 | FG-38 | Typed TraceClue extension selection and lifecycle | Implemented with static-link divergence | `go test -race . ./instrumentation` |
@@ -35,9 +35,9 @@ boundary.
 
 The tracker is source-complete in the local worktree. On 2026-07-13,
 `go mod tidy -diff`, `go vet ./...`, `go test -count=1 ./...`, and
-`go test -race -count=1 ./...` all passed. Metroplex also passed
-`go test -count=1 ./...` with a temporary module-file replacement pointing at
-this worktree; the real Metroplex dependency files were not modified. Publishing
+`go test -race -count=1 ./...` all passed. A representative application also
+passed `go test -count=1 ./...` with a temporary module-file replacement pointing
+at this worktree. Publishing
 an immutable fit-go revision, pinning it, adopting opt-in capabilities, and
 collecting deployed collector/dashboard evidence remain separate release steps.
 
@@ -218,7 +218,7 @@ TraceClue-compatible body and metadata limits count JavaScript UTF-16 code units
 instead of Go runes. Astral Unicode therefore has the same length accounting and
 truncation boundary used by the installed JavaScript formatter.
 
-TriggerHappy's object-first Winston calls are available through the explicit
+Object-first Winston calls are available through the explicit
 `DebugObject`/`InfoObject`/`WarnObject`/`ErrorObject` APIs. Golden tests pin its
 empty-body, nested-object, string-message, and array-message behavior. See
 `TRACECLUE_COMPATIBILITY.md` for the exact fit.js/TraceClue commits and the

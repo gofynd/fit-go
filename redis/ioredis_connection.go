@@ -20,19 +20,6 @@ import (
 	"fmt"
 )
 
-// IORedisCompatClient is the generic name for the proven ioredis-compatible
-// FIFO. The alias preserves the original Slingshot API for existing callers.
-type IORedisCompatClient = SlingshotIORedisCompatClient
-
-// IORedisFuture is the generic name for an accepted ioredis command promise.
-type IORedisFuture = SlingshotIORedisFuture
-
-// IORedisReply is one command result from the compatibility FIFO.
-type IORedisReply = SlingshotIORedisReply
-
-// IORedisRESPOptions configures the owned standalone RESP transport.
-type IORedisRESPOptions = SlingshotIORedisRESPOptions
-
 type ioredisConnection struct {
 	client  *IORedisCompatClient
 	cluster bool
@@ -47,7 +34,9 @@ func resolveIORedisRESPCompatibilityProfile(profile IORedisCompatibilityProfile)
 	switch profile {
 	case IORedisCompatibilityV4:
 		return ioredisRESPCompatibilityProfile{disableClientInfo: true}, nil
-	case IORedisCompatibilityFIT401IORedis582:
+	case IORedisCompatibilityV5:
+		return ioredisRESPCompatibilityProfile{clientInfoLibraryVersion: ioredisLibraryVersion}, nil
+	case IORedisCompatibilityV582, ioredisCompatibilityFIT401IORedis582Value:
 		return ioredisRESPCompatibilityProfile{clientInfoLibraryVersion: "5.8.2"}, nil
 	default:
 		return ioredisRESPCompatibilityProfile{}, fmt.Errorf("redis: unsupported ioredis compatibility profile %q", profile)
@@ -72,7 +61,7 @@ func dialIORedisCompatibleStandalone(
 	if err := applyIORedisRESPCompatibilityProfile(profile, &options); err != nil {
 		return nil, err
 	}
-	client, err := NewSlingshotIORedisRESPCompatClientReady(ctx, options)
+	client, err := NewIORedisRESPCompatClientReady(ctx, options)
 	if err != nil {
 		return nil, err
 	}

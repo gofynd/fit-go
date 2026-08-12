@@ -322,10 +322,10 @@ func TestKafkaJSCompatibleMixedLegacyGroupLive(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	t.Run("legacy_node_member_leads", func(t *testing.T) {
+	t.Run("node_member_starts_first", func(t *testing.T) {
 		runKafkaJSMixedLegacyGroupFixture(t, ctx, broker, kafkaJSModule, expectedVersion, false)
 	})
-	t.Run("migrated_go_member_leads", func(t *testing.T) {
+	t.Run("go_member_starts_first", func(t *testing.T) {
 		runKafkaJSMixedLegacyGroupFixture(t, ctx, broker, kafkaJSModule, expectedVersion, true)
 	})
 }
@@ -336,7 +336,7 @@ func runKafkaJSMixedLegacyGroupFixture(
 	broker string,
 	kafkaJSModule string,
 	expectedVersion string,
-	goLeads bool,
+	goMemberStartsFirst bool,
 ) {
 	t.Helper()
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
@@ -378,7 +378,7 @@ func runKafkaJSMixedLegacyGroupFixture(
 		return consumer, consumeDone
 	}
 
-	if !goLeads {
+	if !goMemberStartsFirst {
 		node := startLegacyKafkaJSRuntimeProcess(t, ctx, broker, group, topic, kafkaJSModule)
 		node.waitForVersion(t, ctx, expectedVersion)
 		_ = node.waitForPartitions(t, ctx, topic, 4)

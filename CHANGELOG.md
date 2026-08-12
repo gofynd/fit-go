@@ -4,10 +4,6 @@ All notable changes to this fork of `github.com/gofynd/fit-go` are documented he
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/);
 this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-> This is the GoFynd-Commerce working fork of the public `fit-go` snapshot,
-> carrying the observability + platform-parity work used by the `metroplex`
-> service while it is upstreamed. See `docs/` for the design notes.
-
 ## [Unreleased]
 
 ### Added
@@ -16,7 +12,7 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `RoundRobinAssigner` group protocol while retaining fit-go's message, batch,
   tracing, offset-finalizer, TLS, and SASL APIs. The existing
   Confluent/librdkafka producer and default consumer are unchanged.
-- **Fail-closed Slingshot ioredis state machine**: a separate, explicitly
+- **Fail-closed ioredis compatibility state machine**: a separate, explicitly
   constructed compatibility client now models ioredis 5.11.1's connection-wide
   offline FIFO, exact reconnect curve and 20-retry flush boundary, replay-before-
   offline ordering, lost-reply duplicate risk, partial-pipeline abort behavior,
@@ -89,8 +85,7 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fit-go owns the mechanism (reflect Origin + `Allow-Credentials` + `Vary`, preflight
   204 with headers/methods/max-age, and a configurable skip header such as
   `X-Skip-Cors`). Coexists with the pre-existing static `CORS(CORSConfig)`; `nil`
-  `Config.CORS` mounts nothing. Replaces the app-layer CORS workaround metroplex
-  shortlinks used.
+  `Config.CORS` mounts nothing.
 - **`international`** package: `AddressFormParser` / `AddressDisplayParser`, the
   byte-compatible Go port of Node `fit/international`, so services with
   country-specific address layouts can migrate unchanged. (Closes the last module

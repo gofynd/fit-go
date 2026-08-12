@@ -205,9 +205,9 @@ func TestKafkaJSGroupRejoinErrorsRestartFromConsumerPollBoundary(t *testing.T) {
 }
 
 func TestKafkaJSNullMetadataOffsetCommitHookPreservesRequest(t *testing.T) {
-	metadata := "metroplex-member"
+	metadata := "go-member"
 	request := kmsg.NewPtrOffsetCommitRequest()
-	request.Group = "galvatron-basic-group-1"
+	request.Group = "legacy-basic-group-1"
 	request.Generation = 7
 	request.MemberID = metadata
 	request.Topics = append(request.Topics, kmsg.OffsetCommitRequestTopic{
@@ -219,7 +219,7 @@ func TestKafkaJSNullMetadataOffsetCommitHookPreservesRequest(t *testing.T) {
 	if err := clearKafkaJSOffsetCommitMetadata(request); err != nil {
 		t.Fatal(err)
 	}
-	if request.Group != "galvatron-basic-group-1" || request.MemberID != "metroplex-member" || request.Generation != 7 {
+	if request.Group != "legacy-basic-group-1" || request.MemberID != "go-member" || request.Generation != 7 {
 		t.Fatalf("group identity changed: %#v", request)
 	}
 	partition := request.Topics[0].Partitions[0]
@@ -365,7 +365,7 @@ func TestKafkaJSRoundRobinBalancerMatchesMultiMemberMultiPartitionPlan(t *testin
 	candidate := kafkaJSRoundRobinBalancer{GroupBalancer: base}
 	members := []kmsg.JoinGroupResponseMember{
 		{MemberID: "legacy-kafkajs", ProtocolMetadata: base.JoinGroupMetadata([]string{"discount-a", "discount-b"}, nil, 1)},
-		{MemberID: "metroplex-go", ProtocolMetadata: candidate.JoinGroupMetadata([]string{"discount-a", "discount-b"}, nil, 1)},
+		{MemberID: "go-client", ProtocolMetadata: candidate.JoinGroupMetadata([]string{"discount-a", "discount-b"}, nil, 1)},
 	}
 	baseBalancer, baseTopics, err := base.MemberBalancer(members)
 	if err != nil {
@@ -595,7 +595,7 @@ func TestKafkaJSCompatibleDrainShutdownCompletesMarkerFinalizerAndCommits(t *tes
 	consumeDone := make(chan error, 1)
 	go func() {
 		consumeDone <- consumer.ConsumeCtx(func(ctx context.Context, _ MessagePayload) error {
-			// Models Galvatron's Redis SETEX marker-before-work boundary.
+			// Models a legacy consumer's Redis SETEX marker-before-work boundary.
 			close(markerWritten)
 			select {
 			case <-ctx.Done():

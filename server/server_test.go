@@ -1093,10 +1093,10 @@ func TestHealthAndReadinessCanUseIndependentCheckers(t *testing.T) {
 	}
 }
 
-func TestLegacyStaticHealthRoutesPreserveFitJSBytes(t *testing.T) {
+func TestStaticHealthRoutesPreserveExpressBytes(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
-	RegisterLegacyStaticHealthRoutes(engine)
+	RegisterStaticHealthRoutes(engine)
 
 	for _, path := range []string{
 		"/_healthz",
@@ -1159,10 +1159,10 @@ func TestLegacyStaticHealthRoutesPreserveFitJSBytes(t *testing.T) {
 	})
 }
 
-func TestLegacyStaticHealthRoutesPreserveExpressConditionalRequests(t *testing.T) {
+func TestStaticHealthRoutesPreserveExpressConditionalRequests(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
-	RegisterLegacyStaticHealthRoutes(engine)
+	RegisterStaticHealthRoutes(engine)
 	legacyETag := `W/"b-2F/2BWc0KYbtLqL5U2Kv5B6uQUQ"`
 
 	for _, test := range []struct {
@@ -1213,6 +1213,17 @@ func TestLegacyStaticHealthRoutesPreserveExpressConditionalRequests(t *testing.T
 				}
 			}
 		})
+	}
+}
+
+func TestDeprecatedStaticHealthAliasUsesCanonicalBehavior(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	RegisterLegacyStaticHealthRoutes(engine)
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/_healthz", nil))
+	if recorder.Code != http.StatusOK || recorder.Body.String() != `{"ok":"ok"}` {
+		t.Fatalf("deprecated health alias = %d %q", recorder.Code, recorder.Body.String())
 	}
 }
 

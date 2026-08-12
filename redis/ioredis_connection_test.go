@@ -34,7 +34,7 @@ func TestInitIORedisV4CompatibilityIsServiceScoped(t *testing.T) {
 
 	server := startRetryLoopbackRedis(t, "")
 	defer server.stop(t)
-	t.Setenv("REDIS_ORBIS_READ_WRITE", "redis://"+server.addr+"/0")
+	t.Setenv("REDIS_PRIMARY_READ_WRITE", "redis://"+server.addr+"/0")
 	t.Setenv("REDIS_CACHE_READ_WRITE", "redis://cache.example:6379/0")
 
 	var defaultDialCalls atomic.Int32
@@ -45,7 +45,7 @@ func TestInitIORedisV4CompatibilityIsServiceScoped(t *testing.T) {
 		},
 		Context: context.Background(),
 		IORedisCompatibility: map[string]IORedisCompatibilityProfile{
-			"ORBIS": IORedisCompatibilityV4,
+			"PRIMARY": IORedisCompatibilityV4,
 		},
 	})
 	if err != nil {
@@ -53,12 +53,12 @@ func TestInitIORedisV4CompatibilityIsServiceScoped(t *testing.T) {
 	}
 	defer client.Close()
 
-	orbis := client.Service("orbis")
-	if orbis == nil || orbis.Write == nil {
-		t.Fatal("orbis compatibility connection is missing")
+	primary := client.Service("primary")
+	if primary == nil || primary.Write == nil {
+		t.Fatal("primary compatibility connection is missing")
 	}
-	if _, ok := orbis.Write.Raw().(*IORedisCompatClient); !ok {
-		t.Fatalf("orbis raw type = %T, want *IORedisCompatClient", orbis.Write.Raw())
+	if _, ok := primary.Write.Raw().(*IORedisCompatClient); !ok {
+		t.Fatalf("primary raw type = %T, want *IORedisCompatClient", primary.Write.Raw())
 	}
 	cache := client.Service("cache")
 	if cache == nil || cache.Write == nil {
@@ -72,40 +72,115 @@ func TestInitIORedisV4CompatibilityIsServiceScoped(t *testing.T) {
 	}
 }
 
-func TestInitFIT401IORedis582CompatibilityStandaloneClientInfo(t *testing.T) {
+func TestInitIORedisV582CompatibilityStandaloneClientInfo(t *testing.T) {
 	restore := isolateRedisEnvironment(t)
 	defer restore()
 
-	server := startSlingshotRESPScenarioServer(t, nil, ioredis582MetadataRejectingHandler)
+	server := startIORedisRESPScenarioServer(t, nil, ioredis582MetadataRejectingHandler)
 	defer server.stop()
-	t.Setenv("REDIS_ORBIS_READ_WRITE", "redis://"+server.addr+"/0")
+	t.Setenv("REDIS_PRIMARY_READ_WRITE", "redis://"+server.addr+"/0")
 
 	client, err := Init(ConnectionOptions{
 		Context: context.Background(),
 		Dial:    mockDial,
 		IORedisCompatibility: map[string]IORedisCompatibilityProfile{
-			"orbis": IORedisCompatibilityFIT401IORedis582,
+			"primary": IORedisCompatibilityV582,
 		},
 	})
 	if err != nil {
 		t.Fatalf("Init standalone: %v", err)
 	}
 	defer client.Close()
-	if err := client.Service("orbis").Write.Ping(context.Background()); err != nil {
+	if err := client.Service("primary").Write.Ping(context.Background()); err != nil {
 		t.Fatalf("Ping: %v", err)
 	}
 	assertIORedis582ClientInfo(t, server.commandsSnapshot(), 1)
 }
 
-func TestInitFIT401IORedis582CompatibilitySentinelClientInfo(t *testing.T) {
+func TestResolveDeprecatedFIT401IORedis582CompatibilityAlias(t *testing.T) {
+	current, err := resolveIORedisRESPCompatibilityProfile(IORedisCompatibilityV582)
+	if err != nil {
+		t.Fatalf("resolve current profile: %v", err)
+	}
+	legacy, err := resolveIORedisRESPCompatibilityProfile(IORedisCompatibilityFIT401IORedis582)
+	if err != nil {
+		t.Fatalf("resolve deprecated profile: %v", err)
+	}
+	if current != legacy {
+		t.Fatalf("deprecated profile = %#v, want current %#v", legacy, current)
+	}
+}
+
+func TestDeprecatedServiceNamedIORedisAliasesRemainSourceCompatible(t *testing.T) {
+	var _ SlingshotIORedisTransportFactory = IORedisTransportFactoryFunc(func(context.Context) (IORedisTransport, error) {
+		return nil, errors.New("not connected")
+	})
+	if SlingshotIORedisMaxRetriesPerRequest != IORedisMaxRetriesPerRequest {
+		t.Fatal("deprecated retry limit differs from canonical value")
+	}
+	if got, want := SlingshotIORedisRetryDelay(3), IORedisRetryDelay(3); got != want {
+		t.Fatalf("deprecated retry delay = %v, want %v", got, want)
+	}
+}
+
+func TestInitIORedisV5CompatibilityUsesCurrentMetadata(t *testing.T) {
 	restore := isolateRedisEnvironment(t)
 	defer restore()
 
-	master := startSlingshotRESPScenarioServer(t, nil, ioredis582MetadataRejectingHandler)
+	server := startIORedisRESPScenarioServer(t, nil, ioredis582MetadataRejectingHandler)
+	defer server.stop()
+	t.Setenv("REDIS_PRIMARY_READ_WRITE", "redis://"+server.addr+"/0")
+
+	client, err := Init(ConnectionOptions{
+		Context: context.Background(),
+		Dial:    mockDial,
+		ProtocolByService: map[string]RedisProtocol{
+			"primary": RedisProtocolRESP2,
+		},
+		IORedisCompatibility: map[string]IORedisCompatibilityProfile{
+			"primary": IORedisCompatibilityV5,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	defer client.Close()
+	if err := client.Service("primary").Write.Ping(context.Background()); err != nil {
+		t.Fatalf("Ping: %v", err)
+	}
+	commands := server.commandsSnapshot()
+	if got := topologyCommandCount(commands, "CLIENT", "SETINFO", "LIB-VER", "5.11.1"); got != 1 {
+		t.Fatalf("CLIENT SETINFO LIB-VER 5.11.1 count = %d, want 1; commands = %#v", got, commands)
+	}
+}
+
+func TestInitIORedisCompatibilityRejectsRESP3(t *testing.T) {
+	restore := isolateRedisEnvironment(t)
+	defer restore()
+	t.Setenv("REDIS_PRIMARY_READ_WRITE", "redis://127.0.0.1:6379/0")
+	_, err := Init(ConnectionOptions{
+		Dial: mockDial,
+		ProtocolByService: map[string]RedisProtocol{
+			"primary": RedisProtocolRESP3,
+		},
+		IORedisCompatibility: map[string]IORedisCompatibilityProfile{
+			"primary": IORedisCompatibilityV5,
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "requires RESP2") {
+		t.Fatalf("Init error = %v, want RESP2 compatibility guard", err)
+	}
+}
+
+func TestInitIORedisV582CompatibilitySentinelClientInfo(t *testing.T) {
+	restore := isolateRedisEnvironment(t)
+	defer restore()
+
+	master := startIORedisRESPScenarioServer(t, nil, ioredis582MetadataRejectingHandler)
 	defer master.stop()
-	sentinel := startSlingshotRESPScenarioServer(t, nil, func(command []string) (string, bool) {
+	sentinel := startIORedisRESPScenarioServer(t, nil, func(command []string) (string, bool) {
 		if len(command) > 0 && strings.EqualFold(command[0], "SENTINEL") {
-			if len(command) != 3 || !strings.EqualFold(command[1], "get-master-addr-by-name") || command[2] != "galvatron-main" {
+			if len(command) != 3 || !strings.EqualFold(command[1], "get-master-addr-by-name") || command[2] != "cache-main" {
 				return "-ERR unexpected sentinel command\r\n", false
 			}
 			masterHost, masterPort := splitTopologyAddress(t, master.addr)
@@ -114,32 +189,32 @@ func TestInitFIT401IORedis582CompatibilitySentinelClientInfo(t *testing.T) {
 		return ioredis582MetadataRejectingHandler(command)
 	})
 	defer sentinel.stop()
-	t.Setenv("REDIS_ORBIS_READ_WRITE", "redis-sentinel://"+sentinel.addr+"/0?master=galvatron-main")
+	t.Setenv("REDIS_PRIMARY_READ_WRITE", "redis-sentinel://"+sentinel.addr+"/0?master=cache-main")
 
 	client, err := Init(ConnectionOptions{
 		Context: context.Background(),
 		Dial:    mockDial,
 		IORedisCompatibility: map[string]IORedisCompatibilityProfile{
-			"orbis": IORedisCompatibilityFIT401IORedis582,
+			"primary": IORedisCompatibilityV582,
 		},
 	})
 	if err != nil {
 		t.Fatalf("Init Sentinel: %v", err)
 	}
 	defer client.Close()
-	if err := client.Service("orbis").Write.Ping(context.Background()); err != nil {
+	if err := client.Service("primary").Write.Ping(context.Background()); err != nil {
 		t.Fatalf("Ping: %v", err)
 	}
 	assertIORedis582ClientInfo(t, sentinel.commandsSnapshot(), 1)
 	assertIORedis582ClientInfo(t, master.commandsSnapshot(), 1)
 }
 
-func TestInitFIT401IORedis582CompatibilityClusterClientInfo(t *testing.T) {
+func TestInitIORedisV582CompatibilityClusterClientInfo(t *testing.T) {
 	restore := isolateRedisEnvironment(t)
 	defer restore()
 
-	var server *slingshotRESPScenarioServer
-	server = startSlingshotRESPScenarioServer(t, nil, func(command []string) (string, bool) {
+	var server *ioredisRESPScenarioServer
+	server = startIORedisRESPScenarioServer(t, nil, func(command []string) (string, bool) {
 		if len(command) > 0 && strings.EqualFold(command[0], "CLUSTER") {
 			if len(command) != 2 || !strings.EqualFold(command[1], "slots") {
 				return "-ERR unexpected cluster command\r\n", false
@@ -152,20 +227,20 @@ func TestInitFIT401IORedis582CompatibilityClusterClientInfo(t *testing.T) {
 		return ioredis582MetadataRejectingHandler(command)
 	})
 	defer server.stop()
-	t.Setenv("REDIS_ORBIS_READ_WRITE", "redis://"+server.addr+"/0?sharded_db=true")
+	t.Setenv("REDIS_PRIMARY_READ_WRITE", "redis://"+server.addr+"/0?sharded_db=true")
 
 	client, err := Init(ConnectionOptions{
 		Context: context.Background(),
 		Dial:    mockDial,
 		IORedisCompatibility: map[string]IORedisCompatibilityProfile{
-			"orbis": IORedisCompatibilityFIT401IORedis582,
+			"primary": IORedisCompatibilityV582,
 		},
 	})
 	if err != nil {
 		t.Fatalf("Init Cluster: %v", err)
 	}
 	defer client.Close()
-	if err := client.Service("orbis").Write.Ping(context.Background()); err != nil {
+	if err := client.Service("primary").Write.Ping(context.Background()); err != nil {
 		t.Fatalf("Ping: %v", err)
 	}
 	// Cluster startup opens one connection for slot discovery and another for
@@ -186,11 +261,11 @@ func TestInitIORedisV4CompatibilityRejectsReplicaTopologies(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			restore := isolateRedisEnvironment(t)
 			defer restore()
-			t.Setenv("REDIS_ORBIS_READ_ONLY", test.uri)
+			t.Setenv("REDIS_PRIMARY_READ_ONLY", test.uri)
 			_, err := Init(ConnectionOptions{
 				Dial: mockDial,
 				IORedisCompatibility: map[string]IORedisCompatibilityProfile{
-					"orbis": IORedisCompatibilityV4,
+					"primary": IORedisCompatibilityV4,
 				},
 			})
 			if err == nil || !strings.Contains(err.Error(), test.want) {
@@ -215,12 +290,12 @@ func TestInitIORedisV4CompatibilitySentinelResolvesMaster(t *testing.T) {
 	defer failoverMaster.stop()
 	var currentMaster atomic.Value
 	currentMaster.Store(master.addr)
-	sentinel := startSlingshotRESPScenarioServer(t, nil, func(command []string) (string, bool) {
+	sentinel := startIORedisRESPScenarioServer(t, nil, func(command []string) (string, bool) {
 		switch strings.ToUpper(command[0]) {
 		case "INFO":
 			return "$11\r\nloading:0\r\n\r\n", false
 		case "SENTINEL":
-			if len(command) != 3 || !strings.EqualFold(command[1], "get-master-addr-by-name") || command[2] != "galvatron-main" {
+			if len(command) != 3 || !strings.EqualFold(command[1], "get-master-addr-by-name") || command[2] != "cache-main" {
 				return "-ERR unexpected sentinel command\r\n", false
 			}
 			masterHost, masterPort := splitTopologyAddress(t, currentMaster.Load().(string))
@@ -230,20 +305,20 @@ func TestInitIORedisV4CompatibilitySentinelResolvesMaster(t *testing.T) {
 		}
 	})
 	defer sentinel.stop()
-	t.Setenv("REDIS_ORBIS_READ_WRITE", "redis-sentinel://"+sentinel.addr+"/0?master=galvatron-main")
+	t.Setenv("REDIS_PRIMARY_READ_WRITE", "redis-sentinel://"+sentinel.addr+"/0?master=cache-main")
 
 	client, err := Init(ConnectionOptions{
 		Context: context.Background(),
 		Dial:    mockDial,
 		IORedisCompatibility: map[string]IORedisCompatibilityProfile{
-			"orbis": IORedisCompatibilityV4,
+			"primary": IORedisCompatibilityV4,
 		},
 	})
 	if err != nil {
 		t.Fatalf("Init Sentinel: %v", err)
 	}
 	defer client.Close()
-	connection := client.Service("orbis").Write
+	connection := client.Service("primary").Write
 	if connection.IsCluster() {
 		t.Fatal("Sentinel connection reported Cluster topology")
 	}
@@ -253,7 +328,7 @@ func TestInitIORedisV4CompatibilitySentinelResolvesMaster(t *testing.T) {
 	if got := master.value("file:job:sentinel"); got != `{"progress":0}` {
 		t.Fatalf("master value = %q", got)
 	}
-	if !topologyCommandsContain(sentinel.commandsSnapshot(), "SENTINEL", "get-master-addr-by-name", "galvatron-main") {
+	if !topologyCommandsContain(sentinel.commandsSnapshot(), "SENTINEL", "get-master-addr-by-name", "cache-main") {
 		t.Fatalf("Sentinel commands = %#v", sentinel.commandsSnapshot())
 	}
 
@@ -267,7 +342,7 @@ func TestInitIORedisV4CompatibilitySentinelResolvesMaster(t *testing.T) {
 	if got := failoverMaster.value("file:job:after-failover"); got != `{"progress":50}` {
 		t.Fatalf("failover master value = %q", got)
 	}
-	if got := topologyCommandCount(sentinel.commandsSnapshot(), "SENTINEL", "get-master-addr-by-name", "galvatron-main"); got < 2 {
+	if got := topologyCommandCount(sentinel.commandsSnapshot(), "SENTINEL", "get-master-addr-by-name", "cache-main"); got < 2 {
 		t.Fatalf("Sentinel discovery calls = %d, want at least initial plus failover", got)
 	}
 }
@@ -290,7 +365,7 @@ func TestInitIORedisV4CompatibilityClusterRoutesByHashSlot(t *testing.T) {
 	firstHost, firstPort := splitTopologyAddress(t, first.addr)
 	var secondRangeMaster atomic.Value
 	secondRangeMaster.Store(second.addr)
-	seed := startSlingshotRESPScenarioServer(t, nil, func(command []string) (string, bool) {
+	seed := startIORedisRESPScenarioServer(t, nil, func(command []string) (string, bool) {
 		switch strings.ToUpper(command[0]) {
 		case "INFO":
 			return "$11\r\nloading:0\r\n\r\n", false
@@ -308,20 +383,20 @@ func TestInitIORedisV4CompatibilityClusterRoutesByHashSlot(t *testing.T) {
 		}
 	})
 	defer seed.stop()
-	t.Setenv("REDIS_ORBIS_READ_WRITE", "redis://"+seed.addr+"/0?sharded_db=true")
+	t.Setenv("REDIS_PRIMARY_READ_WRITE", "redis://"+seed.addr+"/0?sharded_db=true")
 
 	client, err := Init(ConnectionOptions{
 		Context: context.Background(),
 		Dial:    mockDial,
 		IORedisCompatibility: map[string]IORedisCompatibilityProfile{
-			"orbis": IORedisCompatibilityV4,
+			"primary": IORedisCompatibilityV4,
 		},
 	})
 	if err != nil {
 		t.Fatalf("Init Cluster: %v", err)
 	}
 	defer client.Close()
-	connection := client.Service("orbis").Write
+	connection := client.Service("primary").Write
 	if !connection.IsCluster() {
 		t.Fatal("Cluster connection did not report Cluster topology")
 	}
@@ -390,21 +465,21 @@ func TestIORedisV4CompatibilityLiveTopologies(t *testing.T) {
 			}
 			restore := isolateRedisEnvironment(t)
 			defer restore()
-			if err := os.Setenv("REDIS_ORBIS_READ_WRITE", uri); err != nil {
+			if err := os.Setenv("REDIS_PRIMARY_READ_WRITE", uri); err != nil {
 				t.Fatalf("set live URI: %v", err)
 			}
 			client, err := Init(ConnectionOptions{
 				Context: context.Background(),
 				Dial:    mockDial,
 				IORedisCompatibility: map[string]IORedisCompatibilityProfile{
-					"orbis": IORedisCompatibilityV4,
+					"primary": IORedisCompatibilityV4,
 				},
 			})
 			if err != nil {
 				t.Fatalf("Init %s: %v", test.name, err)
 			}
 			defer client.Close()
-			connection := client.Service("orbis").Write
+			connection := client.Service("primary").Write
 			if connection.IsCluster() != test.isCluster {
 				t.Fatalf("IsCluster = %v, want %v", connection.IsCluster(), test.isCluster)
 			}
@@ -417,7 +492,7 @@ func TestIORedisV4CompatibilityLiveTopologies(t *testing.T) {
 }
 
 type ioredisTopologyDataServer struct {
-	server *slingshotRESPScenarioServer
+	server *ioredisRESPScenarioServer
 	addr   string
 	mu     sync.Mutex
 	values map[string]string
@@ -426,7 +501,7 @@ type ioredisTopologyDataServer struct {
 func newIORedisTopologyDataServer(t *testing.T) *ioredisTopologyDataServer {
 	t.Helper()
 	data := &ioredisTopologyDataServer{values: make(map[string]string)}
-	data.server = startSlingshotRESPScenarioServer(t, nil, func(command []string) (string, bool) {
+	data.server = startIORedisRESPScenarioServer(t, nil, func(command []string) (string, bool) {
 		switch strings.ToUpper(command[0]) {
 		case "INFO":
 			return "$11\r\nloading:0\r\n\r\n", false
@@ -593,11 +668,11 @@ func TestInitIORedisV4CompatibilityQueuesAcrossOutageAfterWaitCancellation(t *te
 
 	server := startRetryLoopbackRedis(t, "")
 	addr := server.addr
-	t.Setenv("REDIS_ORBIS_READ_WRITE", "redis://"+addr+"/0")
+	t.Setenv("REDIS_PRIMARY_READ_WRITE", "redis://"+addr+"/0")
 	client, err := Init(ConnectionOptions{
 		Dial: mockDial,
 		IORedisCompatibility: map[string]IORedisCompatibilityProfile{
-			"orbis": IORedisCompatibilityV4,
+			"primary": IORedisCompatibilityV4,
 		},
 	})
 	if err != nil {
@@ -605,7 +680,7 @@ func TestInitIORedisV4CompatibilityQueuesAcrossOutageAfterWaitCancellation(t *te
 		t.Fatalf("Init: %v", err)
 	}
 	defer client.Close()
-	raw := client.Service("orbis").Write.Raw().(*IORedisCompatClient)
+	raw := client.Service("primary").Write.Raw().(*IORedisCompatClient)
 
 	server.stop(t)
 	future := raw.Submit("SETEX", "file:job:proof", "86400", `{"progress":0}`)

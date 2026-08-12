@@ -133,6 +133,11 @@ type DialOptions struct {
 	// DB is the database number to select.
 	DB int
 
+	// Protocol selects the Redis serialization protocol. RedisProtocolDefault
+	// preserves the underlying driver's default. Use RedisProtocolRESP2 for
+	// services migrating from ioredis 4/5, whose wire contract is RESP2.
+	Protocol RedisProtocol
+
 	// ClientName is the connection name visible in CLIENT LIST.
 	ClientName string
 
@@ -187,6 +192,9 @@ type ClusterDialOptions struct {
 
 	// Username for ACL-based auth.
 	Username string
+
+	// Protocol selects the Redis serialization protocol.
+	Protocol RedisProtocol
 
 	// ClientName is the connection name.
 	ClientName string
@@ -254,6 +262,9 @@ type SentinelDialOptions struct {
 
 	// DB is the database number.
 	DB int
+
+	// Protocol selects the Redis serialization protocol.
+	Protocol RedisProtocol
 
 	// ClientName is the connection name.
 	ClientName string
@@ -332,6 +343,12 @@ type ConnectionOptions struct {
 	// Context for connection establishment.
 	Context context.Context
 
+	// ProtocolByService explicitly selects RESP2 or RESP3 for named Redis
+	// services. Keys are matched case-insensitively against names discovered
+	// from REDIS_{SERVICE}_READ_{WRITE|ONLY}. Services not present retain the
+	// existing driver default, making this option safe for incremental rollout.
+	ProtocolByService map[string]RedisProtocol
+
 	// IORedisCompatibility selects the exact standalone ioredis connection
 	// lifecycle for named services. Keys are case-insensitive service names as
 	// discovered from REDIS_{SERVICE}_READ_{WRITE|ONLY}. Services not present in
@@ -348,6 +365,17 @@ type ConnectionOptions struct {
 // configuration error instead of silently falling back to go-redis.
 type IORedisCompatibilityProfile string
 
+// RedisProtocol selects the Redis serialization protocol used by the default
+// go-redis transport. The zero value deliberately means "driver default" so
+// adding this field cannot change existing callers.
+type RedisProtocol int
+
+const (
+	RedisProtocolDefault RedisProtocol = 0
+	RedisProtocolRESP2   RedisProtocol = 2
+	RedisProtocolRESP3   RedisProtocol = 3
+)
+
 const (
 	// IORedisCompatibilityV4 reproduces the shared standalone behavior of
 	// ioredis 4.x used by legacy FIT.js: eager first-ready initialization,
@@ -355,13 +383,19 @@ const (
 	// maxRetriesPerRequest=20. ioredis 4 does not issue CLIENT SETINFO.
 	IORedisCompatibilityV4 IORedisCompatibilityProfile = "ioredis-v4"
 
-	// IORedisCompatibilityFIT401IORedis582 pins the Redis wire identity used by
-	// the live Galvatron FIT.js 4.0.1 dependency tree. It keeps the existing
-	// ioredis-compatible reconnect/offline FIFO policy, but sends the ioredis 5
-	// startup metadata with the exact nested package version. Keep this profile
-	// explicit: a generic ioredis 5 identity would silently drift for services
-	// whose lockfiles resolve a different patch version.
-	IORedisCompatibilityFIT401IORedis582 IORedisCompatibilityProfile = "fit-4.0.1-ioredis-5.8.2"
+	// IORedisCompatibilityV5 reproduces the common ioredis 5.x RESP2
+	// connection lifecycle: eager first-ready initialization, a
+	// connection-owned offline FIFO, min(attempt*50ms, 2s) reconnect delay,
+	// maxRetriesPerRequest=20, and best-effort CLIENT SETINFO metadata. The
+	// metadata version follows the current compatibility oracle (5.11.1), while
+	// application behavior remains defined by this profile rather than a package
+	// patch number.
+	IORedisCompatibilityV5 IORedisCompatibilityProfile = "ioredis-v5-resp2"
+
+	// IORedisCompatibilityV582 pins ioredis 5.8.2 startup metadata while
+	// retaining the ioredis 5 connection lifecycle. Use this only when the
+	// deployed legacy lockfile makes the patch-level wire identity observable.
+	IORedisCompatibilityV582 IORedisCompatibilityProfile = "ioredis-v5.8.2"
 )
 
 // ---------------------------------------------------------------------------
@@ -737,6 +771,13 @@ func dialFromURI(
 
 	isReadOnly := job.connType == "read"
 	compatibilityProfile, compatibilityEnabled := ioredisCompatibilityProfile(opts, job.serviceName)
+	protocol, err := redisProtocolForService(opts, job.serviceName)
+	if err != nil {
+		return nil, fmt.Errorf("redis: protocol for %s_%s: %w", job.serviceName, job.connType, err)
+	}
+	if compatibilityEnabled && protocol == RedisProtocolRESP3 {
+		return nil, fmt.Errorf("redis: %s compatibility for %s_%s requires RESP2", compatibilityProfile, job.serviceName, job.connType)
+	}
 
 	// Route: Sentinel
 	if parsed.Scheme == "redis-sentinel" {
@@ -799,6 +840,7 @@ func dialFromURI(
 			DialerRetries:      envOpts.DialerRetries,
 			DialerRetryTimeout: envOpts.DialerRetryTimeout,
 			DB:                 parsed.DB,
+			Protocol:           protocol,
 			ReadOnly:           isReadOnly,
 		}
 
@@ -856,6 +898,7 @@ func dialFromURI(
 			Addrs:                make([]string, 0, len(parsed.Hosts)),
 			Password:             parsed.Password,
 			Username:             parsed.Username,
+			Protocol:             protocol,
 			ClientName:           clientName,
 			TLSConfig:            tlsCfg,
 			ConnectTimeout:       connectTimeout,
@@ -901,6 +944,7 @@ func dialFromURI(
 		Password:           parsed.Password,
 		Username:           parsed.Username,
 		DB:                 parsed.DB,
+		Protocol:           protocol,
 		ClientName:         clientName,
 		TLSConfig:          tlsCfg,
 		ConnectTimeout:     connectTimeout,
@@ -924,6 +968,34 @@ func ioredisCompatibilityProfile(opts ConnectionOptions, serviceName string) (IO
 		}
 	}
 	return "", false
+}
+
+func redisProtocolForService(opts ConnectionOptions, serviceName string) (RedisProtocol, error) {
+	var selected RedisProtocol
+	matched := false
+	for configuredService, protocol := range opts.ProtocolByService {
+		if !strings.EqualFold(strings.TrimSpace(configuredService), serviceName) {
+			continue
+		}
+		if err := validateRedisProtocol(protocol); err != nil {
+			return RedisProtocolDefault, err
+		}
+		if matched && selected != protocol {
+			return RedisProtocolDefault, fmt.Errorf("conflicting Redis protocols %d and %d", selected, protocol)
+		}
+		selected = protocol
+		matched = true
+	}
+	return selected, nil
+}
+
+func validateRedisProtocol(protocol RedisProtocol) error {
+	switch protocol {
+	case RedisProtocolDefault, RedisProtocolRESP2, RedisProtocolRESP3:
+		return nil
+	default:
+		return fmt.Errorf("unsupported Redis protocol %d", protocol)
+	}
 }
 
 // ---------------------------------------------------------------------------

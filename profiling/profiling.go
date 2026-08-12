@@ -40,7 +40,7 @@
 // - PROJECT_NAME: Project name for app identification
 // - DEPLOYMENT_NAME: Deployment name override
 // - DEPLOYMENT_TYPE: Deployment type (server, worker, etc.)
-// - PLATFORM_VERSION: Fynd platform version tag
+// - PLATFORM_VERSION: Platform version tag
 package profiling
 
 import (
@@ -170,13 +170,15 @@ func NewFromEnv() *Profiler {
 	return New(DefaultConfig())
 }
 
-// buildAppName constructs the application name from environment variables,
-// .
+// buildAppName constructs the application name from environment variables.
 func (p *Profiler) buildAppName() string {
 	podName := envString("K8S_POD_NAME", "unknown-pod")
 	projectName := envString("PROJECT_NAME", "DefaultProject")
 	deploymentName := envString("DEPLOYMENT_NAME", "")
-	deploymentType := strings.ToLower(envString("DEPLOYMENT_TYPE", "server"))
+	deploymentType := strings.ToLower(strings.TrimSpace(envString("DEPLOYMENT_TYPE", "server")))
+	if deploymentType == "" {
+		deploymentType = "server"
+	}
 
 	// Derive deployment name from pod name if not provided.
 	if deploymentName == "" {
@@ -188,7 +190,6 @@ func (p *Profiler) buildAppName() string {
 		}
 	}
 
-	// Capitalize deployment type.
 	deploymentTypeCapitalized := strings.ToUpper(deploymentType[:1]) + deploymentType[1:]
 	return fmt.Sprintf("%s-%s-%s", projectName, deploymentName, deploymentTypeCapitalized)
 }

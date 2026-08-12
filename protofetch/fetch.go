@@ -661,11 +661,11 @@ func cleanOutputPath(outputPath, rootPath string) (string, error) {
 			return "", fmt.Errorf("protofetch: resolve output root: %w", err)
 		}
 	}
-	root, err := filepath.Abs(rootPath)
+	declaredRoot, err := filepath.Abs(rootPath)
 	if err != nil {
 		return "", fmt.Errorf("protofetch: resolve output root: %w", err)
 	}
-	root, err = filepath.EvalSymlinks(root)
+	root, err := filepath.EvalSymlinks(declaredRoot)
 	if err != nil {
 		return "", fmt.Errorf("protofetch: resolve output root: %w", err)
 	}
@@ -682,7 +682,15 @@ func cleanOutputPath(outputPath, rootPath string) (string, error) {
 	}
 	var output string
 	if filepath.IsAbs(outputPath) {
-		output = filepath.Clean(outputPath)
+		absoluteOutput := filepath.Clean(outputPath)
+		if relative, relErr := filepath.Rel(declaredRoot, absoluteOutput); relErr == nil && relative != "." && !escapesRoot(relative) {
+			// Preserve the caller's lexical boundary while using the resolved root.
+			// This handles OS aliases such as macOS /var and /private/var without
+			// weakening descendant or symlink checks.
+			output = filepath.Join(root, relative)
+		} else {
+			output = absoluteOutput
+		}
 	} else {
 		output = filepath.Join(root, filepath.Clean(outputPath))
 	}

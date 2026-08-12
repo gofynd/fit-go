@@ -1,10 +1,10 @@
 "use strict";
 
-// Runtime oracle for the pinned Slingshot dependency. This script is not part
+// Runtime oracle for the pinned ioredis dependency. This script is not part
 // of `go test`; point IOREDIS_MODULE at an installed ioredis 5.11.1 directory.
 // Example:
 //   IOREDIS_MODULE=/tmp/node_modules/ioredis \
-//     node redis/testdata/slingshot_ioredis_wire_probe.cjs startup
+//     node redis/testdata/ioredis_wire_probe.cjs startup
 
 const net = require("net");
 const modulePath = process.env.IOREDIS_MODULE || "ioredis";
@@ -65,7 +65,7 @@ async function startupProbe() {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port;
   const redis = new Redis(`redis://legacy-user:legacy-pass@127.0.0.1:${port}/4`, {
-    connectionName: "uat-slingshot",
+    connectionName: "uat-cache",
     connectTimeout: 10000,
   });
   redis.on("error", () => {});
@@ -109,7 +109,7 @@ async function lostReplyProbe() {
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const redis = new Redis(server.address().port, "127.0.0.1", {
-    connectionName: "slingshot",
+    connectionName: "cache",
     retryStrategy: () => 1,
   });
   redis.on("error", () => {});
@@ -128,7 +128,7 @@ const probe = selected === "startup"
     : null;
 
 if (!probe) {
-  throw new Error("usage: slingshot_ioredis_wire_probe.cjs <startup|lost-reply>");
+  throw new Error("usage: ioredis_wire_probe.cjs <startup|lost-reply>");
 }
 
 probe().then((result) => process.stdout.write(JSON.stringify(result)));

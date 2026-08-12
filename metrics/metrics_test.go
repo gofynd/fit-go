@@ -452,7 +452,7 @@ func TestFileOutput_ImmediateAndAtomicRefresh(t *testing.T) {
 }
 
 func TestFileOutput_DeployedKubernetesContract(t *testing.T) {
-	t.Setenv("K8S_POD_NAME", "metroplex-communications-abc123")
+	t.Setenv("K8S_POD_NAME", "example-api-abc123")
 	dir := t.TempDir()
 	registry, err := New(Options{
 		MetricsDir:         dir,
@@ -464,7 +464,7 @@ func TestFileOutput_DeployedKubernetesContract(t *testing.T) {
 	}
 	defer registry.Shutdown()
 
-	wantFile := filepath.Join(dir, fmt.Sprintf("metroplex-communications-abc123-%d.prom", os.Getpid()))
+	wantFile := filepath.Join(dir, fmt.Sprintf("example-api-abc123-%d.prom", os.Getpid()))
 	if registry.MetricsFile() != wantFile {
 		t.Fatalf("MetricsFile() = %q, want deployed podname-pid contract %q", registry.MetricsFile(), wantFile)
 	}

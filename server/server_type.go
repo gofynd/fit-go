@@ -21,7 +21,7 @@ import (
 )
 
 // ServerType represents the type of server that determines which routes are loaded.
-// In Fynd Commerce, services are split by server type to isolate concerns.
+// Applications may split routes by server type to isolate concerns.
 type ServerType int
 
 const (
@@ -49,7 +49,7 @@ const (
 	ServerTypeDev
 	// ServerTypeCommon serves routes shared across all types.
 	ServerTypeCommon
-	// ServerTypeCentral serves legacy central/admin routes used by Commerce services.
+	// ServerTypeCentral serves legacy central/admin routes.
 	ServerTypeCentral
 )
 

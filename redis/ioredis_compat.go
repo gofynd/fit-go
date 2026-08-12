@@ -25,16 +25,14 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// SlingshotIORedisMaxRetriesPerRequest is the locked ioredis 5.11.1 default
-// used by Slingshot through FIT.js 4.0.1. It is intentionally not applied to
-// any existing fit-go connection.
-const SlingshotIORedisMaxRetriesPerRequest = 20
+// IORedisMaxRetriesPerRequest is the ioredis 5.11.1 default.
+const IORedisMaxRetriesPerRequest = 20
 
-const slingshotIORedisClosedMessage = "Connection is closed."
+const ioredisClosedMessage = "Connection is closed."
 
-// SlingshotIORedisRetryDelay returns the exact ioredis 5.11.1 default
-// retryStrategy delay used by Slingshot: min(times*50ms, 2000ms).
-func SlingshotIORedisRetryDelay(times int) time.Duration {
+// IORedisRetryDelay returns the ioredis 5.11.1 default retryStrategy delay:
+// min(times*50ms, 2000ms).
+func IORedisRetryDelay(times int) time.Duration {
 	if times <= 0 {
 		return 0
 	}
@@ -45,50 +43,44 @@ func SlingshotIORedisRetryDelay(times int) time.Duration {
 	return delay
 }
 
-// SlingshotIORedisMaxRetriesError has the exact observable message emitted by
-// ioredis when its connection-owned retry counter reaches a multiple of 21.
-type SlingshotIORedisMaxRetriesError struct{}
+// IORedisMaxRetriesError reports retry exhaustion using ioredis's message.
+type IORedisMaxRetriesError struct{}
 
-func (SlingshotIORedisMaxRetriesError) Error() string {
+func (IORedisMaxRetriesError) Error() string {
 	return `Reached the max retries per request limit (which is 20). Refer to "maxRetriesPerRequest" option for details.`
 }
 
-// SlingshotIORedisConnectionClosedError mirrors the post-disconnect ioredis
-// error. A dedicated type lets callers distinguish it without changing its
-// legacy text.
-type SlingshotIORedisConnectionClosedError struct{}
+// IORedisConnectionClosedError reports a post-disconnect command.
+type IORedisConnectionClosedError struct{}
 
-func (SlingshotIORedisConnectionClosedError) Error() string { return slingshotIORedisClosedMessage }
+func (IORedisConnectionClosedError) Error() string { return ioredisClosedMessage }
 
-// SlingshotIORedisAbortError mirrors ioredis's treatment of a pipeline whose
-// connection closes after at least one reply: the unread suffix is not replayed.
-type SlingshotIORedisAbortError struct{}
+// IORedisAbortError reports an interrupted pipeline after a partial reply.
+type IORedisAbortError struct{}
 
-func (SlingshotIORedisAbortError) Error() string { return "Command aborted due to connection close" }
+func (IORedisAbortError) Error() string { return "Command aborted due to connection close" }
 
-// SlingshotIORedisReply is one RESP command result. Redis reply errors belong
-// in Error with a nil exchange error; a transport failure belongs in the
-// SlingshotIORedisExchange result instead.
-type SlingshotIORedisReply struct {
+// IORedisReply is one RESP command result.
+type IORedisReply struct {
 	Value any
 	Error error
 }
 
-// SlingshotIORedisExchange reports one ordered write/read attempt.
+// IORedisExchange reports one ordered write/read attempt.
 //
 // A transport must make loss ambiguity explicit. MayHaveExecuted is true when
 // at least one command byte may have reached Redis before a transport error.
 // The state machine intentionally replays a direct command or a zero-reply
 // pipeline in that case, matching ioredis's duplicate-execution risk. Once a
 // pipeline reply has arrived, the remaining commands are aborted instead.
-type SlingshotIORedisExchange struct {
-	Replies         []SlingshotIORedisReply
+type IORedisExchange struct {
+	Replies         []IORedisReply
 	MayHaveExecuted bool
 	// WriteDisposition is populated by the owned RESP transport. Custom
 	// transports written before the owned transport was added may leave it at
-	// SlingshotIORedisWriteUnknown; the compatibility state machine continues
+	// IORedisWriteUnknown; the compatibility state machine continues
 	// to use MayHaveExecuted as its replay decision for that reason.
-	WriteDisposition SlingshotIORedisWriteDisposition
+	WriteDisposition IORedisWriteDisposition
 	BytesWritten     int
 	BytesTotal       int
 	// NetworkBytesWritten counts bytes accepted by the underlying socket for
@@ -98,20 +90,20 @@ type SlingshotIORedisExchange struct {
 	Error               error
 }
 
-// SlingshotIORedisWriteDisposition records how much of an encoded command
+// IORedisWriteDisposition records how much of an encoded command
 // batch crossed the socket boundary before an exchange failed. It separates a
 // definitely unwritten request from partial-write ambiguity and a complete
 // write whose reply was lost.
-type SlingshotIORedisWriteDisposition uint8
+type IORedisWriteDisposition uint8
 
 const (
-	SlingshotIORedisWriteUnknown SlingshotIORedisWriteDisposition = iota
-	SlingshotIORedisNotWritten
-	SlingshotIORedisPartiallyWritten
-	SlingshotIORedisFullyWritten
+	IORedisWriteUnknown IORedisWriteDisposition = iota
+	IORedisNotWritten
+	IORedisPartiallyWritten
+	IORedisFullyWritten
 )
 
-// SlingshotIORedisTransport is one ready standalone Redis connection. Connect
+// IORedisTransport is one ready standalone Redis connection. Connect
 // readiness, authentication, database selection, TLS and RESP parsing belong
 // to the factory. Server reply errors must not be returned as Exchange.Error.
 //
@@ -119,116 +111,111 @@ const (
 // expose enough information to distinguish not-written, partial-write and
 // written/lost-reply failures, so such an adapter would silently claim parity
 // it cannot provide.
-type SlingshotIORedisTransport interface {
-	Exchange(context.Context, [][]string) SlingshotIORedisExchange
+type IORedisTransport interface {
+	Exchange(context.Context, [][]string) IORedisExchange
 	// Closed must signal a remotely closed idle connection. Returning nil is a
 	// contract violation and causes the state machine to discard the transport.
 	Closed() <-chan struct{}
 	Close() error
 }
 
-// slingshotIORedisDuplexTransport is deliberately private: only the owned
-// RESP transport may opt into the ioredis write-ahead path. Third-party
-// transports continue to use the serial Exchange contract unless fit-go can
-// prove their independent write/read boundaries.
-type slingshotIORedisDuplexTransport interface {
-	SlingshotIORedisTransport
-	writeCommands(context.Context, [][]string) SlingshotIORedisExchange
-	readReply(context.Context) (SlingshotIORedisReply, error)
+// ioredisDuplexTransport is limited to transports with independent I/O phases.
+type ioredisDuplexTransport interface {
+	IORedisTransport
+	writeCommands(context.Context, [][]string) IORedisExchange
+	readReply(context.Context) (IORedisReply, error)
 	finishReplyWait()
 }
 
-// SlingshotIORedisTransportFactory creates a fully ready transport. It is
-// called by the single connection-owned reconnect loop.
-type SlingshotIORedisTransportFactory interface {
-	Connect(context.Context) (SlingshotIORedisTransport, error)
+// IORedisTransportFactory creates a fully ready transport.
+type IORedisTransportFactory interface {
+	Connect(context.Context) (IORedisTransport, error)
 }
 
-// SlingshotIORedisTransportFactoryFunc adapts a function to the factory
-// interface.
-type SlingshotIORedisTransportFactoryFunc func(context.Context) (SlingshotIORedisTransport, error)
+// IORedisTransportFactoryFunc adapts a function to IORedisTransportFactory.
+type IORedisTransportFactoryFunc func(context.Context) (IORedisTransport, error)
 
-func (f SlingshotIORedisTransportFactoryFunc) Connect(ctx context.Context) (SlingshotIORedisTransport, error) {
+func (f IORedisTransportFactoryFunc) Connect(ctx context.Context) (IORedisTransport, error) {
 	return f(ctx)
 }
 
-// SlingshotIORedisResult preserves the complete ordered result and records the
+// IORedisResult preserves the complete ordered result and records the
 // duplicate-execution exposure of replay after a lost reply.
-type SlingshotIORedisResult struct {
-	Replies          []SlingshotIORedisReply
+type IORedisResult struct {
+	Replies          []IORedisReply
 	ReplayCount      int
 	AmbiguousReplays int
 }
 
-// SlingshotIORedisFuture is returned immediately when a command is accepted
+// IORedisFuture is returned immediately when a command is accepted
 // into the connection-wide FIFO. Cancelling a Wait context stops only that
 // waiter; it does not remove or cancel the accepted Redis command, matching a
 // JavaScript Promise rather than a request-scoped Go operation.
-type SlingshotIORedisFuture struct {
-	state *slingshotIORedisFutureState
+type IORedisFuture struct {
+	state *ioredisFutureState
 }
 
-type slingshotIORedisCompletion struct {
-	result SlingshotIORedisResult
+type ioredisCompletion struct {
+	result IORedisResult
 	err    error
 }
 
-type slingshotIORedisFutureState struct {
+type ioredisFutureState struct {
 	done       chan struct{}
 	settleOnce sync.Once
-	completion slingshotIORedisCompletion
+	completion ioredisCompletion
 }
 
-func newSlingshotIORedisFutureState() *slingshotIORedisFutureState {
-	return &slingshotIORedisFutureState{done: make(chan struct{})}
+func newIORedisFutureState() *ioredisFutureState {
+	return &ioredisFutureState{done: make(chan struct{})}
 }
 
-func (s *slingshotIORedisFutureState) settle(completion slingshotIORedisCompletion) {
+func (s *ioredisFutureState) settle(completion ioredisCompletion) {
 	s.settleOnce.Do(func() {
 		s.completion = completion
 		close(s.done)
 	})
 }
 
-func completedSlingshotIORedisFuture(result SlingshotIORedisResult, err error) *SlingshotIORedisFuture {
-	state := newSlingshotIORedisFutureState()
-	state.settle(slingshotIORedisCompletion{result: result, err: err})
-	return &SlingshotIORedisFuture{state: state}
+func completedIORedisFuture(result IORedisResult, err error) *IORedisFuture {
+	state := newIORedisFutureState()
+	state.settle(ioredisCompletion{result: result, err: err})
+	return &IORedisFuture{state: state}
 }
 
 // Wait observes settlement without transferring cancellation into the shared
 // queue. The settled value is retained, so multiple waiters observe the same
 // result as multiple handlers attached to one JavaScript Promise.
-func (f *SlingshotIORedisFuture) Wait(ctx context.Context) (SlingshotIORedisResult, error) {
+func (f *IORedisFuture) Wait(ctx context.Context) (IORedisResult, error) {
 	if f == nil || f.state == nil {
-		return SlingshotIORedisResult{}, errors.New("Slingshot ioredis future is not configured")
+		return IORedisResult{}, errors.New("ioredis future is not configured")
 	}
 	select {
 	case <-f.state.done:
 		return f.state.completion.result, f.state.completion.err
 	case <-ctx.Done():
-		return SlingshotIORedisResult{}, ctx.Err()
+		return IORedisResult{}, ctx.Err()
 	}
 }
 
-type slingshotIORedisRequest struct {
+type ioredisRequest struct {
 	commands         [][]string
 	pipeline         bool
 	quit             bool
 	replays          int
 	ambiguousReplays int
-	future           *slingshotIORedisFutureState
+	future           *ioredisFutureState
 	span             trace.Span
 }
 
-type slingshotIORedisPolicy struct {
+type ioredisPolicy struct {
 	retryDelay func(int) time.Duration
 	wait       func(context.Context, time.Duration) bool
 }
 
-func defaultSlingshotIORedisPolicy() slingshotIORedisPolicy {
-	return slingshotIORedisPolicy{
-		retryDelay: SlingshotIORedisRetryDelay,
+func defaultIORedisPolicy() ioredisPolicy {
+	return ioredisPolicy{
+		retryDelay: IORedisRetryDelay,
 		wait: func(ctx context.Context, delay time.Duration) bool {
 			timer := time.NewTimer(delay)
 			defer timer.Stop()
@@ -242,18 +229,11 @@ func defaultSlingshotIORedisPolicy() slingshotIORedisPolicy {
 	}
 }
 
-// SlingshotIORedisCompatClient is an explicit, standalone state machine for
-// the FIT.js 4.0.1/ioredis 5.11.1 behavior used by Slingshot. Construction does
-// not modify InitDefault, DialOptions, environment discovery, or any existing
-// fit-go service.
-//
-// The caller must provide a transport that proves its write disposition. This
-// is a fail-closed boundary: fit-go intentionally provides no automatic
-// go-redis adapter because the driver cannot expose the information required
-// for exact lost-reply behavior.
-type SlingshotIORedisCompatClient struct {
-	factory SlingshotIORedisTransportFactory
-	policy  slingshotIORedisPolicy
+// IORedisCompatClient implements ioredis 5.x connection-owned retry semantics.
+// Callers must supply a transport that reports write disposition.
+type IORedisCompatClient struct {
+	factory IORedisTransportFactory
+	policy  ioredisPolicy
 
 	ctx            context.Context
 	cancel         context.CancelFunc
@@ -263,7 +243,7 @@ type SlingshotIORedisCompatClient struct {
 	firstReadyOnce sync.Once
 
 	mu            sync.Mutex
-	queue         []*slingshotIORedisRequest
+	queue         []*ioredisRequest
 	closing       bool
 	disconnecting bool
 	closed        bool
@@ -272,25 +252,19 @@ type SlingshotIORedisCompatClient struct {
 	firstReadyErr error
 }
 
-// NewSlingshotIORedisCompatClient starts the eager connection/reconnect loop.
-// It supports standalone semantics only. Cluster and Sentinel callers must not
-// use this constructor until separate topology evidence and implementations
-// exist.
-func NewSlingshotIORedisCompatClient(factory SlingshotIORedisTransportFactory) (*SlingshotIORedisCompatClient, error) {
-	return newSlingshotIORedisCompatClient(factory, defaultSlingshotIORedisPolicy())
+// NewIORedisCompatClient starts the eager connection and reconnect loop.
+func NewIORedisCompatClient(factory IORedisTransportFactory) (*IORedisCompatClient, error) {
+	return newIORedisCompatClient(factory, defaultIORedisPolicy())
 }
 
-// NewSlingshotIORedisCompatClientReady is the opt-in Slingshot role bootstrap
-// boundary. It returns only after the first transport completes its startup
-// handshake. The first connection/startup error is returned immediately, like
-// FIT.js waitForRedisConnectionReady, and the client is disconnected before an
-// error is returned so a failed role boot cannot leak a reconnect loop.
+// NewIORedisCompatClientReady waits for the first successful connection and
+// disconnects the client if startup fails.
 // Existing constructors remain asynchronous and unchanged.
-func NewSlingshotIORedisCompatClientReady(ctx context.Context, factory SlingshotIORedisTransportFactory) (*SlingshotIORedisCompatClient, error) {
+func NewIORedisCompatClientReady(ctx context.Context, factory IORedisTransportFactory) (*IORedisCompatClient, error) {
 	if ctx == nil {
-		return nil, errors.New("Slingshot ioredis first-ready context is required")
+		return nil, errors.New("ioredis first-ready context is required")
 	}
-	client, err := NewSlingshotIORedisCompatClient(factory)
+	client, err := NewIORedisCompatClient(factory)
 	if err != nil {
 		return nil, err
 	}
@@ -301,15 +275,15 @@ func NewSlingshotIORedisCompatClientReady(ctx context.Context, factory Slingshot
 	return client, nil
 }
 
-func newSlingshotIORedisCompatClient(factory SlingshotIORedisTransportFactory, policy slingshotIORedisPolicy) (*SlingshotIORedisCompatClient, error) {
+func newIORedisCompatClient(factory IORedisTransportFactory, policy ioredisPolicy) (*IORedisCompatClient, error) {
 	if factory == nil {
-		return nil, errors.New("Slingshot ioredis transport factory is required")
+		return nil, errors.New("ioredis transport factory is required")
 	}
 	if policy.retryDelay == nil || policy.wait == nil {
-		return nil, errors.New("Slingshot ioredis retry policy is required")
+		return nil, errors.New("ioredis retry policy is required")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	client := &SlingshotIORedisCompatClient{
+	client := &IORedisCompatClient{
 		factory:    factory,
 		policy:     policy,
 		ctx:        ctx,
@@ -326,12 +300,12 @@ func newSlingshotIORedisCompatClient(factory SlingshotIORedisTransportFactory, p
 // stop the client when the caller context ends; the role-safe Ready constructor
 // above owns that cleanup. Once successful, later reconnects use the existing
 // ioredis-compatible lifecycle and do not change this immutable result.
-func (c *SlingshotIORedisCompatClient) WaitForFirstReady(ctx context.Context) error {
+func (c *IORedisCompatClient) WaitForFirstReady(ctx context.Context) error {
 	if c == nil || c.firstReady == nil {
-		return errors.New("Slingshot ioredis client is not configured")
+		return errors.New("ioredis client is not configured")
 	}
 	if ctx == nil {
-		return errors.New("Slingshot ioredis first-ready context is required")
+		return errors.New("ioredis first-ready context is required")
 	}
 	select {
 	case <-c.firstReady:
@@ -344,7 +318,7 @@ func (c *SlingshotIORedisCompatClient) WaitForFirstReady(ctx context.Context) er
 	}
 }
 
-func (c *SlingshotIORedisCompatClient) settleFirstReady(err error) {
+func (c *IORedisCompatClient) settleFirstReady(err error) {
 	c.firstReadyOnce.Do(func() {
 		c.mu.Lock()
 		c.firstReadyErr = err
@@ -354,36 +328,36 @@ func (c *SlingshotIORedisCompatClient) settleFirstReady(err error) {
 }
 
 // Submit accepts one command into the shared FIFO.
-func (c *SlingshotIORedisCompatClient) Submit(command ...string) *SlingshotIORedisFuture {
+func (c *IORedisCompatClient) Submit(command ...string) *IORedisFuture {
 	return c.SubmitContext(context.Background(), command...)
 }
 
 // SubmitContext accepts one command and parents its optional tracing span to
 // ctx. Command execution remains detached from caller cancellation, matching
 // the JavaScript Promise semantics of Submit and Wait.
-func (c *SlingshotIORedisCompatClient) SubmitContext(ctx context.Context, command ...string) *SlingshotIORedisFuture {
-	return c.submit(ctx, [][]string{cloneSlingshotIORedisCommand(command)}, false, false)
+func (c *IORedisCompatClient) SubmitContext(ctx context.Context, command ...string) *IORedisFuture {
+	return c.submit(ctx, [][]string{cloneIORedisCommand(command)}, false, false)
 }
 
 // SubmitPipeline accepts an ordered pipeline as one FIFO item. Redis reply
 // errors are returned per reply. Transport failure before any reply causes a
 // complete replay; failure after a prefix of replies aborts only the suffix.
-func (c *SlingshotIORedisCompatClient) SubmitPipeline(commands ...[]string) *SlingshotIORedisFuture {
+func (c *IORedisCompatClient) SubmitPipeline(commands ...[]string) *IORedisFuture {
 	return c.SubmitPipelineContext(context.Background(), commands...)
 }
 
 // SubmitPipelineContext is the context-aware counterpart of SubmitPipeline.
 // It creates one privacy-safe pipeline span and does not transfer ctx
 // cancellation into the accepted FIFO item.
-func (c *SlingshotIORedisCompatClient) SubmitPipelineContext(ctx context.Context, commands ...[]string) *SlingshotIORedisFuture {
+func (c *IORedisCompatClient) SubmitPipelineContext(ctx context.Context, commands ...[]string) *IORedisFuture {
 	cloned := make([][]string, len(commands))
 	for index := range commands {
-		cloned[index] = cloneSlingshotIORedisCommand(commands[index])
+		cloned[index] = cloneIORedisCommand(commands[index])
 	}
 	return c.submit(ctx, cloned, true, false)
 }
 
-func cloneSlingshotIORedisCommand(command []string) []string {
+func cloneIORedisCommand(command []string) []string {
 	cloned := append([]string(nil), command...)
 	if len(cloned) > 0 {
 		// ioredis Command normalizes only the command name. Arguments retain
@@ -393,50 +367,50 @@ func cloneSlingshotIORedisCommand(command []string) []string {
 	return cloned
 }
 
-func (c *SlingshotIORedisCompatClient) submit(ctx context.Context, commands [][]string, pipeline, quit bool) *SlingshotIORedisFuture {
+func (c *IORedisCompatClient) submit(ctx context.Context, commands [][]string, pipeline, quit bool) *IORedisFuture {
 	if c == nil {
-		return completedSlingshotIORedisFuture(SlingshotIORedisResult{}, SlingshotIORedisConnectionClosedError{})
+		return completedIORedisFuture(IORedisResult{}, IORedisConnectionClosedError{})
 	}
 	if len(commands) == 0 {
-		return completedSlingshotIORedisFuture(SlingshotIORedisResult{}, errors.New("Slingshot ioredis command is empty"))
+		return completedIORedisFuture(IORedisResult{}, errors.New("ioredis command is empty"))
 	}
 	for _, command := range commands {
 		if len(command) == 0 || command[0] == "" {
-			return completedSlingshotIORedisFuture(SlingshotIORedisResult{}, errors.New("Slingshot ioredis command is empty"))
+			return completedIORedisFuture(IORedisResult{}, errors.New("ioredis command is empty"))
 		}
 	}
-	request := &slingshotIORedisRequest{
+	request := &ioredisRequest{
 		commands: commands,
 		pipeline: pipeline,
 		quit:     quit,
-		future:   newSlingshotIORedisFutureState(),
+		future:   newIORedisFutureState(),
 		span:     startIORedisCompatibilitySpan(ctx, commands, pipeline),
 	}
 	c.mu.Lock()
 	if c.closed || c.closing || c.disconnecting {
 		c.mu.Unlock()
-		closedErr := SlingshotIORedisConnectionClosedError{}
+		closedErr := IORedisConnectionClosedError{}
 		c.complete(request, nil, closedErr)
-		return &SlingshotIORedisFuture{state: request.future}
+		return &IORedisFuture{state: request.future}
 	}
 	c.queue = append(c.queue, request)
 	c.mu.Unlock()
 	c.signal()
-	return &SlingshotIORedisFuture{state: request.future}
+	return &IORedisFuture{state: request.future}
 }
 
 // Quit appends QUIT after every already accepted command and waits for its
 // settlement. New commands are rejected once Quit begins. If no connection and
 // no queued command exist, it resolves locally like ioredis's offline QUIT
 // special case.
-func (c *SlingshotIORedisCompatClient) Quit(ctx context.Context) error {
+func (c *IORedisCompatClient) Quit(ctx context.Context) error {
 	if c == nil {
 		return nil
 	}
-	request := &slingshotIORedisRequest{
+	request := &ioredisRequest{
 		commands: [][]string{{"quit"}},
 		quit:     true,
-		future:   newSlingshotIORedisFutureState(),
+		future:   newIORedisFutureState(),
 		span:     startIORedisCompatibilitySpan(ctx, [][]string{{"quit"}}, false),
 	}
 	c.mu.Lock()
@@ -460,7 +434,7 @@ func (c *SlingshotIORedisCompatClient) Quit(ctx context.Context) error {
 	if len(c.queue) == 0 && !c.ready {
 		c.disconnecting = true
 		c.mu.Unlock()
-		c.complete(request, []SlingshotIORedisReply{{Value: "OK"}}, nil)
+		c.complete(request, []IORedisReply{{Value: "OK"}}, nil)
 		c.cancel()
 		c.signal()
 		return nil
@@ -468,7 +442,7 @@ func (c *SlingshotIORedisCompatClient) Quit(ctx context.Context) error {
 	c.queue = append(c.queue, request)
 	c.mu.Unlock()
 	c.signal()
-	future := &SlingshotIORedisFuture{state: request.future}
+	future := &IORedisFuture{state: request.future}
 	_, err := future.Wait(ctx)
 	return err
 }
@@ -476,7 +450,7 @@ func (c *SlingshotIORedisCompatClient) Quit(ctx context.Context) error {
 // Disconnect immediately stops reconnecting and settles every accepted item
 // with the exact ioredis connection-closed error. It is the counterpart of
 // ioredis disconnect(), not quit().
-func (c *SlingshotIORedisCompatClient) Disconnect() {
+func (c *IORedisCompatClient) Disconnect() {
 	if c == nil {
 		return
 	}
@@ -487,7 +461,7 @@ func (c *SlingshotIORedisCompatClient) Disconnect() {
 	}
 	c.disconnecting = true
 	c.mu.Unlock()
-	c.settleFirstReady(SlingshotIORedisConnectionClosedError{})
+	c.settleFirstReady(IORedisConnectionClosedError{})
 	c.cancel()
 	c.signal()
 	<-c.done
@@ -495,7 +469,7 @@ func (c *SlingshotIORedisCompatClient) Disconnect() {
 
 // RetryAttempts returns the connection-owned counter. It resets to zero only
 // after the factory returns a ready transport.
-func (c *SlingshotIORedisCompatClient) RetryAttempts() int {
+func (c *IORedisCompatClient) RetryAttempts() int {
 	if c == nil {
 		return 0
 	}
@@ -504,21 +478,21 @@ func (c *SlingshotIORedisCompatClient) RetryAttempts() int {
 	return c.retryAttempts
 }
 
-func (c *SlingshotIORedisCompatClient) signal() {
+func (c *IORedisCompatClient) signal() {
 	select {
 	case c.wake <- struct{}{}:
 	default:
 	}
 }
 
-func (c *SlingshotIORedisCompatClient) run() {
+func (c *IORedisCompatClient) run() {
 	defer close(c.done)
-	var transport SlingshotIORedisTransport
+	var transport IORedisTransport
 	defer func() {
 		if transport != nil {
 			_ = transport.Close()
 		}
-		c.finishClosed(SlingshotIORedisConnectionClosedError{})
+		c.finishClosed(IORedisConnectionClosedError{})
 	}()
 
 	needsRetryDelay := false
@@ -536,7 +510,7 @@ func (c *SlingshotIORedisCompatClient) run() {
 			connected, err := c.factory.Connect(c.ctx)
 			if err != nil || connected == nil {
 				if err == nil {
-					err = errors.New("Slingshot ioredis transport factory returned nil transport")
+					err = errors.New("ioredis transport factory returned nil transport")
 				}
 				c.settleFirstReady(err)
 				c.connectionFailed(err)
@@ -545,7 +519,7 @@ func (c *SlingshotIORedisCompatClient) run() {
 			}
 			if connected.Closed() == nil {
 				_ = connected.Close()
-				err := errors.New("Slingshot ioredis transport returned nil close signal")
+				err := errors.New("ioredis transport returned nil close signal")
 				c.settleFirstReady(err)
 				c.connectionFailed(err)
 				needsRetryDelay = true
@@ -560,7 +534,7 @@ func (c *SlingshotIORedisCompatClient) run() {
 			c.settleFirstReady(nil)
 		}
 
-		if duplex, ok := transport.(slingshotIORedisDuplexTransport); ok {
+		if duplex, ok := transport.(ioredisDuplexTransport); ok {
 			stop, sessionErr := c.runDuplexSession(duplex)
 			_ = transport.Close()
 			transport = nil
@@ -582,7 +556,7 @@ func (c *SlingshotIORedisCompatClient) run() {
 				_ = transport.Close()
 				transport = nil
 				c.setNotReady()
-				c.connectionFailed(errors.New("Slingshot ioredis transport closed"))
+				c.connectionFailed(errors.New("ioredis transport closed"))
 				needsRetryDelay = true
 				continue
 			case <-c.ctx.Done():
@@ -592,7 +566,7 @@ func (c *SlingshotIORedisCompatClient) run() {
 
 		exchange := transport.Exchange(c.ctx, request.commands)
 		if exchange.Error == nil && len(exchange.Replies) != len(request.commands) {
-			exchange.Error = fmt.Errorf("Slingshot ioredis transport returned %d replies for %d commands", len(exchange.Replies), len(request.commands))
+			exchange.Error = fmt.Errorf("ioredis transport returned %d replies for %d commands", len(exchange.Replies), len(request.commands))
 		}
 		if exchange.Error == nil {
 			c.pop(request)
@@ -613,9 +587,9 @@ func (c *SlingshotIORedisCompatClient) run() {
 		transport = nil
 		c.setNotReady()
 		if request.pipeline && len(exchange.Replies) > 0 {
-			replies := append([]SlingshotIORedisReply(nil), exchange.Replies...)
+			replies := append([]IORedisReply(nil), exchange.Replies...)
 			for len(replies) < len(request.commands) {
-				replies = append(replies, SlingshotIORedisReply{Error: SlingshotIORedisAbortError{}})
+				replies = append(replies, IORedisReply{Error: IORedisAbortError{}})
 			}
 			c.pop(request)
 			c.complete(request, replies, nil)
@@ -630,19 +604,19 @@ func (c *SlingshotIORedisCompatClient) run() {
 	}
 }
 
-type slingshotIORedisDuplexWriteResult struct {
-	request  *slingshotIORedisRequest
-	exchange SlingshotIORedisExchange
+type ioredisDuplexWriteResult struct {
+	request  *ioredisRequest
+	exchange IORedisExchange
 }
 
-type slingshotIORedisDuplexReadResult struct {
-	reply SlingshotIORedisReply
+type ioredisDuplexReadResult struct {
+	reply IORedisReply
 	err   error
 }
 
-type slingshotIORedisInFlight struct {
-	request *slingshotIORedisRequest
-	replies []SlingshotIORedisReply
+type ioredisInFlight struct {
+	request *ioredisRequest
+	replies []IORedisReply
 }
 
 // runDuplexSession mirrors ioredis's connection-owned command queue: writes
@@ -651,11 +625,11 @@ type slingshotIORedisInFlight struct {
 // fully or partially written request without a reply is replayed after a lost
 // connection. This is what exposes duplicate execution for more than one
 // direct command on the same socket.
-func (c *SlingshotIORedisCompatClient) runDuplexSession(transport slingshotIORedisDuplexTransport) (bool, error) {
-	writeRequests := make(chan *slingshotIORedisRequest)
-	writeResults := make(chan slingshotIORedisDuplexWriteResult, 1)
+func (c *IORedisCompatClient) runDuplexSession(transport ioredisDuplexTransport) (bool, error) {
+	writeRequests := make(chan *ioredisRequest)
+	writeResults := make(chan ioredisDuplexWriteResult, 1)
 	readRequests := make(chan struct{})
-	readResults := make(chan slingshotIORedisDuplexReadResult, 1)
+	readResults := make(chan ioredisDuplexReadResult, 1)
 	sessionCtx, cancel := context.WithCancel(c.ctx)
 	defer cancel()
 
@@ -664,7 +638,7 @@ func (c *SlingshotIORedisCompatClient) runDuplexSession(transport slingshotIORed
 			select {
 			case request := <-writeRequests:
 				exchange := transport.writeCommands(sessionCtx, request.commands)
-				writeResults <- slingshotIORedisDuplexWriteResult{request: request, exchange: exchange}
+				writeResults <- ioredisDuplexWriteResult{request: request, exchange: exchange}
 			case <-sessionCtx.Done():
 				return
 			}
@@ -675,21 +649,21 @@ func (c *SlingshotIORedisCompatClient) runDuplexSession(transport slingshotIORed
 			select {
 			case <-readRequests:
 				reply, err := transport.readReply(sessionCtx)
-				readResults <- slingshotIORedisDuplexReadResult{reply: reply, err: err}
+				readResults <- ioredisDuplexReadResult{reply: reply, err: err}
 			case <-sessionCtx.Done():
 				return
 			}
 		}
 	}()
 
-	scheduled := make(map[*slingshotIORedisRequest]bool)
-	var writing *slingshotIORedisRequest
-	var inFlight []*slingshotIORedisInFlight
+	scheduled := make(map[*ioredisRequest]bool)
+	var writing *ioredisRequest
+	var inFlight []*ioredisInFlight
 	reading := false
 
 	for {
-		var nextWrite *slingshotIORedisRequest
-		var writeRequestChannel chan *slingshotIORedisRequest
+		var nextWrite *ioredisRequest
+		var writeRequestChannel chan *ioredisRequest
 		if writing == nil {
 			nextWrite = c.firstUnscheduled(scheduled)
 			if nextWrite != nil {
@@ -697,7 +671,7 @@ func (c *SlingshotIORedisCompatClient) runDuplexSession(transport slingshotIORed
 			}
 		}
 		var readRequestChannel chan struct{}
-		if !reading && slingshotIORedisOutstandingReplies(inFlight) > 0 {
+		if !reading && ioredisOutstandingReplies(inFlight) > 0 {
 			readRequestChannel = readRequests
 		}
 
@@ -728,7 +702,7 @@ func (c *SlingshotIORedisCompatClient) runDuplexSession(transport slingshotIORed
 				c.reconcileDuplexFailure(inFlight, writeResult.request, writeResult.exchange)
 				return false, writeResult.exchange.Error
 			}
-			inFlight = append(inFlight, &slingshotIORedisInFlight{request: writeResult.request})
+			inFlight = append(inFlight, &ioredisInFlight{request: writeResult.request})
 		case readRequestChannel <- struct{}{}:
 			reading = true
 		case readResult := <-readResults:
@@ -739,18 +713,18 @@ func (c *SlingshotIORedisCompatClient) runDuplexSession(transport slingshotIORed
 					writeResult := <-writeResults
 					writing = nil
 					if writeResult.exchange.Error == nil {
-						inFlight = append(inFlight, &slingshotIORedisInFlight{request: writeResult.request})
+						inFlight = append(inFlight, &ioredisInFlight{request: writeResult.request})
 					} else {
 						c.reconcileDuplexFailure(inFlight, writeResult.request, writeResult.exchange)
 						return false, readResult.err
 					}
 				}
-				c.reconcileDuplexFailure(inFlight, nil, SlingshotIORedisExchange{})
+				c.reconcileDuplexFailure(inFlight, nil, IORedisExchange{})
 				return false, readResult.err
 			}
 			if len(inFlight) == 0 {
 				_ = transport.Close()
-				return false, errors.New("Slingshot ioredis RESP returned a reply without an in-flight command")
+				return false, errors.New("ioredis RESP returned a reply without an in-flight command")
 			}
 			var stop bool
 			inFlight, stop = c.applyDuplexReply(transport, inFlight, scheduled, readResult.reply)
@@ -765,7 +739,7 @@ func (c *SlingshotIORedisCompatClient) runDuplexSession(transport slingshotIORed
 	}
 }
 
-func (c *SlingshotIORedisCompatClient) applyDuplexReply(transport slingshotIORedisDuplexTransport, inFlight []*slingshotIORedisInFlight, scheduled map[*slingshotIORedisRequest]bool, reply SlingshotIORedisReply) ([]*slingshotIORedisInFlight, bool) {
+func (c *IORedisCompatClient) applyDuplexReply(transport ioredisDuplexTransport, inFlight []*ioredisInFlight, scheduled map[*ioredisRequest]bool, reply IORedisReply) ([]*ioredisInFlight, bool) {
 	entry := inFlight[0]
 	entry.replies = append(entry.replies, reply)
 	if len(entry.replies) != len(entry.request.commands) {
@@ -779,7 +753,7 @@ func (c *SlingshotIORedisCompatClient) applyDuplexReply(transport slingshotIORed
 		commandErr = entry.replies[0].Error
 	}
 	c.complete(entry.request, entry.replies, commandErr)
-	if slingshotIORedisOutstandingReplies(inFlight) == 0 {
+	if ioredisOutstandingReplies(inFlight) == 0 {
 		// socketTimeout applies only while commands await replies. ioredis
 		// leaves an otherwise idle ready connection open indefinitely.
 		transport.finishReplyWait()
@@ -787,7 +761,7 @@ func (c *SlingshotIORedisCompatClient) applyDuplexReply(transport slingshotIORed
 	return inFlight, entry.request.quit
 }
 
-func slingshotIORedisOutstandingReplies(inFlight []*slingshotIORedisInFlight) int {
+func ioredisOutstandingReplies(inFlight []*ioredisInFlight) int {
 	total := 0
 	for _, entry := range inFlight {
 		total += len(entry.request.commands) - len(entry.replies)
@@ -795,7 +769,7 @@ func slingshotIORedisOutstandingReplies(inFlight []*slingshotIORedisInFlight) in
 	return total
 }
 
-func (c *SlingshotIORedisCompatClient) firstUnscheduled(scheduled map[*slingshotIORedisRequest]bool) *slingshotIORedisRequest {
+func (c *IORedisCompatClient) firstUnscheduled(scheduled map[*ioredisRequest]bool) *ioredisRequest {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, request := range c.queue {
@@ -806,12 +780,12 @@ func (c *SlingshotIORedisCompatClient) firstUnscheduled(scheduled map[*slingshot
 	return nil
 }
 
-func (c *SlingshotIORedisCompatClient) reconcileDuplexFailure(inFlight []*slingshotIORedisInFlight, writing *slingshotIORedisRequest, writeExchange SlingshotIORedisExchange) {
+func (c *IORedisCompatClient) reconcileDuplexFailure(inFlight []*ioredisInFlight, writing *ioredisRequest, writeExchange IORedisExchange) {
 	for _, entry := range inFlight {
 		if entry.request.pipeline && len(entry.replies) > 0 {
-			replies := append([]SlingshotIORedisReply(nil), entry.replies...)
+			replies := append([]IORedisReply(nil), entry.replies...)
 			for len(replies) < len(entry.request.commands) {
-				replies = append(replies, SlingshotIORedisReply{Error: SlingshotIORedisAbortError{}})
+				replies = append(replies, IORedisReply{Error: IORedisAbortError{}})
 			}
 			c.pop(entry.request)
 			c.complete(entry.request, replies, nil)
@@ -828,30 +802,30 @@ func (c *SlingshotIORedisCompatClient) reconcileDuplexFailure(inFlight []*slings
 	}
 }
 
-func (c *SlingshotIORedisCompatClient) setNotReady() {
+func (c *IORedisCompatClient) setNotReady() {
 	c.mu.Lock()
 	c.ready = false
 	c.mu.Unlock()
 }
 
-func (c *SlingshotIORedisCompatClient) shouldDisconnect() bool {
+func (c *IORedisCompatClient) shouldDisconnect() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.disconnecting
 }
 
-func (c *SlingshotIORedisCompatClient) currentRetryDelay() time.Duration {
+func (c *IORedisCompatClient) currentRetryDelay() time.Duration {
 	c.mu.Lock()
 	attempts := c.retryAttempts
 	c.mu.Unlock()
 	return c.policy.retryDelay(attempts)
 }
 
-func (c *SlingshotIORedisCompatClient) connectionFailed(_ error) {
+func (c *IORedisCompatClient) connectionFailed(_ error) {
 	c.mu.Lock()
 	c.retryAttempts++
-	flush := c.retryAttempts%(SlingshotIORedisMaxRetriesPerRequest+1) == 0
-	var requests []*slingshotIORedisRequest
+	flush := c.retryAttempts%(IORedisMaxRetriesPerRequest+1) == 0
+	var requests []*ioredisRequest
 	if flush {
 		requests = c.queue
 		c.queue = nil
@@ -862,18 +836,18 @@ func (c *SlingshotIORedisCompatClient) connectionFailed(_ error) {
 	}
 	for _, request := range requests {
 		if request.pipeline {
-			replies := make([]SlingshotIORedisReply, len(request.commands))
+			replies := make([]IORedisReply, len(request.commands))
 			for index := range replies {
-				replies[index].Error = SlingshotIORedisMaxRetriesError{}
+				replies[index].Error = IORedisMaxRetriesError{}
 			}
 			c.complete(request, replies, nil)
 			continue
 		}
-		c.complete(request, nil, SlingshotIORedisMaxRetriesError{})
+		c.complete(request, nil, IORedisMaxRetriesError{})
 	}
 }
 
-func (c *SlingshotIORedisCompatClient) peek() *slingshotIORedisRequest {
+func (c *IORedisCompatClient) peek() *ioredisRequest {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.queue) == 0 {
@@ -882,25 +856,29 @@ func (c *SlingshotIORedisCompatClient) peek() *slingshotIORedisRequest {
 	return c.queue[0]
 }
 
-func (c *SlingshotIORedisCompatClient) pop(request *slingshotIORedisRequest) {
+func (c *IORedisCompatClient) pop(request *ioredisRequest) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.queue) > 0 && c.queue[0] == request {
+		c.queue[0] = nil
 		c.queue = c.queue[1:]
+		if len(c.queue) == 0 {
+			c.queue = nil
+		}
 	}
 }
 
-func (c *SlingshotIORedisCompatClient) complete(request *slingshotIORedisRequest, replies []SlingshotIORedisReply, err error) {
-	result := SlingshotIORedisResult{
-		Replies:          append([]SlingshotIORedisReply(nil), replies...),
+func (c *IORedisCompatClient) complete(request *ioredisRequest, replies []IORedisReply, err error) {
+	result := IORedisResult{
+		Replies:          append([]IORedisReply(nil), replies...),
 		ReplayCount:      request.replays,
 		AmbiguousReplays: request.ambiguousReplays,
 	}
 	finishIORedisCompatibilitySpan(request.span, replies, err)
-	request.future.settle(slingshotIORedisCompletion{result: result, err: err})
+	request.future.settle(ioredisCompletion{result: result, err: err})
 }
 
-func (c *SlingshotIORedisCompatClient) finishClosed(err error) {
+func (c *IORedisCompatClient) finishClosed(err error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()

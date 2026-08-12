@@ -15,7 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// The access logger keeps the legacy field shape while enforcing Commerce's
+// The access logger keeps the legacy field shape while enforcing fit-go's
 // no-PII/no-secrets telemetry boundary.
 func TestLogRequestResponse_SecureLegacyFieldShape(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -112,7 +112,7 @@ func TestLogRequestResponse_OriginalURLOptIn(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
 
 	engine := gin.New()
-	engine.Use(LogRequestResponse(LogRequestResponseConfig{Logger: logger, LegacyOriginalURL: true}))
+	engine.Use(LogRequestResponse(LogRequestResponseConfig{Logger: logger, IncludeQueryInRequestURL: true}))
 	engine.GET("/v1/items", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
 
 	engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/v1/items?limit=10&token=topsecret", nil))
@@ -170,9 +170,7 @@ func TestLogRequestResponse_TraceClueAccessShape(t *testing.T) {
 	}
 }
 
-// A catch-all (/*wildcard) route param just duplicates request_url, so it must be
-// suppressed — no path_params field for a service that mounts a wildcard + does
-// internal dispatch (the metroplex case). Named params are still logged.
+// A catch-all route duplicates request_url, so it is omitted from path_params.
 func TestLogRequestResponse_CatchAllPathParamSuppressed(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	var buf bytes.Buffer

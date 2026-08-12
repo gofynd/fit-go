@@ -31,20 +31,13 @@ import (
 )
 
 const (
-	slingshotIORedisDefaultConnectTimeout = 10 * time.Second
-	slingshotIORedisDefaultLoadingRetry   = 10 * time.Second
-	slingshotIORedisLibraryVersion        = "5.11.1"
+	ioredisDefaultConnectTimeout = 10 * time.Second
+	ioredisDefaultLoadingRetry   = 10 * time.Second
+	ioredisLibraryVersion        = "5.11.1"
 )
 
-// SlingshotIORedisRESPOptions configures the strictly opt-in standalone RESP2
-// transport used by SlingshotIORedisCompatClient. No option is read from the
-// environment and no existing fit-go Redis constructor selects this transport.
-//
-// The defaults mirror FIT.js 4.0.1 with ioredis 5.11.1: a 10-second connect
-// timeout, TCP no-delay, TCP keepalive, ready-check INFO, CLIENT SETINFO, and a
-// 10-second maximum loading retry delay. SocketTimeout remains disabled unless
-// explicitly set, just as ioredis's socketTimeout is undefined by default.
-type SlingshotIORedisRESPOptions struct {
+// IORedisRESPOptions configures the opt-in RESP2 compatibility transport.
+type IORedisRESPOptions struct {
 	Addr           string
 	Username       string
 	Password       string
@@ -61,91 +54,77 @@ type SlingshotIORedisRESPOptions struct {
 	DisableClientInfo   bool
 	DisableReadyCheck   bool
 	MaxLoadingRetryTime time.Duration
-	// clientInfoLibraryVersion is selected only by a source-pinned compatibility
-	// profile. Direct Slingshot constructors leave it empty and retain the locked
-	// ioredis 5.11.1 default.
+	// clientInfoLibraryVersion is set by patch-specific compatibility profiles.
 	clientInfoLibraryVersion string
 
-	// DialContext is an explicit test/custom-network seam. nil uses net.Dialer.
-	// Supplying it does not disable TLS; TLS is still negotiated over the
-	// returned connection when TLSConfig is non-nil.
+	// DialContext overrides network dialing. nil uses net.Dialer.
 	DialContext func(context.Context, string, string) (net.Conn, error)
 
-	// readyWait is deliberately unexported. Deterministic package tests replace
-	// loading waits without creating a production timing override that legacy
-	// FIT.js never exposed.
+	// readyWait allows deterministic package tests.
 	readyWait func(context.Context, time.Duration) bool
 }
 
-// SlingshotIORedisRESPTransportFactory owns one standalone connection per
-// Connect call and performs the complete ioredis startup handshake before
-// returning it to the compatibility queue.
-type SlingshotIORedisRESPTransportFactory struct {
-	options SlingshotIORedisRESPOptions
+// IORedisRESPTransportFactory creates ready standalone connections.
+type IORedisRESPTransportFactory struct {
+	options IORedisRESPOptions
 }
 
-// NewSlingshotIORedisRESPTransportFactory validates options and returns an
-// opt-in factory. Cluster, Sentinel, Unix sockets and RESP3 are rejected rather
-// than silently approximated.
-func NewSlingshotIORedisRESPTransportFactory(options SlingshotIORedisRESPOptions) (*SlingshotIORedisRESPTransportFactory, error) {
+// NewIORedisRESPTransportFactory validates options and returns a factory.
+func NewIORedisRESPTransportFactory(options IORedisRESPOptions) (*IORedisRESPTransportFactory, error) {
 	if strings.TrimSpace(options.Addr) == "" {
-		return nil, errors.New("Slingshot ioredis RESP address is required")
+		return nil, errors.New("ioredis RESP address is required")
 	}
 	if options.DB < 0 {
-		return nil, errors.New("Slingshot ioredis RESP database must be non-negative")
+		return nil, errors.New("ioredis RESP database must be non-negative")
 	}
 	if options.ConnectTimeout < 0 {
-		return nil, errors.New("Slingshot ioredis RESP connect timeout must be non-negative")
+		return nil, errors.New("ioredis RESP connect timeout must be non-negative")
 	}
 	if options.SocketTimeout < 0 {
-		return nil, errors.New("Slingshot ioredis RESP socket timeout must be non-negative")
+		return nil, errors.New("ioredis RESP socket timeout must be non-negative")
 	}
 	if options.KeepAlive < 0 {
-		return nil, errors.New("Slingshot ioredis RESP keepalive must be non-negative")
+		return nil, errors.New("ioredis RESP keepalive must be non-negative")
 	}
 	if options.MaxLoadingRetryTime < 0 {
-		return nil, errors.New("Slingshot ioredis RESP loading retry time must be non-negative")
+		return nil, errors.New("ioredis RESP loading retry time must be non-negative")
 	}
 	if options.ConnectTimeout == 0 {
-		options.ConnectTimeout = slingshotIORedisDefaultConnectTimeout
+		options.ConnectTimeout = ioredisDefaultConnectTimeout
 	}
 	if options.MaxLoadingRetryTime == 0 {
-		options.MaxLoadingRetryTime = slingshotIORedisDefaultLoadingRetry
+		options.MaxLoadingRetryTime = ioredisDefaultLoadingRetry
 	}
 	if options.clientInfoLibraryVersion == "" {
-		options.clientInfoLibraryVersion = slingshotIORedisLibraryVersion
+		options.clientInfoLibraryVersion = ioredisLibraryVersion
 	}
 	if options.readyWait == nil {
-		options.readyWait = waitSlingshotIORedisRESPReady
+		options.readyWait = waitIORedisRESPReady
 	}
-	return &SlingshotIORedisRESPTransportFactory{options: options}, nil
+	return &IORedisRESPTransportFactory{options: options}, nil
 }
 
-// NewSlingshotIORedisRESPCompatClient is a convenience constructor that keeps
-// the owned transport explicitly selected at the call site.
-func NewSlingshotIORedisRESPCompatClient(options SlingshotIORedisRESPOptions) (*SlingshotIORedisCompatClient, error) {
-	factory, err := NewSlingshotIORedisRESPTransportFactory(options)
+// NewIORedisRESPCompatClient creates a client using the RESP2 transport.
+func NewIORedisRESPCompatClient(options IORedisRESPOptions) (*IORedisCompatClient, error) {
+	factory, err := NewIORedisRESPTransportFactory(options)
 	if err != nil {
 		return nil, err
 	}
-	return NewSlingshotIORedisCompatClient(factory)
+	return NewIORedisCompatClient(factory)
 }
 
-// NewSlingshotIORedisRESPCompatClientReady is the opt-in, role-safe constructor
-// for Slingshot boot. It preserves the asynchronous constructor for every
-// existing caller while matching FIT.js's first ready-or-error initialization
-// promise and cleaning up the reconnect loop on failure or cancellation.
-func NewSlingshotIORedisRESPCompatClientReady(ctx context.Context, options SlingshotIORedisRESPOptions) (*SlingshotIORedisCompatClient, error) {
-	factory, err := NewSlingshotIORedisRESPTransportFactory(options)
+// NewIORedisRESPCompatClientReady waits for the RESP2 client to become ready.
+func NewIORedisRESPCompatClientReady(ctx context.Context, options IORedisRESPOptions) (*IORedisCompatClient, error) {
+	factory, err := NewIORedisRESPTransportFactory(options)
 	if err != nil {
 		return nil, err
 	}
-	return NewSlingshotIORedisCompatClientReady(ctx, factory)
+	return NewIORedisCompatClientReady(ctx, factory)
 }
 
-func (f *SlingshotIORedisRESPTransportFactory) Connect(ctx context.Context) (SlingshotIORedisTransport, error) {
+func (f *IORedisRESPTransportFactory) Connect(ctx context.Context) (IORedisTransport, error) {
 	if f == nil {
-		return nil, errors.New("Slingshot ioredis RESP transport factory is not configured")
+		return nil, errors.New("ioredis RESP transport factory is not configured")
 	}
 	options := f.options
 	dialCtx, cancel := context.WithTimeout(ctx, options.ConnectTimeout)
@@ -184,7 +163,7 @@ func (f *SlingshotIORedisRESPTransportFactory) Connect(ctx context.Context) (Sli
 			}
 		}
 	}
-	trackedConnection := &slingshotIORedisRESPCountingConn{Conn: connection}
+	trackedConnection := &ioredisRESPCountingConn{Conn: connection}
 	connection = trackedConnection
 
 	if options.TLSConfig != nil {
@@ -203,7 +182,7 @@ func (f *SlingshotIORedisRESPTransportFactory) Connect(ctx context.Context) (Sli
 		connection = tlsConnection
 	}
 
-	transport := newSlingshotIORedisRESPTransport(connection, options.SocketTimeout, trackedConnection)
+	transport := newIORedisRESPTransport(connection, options.SocketTimeout, trackedConnection)
 	// ioredis clears connectTimeout on TCP/TLS connect. AUTH, SELECT, client
 	// metadata and INFO therefore use the caller lifetime plus socket timeout,
 	// not the connect timeout.
@@ -215,7 +194,7 @@ func (f *SlingshotIORedisRESPTransportFactory) Connect(ctx context.Context) (Sli
 	return transport, nil
 }
 
-func (f *SlingshotIORedisRESPTransportFactory) startup(ctx context.Context, transport *slingshotIORedisRESPTransport) error {
+func (f *IORedisRESPTransportFactory) startup(ctx context.Context, transport *ioredisRESPTransport) error {
 	options := f.options
 	commands := make([][]string, 0, 5)
 	authIndex := -1
@@ -248,7 +227,7 @@ func (f *SlingshotIORedisRESPTransportFactory) startup(ctx context.Context, tran
 		if exchange.Error != nil {
 			return exchange.Error
 		}
-		if authIndex >= 0 && exchange.Replies[authIndex].Error != nil && !slingshotIORedisToleratesAuthError(exchange.Replies[authIndex].Error) {
+		if authIndex >= 0 && exchange.Replies[authIndex].Error != nil && !ioredisToleratesAuthError(exchange.Replies[authIndex].Error) {
 			return exchange.Replies[authIndex].Error
 		}
 		// FIT.js rejects its initialization promise on a SELECT error before
@@ -279,28 +258,28 @@ func (f *SlingshotIORedisRESPTransportFactory) startup(ctx context.Context, tran
 		if !ok {
 			return nil
 		}
-		fields := parseSlingshotIORedisINFO(info)
+		fields := parseIORedisINFO(info)
 		if fields["loading"] == "" || fields["loading"] == "0" {
 			return nil
 		}
-		delay := slingshotIORedisLoadingDelay(fields["loading_eta_seconds"], options.MaxLoadingRetryTime)
+		delay := ioredisLoadingDelay(fields["loading_eta_seconds"], options.MaxLoadingRetryTime)
 		if !options.readyWait(ctx, delay) {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			return errors.New("Slingshot ioredis RESP ready wait stopped")
+			return errors.New("ioredis RESP ready wait stopped")
 		}
 	}
 }
 
-func slingshotIORedisToleratesAuthError(err error) bool {
+func ioredisToleratesAuthError(err error) bool {
 	message := err.Error()
 	return strings.Contains(message, "no password is set") ||
 		strings.Contains(message, "without any password configured for the default user") ||
 		strings.Contains(message, "wrong number of arguments for 'auth' command")
 }
 
-func parseSlingshotIORedisINFO(value string) map[string]string {
+func parseIORedisINFO(value string) map[string]string {
 	fields := make(map[string]string)
 	for _, line := range strings.Split(value, "\r\n") {
 		name, fieldValue, found := strings.Cut(line, ":")
@@ -311,7 +290,7 @@ func parseSlingshotIORedisINFO(value string) map[string]string {
 	return fields
 }
 
-func slingshotIORedisLoadingDelay(eta string, maximum time.Duration) time.Duration {
+func ioredisLoadingDelay(eta string, maximum time.Duration) time.Duration {
 	seconds := float64(1)
 	if eta != "" {
 		if parsed, err := strconv.ParseFloat(eta, 64); err == nil {
@@ -327,7 +306,7 @@ func slingshotIORedisLoadingDelay(eta string, maximum time.Duration) time.Durati
 	return delay
 }
 
-func waitSlingshotIORedisRESPReady(ctx context.Context, delay time.Duration) bool {
+func waitIORedisRESPReady(ctx context.Context, delay time.Duration) bool {
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
@@ -338,16 +317,16 @@ func waitSlingshotIORedisRESPReady(ctx context.Context, delay time.Duration) boo
 	}
 }
 
-type slingshotIORedisRESPRead struct {
-	reply SlingshotIORedisReply
+type ioredisRESPRead struct {
+	reply IORedisReply
 	err   error
 }
 
-type slingshotIORedisRESPTransport struct {
+type ioredisRESPTransport struct {
 	connection    net.Conn
-	writeCounter  *slingshotIORedisRESPCountingConn
+	writeCounter  *ioredisRESPCountingConn
 	socketTimeout time.Duration
-	replies       chan slingshotIORedisRESPRead
+	replies       chan ioredisRESPRead
 	closed        chan struct{}
 	closeOnce     sync.Once
 	exchangeMu    sync.Mutex
@@ -355,21 +334,21 @@ type slingshotIORedisRESPTransport struct {
 	awaitingReply atomic.Bool
 }
 
-func newSlingshotIORedisRESPTransport(connection net.Conn, socketTimeout time.Duration, writeCounter *slingshotIORedisRESPCountingConn) *slingshotIORedisRESPTransport {
-	transport := &slingshotIORedisRESPTransport{
+func newIORedisRESPTransport(connection net.Conn, socketTimeout time.Duration, writeCounter *ioredisRESPCountingConn) *ioredisRESPTransport {
+	transport := &ioredisRESPTransport{
 		connection:    connection,
 		writeCounter:  writeCounter,
 		socketTimeout: socketTimeout,
-		replies:       make(chan slingshotIORedisRESPRead, 1),
+		replies:       make(chan ioredisRESPRead, 1),
 		closed:        make(chan struct{}),
 	}
 	go transport.readLoop()
 	return transport
 }
 
-func (t *slingshotIORedisRESPTransport) Closed() <-chan struct{} { return t.closed }
+func (t *ioredisRESPTransport) Closed() <-chan struct{} { return t.closed }
 
-func (t *slingshotIORedisRESPTransport) Close() error {
+func (t *ioredisRESPTransport) Close() error {
 	if t == nil {
 		return nil
 	}
@@ -381,12 +360,12 @@ func (t *slingshotIORedisRESPTransport) Close() error {
 	return closeErr
 }
 
-func (t *slingshotIORedisRESPTransport) Exchange(ctx context.Context, commands [][]string) SlingshotIORedisExchange {
+func (t *ioredisRESPTransport) Exchange(ctx context.Context, commands [][]string) IORedisExchange {
 	if t == nil || t.connection == nil {
-		return SlingshotIORedisExchange{WriteDisposition: SlingshotIORedisNotWritten, Error: errors.New("Slingshot ioredis RESP transport is not configured")}
+		return IORedisExchange{WriteDisposition: IORedisNotWritten, Error: errors.New("ioredis RESP transport is not configured")}
 	}
 	if len(commands) == 0 {
-		return SlingshotIORedisExchange{WriteDisposition: SlingshotIORedisNotWritten, Error: errors.New("Slingshot ioredis RESP exchange is empty")}
+		return IORedisExchange{WriteDisposition: IORedisNotWritten, Error: errors.New("ioredis RESP exchange is empty")}
 	}
 
 	t.exchangeMu.Lock()
@@ -408,21 +387,21 @@ func (t *slingshotIORedisRESPTransport) Exchange(ctx context.Context, commands [
 	return exchange
 }
 
-func (t *slingshotIORedisRESPTransport) writeCommands(_ context.Context, commands [][]string) SlingshotIORedisExchange {
+func (t *ioredisRESPTransport) writeCommands(_ context.Context, commands [][]string) IORedisExchange {
 	if t == nil || t.connection == nil {
-		return SlingshotIORedisExchange{WriteDisposition: SlingshotIORedisNotWritten, Error: errors.New("Slingshot ioredis RESP transport is not configured")}
+		return IORedisExchange{WriteDisposition: IORedisNotWritten, Error: errors.New("ioredis RESP transport is not configured")}
 	}
 	if len(commands) == 0 {
-		return SlingshotIORedisExchange{WriteDisposition: SlingshotIORedisNotWritten, Error: errors.New("Slingshot ioredis RESP exchange is empty")}
+		return IORedisExchange{WriteDisposition: IORedisNotWritten, Error: errors.New("ioredis RESP exchange is empty")}
 	}
 
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
-	wire, err := encodeSlingshotIORedisRESPCommands(commands)
+	wire, err := encodeIORedisRESPCommands(commands)
 	if err != nil {
-		return SlingshotIORedisExchange{WriteDisposition: SlingshotIORedisNotWritten, Error: err}
+		return IORedisExchange{WriteDisposition: IORedisNotWritten, Error: err}
 	}
-	exchange := SlingshotIORedisExchange{BytesTotal: len(wire), WriteDisposition: SlingshotIORedisNotWritten}
+	exchange := IORedisExchange{BytesTotal: len(wire), WriteDisposition: IORedisNotWritten}
 	networkStart := t.networkBytesWritten()
 
 	written := 0
@@ -432,13 +411,13 @@ func (t *slingshotIORedisRESPTransport) writeCommands(_ context.Context, command
 			written += count
 			exchange.BytesWritten = written
 			exchange.MayHaveExecuted = true
-			exchange.WriteDisposition = SlingshotIORedisPartiallyWritten
+			exchange.WriteDisposition = IORedisPartiallyWritten
 		}
 		if writeErr != nil {
 			exchange.NetworkBytesWritten = t.networkBytesWritten() - networkStart
 			if exchange.NetworkBytesWritten > 0 {
 				exchange.MayHaveExecuted = true
-				exchange.WriteDisposition = SlingshotIORedisPartiallyWritten
+				exchange.WriteDisposition = IORedisPartiallyWritten
 			}
 			exchange.Error = writeErr
 			_ = t.Close()
@@ -448,7 +427,7 @@ func (t *slingshotIORedisRESPTransport) writeCommands(_ context.Context, command
 			exchange.NetworkBytesWritten = t.networkBytesWritten() - networkStart
 			if exchange.NetworkBytesWritten > 0 {
 				exchange.MayHaveExecuted = true
-				exchange.WriteDisposition = SlingshotIORedisPartiallyWritten
+				exchange.WriteDisposition = IORedisPartiallyWritten
 			}
 			exchange.Error = io.ErrNoProgress
 			_ = t.Close()
@@ -456,46 +435,46 @@ func (t *slingshotIORedisRESPTransport) writeCommands(_ context.Context, command
 		}
 	}
 	exchange.NetworkBytesWritten = t.networkBytesWritten() - networkStart
-	exchange.WriteDisposition = SlingshotIORedisFullyWritten
+	exchange.WriteDisposition = IORedisFullyWritten
 	return exchange
 }
 
-func (t *slingshotIORedisRESPTransport) readReply(ctx context.Context) (SlingshotIORedisReply, error) {
+func (t *ioredisRESPTransport) readReply(ctx context.Context) (IORedisReply, error) {
 	if t == nil || t.connection == nil {
-		return SlingshotIORedisReply{}, errors.New("Slingshot ioredis RESP transport is not configured")
+		return IORedisReply{}, errors.New("ioredis RESP transport is not configured")
 	}
 	t.awaitingReply.Store(true)
 	if t.socketTimeout > 0 {
 		if err := t.connection.SetReadDeadline(time.Now().Add(t.socketTimeout)); err != nil {
 			_ = t.Close()
-			return SlingshotIORedisReply{}, err
+			return IORedisReply{}, err
 		}
 	}
 	select {
 	case result := <-t.replies:
 		if result.err != nil {
-			return SlingshotIORedisReply{}, t.normalizeReadError(result.err)
+			return IORedisReply{}, t.normalizeReadError(result.err)
 		}
 		return result.reply, nil
 	case <-ctx.Done():
 		_ = t.Close()
-		return SlingshotIORedisReply{}, ctx.Err()
+		return IORedisReply{}, ctx.Err()
 	case <-t.closed:
 		// The reader publishes its precise error before closing. Prefer it if
 		// already available, otherwise use the legacy close text.
 		select {
 		case result := <-t.replies:
 			if result.err != nil {
-				return SlingshotIORedisReply{}, t.normalizeReadError(result.err)
+				return IORedisReply{}, t.normalizeReadError(result.err)
 			}
 			return result.reply, nil
 		default:
-			return SlingshotIORedisReply{}, SlingshotIORedisConnectionClosedError{}
+			return IORedisReply{}, IORedisConnectionClosedError{}
 		}
 	}
 }
 
-func (t *slingshotIORedisRESPTransport) finishReplyWait() {
+func (t *ioredisRESPTransport) finishReplyWait() {
 	if t == nil || t.connection == nil {
 		return
 	}
@@ -505,16 +484,16 @@ func (t *slingshotIORedisRESPTransport) finishReplyWait() {
 	}
 }
 
-func (t *slingshotIORedisRESPTransport) networkBytesWritten() int64 {
+func (t *ioredisRESPTransport) networkBytesWritten() int64 {
 	if t.writeCounter == nil {
 		return 0
 	}
 	return t.writeCounter.written.Load()
 }
 
-func (t *slingshotIORedisRESPTransport) normalizeReadError(err error) error {
+func (t *ioredisRESPTransport) normalizeReadError(err error) error {
 	if err == nil {
-		return SlingshotIORedisConnectionClosedError{}
+		return IORedisConnectionClosedError{}
 	}
 	var networkError net.Error
 	if t.socketTimeout > 0 && errors.As(err, &networkError) && networkError.Timeout() {
@@ -523,13 +502,13 @@ func (t *slingshotIORedisRESPTransport) normalizeReadError(err error) error {
 	return err
 }
 
-func (t *slingshotIORedisRESPTransport) readLoop() {
-	reader := bufio.NewReader(slingshotIORedisRESPActivityReader{transport: t})
+func (t *ioredisRESPTransport) readLoop() {
+	reader := bufio.NewReader(ioredisRESPActivityReader{transport: t})
 	for {
-		value, replyErr, err := readSlingshotIORedisRESPValue(reader)
+		value, replyErr, err := readIORedisRESPValue(reader)
 		if err != nil {
 			select {
-			case t.replies <- slingshotIORedisRESPRead{err: err}:
+			case t.replies <- ioredisRESPRead{err: err}:
 			case <-t.closed:
 				return
 			}
@@ -537,29 +516,29 @@ func (t *slingshotIORedisRESPTransport) readLoop() {
 			return
 		}
 		select {
-		case t.replies <- slingshotIORedisRESPRead{reply: SlingshotIORedisReply{Value: value, Error: replyErr}}:
+		case t.replies <- ioredisRESPRead{reply: IORedisReply{Value: value, Error: replyErr}}:
 		case <-t.closed:
 			return
 		}
 	}
 }
 
-type slingshotIORedisRESPActivityReader struct {
-	transport *slingshotIORedisRESPTransport
+type ioredisRESPActivityReader struct {
+	transport *ioredisRESPTransport
 }
 
-type slingshotIORedisRESPCountingConn struct {
+type ioredisRESPCountingConn struct {
 	net.Conn
 	written atomic.Int64
 }
 
-func (c *slingshotIORedisRESPCountingConn) Write(buffer []byte) (int, error) {
+func (c *ioredisRESPCountingConn) Write(buffer []byte) (int, error) {
 	count, err := c.Conn.Write(buffer)
 	c.written.Add(int64(count))
 	return count, err
 }
 
-func (r slingshotIORedisRESPActivityReader) Read(buffer []byte) (int, error) {
+func (r ioredisRESPActivityReader) Read(buffer []byte) (int, error) {
 	count, err := r.transport.connection.Read(buffer)
 	if count > 0 && r.transport.socketTimeout > 0 && r.transport.awaitingReply.Load() {
 		// ioredis resets socketTimeout on every data event, including a partial
@@ -569,11 +548,11 @@ func (r slingshotIORedisRESPActivityReader) Read(buffer []byte) (int, error) {
 	return count, err
 }
 
-func encodeSlingshotIORedisRESPCommands(commands [][]string) ([]byte, error) {
+func encodeIORedisRESPCommands(commands [][]string) ([]byte, error) {
 	var buffer bytes.Buffer
 	for _, command := range commands {
 		if len(command) == 0 || command[0] == "" {
-			return nil, errors.New("Slingshot ioredis RESP command is empty")
+			return nil, errors.New("ioredis RESP command is empty")
 		}
 		fmt.Fprintf(&buffer, "*%d\r\n", len(command))
 		for _, argument := range command {
@@ -585,23 +564,23 @@ func encodeSlingshotIORedisRESPCommands(commands [][]string) ([]byte, error) {
 	return buffer.Bytes(), nil
 }
 
-func readSlingshotIORedisRESPValue(reader *bufio.Reader) (any, error, error) {
+func readIORedisRESPValue(reader *bufio.Reader) (any, error, error) {
 	prefix, err := reader.ReadByte()
 	if err != nil {
 		return nil, nil, err
 	}
 	switch prefix {
 	case '+':
-		line, err := readSlingshotIORedisRESPLine(reader)
+		line, err := readIORedisRESPLine(reader)
 		return line, nil, err
 	case '-':
-		line, err := readSlingshotIORedisRESPLine(reader)
+		line, err := readIORedisRESPLine(reader)
 		if err != nil {
 			return nil, nil, err
 		}
 		return nil, errors.New(line), nil
 	case ':':
-		line, err := readSlingshotIORedisRESPLine(reader)
+		line, err := readIORedisRESPLine(reader)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -611,7 +590,7 @@ func readSlingshotIORedisRESPValue(reader *bufio.Reader) (any, error, error) {
 		}
 		return integer, nil, nil
 	case '$':
-		line, err := readSlingshotIORedisRESPLine(reader)
+		line, err := readIORedisRESPLine(reader)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -634,7 +613,7 @@ func readSlingshotIORedisRESPValue(reader *bufio.Reader) (any, error, error) {
 		}
 		return string(payload[:len(payload)-2]), nil, nil
 	case '*':
-		line, err := readSlingshotIORedisRESPLine(reader)
+		line, err := readIORedisRESPLine(reader)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -650,7 +629,7 @@ func readSlingshotIORedisRESPValue(reader *bufio.Reader) (any, error, error) {
 		}
 		values := make([]any, int(length))
 		for index := range values {
-			value, replyErr, err := readSlingshotIORedisRESPValue(reader)
+			value, replyErr, err := readIORedisRESPValue(reader)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -666,7 +645,7 @@ func readSlingshotIORedisRESPValue(reader *bufio.Reader) (any, error, error) {
 	}
 }
 
-func readSlingshotIORedisRESPLine(reader *bufio.Reader) (string, error) {
+func readIORedisRESPLine(reader *bufio.Reader) (string, error) {
 	line, err := reader.ReadString('\n')
 	if err != nil {
 		return "", err

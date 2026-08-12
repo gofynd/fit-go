@@ -31,7 +31,7 @@ import (
 	"time"
 )
 
-func TestSlingshotIORedisLockedDefaults(t *testing.T) {
+func TestIORedisLockedDefaults(t *testing.T) {
 	want := []time.Duration{
 		50 * time.Millisecond, 100 * time.Millisecond, 150 * time.Millisecond,
 		200 * time.Millisecond, 250 * time.Millisecond, 300 * time.Millisecond,
@@ -42,22 +42,22 @@ func TestSlingshotIORedisLockedDefaults(t *testing.T) {
 		950 * time.Millisecond, time.Second,
 	}
 	for index, expected := range want {
-		if got := SlingshotIORedisRetryDelay(index + 1); got != expected {
+		if got := IORedisRetryDelay(index + 1); got != expected {
 			t.Fatalf("retry delay %d = %v, want %v", index+1, got, expected)
 		}
 	}
-	if got := SlingshotIORedisRetryDelay(40); got != 2*time.Second {
+	if got := IORedisRetryDelay(40); got != 2*time.Second {
 		t.Fatalf("retry delay cap = %v, want 2s", got)
 	}
-	if got := (SlingshotIORedisMaxRetriesError{}).Error(); got != `Reached the max retries per request limit (which is 20). Refer to "maxRetriesPerRequest" option for details.` {
+	if got := (IORedisMaxRetriesError{}).Error(); got != `Reached the max retries per request limit (which is 20). Refer to "maxRetriesPerRequest" option for details.` {
 		t.Fatalf("max retries error = %q", got)
 	}
 }
 
-func TestSlingshotIORedisFirstReadyRejectsFirstErrorAndStopsReconnect(t *testing.T) {
+func TestIORedisFirstReadyRejectsFirstErrorAndStopsReconnect(t *testing.T) {
 	want := errors.New("initial Redis unavailable")
 	var attempts atomic.Int32
-	client, err := NewSlingshotIORedisCompatClientReady(context.Background(), SlingshotIORedisTransportFactoryFunc(func(context.Context) (SlingshotIORedisTransport, error) {
+	client, err := NewIORedisCompatClientReady(context.Background(), IORedisTransportFactoryFunc(func(context.Context) (IORedisTransport, error) {
 		attempts.Add(1)
 		return nil, want
 	}))
@@ -70,11 +70,11 @@ func TestSlingshotIORedisFirstReadyRejectsFirstErrorAndStopsReconnect(t *testing
 	}
 }
 
-func TestSlingshotIORedisFirstReadyWaitsForDelayedSuccess(t *testing.T) {
+func TestIORedisFirstReadyWaitsForDelayedSuccess(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
-	transport := newSignaledSlingshotTransport()
-	factory := SlingshotIORedisTransportFactoryFunc(func(ctx context.Context) (SlingshotIORedisTransport, error) {
+	transport := newSignaledIORedisTestTransport()
+	factory := IORedisTransportFactoryFunc(func(ctx context.Context) (IORedisTransport, error) {
 		close(started)
 		select {
 		case <-release:
@@ -83,10 +83,10 @@ func TestSlingshotIORedisFirstReadyWaitsForDelayedSuccess(t *testing.T) {
 			return nil, ctx.Err()
 		}
 	})
-	result := make(chan *SlingshotIORedisCompatClient, 1)
+	result := make(chan *IORedisCompatClient, 1)
 	failures := make(chan error, 1)
 	go func() {
-		client, err := NewSlingshotIORedisCompatClientReady(context.Background(), factory)
+		client, err := NewIORedisCompatClientReady(context.Background(), factory)
 		result <- client
 		failures <- err
 	}()
@@ -104,11 +104,11 @@ func TestSlingshotIORedisFirstReadyWaitsForDelayedSuccess(t *testing.T) {
 	client.Disconnect()
 }
 
-func TestSlingshotIORedisFirstReadyContextCancellationCleansLoop(t *testing.T) {
+func TestIORedisFirstReadyContextCancellationCleansLoop(t *testing.T) {
 	started := make(chan struct{})
 	stopped := make(chan struct{})
 	var once sync.Once
-	factory := SlingshotIORedisTransportFactoryFunc(func(ctx context.Context) (SlingshotIORedisTransport, error) {
+	factory := IORedisTransportFactoryFunc(func(ctx context.Context) (IORedisTransport, error) {
 		once.Do(func() { close(started) })
 		<-ctx.Done()
 		close(stopped)
@@ -117,7 +117,7 @@ func TestSlingshotIORedisFirstReadyContextCancellationCleansLoop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		client, err := NewSlingshotIORedisCompatClientReady(ctx, factory)
+		client, err := NewIORedisCompatClientReady(ctx, factory)
 		if client != nil {
 			client.Disconnect()
 		}
@@ -135,38 +135,38 @@ func TestSlingshotIORedisFirstReadyContextCancellationCleansLoop(t *testing.T) {
 	}
 }
 
-func TestSlingshotIORedisFirstReadySuccessKeepsReconnectLifecycle(t *testing.T) {
-	server := startSlingshotLoopbackServer(t, "", nil)
+func TestIORedisFirstReadySuccessKeepsReconnectLifecycle(t *testing.T) {
+	server := startIORedisLoopbackServer(t, "", nil)
 	defer server.stop()
-	first := newSignaledSlingshotTransport()
+	first := newSignaledIORedisTestTransport()
 	var calls atomic.Int32
-	factory := SlingshotIORedisTransportFactoryFunc(func(ctx context.Context) (SlingshotIORedisTransport, error) {
+	factory := IORedisTransportFactoryFunc(func(ctx context.Context) (IORedisTransport, error) {
 		if calls.Add(1) == 1 {
 			return first, nil
 		}
-		return (&slingshotLoopbackFactory{addr: server.addr}).Connect(ctx)
+		return (&ioredisLoopbackFactory{addr: server.addr}).Connect(ctx)
 	})
-	client, err := NewSlingshotIORedisCompatClientReady(context.Background(), factory)
+	client, err := NewIORedisCompatClientReady(context.Background(), factory)
 	if err != nil {
-		t.Fatalf("NewSlingshotIORedisCompatClientReady: %v", err)
+		t.Fatalf("NewIORedisCompatClientReady: %v", err)
 	}
 	defer client.Disconnect()
 	first.signalRemoteClose()
-	waitForSlingshotCondition(t, time.Second, func() bool { return calls.Load() >= 2 })
+	waitForIORedisCondition(t, time.Second, func() bool { return calls.Load() >= 2 })
 	future := client.Submit("SET", "after-first-ready", "1")
-	assertSlingshotFutureOK(t, future, "OK", 0, 0)
+	assertIORedisFutureOK(t, future, "OK", 0, 0)
 	if calls.Load() < 2 {
 		t.Fatalf("factory calls = %d, want reconnect after first-ready", calls.Load())
 	}
 }
 
-func TestSlingshotIORedisFirstReadyConcurrentWaitersObserveImmutableResult(t *testing.T) {
-	transport := newSignaledSlingshotTransport()
-	client, err := NewSlingshotIORedisCompatClient(SlingshotIORedisTransportFactoryFunc(func(context.Context) (SlingshotIORedisTransport, error) {
+func TestIORedisFirstReadyConcurrentWaitersObserveImmutableResult(t *testing.T) {
+	transport := newSignaledIORedisTestTransport()
+	client, err := NewIORedisCompatClient(IORedisTransportFactoryFunc(func(context.Context) (IORedisTransport, error) {
 		return transport, nil
 	}))
 	if err != nil {
-		t.Fatalf("NewSlingshotIORedisCompatClient: %v", err)
+		t.Fatalf("NewIORedisCompatClient: %v", err)
 	}
 	defer client.Disconnect()
 
@@ -192,11 +192,11 @@ func TestSlingshotIORedisFirstReadyConcurrentWaitersObserveImmutableResult(t *te
 	}
 }
 
-func TestSlingshotIORedisFirstReadyWaiterCancellationDoesNotStopClient(t *testing.T) {
+func TestIORedisFirstReadyWaiterCancellationDoesNotStopClient(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
-	transport := newSignaledSlingshotTransport()
-	client, err := NewSlingshotIORedisCompatClient(SlingshotIORedisTransportFactoryFunc(func(ctx context.Context) (SlingshotIORedisTransport, error) {
+	transport := newSignaledIORedisTestTransport()
+	client, err := NewIORedisCompatClient(IORedisTransportFactoryFunc(func(ctx context.Context) (IORedisTransport, error) {
 		close(started)
 		select {
 		case <-release:
@@ -206,7 +206,7 @@ func TestSlingshotIORedisFirstReadyWaiterCancellationDoesNotStopClient(t *testin
 		}
 	}))
 	if err != nil {
-		t.Fatalf("NewSlingshotIORedisCompatClient: %v", err)
+		t.Fatalf("NewIORedisCompatClient: %v", err)
 	}
 	defer client.Disconnect()
 	<-started
@@ -221,15 +221,15 @@ func TestSlingshotIORedisFirstReadyWaiterCancellationDoesNotStopClient(t *testin
 	}
 }
 
-func TestSlingshotIORedisDisconnectBeforeFirstReadySettlesAllWaiters(t *testing.T) {
+func TestIORedisDisconnectBeforeFirstReadySettlesAllWaiters(t *testing.T) {
 	started := make(chan struct{})
-	client, err := NewSlingshotIORedisCompatClient(SlingshotIORedisTransportFactoryFunc(func(ctx context.Context) (SlingshotIORedisTransport, error) {
+	client, err := NewIORedisCompatClient(IORedisTransportFactoryFunc(func(ctx context.Context) (IORedisTransport, error) {
 		close(started)
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}))
 	if err != nil {
-		t.Fatalf("NewSlingshotIORedisCompatClient: %v", err)
+		t.Fatalf("NewIORedisCompatClient: %v", err)
 	}
 	<-started
 
@@ -240,35 +240,35 @@ func TestSlingshotIORedisDisconnectBeforeFirstReadySettlesAllWaiters(t *testing.
 	}
 	client.Disconnect()
 	for range waiters {
-		var closed SlingshotIORedisConnectionClosedError
+		var closed IORedisConnectionClosedError
 		if waiterErr := <-results; !errors.As(waiterErr, &closed) {
 			t.Fatalf("disconnect-before-ready waiter error = %v, want connection closed", waiterErr)
 		}
 	}
-	var closed SlingshotIORedisConnectionClosedError
+	var closed IORedisConnectionClosedError
 	if err := client.WaitForFirstReady(context.Background()); !errors.As(err, &closed) {
 		t.Fatalf("repeated disconnect-before-ready error = %v, want connection closed", err)
 	}
 }
 
-func TestSlingshotIORedisSharedOfflineFIFORecoversOnLoopback(t *testing.T) {
-	addr := reserveSlingshotLoopbackAddr(t)
+func TestIORedisSharedOfflineFIFORecoversOnLoopback(t *testing.T) {
+	addr := reserveIORedisLoopbackAddr(t)
 	var attempts atomic.Int32
-	factory := &slingshotLoopbackFactory{addr: addr, attempts: &attempts}
-	client, err := NewSlingshotIORedisCompatClient(factory)
+	factory := &ioredisLoopbackFactory{addr: addr, attempts: &attempts}
+	client, err := NewIORedisCompatClient(factory)
 	if err != nil {
-		t.Fatalf("NewSlingshotIORedisCompatClient: %v", err)
+		t.Fatalf("NewIORedisCompatClient: %v", err)
 	}
 	t.Cleanup(client.Disconnect)
 
 	first := client.Submit("SET", "first", "1")
 	second := client.Submit("SET", "second", "2")
-	waitForSlingshotCondition(t, time.Second, func() bool { return attempts.Load() >= 2 })
-	server := startSlingshotLoopbackServer(t, addr, nil)
+	waitForIORedisCondition(t, time.Second, func() bool { return attempts.Load() >= 2 })
+	server := startIORedisLoopbackServer(t, addr, nil)
 	t.Cleanup(server.stop)
 
-	assertSlingshotFutureOK(t, first, "OK", 0, 0)
-	assertSlingshotFutureOK(t, second, "OK", 0, 0)
+	assertIORedisFutureOK(t, first, "OK", 0, 0)
+	assertIORedisFutureOK(t, second, "OK", 0, 0)
 	if got := server.commandKeys(); strings.Join(got, ",") != "first,second" {
 		t.Fatalf("recovered command order = %v, want [first second]", got)
 	}
@@ -277,64 +277,64 @@ func TestSlingshotIORedisSharedOfflineFIFORecoversOnLoopback(t *testing.T) {
 	}
 }
 
-func TestSlingshotIORedisLostReplyReplaysBeforeLaterFIFOItem(t *testing.T) {
-	server := startSlingshotLoopbackServer(t, "", func(sequence int, _ []string) slingshotLoopbackAction {
+func TestIORedisLostReplyReplaysBeforeLaterFIFOItem(t *testing.T) {
+	server := startIORedisLoopbackServer(t, "", func(sequence int, _ []string) ioredisLoopbackAction {
 		if sequence == 1 {
-			return slingshotLoopbackCloseWithoutReply
+			return ioredisLoopbackCloseWithoutReply
 		}
-		return slingshotLoopbackReplyOK
+		return ioredisLoopbackReplyOK
 	})
 	defer server.stop()
-	client := newFastSlingshotIORedisClient(t, &slingshotLoopbackFactory{addr: server.addr})
+	client := newFastIORedisClient(t, &ioredisLoopbackFactory{addr: server.addr})
 	defer client.Disconnect()
 
 	first := client.Submit("SET", "first", "1")
 	second := client.Submit("SET", "second", "2")
-	assertSlingshotFutureOK(t, first, "OK", 1, 1)
-	assertSlingshotFutureOK(t, second, "OK", 0, 0)
+	assertIORedisFutureOK(t, first, "OK", 1, 1)
+	assertIORedisFutureOK(t, second, "OK", 0, 0)
 	if got := server.commandKeys(); strings.Join(got, ",") != "first,first,second" {
 		t.Fatalf("lost-reply replay order = %v, want [first first second]", got)
 	}
 }
 
-func TestSlingshotIORedisDuplexPreservesPriorReplyAcrossLaterWriteFailure(t *testing.T) {
-	server := startSlingshotLoopbackServer(t, "", nil)
+func TestIORedisDuplexPreservesPriorReplyAcrossLaterWriteFailure(t *testing.T) {
+	server := startIORedisLoopbackServer(t, "", nil)
 	defer server.stop()
-	firstTransport := newReplyBeforeWriteFailureSlingshotTransport()
+	firstTransport := newReplyBeforeWriteFailureIORedisTestTransport()
 	var connections atomic.Int32
-	factory := SlingshotIORedisTransportFactoryFunc(func(ctx context.Context) (SlingshotIORedisTransport, error) {
+	factory := IORedisTransportFactoryFunc(func(ctx context.Context) (IORedisTransport, error) {
 		if connections.Add(1) == 1 {
 			return firstTransport, nil
 		}
-		return (&slingshotLoopbackFactory{addr: server.addr}).Connect(ctx)
+		return (&ioredisLoopbackFactory{addr: server.addr}).Connect(ctx)
 	})
-	client := newFastSlingshotIORedisClient(t, factory)
+	client := newFastIORedisClient(t, factory)
 	defer client.Disconnect()
 
 	first := client.Submit("SET", "first", "1")
 	second := client.Submit("SET", "second", "2")
-	assertSlingshotFutureOK(t, first, "OK", 0, 0)
-	assertSlingshotFutureOK(t, second, "OK", 1, 1)
+	assertIORedisFutureOK(t, first, "OK", 0, 0)
+	assertIORedisFutureOK(t, second, "OK", 1, 1)
 	if got := server.commandKeys(); !reflect.DeepEqual(got, []string{"second"}) {
 		t.Fatalf("reconnected command keys = %v, want only uncertain second command", got)
 	}
 }
 
-func TestSlingshotIORedisIdleCloseEntersSharedReconnectLifecycle(t *testing.T) {
-	server := startSlingshotLoopbackServer(t, "", nil)
+func TestIORedisIdleCloseEntersSharedReconnectLifecycle(t *testing.T) {
+	server := startIORedisLoopbackServer(t, "", nil)
 	defer server.stop()
-	idle := newSignaledSlingshotTransport()
+	idle := newSignaledIORedisTestTransport()
 	var calls atomic.Int32
-	factory := SlingshotIORedisTransportFactoryFunc(func(ctx context.Context) (SlingshotIORedisTransport, error) {
+	factory := IORedisTransportFactoryFunc(func(ctx context.Context) (IORedisTransport, error) {
 		if calls.Add(1) == 1 {
 			return idle, nil
 		}
-		return (&slingshotLoopbackFactory{addr: server.addr}).Connect(ctx)
+		return (&ioredisLoopbackFactory{addr: server.addr}).Connect(ctx)
 	})
 	retryWait := make(chan struct{}, 1)
 	releaseRetry := make(chan struct{})
-	client, err := newSlingshotIORedisCompatClient(factory, slingshotIORedisPolicy{
-		retryDelay: SlingshotIORedisRetryDelay,
+	client, err := newIORedisCompatClient(factory, ioredisPolicy{
+		retryDelay: IORedisRetryDelay,
 		wait: func(ctx context.Context, _ time.Duration) bool {
 			retryWait <- struct{}{}
 			select {
@@ -346,7 +346,7 @@ func TestSlingshotIORedisIdleCloseEntersSharedReconnectLifecycle(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("newSlingshotIORedisCompatClient: %v", err)
+		t.Fatalf("newIORedisCompatClient: %v", err)
 	}
 	defer client.Disconnect()
 	idle.signalRemoteClose()
@@ -357,21 +357,21 @@ func TestSlingshotIORedisIdleCloseEntersSharedReconnectLifecycle(t *testing.T) {
 	}
 	future := client.Submit("SET", "after-idle-close", "1")
 	close(releaseRetry)
-	assertSlingshotFutureOK(t, future, "OK", 0, 0)
+	assertIORedisFutureOK(t, future, "OK", 0, 0)
 	if calls.Load() < 2 {
 		t.Fatalf("factory calls = %d, want reconnect after idle close", calls.Load())
 	}
 }
 
-func TestSlingshotIORedisPartialPipelineAbortsUnreadSuffix(t *testing.T) {
-	server := startSlingshotLoopbackServer(t, "", func(sequence int, _ []string) slingshotLoopbackAction {
+func TestIORedisPartialPipelineAbortsUnreadSuffix(t *testing.T) {
+	server := startIORedisLoopbackServer(t, "", func(sequence int, _ []string) ioredisLoopbackAction {
 		if sequence == 2 {
-			return slingshotLoopbackCloseWithoutReply
+			return ioredisLoopbackCloseWithoutReply
 		}
-		return slingshotLoopbackReplyOK
+		return ioredisLoopbackReplyOK
 	})
 	defer server.stop()
-	client := newFastSlingshotIORedisClient(t, &slingshotLoopbackFactory{addr: server.addr})
+	client := newFastIORedisClient(t, &ioredisLoopbackFactory{addr: server.addr})
 	defer client.Disconnect()
 
 	future := client.SubmitPipeline(
@@ -379,7 +379,7 @@ func TestSlingshotIORedisPartialPipelineAbortsUnreadSuffix(t *testing.T) {
 		[]string{"SET", "second", "2"},
 		[]string{"SET", "third", "3"},
 	)
-	result, err := waitSlingshotFuture(t, future)
+	result, err := waitIORedisFuture(t, future)
 	if err != nil {
 		t.Fatalf("partial pipeline top-level error = %v, want nil", err)
 	}
@@ -387,9 +387,9 @@ func TestSlingshotIORedisPartialPipelineAbortsUnreadSuffix(t *testing.T) {
 		t.Fatalf("partial pipeline replies = %#v", result.Replies)
 	}
 	for index := 1; index < 3; index++ {
-		var abort SlingshotIORedisAbortError
+		var abort IORedisAbortError
 		if !errors.As(result.Replies[index].Error, &abort) {
-			t.Fatalf("reply %d error = %T %v, want SlingshotIORedisAbortError", index, result.Replies[index].Error, result.Replies[index].Error)
+			t.Fatalf("reply %d error = %T %v, want IORedisAbortError", index, result.Replies[index].Error, result.Replies[index].Error)
 		}
 	}
 	if result.ReplayCount != 0 || result.AmbiguousReplays != 0 {
@@ -401,16 +401,16 @@ func TestSlingshotIORedisPartialPipelineAbortsUnreadSuffix(t *testing.T) {
 	// resending any pipeline fragment. A later command must reconnect and run
 	// after that boundary.
 	later := client.Submit("SET", "later", "4")
-	assertSlingshotFutureOK(t, later, "OK", 0, 0)
+	assertIORedisFutureOK(t, later, "OK", 0, 0)
 	if got := server.commandKeys(); strings.Join(got, ",") != "first,second,later" {
 		t.Fatalf("partial pipeline wire order = %v", got)
 	}
 }
 
-func TestSlingshotIORedisTwentyFirstReconnectFlushesWholeQueue(t *testing.T) {
+func TestIORedisTwentyFirstReconnectFlushesWholeQueue(t *testing.T) {
 	release := make(chan struct{}, 64)
 	var attempts atomic.Int32
-	factory := SlingshotIORedisTransportFactoryFunc(func(ctx context.Context) (SlingshotIORedisTransport, error) {
+	factory := IORedisTransportFactoryFunc(func(ctx context.Context) (IORedisTransport, error) {
 		attempts.Add(1)
 		select {
 		case <-release:
@@ -419,28 +419,28 @@ func TestSlingshotIORedisTwentyFirstReconnectFlushesWholeQueue(t *testing.T) {
 			return nil, ctx.Err()
 		}
 	})
-	policy := slingshotIORedisPolicy{
-		retryDelay: SlingshotIORedisRetryDelay,
+	policy := ioredisPolicy{
+		retryDelay: IORedisRetryDelay,
 		wait:       func(context.Context, time.Duration) bool { return true },
 	}
-	client, err := newSlingshotIORedisCompatClient(factory, policy)
+	client, err := newIORedisCompatClient(factory, policy)
 	if err != nil {
-		t.Fatalf("newSlingshotIORedisCompatClient: %v", err)
+		t.Fatalf("newIORedisCompatClient: %v", err)
 	}
 	defer client.Disconnect()
 
 	direct := client.Submit("SET", "direct", "1")
 	pipeline := client.SubmitPipeline([]string{"SET", "one", "1"}, []string{"SET", "two", "2"})
-	for range SlingshotIORedisMaxRetriesPerRequest + 1 {
+	for range IORedisMaxRetriesPerRequest + 1 {
 		release <- struct{}{}
 	}
 
-	_, directErr := waitSlingshotFuture(t, direct)
-	var maxErr SlingshotIORedisMaxRetriesError
-	if !errors.As(directErr, &maxErr) || directErr.Error() != (SlingshotIORedisMaxRetriesError{}).Error() {
+	_, directErr := waitIORedisFuture(t, direct)
+	var maxErr IORedisMaxRetriesError
+	if !errors.As(directErr, &maxErr) || directErr.Error() != (IORedisMaxRetriesError{}).Error() {
 		t.Fatalf("direct error = %T %v", directErr, directErr)
 	}
-	pipelineResult, pipelineErr := waitSlingshotFuture(t, pipeline)
+	pipelineResult, pipelineErr := waitIORedisFuture(t, pipeline)
 	if pipelineErr != nil {
 		t.Fatalf("pipeline top-level error = %v, want nil", pipelineErr)
 	}
@@ -457,10 +457,10 @@ func TestSlingshotIORedisTwentyFirstReconnectFlushesWholeQueue(t *testing.T) {
 	}
 }
 
-func TestSlingshotIORedisQuitDrainsAndPostCloseFails(t *testing.T) {
-	server := startSlingshotLoopbackServer(t, "", nil)
+func TestIORedisQuitDrainsAndPostCloseFails(t *testing.T) {
+	server := startIORedisLoopbackServer(t, "", nil)
 	defer server.stop()
-	client := newFastSlingshotIORedisClient(t, &slingshotLoopbackFactory{addr: server.addr})
+	client := newFastIORedisClient(t, &ioredisLoopbackFactory{addr: server.addr})
 
 	set := client.Submit("SET", "before-quit", "1")
 	quitDone := make(chan error, 1)
@@ -469,30 +469,30 @@ func TestSlingshotIORedisQuitDrainsAndPostCloseFails(t *testing.T) {
 		defer cancel()
 		quitDone <- client.Quit(ctx)
 	}()
-	assertSlingshotFutureOK(t, set, "OK", 0, 0)
+	assertIORedisFutureOK(t, set, "OK", 0, 0)
 	if err := <-quitDone; err != nil {
 		t.Fatalf("Quit: %v", err)
 	}
 	if got := server.commandNames(); strings.Join(got, ",") != "SET,QUIT" {
 		t.Fatalf("drain order = %v, want [SET QUIT]", got)
 	}
-	_, err := waitSlingshotFuture(t, client.Submit("SET", "after-quit", "2"))
-	var closed SlingshotIORedisConnectionClosedError
-	if !errors.As(err, &closed) || err.Error() != slingshotIORedisClosedMessage {
+	_, err := waitIORedisFuture(t, client.Submit("SET", "after-quit", "2"))
+	var closed IORedisConnectionClosedError
+	if !errors.As(err, &closed) || err.Error() != ioredisClosedMessage {
 		t.Fatalf("post-quit error = %T %v", err, err)
 	}
 }
 
-func TestSlingshotIORedisOfflineQuitWithEmptyQueueDoesNotReconnect(t *testing.T) {
+func TestIORedisOfflineQuitWithEmptyQueueDoesNotReconnect(t *testing.T) {
 	connectStarted := make(chan struct{}, 1)
-	factory := SlingshotIORedisTransportFactoryFunc(func(ctx context.Context) (SlingshotIORedisTransport, error) {
+	factory := IORedisTransportFactoryFunc(func(ctx context.Context) (IORedisTransport, error) {
 		connectStarted <- struct{}{}
 		<-ctx.Done()
 		return nil, ctx.Err()
 	})
-	client, err := NewSlingshotIORedisCompatClient(factory)
+	client, err := NewIORedisCompatClient(factory)
 	if err != nil {
-		t.Fatalf("NewSlingshotIORedisCompatClient: %v", err)
+		t.Fatalf("NewIORedisCompatClient: %v", err)
 	}
 	select {
 	case <-connectStarted:
@@ -511,22 +511,22 @@ func TestSlingshotIORedisOfflineQuitWithEmptyQueueDoesNotReconnect(t *testing.T)
 	}
 }
 
-func TestSlingshotIORedisServerErrorsRejectDirectButRemainPipelineReplies(t *testing.T) {
-	server := startSlingshotLoopbackServer(t, "", func(_ int, _ []string) slingshotLoopbackAction {
-		return slingshotLoopbackReplyError
+func TestIORedisServerErrorsRejectDirectButRemainPipelineReplies(t *testing.T) {
+	server := startIORedisLoopbackServer(t, "", func(_ int, _ []string) ioredisLoopbackAction {
+		return ioredisLoopbackReplyError
 	})
 	defer server.stop()
-	client := newFastSlingshotIORedisClient(t, &slingshotLoopbackFactory{addr: server.addr})
+	client := newFastIORedisClient(t, &ioredisLoopbackFactory{addr: server.addr})
 	defer client.Disconnect()
 
-	directResult, directErr := waitSlingshotFuture(t, client.Submit("SET", "direct", "1"))
+	directResult, directErr := waitIORedisFuture(t, client.Submit("SET", "direct", "1"))
 	if directErr == nil || directErr.Error() != "NOPERM denied" {
 		t.Fatalf("direct server error = %v", directErr)
 	}
 	if len(directResult.Replies) != 1 || directResult.Replies[0].Error == nil {
 		t.Fatalf("direct result = %#v", directResult)
 	}
-	pipelineResult, pipelineErr := waitSlingshotFuture(t, client.SubmitPipeline(
+	pipelineResult, pipelineErr := waitIORedisFuture(t, client.SubmitPipeline(
 		[]string{"SET", "one", "1"}, []string{"SET", "two", "2"},
 	))
 	if pipelineErr != nil {
@@ -537,10 +537,10 @@ func TestSlingshotIORedisServerErrorsRejectDirectButRemainPipelineReplies(t *tes
 	}
 }
 
-func TestSlingshotIORedisWaitCancellationDoesNotCancelAcceptedCommand(t *testing.T) {
-	server := startSlingshotLoopbackServer(t, "", nil)
+func TestIORedisWaitCancellationDoesNotCancelAcceptedCommand(t *testing.T) {
+	server := startIORedisLoopbackServer(t, "", nil)
 	defer server.stop()
-	client := newFastSlingshotIORedisClient(t, &slingshotLoopbackFactory{addr: server.addr})
+	client := newFastIORedisClient(t, &ioredisLoopbackFactory{addr: server.addr})
 	defer client.Disconnect()
 
 	future := client.Submit("SET", "survives-waiter", "1")
@@ -549,15 +549,15 @@ func TestSlingshotIORedisWaitCancellationDoesNotCancelAcceptedCommand(t *testing
 	if _, err := future.Wait(cancelled); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled waiter error = %v, want context.Canceled", err)
 	}
-	assertSlingshotFutureOK(t, future, "OK", 0, 0)
+	assertIORedisFutureOK(t, future, "OK", 0, 0)
 	// Promise-like futures retain settlement for another observer.
-	assertSlingshotFutureOK(t, future, "OK", 0, 0)
+	assertIORedisFutureOK(t, future, "OK", 0, 0)
 }
 
-func newFastSlingshotIORedisClient(t *testing.T, factory SlingshotIORedisTransportFactory) *SlingshotIORedisCompatClient {
+func newFastIORedisClient(t *testing.T, factory IORedisTransportFactory) *IORedisCompatClient {
 	t.Helper()
-	client, err := newSlingshotIORedisCompatClient(factory, slingshotIORedisPolicy{
-		retryDelay: SlingshotIORedisRetryDelay,
+	client, err := newIORedisCompatClient(factory, ioredisPolicy{
+		retryDelay: IORedisRetryDelay,
 		wait: func(ctx context.Context, _ time.Duration) bool {
 			select {
 			case <-ctx.Done():
@@ -568,21 +568,21 @@ func newFastSlingshotIORedisClient(t *testing.T, factory SlingshotIORedisTranspo
 		},
 	})
 	if err != nil {
-		t.Fatalf("newSlingshotIORedisCompatClient: %v", err)
+		t.Fatalf("newIORedisCompatClient: %v", err)
 	}
 	return client
 }
 
-func waitSlingshotFuture(t *testing.T, future *SlingshotIORedisFuture) (SlingshotIORedisResult, error) {
+func waitIORedisFuture(t *testing.T, future *IORedisFuture) (IORedisResult, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	return future.Wait(ctx)
 }
 
-func assertSlingshotFutureOK(t *testing.T, future *SlingshotIORedisFuture, want any, replays, ambiguous int) {
+func assertIORedisFutureOK(t *testing.T, future *IORedisFuture, want any, replays, ambiguous int) {
 	t.Helper()
-	result, err := waitSlingshotFuture(t, future)
+	result, err := waitIORedisFuture(t, future)
 	if err != nil {
 		t.Fatalf("future error = %v", err)
 	}
@@ -594,23 +594,23 @@ func assertSlingshotFutureOK(t *testing.T, future *SlingshotIORedisFuture, want 
 	}
 }
 
-func waitForSlingshotCondition(t *testing.T, timeout time.Duration, condition func() bool) {
+func waitForIORedisCondition(t *testing.T, timeout time.Duration, condition func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for !condition() {
 		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for Slingshot ioredis condition")
+			t.Fatal("timed out waiting for ioredis condition")
 		}
 		time.Sleep(time.Millisecond)
 	}
 }
 
-type slingshotLoopbackFactory struct {
+type ioredisLoopbackFactory struct {
 	addr     string
 	attempts *atomic.Int32
 }
 
-func (f *slingshotLoopbackFactory) Connect(ctx context.Context) (SlingshotIORedisTransport, error) {
+func (f *ioredisLoopbackFactory) Connect(ctx context.Context) (IORedisTransport, error) {
 	if f.attempts != nil {
 		f.attempts.Add(1)
 	}
@@ -619,17 +619,17 @@ func (f *slingshotLoopbackFactory) Connect(ctx context.Context) (SlingshotIORedi
 	if err != nil {
 		return nil, err
 	}
-	return &slingshotRESPTransport{conn: conn, reader: bufio.NewReader(conn), closed: make(chan struct{})}, nil
+	return &testIORedisRESPTransport{conn: conn, reader: bufio.NewReader(conn), closed: make(chan struct{})}, nil
 }
 
-type slingshotRESPTransport struct {
+type testIORedisRESPTransport struct {
 	conn      net.Conn
 	reader    *bufio.Reader
 	closed    chan struct{}
 	closeOnce sync.Once
 }
 
-func (t *slingshotRESPTransport) Exchange(ctx context.Context, commands [][]string) SlingshotIORedisExchange {
+func (t *testIORedisRESPTransport) Exchange(ctx context.Context, commands [][]string) IORedisExchange {
 	deadline := time.Now().Add(2 * time.Second)
 	if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(deadline) {
 		deadline = callerDeadline
@@ -637,7 +637,7 @@ func (t *slingshotRESPTransport) Exchange(ctx context.Context, commands [][]stri
 	_ = t.conn.SetDeadline(deadline)
 	var payload bytes.Buffer
 	for _, command := range commands {
-		writeSlingshotRESPCommand(&payload, command)
+		writeIORedisRESPCommand(&payload, command)
 	}
 	written, err := t.conn.Write(payload.Bytes())
 	mayHaveExecuted := written > 0
@@ -645,33 +645,33 @@ func (t *slingshotRESPTransport) Exchange(ctx context.Context, commands [][]stri
 		if err == nil {
 			err = io.ErrShortWrite
 		}
-		return SlingshotIORedisExchange{MayHaveExecuted: mayHaveExecuted, Error: err}
+		return IORedisExchange{MayHaveExecuted: mayHaveExecuted, Error: err}
 	}
-	replies := make([]SlingshotIORedisReply, 0, len(commands))
+	replies := make([]IORedisReply, 0, len(commands))
 	for range commands {
-		reply, err := readSlingshotRESPReply(t.reader)
+		reply, err := readIORedisRESPReply(t.reader)
 		if err != nil {
-			return SlingshotIORedisExchange{Replies: replies, MayHaveExecuted: true, Error: err}
+			return IORedisExchange{Replies: replies, MayHaveExecuted: true, Error: err}
 		}
 		replies = append(replies, reply)
 	}
-	return SlingshotIORedisExchange{Replies: replies, MayHaveExecuted: true}
+	return IORedisExchange{Replies: replies, MayHaveExecuted: true}
 }
 
-func (t *slingshotRESPTransport) Closed() <-chan struct{} { return t.closed }
+func (t *testIORedisRESPTransport) Closed() <-chan struct{} { return t.closed }
 
-func (t *slingshotRESPTransport) Close() error {
+func (t *testIORedisRESPTransport) Close() error {
 	err := t.conn.Close()
 	t.closeOnce.Do(func() { close(t.closed) })
 	return err
 }
 
-type signaledSlingshotTransport struct {
+type signaledIORedisTestTransport struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 }
 
-type replyBeforeWriteFailureSlingshotTransport struct {
+type replyBeforeWriteFailureIORedisTestTransport struct {
 	closed      chan struct{}
 	readStarted chan struct{}
 	releaseRead chan struct{}
@@ -680,47 +680,47 @@ type replyBeforeWriteFailureSlingshotTransport struct {
 	writes      atomic.Int32
 }
 
-func newReplyBeforeWriteFailureSlingshotTransport() *replyBeforeWriteFailureSlingshotTransport {
-	return &replyBeforeWriteFailureSlingshotTransport{
+func newReplyBeforeWriteFailureIORedisTestTransport() *replyBeforeWriteFailureIORedisTestTransport {
+	return &replyBeforeWriteFailureIORedisTestTransport{
 		closed:      make(chan struct{}),
 		readStarted: make(chan struct{}),
 		releaseRead: make(chan struct{}),
 	}
 }
 
-func (t *replyBeforeWriteFailureSlingshotTransport) Exchange(context.Context, [][]string) SlingshotIORedisExchange {
-	return SlingshotIORedisExchange{Error: errors.New("duplex transport must not use serial Exchange")}
+func (t *replyBeforeWriteFailureIORedisTestTransport) Exchange(context.Context, [][]string) IORedisExchange {
+	return IORedisExchange{Error: errors.New("duplex transport must not use serial Exchange")}
 }
 
-func (t *replyBeforeWriteFailureSlingshotTransport) writeCommands(_ context.Context, commands [][]string) SlingshotIORedisExchange {
-	wire, err := encodeSlingshotIORedisRESPCommands(commands)
+func (t *replyBeforeWriteFailureIORedisTestTransport) writeCommands(_ context.Context, commands [][]string) IORedisExchange {
+	wire, err := encodeIORedisRESPCommands(commands)
 	if err != nil {
-		return SlingshotIORedisExchange{Error: err}
+		return IORedisExchange{Error: err}
 	}
 	if t.writes.Add(1) == 1 {
-		return SlingshotIORedisExchange{
-			MayHaveExecuted: true, WriteDisposition: SlingshotIORedisFullyWritten,
+		return IORedisExchange{
+			MayHaveExecuted: true, WriteDisposition: IORedisFullyWritten,
 			BytesWritten: len(wire), BytesTotal: len(wire),
 		}
 	}
 	<-t.readStarted
-	return SlingshotIORedisExchange{
-		MayHaveExecuted: true, WriteDisposition: SlingshotIORedisFullyWritten,
+	return IORedisExchange{
+		MayHaveExecuted: true, WriteDisposition: IORedisFullyWritten,
 		BytesWritten: len(wire), BytesTotal: len(wire), Error: errors.New("later write failed"),
 	}
 }
 
-func (t *replyBeforeWriteFailureSlingshotTransport) readReply(context.Context) (SlingshotIORedisReply, error) {
+func (t *replyBeforeWriteFailureIORedisTestTransport) readReply(context.Context) (IORedisReply, error) {
 	t.readOnce.Do(func() { close(t.readStarted) })
 	<-t.releaseRead
-	return SlingshotIORedisReply{Value: "OK"}, nil
+	return IORedisReply{Value: "OK"}, nil
 }
 
-func (*replyBeforeWriteFailureSlingshotTransport) finishReplyWait() {}
+func (*replyBeforeWriteFailureIORedisTestTransport) finishReplyWait() {}
 
-func (t *replyBeforeWriteFailureSlingshotTransport) Closed() <-chan struct{} { return t.closed }
+func (t *replyBeforeWriteFailureIORedisTestTransport) Closed() <-chan struct{} { return t.closed }
 
-func (t *replyBeforeWriteFailureSlingshotTransport) Close() error {
+func (t *replyBeforeWriteFailureIORedisTestTransport) Close() error {
 	t.closeOnce.Do(func() {
 		close(t.releaseRead)
 		close(t.closed)
@@ -728,66 +728,66 @@ func (t *replyBeforeWriteFailureSlingshotTransport) Close() error {
 	return nil
 }
 
-func newSignaledSlingshotTransport() *signaledSlingshotTransport {
-	return &signaledSlingshotTransport{closed: make(chan struct{})}
+func newSignaledIORedisTestTransport() *signaledIORedisTestTransport {
+	return &signaledIORedisTestTransport{closed: make(chan struct{})}
 }
 
-func (t *signaledSlingshotTransport) Exchange(context.Context, [][]string) SlingshotIORedisExchange {
-	return SlingshotIORedisExchange{Error: errors.New("signaled transport cannot exchange")}
+func (t *signaledIORedisTestTransport) Exchange(context.Context, [][]string) IORedisExchange {
+	return IORedisExchange{Error: errors.New("signaled transport cannot exchange")}
 }
 
-func (t *signaledSlingshotTransport) Closed() <-chan struct{} { return t.closed }
+func (t *signaledIORedisTestTransport) Closed() <-chan struct{} { return t.closed }
 
-func (t *signaledSlingshotTransport) Close() error {
+func (t *signaledIORedisTestTransport) Close() error {
 	t.signalRemoteClose()
 	return nil
 }
 
-func (t *signaledSlingshotTransport) signalRemoteClose() {
+func (t *signaledIORedisTestTransport) signalRemoteClose() {
 	t.closeOnce.Do(func() { close(t.closed) })
 }
 
-func writeSlingshotRESPCommand(writer io.Writer, command []string) {
+func writeIORedisRESPCommand(writer io.Writer, command []string) {
 	_, _ = fmt.Fprintf(writer, "*%d\r\n", len(command))
 	for _, argument := range command {
 		_, _ = fmt.Fprintf(writer, "$%d\r\n%s\r\n", len(argument), argument)
 	}
 }
 
-func readSlingshotRESPReply(reader *bufio.Reader) (SlingshotIORedisReply, error) {
+func readIORedisRESPReply(reader *bufio.Reader) (IORedisReply, error) {
 	line, err := reader.ReadString('\n')
 	if err != nil {
-		return SlingshotIORedisReply{}, err
+		return IORedisReply{}, err
 	}
 	if len(line) < 3 || !strings.HasSuffix(line, "\r\n") {
-		return SlingshotIORedisReply{}, fmt.Errorf("invalid RESP reply %q", line)
+		return IORedisReply{}, fmt.Errorf("invalid RESP reply %q", line)
 	}
 	payload := strings.TrimSuffix(line[1:], "\r\n")
 	switch line[0] {
 	case '+':
-		return SlingshotIORedisReply{Value: payload}, nil
+		return IORedisReply{Value: payload}, nil
 	case ':':
 		value, parseErr := strconv.ParseInt(payload, 10, 64)
-		return SlingshotIORedisReply{Value: value}, parseErr
+		return IORedisReply{Value: value}, parseErr
 	case '-':
-		return SlingshotIORedisReply{Error: errors.New(payload)}, nil
+		return IORedisReply{Error: errors.New(payload)}, nil
 	default:
-		return SlingshotIORedisReply{}, fmt.Errorf("unsupported RESP reply prefix %q", line[0])
+		return IORedisReply{}, fmt.Errorf("unsupported RESP reply prefix %q", line[0])
 	}
 }
 
-type slingshotLoopbackAction int
+type ioredisLoopbackAction int
 
 const (
-	slingshotLoopbackReplyOK slingshotLoopbackAction = iota
-	slingshotLoopbackCloseWithoutReply
-	slingshotLoopbackReplyError
+	ioredisLoopbackReplyOK ioredisLoopbackAction = iota
+	ioredisLoopbackCloseWithoutReply
+	ioredisLoopbackReplyError
 )
 
-type slingshotLoopbackServer struct {
+type ioredisLoopbackServer struct {
 	listener net.Listener
 	addr     string
-	action   func(int, []string) slingshotLoopbackAction
+	action   func(int, []string) ioredisLoopbackAction
 
 	mu          sync.Mutex
 	connections map[net.Conn]struct{}
@@ -795,7 +795,7 @@ type slingshotLoopbackServer struct {
 	done        chan struct{}
 }
 
-func reserveSlingshotLoopbackAddr(t *testing.T) string {
+func reserveIORedisLoopbackAddr(t *testing.T) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -808,7 +808,7 @@ func reserveSlingshotLoopbackAddr(t *testing.T) string {
 	return addr
 }
 
-func startSlingshotLoopbackServer(t *testing.T, addr string, action func(int, []string) slingshotLoopbackAction) *slingshotLoopbackServer {
+func startIORedisLoopbackServer(t *testing.T, addr string, action func(int, []string) ioredisLoopbackAction) *ioredisLoopbackServer {
 	t.Helper()
 	if addr == "" {
 		addr = "127.0.0.1:0"
@@ -817,7 +817,7 @@ func startSlingshotLoopbackServer(t *testing.T, addr string, action func(int, []
 	if err != nil {
 		t.Fatalf("listen on %s: %v", addr, err)
 	}
-	server := &slingshotLoopbackServer{
+	server := &ioredisLoopbackServer{
 		listener:    listener,
 		addr:        listener.Addr().String(),
 		action:      action,
@@ -828,7 +828,7 @@ func startSlingshotLoopbackServer(t *testing.T, addr string, action func(int, []
 	return server
 }
 
-func (s *slingshotLoopbackServer) serve() {
+func (s *ioredisLoopbackServer) serve() {
 	defer close(s.done)
 	for {
 		conn, err := s.listener.Accept()
@@ -842,7 +842,7 @@ func (s *slingshotLoopbackServer) serve() {
 	}
 }
 
-func (s *slingshotLoopbackServer) serveConn(conn net.Conn) {
+func (s *ioredisLoopbackServer) serveConn(conn net.Conn) {
 	defer func() {
 		_ = conn.Close()
 		s.mu.Lock()
@@ -860,15 +860,15 @@ func (s *slingshotLoopbackServer) serveConn(conn net.Conn) {
 		s.commands = append(s.commands, cloned)
 		sequence := len(s.commands)
 		s.mu.Unlock()
-		action := slingshotLoopbackReplyOK
+		action := ioredisLoopbackReplyOK
 		if s.action != nil {
 			action = s.action(sequence, cloned)
 		}
-		if action == slingshotLoopbackCloseWithoutReply {
+		if action == ioredisLoopbackCloseWithoutReply {
 			return
 		}
 		reply := "+OK\r\n"
-		if action == slingshotLoopbackReplyError {
+		if action == ioredisLoopbackReplyError {
 			reply = "-NOPERM denied\r\n"
 		}
 		if _, err := io.WriteString(conn, reply); err != nil {
@@ -880,7 +880,7 @@ func (s *slingshotLoopbackServer) serveConn(conn net.Conn) {
 	}
 }
 
-func (s *slingshotLoopbackServer) commandKeys() []string {
+func (s *ioredisLoopbackServer) commandKeys() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	keys := make([]string, 0, len(s.commands))
@@ -892,7 +892,7 @@ func (s *slingshotLoopbackServer) commandKeys() []string {
 	return keys
 }
 
-func (s *slingshotLoopbackServer) commandNames() []string {
+func (s *ioredisLoopbackServer) commandNames() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	names := make([]string, 0, len(s.commands))
@@ -902,7 +902,7 @@ func (s *slingshotLoopbackServer) commandNames() []string {
 	return names
 }
 
-func (s *slingshotLoopbackServer) stop() {
+func (s *ioredisLoopbackServer) stop() {
 	s.mu.Lock()
 	listener := s.listener
 	connections := make([]net.Conn, 0, len(s.connections))

@@ -24,10 +24,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestProducerConfigSlingshotCompatibilityIsExplicitAndExact(t *testing.T) {
+func TestDeprecatedKafkaJSPartitionerAliasMatchesCanonicalValue(t *testing.T) {
+	require.Equal(t, ProducerPartitionerKafkaJSCompatible, ProducerPartitionerKafkaJSLegacy)
+}
+
+func TestProducerConfigKafkaJSCompatibilityIsExplicitAndExact(t *testing.T) {
 	client, err := NewConfluentClient(&Config{
 		Brokers:     []string{"broker:9092"},
-		ClientID:    "slingshot-main-server",
+		ClientID:    "legacy-main-server",
 		Compression: CompressionLZ4,
 	})
 	require.NoError(t, err)
@@ -38,7 +42,7 @@ func TestProducerConfigSlingshotCompatibilityIsExplicitAndExact(t *testing.T) {
 		MaxRetries:        10,
 		RetryBackoff:      2 * time.Second,
 		RetryBackoffMax:   2 * time.Second,
-		Partitioner:       ProducerPartitionerKafkaJSLegacy,
+		Partitioner:       ProducerPartitionerKafkaJSCompatible,
 		TraceHeaderPolicy: ProducerTraceHeadersPreserve,
 	})
 	require.NoError(t, err)
@@ -90,11 +94,11 @@ func TestKafkaJSLegacyPartitionerKnownSevenPartitionFixture(t *testing.T) {
 	cluster, err := ckafka.NewMockCluster(1)
 	require.NoError(t, err)
 	t.Cleanup(cluster.Close)
-	require.NoError(t, cluster.CreateTopic("slingshot-application-v2", 7, 1))
+	require.NoError(t, cluster.CreateTopic("application-events-v2", 7, 1))
 
 	client, err := NewConfluentClient(&Config{
 		Brokers:  []string{cluster.BootstrapServers()},
-		ClientID: "slingshot-partitioner-fixture",
+		ClientID: "kafkajs-partitioner-fixture",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
@@ -102,14 +106,14 @@ func TestKafkaJSLegacyPartitionerKnownSevenPartitionFixture(t *testing.T) {
 	producerAPI, err := client.Producer(ProducerConfig{
 		Acks:        -1,
 		AcksSet:     true,
-		Partitioner: ProducerPartitionerKafkaJSLegacy,
+		Partitioner: ProducerPartitionerKafkaJSCompatible,
 	})
 	require.NoError(t, err)
 	producer := producerAPI.(*ConfluentProducer)
 	require.NoError(t, producer.Connect())
 	t.Cleanup(func() { require.NoError(t, producer.Close()) })
 
-	metadata, err := producer.ProduceWithMetadata("slingshot-application-v2", []Message{{
+	metadata, err := producer.ProduceWithMetadata("application-events-v2", []Message{{
 		Key:       []byte("66aa11bb22cc33dd44ee5501"),
 		Value:     []byte(`{"fixture":"application-v2"}`),
 		Partition: -1,
@@ -135,7 +139,7 @@ func TestKafkaJSLegacyPartitionerKeylessRoundRobinOnBroker(t *testing.T) {
 	producerAPI, err := client.Producer(ProducerConfig{
 		Acks:        -1,
 		AcksSet:     true,
-		Partitioner: ProducerPartitionerKafkaJSLegacy,
+		Partitioner: ProducerPartitionerKafkaJSCompatible,
 	})
 	require.NoError(t, err)
 	producer := producerAPI.(*ConfluentProducer)
@@ -160,7 +164,7 @@ func TestKafkaJSLegacyPartitionerKeylessRoundRobinOnBroker(t *testing.T) {
 
 func TestProducerTraceHeaderPreservePolicyKeepsSpansAndExactHeaders(t *testing.T) {
 	tracer, exporter := enabledKafkaTracer(t)
-	ctx, parent := tracer.StartSpan(context.Background(), "slingshot-save", tracing.SpanKindInternal)
+	ctx, parent := tracer.StartSpan(context.Background(), "legacy-save", tracing.SpanKindInternal)
 
 	var produced []*ckafka.Message
 	driver := &fakeConfluentProducerDriver{produceFn: func(message *ckafka.Message, reports chan ckafka.Event) error {
@@ -171,7 +175,7 @@ func TestProducerTraceHeaderPreservePolicyKeepsSpansAndExactHeaders(t *testing.T
 	producer := newTestConfluentProducer(driver)
 	producer.traceHeaders = ProducerTraceHeadersPreserve
 
-	require.NoError(t, producer.ProduceCtx(ctx, "fynd-json-slingshot-application-v2", []Message{
+	require.NoError(t, producer.ProduceCtx(ctx, "fynd-json-application-events-v2", []Message{
 		{Value: []byte("no-headers"), Partition: -1},
 		{
 			Value:     []byte("caller-header"),
@@ -182,7 +186,7 @@ func TestProducerTraceHeaderPreservePolicyKeepsSpansAndExactHeaders(t *testing.T
 	parent.End()
 
 	require.Len(t, produced, 2)
-	require.Empty(t, produced[0].Headers, "Slingshot's production-order TraceClue record had no automatic headers")
+	require.Empty(t, produced[0].Headers, "Legacy KafkaJS production-order TraceClue record had no automatic headers")
 	require.Equal(t, []ckafka.Header{{Key: "TraceParent", Value: []byte("caller-owned")}}, produced[1].Headers)
 	producerSpans := exportedSpansNamed(exporter, "send ")
 	require.Len(t, producerSpans, 2, "header suppression must not suppress producer observability")

@@ -24,8 +24,6 @@ import (
 // DB_CONNECTION_PROVIDER is set to "GSM", the envValue is treated as a Google
 // Secret Manager secret name and the actual connection string is fetched from
 // GCP. Otherwise the value is returned as-is.
-//
-// This mirrors the resolveConnectionString function/src/utilities.
 func ResolveConnectionString(envValue string) (string, error) {
 	provider := strings.ToUpper(strings.TrimSpace(os.Getenv("DB_CONNECTION_PROVIDER")))
 	if provider == "GSM" {
@@ -43,15 +41,13 @@ func ResolveConnectionString(envValue string) (string, error) {
 }
 
 // GetDeploymentName extracts a Kubernetes deployment name from a pod name.
-// Pod names in Fynd follow the convention:
+// Supported pod names follow the convention:
 //
 //	<deployment-name>dply-<replicaset>-<pod-hash>
 //	<deployment-name>cron-<replicaset>-<pod-hash>
 //
 // The function returns the deployment name including the "dply" or "cron"
 // suffix, or an empty string if the pattern is not recognized.
-//
-// This mirrors getDeploymentName/src/utilities.
 func GetDeploymentName(podName string) string {
 	if podName == "" {
 		return ""
@@ -72,8 +68,6 @@ func GetDeploymentName(podName string) string {
 // connection options (e.g., MongoDB appName, PostgreSQL application_name). The
 // format is "<namespace>-<deploymentName>" when both are available, falling
 // back to just the deployment name or SERVICE_NAME.
-//
-// This mirrors getAppNameForDbOptions/src/utilities.
 func GetAppNameForDBOptions() string {
 	deploymentName := GetDeploymentName(os.Getenv("K8S_POD_NAME"))
 	if deploymentName == "" {

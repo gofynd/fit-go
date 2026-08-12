@@ -108,7 +108,8 @@ type Schema string
 
 // TraceClueBodyTruncation selects the installed TraceClue generation's body
 // behavior. TraceClue 3.1.3 truncates only when LOG_LEVEL=debug; pyfit 1.10
-// truncates at non-debug levels; 3.0.5 and TriggerHappy truncate at every level.
+// truncates at non-debug levels; TraceClue 3.0.5 and some older integrations
+// truncate at every level.
 type TraceClueBodyTruncation string
 
 const (

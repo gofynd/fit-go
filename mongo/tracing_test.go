@@ -102,7 +102,7 @@ func TestCommandTracer_Lifecycle(t *testing.T) {
 	// Success path.
 	ct.started(context.Background(), &event.CommandStartedEvent{
 		CommandName:  "find",
-		DatabaseName: "highbrow",
+		DatabaseName: "example",
 		RequestID:    1,
 	})
 	if got := len(ct.inflight); got != 1 {
@@ -116,7 +116,7 @@ func TestCommandTracer_Lifecycle(t *testing.T) {
 	// Failure path.
 	ct.started(context.Background(), &event.CommandStartedEvent{
 		CommandName:  "insert",
-		DatabaseName: "highbrow",
+		DatabaseName: "example",
 		RequestID:    2,
 	})
 	ct.finished(2, errors.New("boom"))
@@ -140,7 +140,7 @@ func TestCommandTracer_InheritsActiveGoroutineParent(t *testing.T) {
 	cancel()
 	ct.started(base, &event.CommandStartedEvent{
 		CommandName:  "find",
-		DatabaseName: "highbrow",
+		DatabaseName: "example",
 		RequestID:    10,
 	})
 	ct.finished(10, nil)
@@ -163,7 +163,7 @@ func TestCommandTracer_ExplicitContextParentWins(t *testing.T) {
 
 	ct.started(explicitCtx, &event.CommandStartedEvent{
 		CommandName:  "find",
-		DatabaseName: "highbrow",
+		DatabaseName: "example",
 		RequestID:    11,
 	})
 	ct.finished(11, nil)

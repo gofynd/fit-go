@@ -18,6 +18,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -645,6 +646,64 @@ func TestInit(t *testing.T) {
 		}
 	})
 
+	t.Run("applies service-scoped protocol without changing other services", func(t *testing.T) {
+		os.Setenv("REDIS_LEGACY_READ_WRITE", "redis://legacy.example:6379/0")
+		os.Setenv("REDIS_NATIVE_READ_WRITE", "redis://native.example:6379/0")
+		defer func() {
+			os.Unsetenv("REDIS_LEGACY_READ_WRITE")
+			os.Unsetenv("REDIS_NATIVE_READ_WRITE")
+		}()
+
+		captured := make(map[string]RedisProtocol)
+		var capturedMu sync.Mutex
+		_, err := Init(ConnectionOptions{
+			Dial: func(_ context.Context, opts *DialOptions) (Connection, error) {
+				capturedMu.Lock()
+				captured[opts.Addr] = opts.Protocol
+				capturedMu.Unlock()
+				return &mockConnection{}, nil
+			},
+			ProtocolByService: map[string]RedisProtocol{"LeGaCy": RedisProtocolRESP2},
+		})
+		if err != nil {
+			t.Fatalf("Init() error = %v", err)
+		}
+		capturedMu.Lock()
+		legacy := captured["legacy.example:6379"]
+		native := captured["native.example:6379"]
+		capturedMu.Unlock()
+		if legacy != RedisProtocolRESP2 || native != RedisProtocolDefault {
+			t.Fatalf("captured protocols = %#v, want legacy=RESP2 and native=default", captured)
+		}
+	})
+
+	t.Run("rejects unsupported service protocol", func(t *testing.T) {
+		os.Setenv("REDIS_CACHE_READ_WRITE", "redis://localhost:6379/0")
+		defer os.Unsetenv("REDIS_CACHE_READ_WRITE")
+		_, err := Init(ConnectionOptions{
+			Dial:              mockDial,
+			ProtocolByService: map[string]RedisProtocol{"cache": 4},
+		})
+		if err == nil || !strings.Contains(err.Error(), "unsupported Redis protocol 4") {
+			t.Fatalf("Init error = %v, want unsupported protocol", err)
+		}
+	})
+
+	t.Run("rejects conflicting case-insensitive service protocols", func(t *testing.T) {
+		os.Setenv("REDIS_CACHE_READ_WRITE", "redis://localhost:6379/0")
+		defer os.Unsetenv("REDIS_CACHE_READ_WRITE")
+		_, err := Init(ConnectionOptions{
+			Dial: mockDial,
+			ProtocolByService: map[string]RedisProtocol{
+				"cache": RedisProtocolRESP2,
+				"CACHE": RedisProtocolRESP3,
+			},
+		})
+		if err == nil || !strings.Contains(err.Error(), "conflicting Redis protocols") {
+			t.Fatalf("Init error = %v, want conflicting protocols", err)
+		}
+	})
+
 	t.Run("routes to cluster dial", func(t *testing.T) {
 		os.Setenv("REDIS_CLUSTER_READ_WRITE", "redis://host1:6379,host2:6379,host3:6379")
 		defer os.Unsetenv("REDIS_CLUSTER_READ_WRITE")
@@ -655,12 +714,16 @@ func TestInit(t *testing.T) {
 			if len(opts.Addrs) != 3 {
 				t.Errorf("Cluster addrs = %d, want 3", len(opts.Addrs))
 			}
+			if opts.Protocol != RedisProtocolRESP2 {
+				t.Errorf("Cluster protocol = %d, want RESP2", opts.Protocol)
+			}
 			return &mockConnection{isCluster: true}, nil
 		}
 
 		_, err := Init(ConnectionOptions{
-			Dial:        mockDial,
-			ClusterDial: clusterDial,
+			Dial:              mockDial,
+			ClusterDial:       clusterDial,
+			ProtocolByService: map[string]RedisProtocol{"cluster": RedisProtocolRESP2},
 		})
 		if err != nil {
 			t.Fatalf("Init() error = %v", err)
@@ -681,12 +744,16 @@ func TestInit(t *testing.T) {
 			if opts.MasterName != "mymaster" {
 				t.Errorf("MasterName = %q, want 'mymaster'", opts.MasterName)
 			}
+			if opts.Protocol != RedisProtocolRESP2 {
+				t.Errorf("Sentinel protocol = %d, want RESP2", opts.Protocol)
+			}
 			return &mockConnection{}, nil
 		}
 
 		_, err := Init(ConnectionOptions{
-			Dial:         mockDial,
-			SentinelDial: sentinelDial,
+			Dial:              mockDial,
+			SentinelDial:      sentinelDial,
+			ProtocolByService: map[string]RedisProtocol{"sentinel": RedisProtocolRESP2},
 		})
 		if err != nil {
 			t.Fatalf("Init() error = %v", err)

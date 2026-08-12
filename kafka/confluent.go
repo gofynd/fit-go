@@ -1711,7 +1711,7 @@ func confluentPartitioner(partitioner ProducerPartitioner) (string, error) {
 	switch partitioner {
 	case ProducerPartitionerDefault:
 		return "", nil
-	case ProducerPartitionerKafkaJSLegacy:
+	case ProducerPartitionerKafkaJSCompatible:
 		return "murmur2_random", nil
 	default:
 		return "", fmt.Errorf("kafka/confluent: unsupported producer partitioner %q", partitioner)
@@ -1735,7 +1735,7 @@ func (cp *ConfluentProducer) buildBrokerMessages(
 	brokerMessages := make([]*ckafka.Message, 0, len(messages))
 	needsKafkaJSKeylessPartition := false
 	for _, msg := range messages {
-		if cp.partitioner == ProducerPartitionerKafkaJSLegacy && msg.Partition < 0 && msg.Key == nil {
+		if cp.partitioner == ProducerPartitionerKafkaJSCompatible && msg.Partition < 0 && msg.Key == nil {
 			needsKafkaJSKeylessPartition = true
 			break
 		}
@@ -1756,7 +1756,7 @@ func (cp *ConfluentProducer) buildBrokerMessages(
 
 	for _, msg := range messages {
 		brokerMessage := buildConfluentMessage(topic, msg)
-		if cp.partitioner == ProducerPartitionerKafkaJSLegacy && msg.Partition < 0 && msg.Key == nil {
+		if cp.partitioner == ProducerPartitionerKafkaJSCompatible && msg.Partition < 0 && msg.Key == nil {
 			partition, err := cp.nextKafkaJSKeylessPartition(topic, partitionMetadata)
 			if err != nil {
 				return nil, err
@@ -1875,7 +1875,7 @@ func clonePartitionMetadata(partitions []ckafka.PartitionMetadata) []ckafka.Part
 }
 
 func (cp *ConfluentProducer) invalidateKafkaJSMetadata(topics ...string) {
-	if cp.partitioner != ProducerPartitionerKafkaJSLegacy || len(topics) == 0 {
+	if cp.partitioner != ProducerPartitionerKafkaJSCompatible || len(topics) == 0 {
 		return
 	}
 	cp.metadataMu.Lock()

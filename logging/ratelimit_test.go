@@ -172,20 +172,18 @@ func TestRateLimit_OnDecisionCallback(t *testing.T) {
 	}
 }
 
-// TestPyfitDebugRateLimit_ShapeMatchesPyfit: current pyfit async defaults (DEBUG only:
-// 1000/sec, burst 1000, cap 6000; every other level unlimited).
-func TestPyfitDebugRateLimit_ShapeMatchesPyfit(t *testing.T) {
-	cfg := PyfitDebugRateLimit()
+func TestDebugRateLimitPreset(t *testing.T) {
+	cfg := DebugRateLimitPreset()
 
 	dbg, ok := cfg.Levels[slog.LevelDebug]
 	if !ok {
 		t.Fatal("no DEBUG bucket")
 	}
 	if dbg.TokensPerSec != 1000 || dbg.StartingTokens != 1000 || dbg.MaxTokensBalance != 6000 {
-		t.Errorf("DEBUG bucket = %+v, want {1000,1000,6000} (pyfit async config)", dbg)
+		t.Errorf("DEBUG bucket = %+v, want {1000,1000,6000}", dbg)
 	}
 	if cfg.Default != nil {
-		t.Error("pyfit sets NO default bucket — INFO/WARN/ERROR must be unlimited")
+		t.Error("default bucket must be nil so INFO/WARN/ERROR remain unlimited")
 	}
 
 	// ERROR must be unlimited under this config.
@@ -194,5 +192,13 @@ func TestPyfitDebugRateLimit_ShapeMatchesPyfit(t *testing.T) {
 	emit(h, slog.LevelError, 500)
 	if next.n != 500 {
 		t.Fatalf("ERROR passed %d of 500 — pyfit's config throttles DEBUG only", next.n)
+	}
+}
+
+func TestDeprecatedDebugRateLimitAliasMatchesPreset(t *testing.T) {
+	current := DebugRateLimitPreset().Levels[slog.LevelDebug]
+	deprecated := PyfitDebugRateLimit().Levels[slog.LevelDebug]
+	if current != deprecated {
+		t.Fatalf("deprecated preset = %+v, want %+v", deprecated, current)
 	}
 }

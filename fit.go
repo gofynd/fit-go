@@ -39,8 +39,7 @@ import (
 	"go.opentelemetry.io/otel"
 )
 
-// Connections holds all initialized database and service connections.
-// interface.
+// Connections holds initialized database and service connections.
 type Connections struct {
 	Mongo       interface{} // MongoDB connections (read/write per service)
 	MySQL       interface{} // MySQL connections via database/sql
@@ -88,8 +87,7 @@ func Instance() *Fit {
 	return instance
 }
 
-// Init initializes the Fit framework with the given options.
-// This is the primary entry point -
+// Init initializes the framework with the given options.
 func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 	f := Instance()
 	f.mu.Lock()
@@ -126,12 +124,16 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 	// installed so a required initial-state failure leaves no partial framework
 	// ownership behind.
 	if cfg.GetBool("FEATURE_FLAG_ENABLED", false) {
-		featureClient, err := feature.InitWithOptions(feature.Options{
+		featureOptions := feature.Options{
 			Enabled:             true,
 			URL:                 cfg.GetString("FEATURE_FLAG_URL", ""),
 			APIKey:              cfg.GetString("FEATURE_FLAG_API_KEY", ""),
 			RequireInitialState: cfg.GetBool("FEATURE_FLAG_REQUIRE_INITIAL_STATE", false),
-		})
+		}
+		if serviceName := strings.TrimSpace(cfg.GetString("SERVICE_NAME", "")); serviceName != "" {
+			featureOptions.DefaultAttributes = map[string][]string{"service_name": {serviceName}}
+		}
+		featureClient, err := feature.InitWithOptions(featureOptions)
 		if err != nil {
 			f.Config = nil
 			return nil, fmt.Errorf("fit: failed to init feature flags: %w", err)

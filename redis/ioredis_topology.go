@@ -65,7 +65,7 @@ func dialIORedisCompatibleSentinel(ctx context.Context, profile IORedisCompatibi
 	options.DisableClientInfo = resolved.disableClientInfo
 	options.clientInfoLibraryVersion = resolved.clientInfoLibraryVersion
 	factory := &ioredisSentinelFactory{options: options}
-	client, err := NewSlingshotIORedisCompatClientReady(ctx, factory)
+	client, err := NewIORedisCompatClientReady(ctx, factory)
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +76,7 @@ type ioredisSentinelFactory struct {
 	options ioredisSentinelOptions
 }
 
-func (f *ioredisSentinelFactory) Connect(ctx context.Context) (SlingshotIORedisTransport, error) {
+func (f *ioredisSentinelFactory) Connect(ctx context.Context) (IORedisTransport, error) {
 	if f == nil || len(f.options.SentinelAddrs) == 0 || strings.TrimSpace(f.options.MasterName) == "" {
 		return nil, errors.New("redis: ioredis Sentinel addresses and master name are required")
 	}
@@ -158,7 +158,7 @@ func dialIORedisCompatibleCluster(ctx context.Context, profile IORedisCompatibil
 	options.DisableClientInfo = resolved.disableClientInfo
 	options.clientInfoLibraryVersion = resolved.clientInfoLibraryVersion
 	factory := &ioredisClusterFactory{options: options}
-	client, err := NewSlingshotIORedisCompatClientReady(ctx, factory)
+	client, err := NewIORedisCompatClientReady(ctx, factory)
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +169,7 @@ type ioredisClusterFactory struct {
 	options ioredisClusterOptions
 }
 
-func (f *ioredisClusterFactory) Connect(ctx context.Context) (SlingshotIORedisTransport, error) {
+func (f *ioredisClusterFactory) Connect(ctx context.Context) (IORedisTransport, error) {
 	if f == nil || len(f.options.SeedAddrs) == 0 {
 		return nil, errors.New("redis: ioredis Cluster seed address is required")
 	}
@@ -204,7 +204,7 @@ func (f *ioredisClusterFactory) Connect(ctx context.Context) (SlingshotIORedisTr
 	return nil, fmt.Errorf("redis: no Cluster seed returned slots: %s", strings.Join(failures, "; "))
 }
 
-func (f *ioredisClusterFactory) connectNode(ctx context.Context, address string) (SlingshotIORedisTransport, error) {
+func (f *ioredisClusterFactory) connectNode(ctx context.Context, address string) (IORedisTransport, error) {
 	return connectIORedisRESP(ctx, IORedisRESPOptions{
 		Addr:                     address,
 		Username:                 f.options.Username,
@@ -220,8 +220,8 @@ func (f *ioredisClusterFactory) connectNode(ctx context.Context, address string)
 	})
 }
 
-func connectIORedisRESP(ctx context.Context, options IORedisRESPOptions) (SlingshotIORedisTransport, error) {
-	factory, err := NewSlingshotIORedisRESPTransportFactory(options)
+func connectIORedisRESP(ctx context.Context, options IORedisRESPOptions) (IORedisTransport, error) {
+	factory, err := NewIORedisRESPTransportFactory(options)
 	if err != nil {
 		return nil, err
 	}
@@ -284,7 +284,7 @@ func ioredisReplyInt(value any) (int64, bool) {
 
 type ioredisClusterTransport struct {
 	factory    *ioredisClusterFactory
-	nodes      map[string]SlingshotIORedisTransport
+	nodes      map[string]IORedisTransport
 	slots      [16384]string
 	first      string
 	closed     chan struct{}
@@ -295,7 +295,7 @@ type ioredisClusterTransport struct {
 
 func newIORedisClusterTransport(ctx context.Context, factory *ioredisClusterFactory, ranges []ioredisClusterSlotRange) (*ioredisClusterTransport, error) {
 	transport := &ioredisClusterTransport{
-		factory: factory, nodes: make(map[string]SlingshotIORedisTransport),
+		factory: factory, nodes: make(map[string]IORedisTransport),
 		closed: make(chan struct{}), stop: make(chan struct{}),
 	}
 	for _, slotRange := range ranges {
@@ -322,7 +322,7 @@ func newIORedisClusterTransport(ctx context.Context, factory *ioredisClusterFact
 	return transport, nil
 }
 
-func (t *ioredisClusterTransport) watch(node SlingshotIORedisTransport) {
+func (t *ioredisClusterTransport) watch(node IORedisTransport) {
 	select {
 	case <-node.Closed():
 		t.closedOnce.Do(func() { close(t.closed) })
@@ -350,9 +350,9 @@ func (t *ioredisClusterTransport) Close() error {
 	return nil
 }
 
-func (t *ioredisClusterTransport) Exchange(ctx context.Context, commands [][]string) SlingshotIORedisExchange {
+func (t *ioredisClusterTransport) Exchange(ctx context.Context, commands [][]string) IORedisExchange {
 	if t == nil || len(commands) == 0 {
-		return SlingshotIORedisExchange{WriteDisposition: SlingshotIORedisNotWritten, Error: errors.New("redis: empty Cluster exchange")}
+		return IORedisExchange{WriteDisposition: IORedisNotWritten, Error: errors.New("redis: empty Cluster exchange")}
 	}
 	type commandRoute struct {
 		index   int
@@ -363,18 +363,18 @@ func (t *ioredisClusterTransport) Exchange(ctx context.Context, commands [][]str
 	for index, command := range commands {
 		address, err := t.route(command)
 		if err != nil {
-			return SlingshotIORedisExchange{WriteDisposition: SlingshotIORedisNotWritten, Error: err}
+			return IORedisExchange{WriteDisposition: IORedisNotWritten, Error: err}
 		}
 		if _, exists := groups[address]; !exists {
 			order = append(order, address)
 		}
 		groups[address] = append(groups[address], commandRoute{index: index, command: command})
 	}
-	replies := make([]SlingshotIORedisReply, len(commands))
+	replies := make([]IORedisReply, len(commands))
 	for _, address := range order {
 		node := t.nodes[address]
 		if node == nil {
-			return SlingshotIORedisExchange{WriteDisposition: SlingshotIORedisNotWritten, Error: fmt.Errorf("redis: Cluster node %s is not connected", address)}
+			return IORedisExchange{WriteDisposition: IORedisNotWritten, Error: fmt.Errorf("redis: Cluster node %s is not connected", address)}
 		}
 		routes := groups[address]
 		nodeCommands := make([][]string, len(routes))
@@ -386,16 +386,16 @@ func (t *ioredisClusterTransport) Exchange(ctx context.Context, commands [][]str
 			return exchange
 		}
 		if len(exchange.Replies) != len(routes) {
-			return SlingshotIORedisExchange{WriteDisposition: SlingshotIORedisFullyWritten, MayHaveExecuted: true, Error: fmt.Errorf("redis: Cluster node returned %d replies for %d commands", len(exchange.Replies), len(routes))}
+			return IORedisExchange{WriteDisposition: IORedisFullyWritten, MayHaveExecuted: true, Error: fmt.Errorf("redis: Cluster node returned %d replies for %d commands", len(exchange.Replies), len(routes))}
 		}
 		for index, route := range routes {
 			if ioredisClusterRedirect(exchange.Replies[index].Error) {
-				return SlingshotIORedisExchange{WriteDisposition: SlingshotIORedisFullyWritten, Error: exchange.Replies[index].Error}
+				return IORedisExchange{WriteDisposition: IORedisFullyWritten, Error: exchange.Replies[index].Error}
 			}
 			replies[route.index] = exchange.Replies[index]
 		}
 	}
-	return SlingshotIORedisExchange{Replies: replies, WriteDisposition: SlingshotIORedisFullyWritten, MayHaveExecuted: true}
+	return IORedisExchange{Replies: replies, WriteDisposition: IORedisFullyWritten, MayHaveExecuted: true}
 }
 
 func (t *ioredisClusterTransport) route(command []string) (string, error) {

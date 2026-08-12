@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Package kafka provides Kafka client initialization, producer, and consumer
-// abstractions for the fit.go framework. It is the Go implementation modules/kafka/index.ts.
+// abstractions.
 //
 // This package defines interfaces (KafkaClient, KafkaProducer, KafkaConsumer)
 // that decouple business logic from the concrete Kafka driver. When a real
@@ -41,10 +41,6 @@ import (
 	"github.com/gofynd/fit-go/logging"
 )
 
-// ---------------------------------------------------------------------------
-// Log-level mapping (mirrors logLevelMapping)
-// ---------------------------------------------------------------------------
-
 // LogLevel represents Kafka-client log verbosity.
 type LogLevel int
 
@@ -56,8 +52,8 @@ const (
 	LogLevelDebug
 )
 
-// ParseLogLevel converts the LOG_LEVEL env-var value used across Fynd Commerce
-// into a Kafka LogLevel. Unknown values map to LogLevelNothing.
+// ParseLogLevel converts a LOG_LEVEL-style value into a Kafka LogLevel.
+// Unknown values map to LogLevelNothing.
 func ParseLogLevel(s string) LogLevel {
 	switch strings.ToUpper(strings.TrimSpace(s)) {
 	case "ERROR":
@@ -73,10 +69,6 @@ func ParseLogLevel(s string) LogLevel {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Compression codec (interface for LZ4 / Snappy / GZIP / etc.)
-// ---------------------------------------------------------------------------
-
 // CompressionType identifies a Kafka message compression algorithm.
 type CompressionType int
 
@@ -89,19 +81,12 @@ const (
 )
 
 // CompressionCodec compresses and decompresses message payloads.
-// Register an LZ4 implementation via Config.Compression when the driver is
-// wired up. defaults to LZ4 for all produce calls.
 type CompressionCodec interface {
 	Compress(data []byte) ([]byte, error)
 	Decompress(data []byte) ([]byte, error)
 }
 
-// ---------------------------------------------------------------------------
-// SASL configuration
-// ---------------------------------------------------------------------------
-
 // SASLConfig holds SASL authentication credentials.
-// Mirrors the SASL options used.
 type SASLConfig struct {
 	// Mechanism is the SASL mechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512).
 	// Defaults to "PLAIN" when not set.
@@ -109,10 +94,6 @@ type SASLConfig struct {
 	Username  string
 	Password  string
 }
-
-// ---------------------------------------------------------------------------
-// TLS configuration
-// ---------------------------------------------------------------------------
 
 // TLSConfig holds mutual-TLS file paths for Kafka SSL connections.
 // The paths point to PEM-encoded certificate/key files on disk.
@@ -122,9 +103,7 @@ type TLSConfig struct {
 	KeyFile  string // Path to the client private key file
 }
 
-// BuildTLSConfig reads PEM files and returns a *tls.Config ready for use with
-// a Kafka driver. It of reading files at init time
-// with rejectUnauthorized: false (InsecureSkipVerify in Go).
+// BuildTLSConfig reads PEM files and builds Kafka TLS configuration.
 func (t *TLSConfig) BuildTLSConfig() (*tls.Config, error) {
 	if t == nil {
 		return nil, nil
@@ -135,7 +114,6 @@ func (t *TLSConfig) BuildTLSConfig() (*tls.Config, error) {
 		InsecureSkipVerify: true, // matches rejectUnauthorized: false
 	}
 
-	// Load CA certificate
 	if t.CAFile != "" {
 		caPEM, err := os.ReadFile(t.CAFile)
 		if err != nil {
@@ -148,7 +126,6 @@ func (t *TLSConfig) BuildTLSConfig() (*tls.Config, error) {
 		tlsCfg.RootCAs = pool
 	}
 
-	// Load client certificate + key (mutual TLS)
 	if t.CertFile != "" && t.KeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile)
 		if err != nil {
@@ -159,10 +136,6 @@ func (t *TLSConfig) BuildTLSConfig() (*tls.Config, error) {
 
 	return tlsCfg, nil
 }
-
-// ---------------------------------------------------------------------------
-// Client configuration
-// ---------------------------------------------------------------------------
 
 // Config holds all parameters needed to create a Kafka client.
 // Fields can be set explicitly or resolved from environment variables via
@@ -186,8 +159,6 @@ type Config struct {
 	TLS *TLSConfig
 
 	// Compression selects the default compression for produced messages.
-	// defaults to LZ4. The actual codec must be provided by the
-	// driver integration layer.
 	Compression CompressionType
 
 	// CompressionCodec is an optional codec implementation for the selected

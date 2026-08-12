@@ -31,9 +31,9 @@ const (
 	// ProducerCloseKafkaJSAwaitDelivery stops admission, waits boundedly for
 	// accepted produce calls and their delivery reports, and then closes the
 	// driver without requiring a separate broker-responsive Flush round trip.
-	// This matches callers such as legacy Galvatron that await KafkaJS
-	// producer.disconnect after their in-flight work has reached its delivery
-	// boundary. If the bound expires, Close reports the outstanding accepted
+	// This matches KafkaJS callers that await producer.disconnect after their
+	// in-flight work has reached its delivery boundary. If the bound expires,
+	// Close reports the outstanding accepted
 	// count while the ordered drain and driver cleanup continue in the background.
 	ProducerCloseKafkaJSAwaitDelivery
 )
@@ -47,10 +47,10 @@ const (
 	// ProducerPartitionerDefault preserves librdkafka's configured/default
 	// partitioner.
 	ProducerPartitionerDefault ProducerPartitioner = ""
-	// ProducerPartitionerKafkaJSLegacy selects librdkafka's Java-compatible
+	// ProducerPartitionerKafkaJSCompatible selects librdkafka's Java-compatible
 	// murmur2 partitioning for keyed records and KafkaJS 2.2.4's per-topic,
 	// randomly seeded round-robin selection for keyless records.
-	ProducerPartitionerKafkaJSLegacy ProducerPartitioner = "kafkajs-legacy"
+	ProducerPartitionerKafkaJSCompatible ProducerPartitioner = "kafkajs-legacy"
 )
 
 // ProducerTraceHeaderPolicy controls automatic trace propagation performed by

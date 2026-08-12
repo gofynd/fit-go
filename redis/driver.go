@@ -153,8 +153,14 @@ func (c *sentinelConnection) IsCluster() bool {
 // go-redis/v9. It maps the framework's DialOptions to go-redis Options.
 func DefaultDialFunc() DialFunc {
 	return func(ctx context.Context, opts *DialOptions) (Connection, error) {
+		if err := validateRedisProtocol(opts.Protocol); err != nil {
+			return nil, err
+		}
 		redisOpts := &goredis.Options{
 			Addr: opts.Addr,
+		}
+		if opts.Protocol != RedisProtocolDefault {
+			redisOpts.Protocol = int(opts.Protocol)
 		}
 
 		if opts.Password != "" {
@@ -296,8 +302,14 @@ func clientHandshakeRejected(ctx context.Context, c pinger) bool {
 // proxy that rejects the CLIENT SETNAME/SETINFO handshake.
 func DefaultClusterDialFunc() ClusterDialFunc {
 	return func(ctx context.Context, opts *ClusterDialOptions) (Connection, error) {
+		if err := validateRedisProtocol(opts.Protocol); err != nil {
+			return nil, err
+		}
 		clusterOpts := &goredis.ClusterOptions{
 			Addrs: opts.Addrs,
+		}
+		if opts.Protocol != RedisProtocolDefault {
+			clusterOpts.Protocol = int(opts.Protocol)
 		}
 
 		if opts.Password != "" {
@@ -381,9 +393,15 @@ func DefaultClusterDialFunc() ClusterDialFunc {
 // from a proxy that rejects the CLIENT SETNAME/SETINFO handshake.
 func DefaultSentinelDialFunc() SentinelDialFunc {
 	return func(ctx context.Context, opts *SentinelDialOptions) (Connection, error) {
+		if err := validateRedisProtocol(opts.Protocol); err != nil {
+			return nil, err
+		}
 		failoverOpts := &goredis.FailoverOptions{
 			MasterName:    opts.MasterName,
 			SentinelAddrs: opts.SentinelAddrs,
+		}
+		if opts.Protocol != RedisProtocolDefault {
+			failoverOpts.Protocol = int(opts.Protocol)
 		}
 
 		if opts.Password != "" {

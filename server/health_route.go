@@ -74,23 +74,19 @@ func SetHealthChecker(hc HealthChecker) {
 	}
 }
 
-// RegisterHealthRoutes registers the /_healthz and /_readyz endpoints on the
-// given gin.Engine. These endpoints are
+// RegisterHealthRoutes registers /_healthz and /_readyz.
 func RegisterHealthRoutes(engine *gin.Engine) {
 	RegisterHealthRoutesWithCheckers(engine, nil, nil)
 }
 
-// RegisterLegacyStaticHealthRoutes registers the legacy fit.js static health
-// contract.  Some Node services expose these probes as an unconditional 200
-// with exactly {"ok":"ok"}; they do not run dependency checks and clients
-// observe the absence of fit-go's status field.  Keep this separate from the
-// default health routes so existing Go services retain their current behavior.
-func RegisterLegacyStaticHealthRoutes(engine *gin.Engine) {
+// RegisterStaticHealthRoutes registers unconditional Express-compatible health
+// responses with the exact body {"ok":"ok"}.
+func RegisterStaticHealthRoutes(engine *gin.Engine) {
 	// Express routes are case-insensitive and non-strict and automatically use
 	// GET for HEAD. Gin's exact-path GET registration provides none of those
 	// behaviors, so install the compatibility boundary before registering the
-	// canonical routes. Other methods deliberately continue to NoRoute: the
-	// legacy Galvatron app's app.all("*") catch-all owns OPTIONS/POST.
+	// canonical routes. Other methods continue to NoRoute so an application's
+	// catch-all may own them.
 	engine.Use(func(c *gin.Context) {
 		path := strings.TrimSuffix(c.Request.URL.Path, "/")
 		if !strings.EqualFold(path, "/_healthz") && !strings.EqualFold(path, "/_readyz") {
@@ -101,17 +97,17 @@ func RegisterLegacyStaticHealthRoutes(engine *gin.Engine) {
 			c.Next()
 			return
 		}
-		legacyStaticHealthHandler()(c)
+		staticHealthHandler()(c)
 		c.Abort()
 	})
-	engine.GET("/_healthz", legacyStaticHealthHandler())
-	engine.GET("/_healthz/", legacyStaticHealthHandler())
-	engine.GET("/_readyz", legacyStaticHealthHandler())
-	engine.GET("/_readyz/", legacyStaticHealthHandler())
-	engine.HEAD("/_healthz", legacyStaticHealthHandler())
-	engine.HEAD("/_healthz/", legacyStaticHealthHandler())
-	engine.HEAD("/_readyz", legacyStaticHealthHandler())
-	engine.HEAD("/_readyz/", legacyStaticHealthHandler())
+	engine.GET("/_healthz", staticHealthHandler())
+	engine.GET("/_healthz/", staticHealthHandler())
+	engine.GET("/_readyz", staticHealthHandler())
+	engine.GET("/_readyz/", staticHealthHandler())
+	engine.HEAD("/_healthz", staticHealthHandler())
+	engine.HEAD("/_healthz/", staticHealthHandler())
+	engine.HEAD("/_readyz", staticHealthHandler())
+	engine.HEAD("/_readyz/", staticHealthHandler())
 }
 
 // RegisterHealthRoutesWithCheckers registers independent liveness and
@@ -154,7 +150,7 @@ func healthHandler(checker HealthChecker) gin.HandlerFunc {
 	}
 }
 
-func legacyStaticHealthHandler() gin.HandlerFunc {
+func staticHealthHandler() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Do not use c.JSON here: this is a byte-level compatibility mode for
 		// fit.js services whose health endpoint returned this exact object.
@@ -175,7 +171,7 @@ func legacyStaticHealthHandler() gin.HandlerFunc {
 			c.Header("Connection", "keep-alive")
 			c.Header("Keep-Alive", "timeout=5")
 		}
-		if legacyExpressResponseIsFresh(c.Request, etag) {
+		if expressResponseIsFresh(c.Request, etag) {
 			// Express strips entity headers when res.send changes a fresh GET/HEAD
 			// response to 304, while retaining ETag and X-Powered-By.
 			c.Writer.Header().Del("Content-Type")
@@ -192,7 +188,7 @@ func legacyStaticHealthHandler() gin.HandlerFunc {
 	}
 }
 
-func legacyExpressResponseIsFresh(request *http.Request, responseETag string) bool {
+func expressResponseIsFresh(request *http.Request, responseETag string) bool {
 	if request == nil {
 		return false
 	}

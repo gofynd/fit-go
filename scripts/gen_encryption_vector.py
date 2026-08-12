@@ -1,16 +1,4 @@
-"""
-Generate an authoritative cross-language encryption vector for fit-go G2.
-
-This mirrors EXACTLY how pyfit (`pyfit.encryption`) and Node `fit/encryption`
-encrypt PII: AES-256-GCM, fixed IV used verbatim (here a non-standard 9-byte
-nonce, as production Vault secrets actually are), wire format
-`base64(ciphertext) + "." + base64(tag)`.
-
-It uses the same `cryptography` primitive (`modes.GCM`) that pyfit wraps, so the
-emitted strings are a faithful reference for what the platform produces. The
-output is pasted into fit-go/encryption/interop_kat_test.go as a known-answer
-test so the Go test is self-contained (no Python needed in CI).
-"""
+"""Generate deterministic AES-GCM interoperability test vectors."""
 import base64
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -19,7 +7,7 @@ DEK = bytes(range(32))          # 32 bytes -> AES-256
 IV  = bytes(range(9))           # 9 bytes  -> the real-world non-standard nonce length
 
 PLAINTEXTS = [
-    "swapnil@gofynd.com",       # email-like PII
+    "person@example.com",       # email-like PII
     "+91-9876543210",           # phone-like PII
     "",                         # empty string edge case
     "héllo-uniçode-😀",    # multibyte / emoji

@@ -36,7 +36,7 @@ func TestIsClientCommandUnsupported(t *testing.T) {
 		{
 			// The exact error observed in the SIT pods.
 			"client setname rejected",
-			errors.New("ERR unknown command `client`, with args beginning with: `setname`, `fplt-highbrow-app-srvr-dply`"),
+			errors.New("ERR unknown command `client`, with args beginning with: `setname`, `fplt-example-app-srvr-dply`"),
 			true,
 		},
 		{

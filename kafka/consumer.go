@@ -323,7 +323,8 @@ type ConsumerOptions struct {
 	// ResolveAfterSuccessfulFinalizer performs a second, synchronous broker
 	// commit of the next offset after the finalizer and handler succeed. Despite
 	// its name, it does not merely resolve local consumer state and is not exact
-	// legacy Slingshot parity: Slingshot commits only the physical current offset.
+	// KafkaJS finalizer parity: some legacy consumers commit only the physical
+	// current offset.
 	// It is ignored unless OffsetFinalizer is set.
 	ResolveAfterSuccessfulFinalizer bool
 

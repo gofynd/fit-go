@@ -8,9 +8,9 @@ default. The platform schema remains available through an explicit
 
 | Legacy runtime | Formatter behavior | fit-go setting |
 |---|---|---|
-| Sentinel and Pointblank, TraceClue 3.1.3 | 500-character body limit only when configured `LOG_LEVEL=debug` | `debug-only` (default) |
-| Highbrow, TraceClue 3.0.5 | 500-character body limit at every level | `always` |
-| TriggerHappy, TraceClue commit `c61fd045` (package 2.1.2) / `winston-opentelemetry-format` 0.0.4 | 500-character body limit at every level | `always` |
+| TraceClue 3.1.3 | 500-character body limit only when configured `LOG_LEVEL=debug` | `debug-only` (default) |
+| TraceClue 3.0.5 | 500-character body limit at every level | `always` |
+| TraceClue commit `c61fd045` (package 2.1.2) / `winston-opentelemetry-format` 0.0.4 | 500-character body limit at every level | `always` |
 | pyfit 1.10 queue formatter | 500-character body limit outside debug | `non-debug` |
 
 Select a profile with `FIT_TRACECLUE_BODY_TRUNCATION=debug-only|non-debug|always|never`,
@@ -35,14 +35,13 @@ fields and includes the existing response `duration` field. With
 `request_url` that may include the query string, route values under
 `request_params`, and no middleware duration attribute. Query values and
 configured headers remain redacted in both modes; selecting TraceClue never
-disables the Commerce privacy boundary.
+disables fit-go's privacy boundary.
 
-## TriggerHappy Object Messages
+## Object Messages
 
-TriggerHappy locks fit.js commit `ff7ff1ff` (package 0.4.4). That lock requests
-TraceClue v2.1.3 but resolves commit `c61fd045`, whose package metadata is 2.1.2,
-and `winston-opentelemetry-format` 0.0.4. The installed formatter has these
-observable mappings for `logger.info({...})` / `logger.error({...})`:
+The TraceClue commit `c61fd045` reports package version 2.1.2 and uses
+`winston-opentelemetry-format` 0.0.4. Its observable mappings for
+`logger.info({...})` / `logger.error({...})` are:
 
 | Input object shape | TraceClue body | TraceClue attributes |
 |---|---|---|
@@ -61,8 +60,8 @@ serializing provider text; this is a deliberate platform privacy improvement.
 Trace and TraceClue-log resources use the same precedence: explicit option,
 `OTEL_SERVICE_NAME`, explicit `service.name` resource attribute,
 `OTEL_RESOURCE_ATTRIBUTES` (traces), `SERVICE_NAME`, then `unknown_service`.
-Legacy TraceClue did not consult `SERVICE_NAME`, so TriggerHappy could report an
-unknown telemetry service even while FIT routing and Kafka used `triggerhappy`.
+Legacy TraceClue did not consult `SERVICE_NAME`, so an application could report
+an unknown telemetry service even while its runtime used a service identity.
 Using `SERVICE_NAME` only as the final telemetry fallback is an explicit identity
 improvement; an explicit `OTEL_SERVICE_NAME` still wins and represents a named
 dashboard migration.

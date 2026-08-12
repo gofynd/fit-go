@@ -38,7 +38,7 @@ func TestTraceClueSchemaGoldenAndNativeChildCorrelation(t *testing.T) {
 	logger, err := New(Options{
 		Level:   "debug",
 		Env:     "production",
-		Service: "communications",
+		Service: "example-service",
 		Schema:  SchemaTraceClue,
 		Output:  &buf,
 		ResourceAttributes: map[string]interface{}{
@@ -76,7 +76,7 @@ func TestTraceClueSchemaGoldenAndNativeChildCorrelation(t *testing.T) {
 	}
 	resource := record["resource"].(map[string]interface{})
 	for key, want := range map[string]interface{}{
-		"service.name":           "communications",
+		"service.name":           "example-service",
 		"service.instance.id":    "pod-1",
 		"deployment.environment": "production",
 		"telemetry.sdk.language": "go",
@@ -99,7 +99,7 @@ func TestTraceClueSchemaCanOmitEnvironmentResourceForPinnedLegacyRuntime(t *test
 	var buf bytes.Buffer
 	logger, err := New(Options{
 		Env:                     "production",
-		Service:                 "galvatron-proof",
+		Service:                 "example-proof",
 		Schema:                  SchemaTraceClue,
 		Output:                  &buf,
 		OmitEnvironmentResource: true,
@@ -113,12 +113,12 @@ func TestTraceClueSchemaCanOmitEnvironmentResourceForPinnedLegacyRuntime(t *test
 	if _, exists := resource["deployment.environment"]; exists {
 		t.Fatalf("deployment.environment must be absent: %v", resource)
 	}
-	if resource["service.name"] != "galvatron-proof" {
+	if resource["service.name"] != "example-proof" {
 		t.Fatalf("service.name = %v", resource["service.name"])
 	}
 }
 
-func TestTriggerHappyObjectMessageGolden(t *testing.T) {
+func TestLegacyObjectMessageGolden(t *testing.T) {
 	tests := []struct {
 		name    string
 		level   Level

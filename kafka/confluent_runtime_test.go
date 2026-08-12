@@ -170,7 +170,7 @@ func TestConfluentProducerKafkaJSLegacyKeylessRoundRobin(t *testing.T) {
 		},
 	}
 	producer := newTestConfluentProducer(driver)
-	producer.partitioner = ProducerPartitionerKafkaJSLegacy
+	producer.partitioner = ProducerPartitionerKafkaJSCompatible
 	producer.partitionSeed = func() (uint32, error) { return 0, nil }
 
 	err := producer.Produce("events", []Message{
@@ -198,7 +198,7 @@ func TestConfluentProducerKafkaJSLegacyCachesMetadataPerTopic(t *testing.T) {
 		},
 	}
 	producer := newTestConfluentProducer(driver)
-	producer.partitioner = ProducerPartitionerKafkaJSLegacy
+	producer.partitioner = ProducerPartitionerKafkaJSCompatible
 	producer.partitionSeed = func() (uint32, error) { return 0, nil }
 
 	for range 3 {
@@ -225,7 +225,7 @@ func TestConfluentProducerKafkaJSLegacyMetadataExpiresAtKafkaJSMaxAge(t *testing
 		},
 	}
 	producer := newTestConfluentProducer(driver)
-	producer.partitioner = ProducerPartitionerKafkaJSLegacy
+	producer.partitioner = ProducerPartitionerKafkaJSCompatible
 	producer.partitionSeed = func() (uint32, error) { return 0, nil }
 	clock := time.Date(2026, time.August, 5, 0, 0, 0, 0, time.UTC)
 	producer.metadataNow = func() time.Time { return clock }
@@ -263,7 +263,7 @@ func TestConfluentProducerKafkaJSLegacyRefreshFailurePreservesLastHealthyCacheEn
 		},
 	}
 	producer := newTestConfluentProducer(driver)
-	producer.partitioner = ProducerPartitionerKafkaJSLegacy
+	producer.partitioner = ProducerPartitionerKafkaJSCompatible
 	producer.partitionSeed = func() (uint32, error) { return 0, nil }
 	clock := time.Date(2026, time.August, 5, 0, 0, 0, 0, time.UTC)
 	producer.metadataNow = func() time.Time { return clock }
@@ -311,7 +311,7 @@ func TestConfluentProducerKafkaJSLegacyCoalescesConcurrentMetadataRefresh(t *tes
 		},
 	}
 	producer := newTestConfluentProducer(driver)
-	producer.partitioner = ProducerPartitionerKafkaJSLegacy
+	producer.partitioner = ProducerPartitionerKafkaJSCompatible
 
 	const callers = 24
 	start := make(chan struct{})
@@ -352,7 +352,7 @@ func TestConfluentProducerKafkaJSLegacyMetadataWaitHonorsContext(t *testing.T) {
 		},
 	}
 	producer := newTestConfluentProducer(driver)
-	producer.partitioner = ProducerPartitionerKafkaJSLegacy
+	producer.partitioner = ProducerPartitionerKafkaJSCompatible
 	ownerDone := make(chan error, 1)
 	go func() {
 		_, err := producer.kafkaJSPartitionMetadata(context.Background(), driver, "events")
@@ -382,7 +382,7 @@ func TestConfluentProducerKafkaJSLegacyBatchReusesMetadataForDuplicateTopic(t *t
 		},
 	}
 	producer := newTestConfluentProducer(driver)
-	producer.partitioner = ProducerPartitionerKafkaJSLegacy
+	producer.partitioner = ProducerPartitionerKafkaJSCompatible
 	producer.partitionSeed = func() (uint32, error) { return 0, nil }
 
 	err := producer.ProduceBatch([]TopicMessages{
@@ -418,7 +418,7 @@ func TestConfluentProducerKafkaJSLegacyInvalidatesMetadataAfterTopologyError(t *
 		},
 	}
 	producer := newTestConfluentProducer(driver)
-	producer.partitioner = ProducerPartitionerKafkaJSLegacy
+	producer.partitioner = ProducerPartitionerKafkaJSCompatible
 	producer.partitionSeed = func() (uint32, error) { return 0, nil }
 
 	if err := producer.Produce("events", []Message{NewMessage([]byte("first"))}, -1); err == nil {
@@ -442,7 +442,7 @@ func TestConfluentProducerKafkaJSLegacySkipsMetadataForKeyedAndExplicitMessages(
 		},
 	}
 	producer := newTestConfluentProducer(driver)
-	producer.partitioner = ProducerPartitionerKafkaJSLegacy
+	producer.partitioner = ProducerPartitionerKafkaJSCompatible
 
 	if err := producer.Produce("events", []Message{
 		NewKeyedMessage([]byte("key"), []byte("keyed")),
@@ -1517,7 +1517,7 @@ func TestConfluentConsumerSurfacesPostHandlerCommitFailures(t *testing.T) {
 }
 
 func TestConfluentConsumerOffsetFinalizerCommitsExactCurrentOffsetAfterHandlerFailure(t *testing.T) {
-	topic := "slingshot-events"
+	topic := "application-events"
 	message := &ckafka.Message{TopicPartition: ckafka.TopicPartition{
 		Topic:     &topic,
 		Partition: 3,
@@ -1570,7 +1570,7 @@ func TestConfluentConsumerOffsetFinalizerCommitsExactCurrentOffsetAfterHandlerFa
 }
 
 func TestConfluentConsumerOffsetFinalizerOwnsPostCommitOrdering(t *testing.T) {
-	topic := "slingshot-events"
+	topic := "application-events"
 	message := &ckafka.Message{TopicPartition: ckafka.TopicPartition{Topic: &topic, Partition: 0, Offset: 12}}
 	groups := groupConfluentBatchMessages([]*ckafka.Message{message})
 	var mu sync.Mutex
@@ -1616,7 +1616,7 @@ func TestConfluentConsumerOffsetFinalizerOwnsPostCommitOrdering(t *testing.T) {
 }
 
 func TestConfluentConsumerOffsetFinalizerCanResolveAfterExactCommitOnSuccess(t *testing.T) {
-	topic := "galvatron-events"
+	topic := "job-events"
 	message := &ckafka.Message{TopicPartition: ckafka.TopicPartition{Topic: &topic, Partition: 2, Offset: 17}}
 	groups := groupConfluentBatchMessages([]*ckafka.Message{message})
 	events := make([]string, 0, 4)
@@ -1659,8 +1659,8 @@ func TestConfluentConsumerOffsetFinalizerCanResolveAfterExactCommitOnSuccess(t *
 }
 
 func TestConfluentConsumerOffsetFinalizerCanClearKafkaJSCommitMetadata(t *testing.T) {
-	topic := "galvatron-events"
-	memberID := "galvatron-main-server-1234"
+	topic := "job-events"
+	memberID := "legacy-main-server-1234"
 	message := &ckafka.Message{TopicPartition: ckafka.TopicPartition{
 		Topic: &topic, Partition: 2, Offset: 17, Metadata: &memberID,
 	}}
@@ -1709,7 +1709,7 @@ func TestConfluentConsumerOffsetFinalizerCanClearKafkaJSCommitMetadata(t *testin
 }
 
 func TestConfluentConsumerOffsetFinalizerDoesNotResolveSuppressedHandlerFailure(t *testing.T) {
-	topic := "galvatron-events"
+	topic := "job-events"
 	message := &ckafka.Message{TopicPartition: ckafka.TopicPartition{Topic: &topic, Partition: 2, Offset: 17}}
 	groups := groupConfluentBatchMessages([]*ckafka.Message{message})
 	handlerErr := errors.New("dispatch failed")
@@ -1739,7 +1739,7 @@ func TestConfluentConsumerOffsetFinalizerDoesNotResolveSuppressedHandlerFailure(
 }
 
 func TestConfluentConsumerOffsetFinalizerRejectsSecondCommit(t *testing.T) {
-	topic := "slingshot-events"
+	topic := "application-events"
 	message := &ckafka.Message{TopicPartition: ckafka.TopicPartition{Topic: &topic, Partition: 0, Offset: 12}}
 	groups := groupConfluentBatchMessages([]*ckafka.Message{message})
 	driver := &fakeConfluentConsumerDriver{}
@@ -1763,7 +1763,7 @@ func TestConfluentConsumerOffsetFinalizerRejectsSecondCommit(t *testing.T) {
 }
 
 func TestConfluentConsumerOffsetFinalizerCanSkipCommit(t *testing.T) {
-	topic := "slingshot-events"
+	topic := "application-events"
 	message := &ckafka.Message{TopicPartition: ckafka.TopicPartition{Topic: &topic, Partition: 1, Offset: 9}}
 	groups := groupConfluentBatchMessages([]*ckafka.Message{message})
 	handlerErr := errors.New("before commit boundary")
@@ -1787,7 +1787,7 @@ func TestConfluentConsumerOffsetFinalizerCanSkipCommit(t *testing.T) {
 }
 
 func TestConfluentConsumerOffsetFinalizerFailurePrecedence(t *testing.T) {
-	topic := "slingshot-events"
+	topic := "application-events"
 	message := &ckafka.Message{TopicPartition: ckafka.TopicPartition{Topic: &topic, Partition: 1, Offset: 9}}
 	groups := groupConfluentBatchMessages([]*ckafka.Message{message})
 	handlerErr := errors.New("handler failed")

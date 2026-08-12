@@ -166,7 +166,7 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		span.SetAttributes(map[string]any{
 			"http.request.method": req.Method,
 			// url.full is deliberately query/userinfo-free. The standard key is
-			// retained while its value follows Commerce's stricter privacy policy.
+			// retained while its value follows fit-go's privacy-safe telemetry policy.
 			"url.full":        safeURL,
 			"server.address":  req.URL.Hostname(),
 			"http.request_id": reqID,
@@ -286,19 +286,8 @@ func newRequestID() string {
 	return hex.EncodeToString(b)
 }
 
-// ProxyFromEnvWithForce mirrors legacy fit/axios proxy handling
-// (services/sentinel/node_modules/fit/dist/modules/axios/index.js): for an
-// https request whose hostname is an EXACT member of the comma-separated
-// FORCE_PROXY_DOMAINS, the request is forced through HTTPS_PROXY (bypassing
-// NO_PROXY). Every other request falls back to the standard HTTP(S)_PROXY /
-// NO_PROXY behaviour. Two details are faithful to fit/axios and deliberate:
-//   - HTTPS-only: the force block runs only when the URL scheme is https
-//     (legacy gates on `HTTPS_PROXY && url.startsWith("https://")`).
-//   - Exact hostname membership, NOT subdomain-suffix or substring
-//     (legacy uses `FORCE_PROXY_DOMAINS.split(",").includes(hostname)`).
-//
-// If forcing http targets or subdomains is ever wanted, add it as an explicit
-// opt-in option rather than changing this default — it would diverge from fit.js.
+// ProxyFromEnvWithForce applies FORCE_PROXY_DOMAINS to exact HTTPS hostnames,
+// then falls back to the standard proxy environment behavior.
 func ProxyFromEnvWithForce(req *http.Request) (*url.URL, error) {
 	if req.URL.Scheme == "https" {
 		if force := os.Getenv("FORCE_PROXY_DOMAINS"); force != "" {
@@ -313,11 +302,7 @@ func ProxyFromEnvWithForce(req *http.Request) (*url.URL, error) {
 	return http.ProxyFromEnvironment(req)
 }
 
-// forceProxyDomainsContains reports whether hostname is an exact member of the
-// comma-separated domain list, matching legacy fit/axios
-// `FORCE_PROXY_DOMAINS.split(",").includes(hostname)`. The hostname is
-// lower-cased to mirror JS `new URL(url).hostname` (the WHATWG URL parser
-// lower-cases the host); list entries are compared verbatim, as fit/axios does
+// forceProxyDomainsContains checks exact comma-separated hostname membership.
 // (no trimming, no subdomain matching).
 func forceProxyDomainsContains(force, hostname string) bool {
 	hostname = strings.ToLower(hostname)

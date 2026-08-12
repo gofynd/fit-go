@@ -193,15 +193,14 @@ func TestFeatureHubSSEEndpointAndTypedValues(t *testing.T) {
 }
 
 func TestContextStrategiesMatchLegacyFeatureHubBehavior(t *testing.T) {
-	t.Setenv("METROPLEX_MODULE", "communications")
-	t.Setenv("SERVICE_NAME", "communication")
+	t.Setenv("SERVICE_NAME", "example-api")
 	t.Setenv("PLATFORM_VERSION", "v2.4.0-RC12")
 	version := int64(1)
 	stream := newFeatureTestServer(t, sseEvent{name: "features", data: []*featureState{
 		{
 			ID: "service-feature-id", Key: "service-feature", Version: &version, Type: featureTypeBoolean, Value: false,
 			Strategies: []rolloutStrategy{{Value: true, Attributes: []strategyAttribute{{
-				FieldName: "service_name", Type: "STRING", Conditional: "EQUALS", Values: []interface{}{"communication"},
+				FieldName: "service_name", Type: "STRING", Conditional: "EQUALS", Values: []interface{}{"example-api"},
 			}}}},
 		},
 		{
@@ -223,6 +222,34 @@ func TestContextStrategiesMatchLegacyFeatureHubBehavior(t *testing.T) {
 	client.ResetContext()
 	if client.IsEnabled("language-feature") || !client.IsEnabled("service-feature") {
 		t.Fatal("ResetContext should remove runtime attributes and preserve service defaults")
+	}
+}
+
+func TestConfiguredDefaultAttributesOverrideEnvironmentDefaults(t *testing.T) {
+	t.Setenv("SERVICE_NAME", "environment-service")
+	t.Setenv("PLATFORM_VERSION", "v2.4.0-RC12")
+	got := defaultAttributes(map[string][]string{
+		"service_name":              {"configured-service"},
+		"release_candidate_version": {"configured-release"},
+		"region":                    {"west"},
+	})
+	want := map[string][]string{
+		"service_name":              {"configured-service"},
+		"platform_version":          {"v2.4.0"},
+		"release_candidate_version": {"configured-release"},
+		"region":                    {"west"},
+	}
+	if !attributeMapsEqual(got, want) {
+		t.Fatalf("default attributes = %#v, want %#v", got, want)
+	}
+}
+
+func TestDeprecatedModuleEnvironmentStillProvidesDefaultServiceName(t *testing.T) {
+	t.Setenv("SERVICE_NAME", "")
+	t.Setenv("METROPLEX_MODULE", "example-module")
+	got := defaultAttributes(nil)
+	if values := got["service_name"]; len(values) != 1 || values[0] != "example-module" {
+		t.Fatalf("service_name = %#v, want deprecated environment fallback", values)
 	}
 }
 
@@ -326,8 +353,7 @@ func TestOptionalInitDoesNotBlockOnFeatureHubReadiness(t *testing.T) {
 }
 
 func TestServerEvaluatedContextReconnectsWithFeatureHubHeader(t *testing.T) {
-	t.Setenv("SERVICE_NAME", "communication")
-	t.Setenv("METROPLEX_MODULE", "communications")
+	t.Setenv("SERVICE_NAME", "example-api")
 	t.Setenv("PLATFORM_VERSION", "")
 	requests := make(chan string, 4)
 	var requestCount atomic.Int32
@@ -344,7 +370,7 @@ func TestServerEvaluatedContextReconnectsWithFeatureHubHeader(t *testing.T) {
 		_, _ = fmt.Fprintf(w, "event: features\ndata: %s\n\n", mustJSON(t, []*featureState{{
 			ID: "server-id", Key: "server-flag", Version: &version, Type: featureTypeBoolean, Value: value,
 			Strategies: []rolloutStrategy{{Value: true, Attributes: []strategyAttribute{{
-				FieldName: "service_name", Type: "STRING", Conditional: "EQUALS", Values: []interface{}{"communication"},
+				FieldName: "service_name", Type: "STRING", Conditional: "EQUALS", Values: []interface{}{"example-api"},
 			}}}},
 		}}))
 		w.(http.Flusher).Flush()
@@ -362,7 +388,7 @@ func TestServerEvaluatedContextReconnectsWithFeatureHubHeader(t *testing.T) {
 	if client.ClientEvaluated() {
 		t.Fatal("API key without an asterisk should use server evaluation")
 	}
-	if initial := <-requests; initial != "service_name=communication" {
+	if initial := <-requests; initial != "service_name=example-api" {
 		t.Fatalf("initial x-featurehub = %q", initial)
 	}
 	if client.IsEnabled("server-flag") {
@@ -375,7 +401,7 @@ func TestServerEvaluatedContextReconnectsWithFeatureHubHeader(t *testing.T) {
 	if err := client.WaitReady(readyContext); err != nil {
 		t.Fatalf("WaitReady after context change: %v", err)
 	}
-	if refreshed := <-requests; refreshed != "service_name=communication,userkey=user%20one%2Ctwo!" {
+	if refreshed := <-requests; refreshed != "service_name=example-api,userkey=user%20one%2Ctwo!" {
 		t.Fatalf("refreshed x-featurehub = %q", refreshed)
 	}
 	if requestCount.Load() < 2 || !client.IsEnabled("server-flag") {

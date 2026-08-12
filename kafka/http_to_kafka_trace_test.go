@@ -25,16 +25,8 @@ import (
 	"github.com/gofynd/fit-go/tracing"
 )
 
-// TestInjectTraceHeaders_FromNativeHTTPSpan is the end-to-end regression test for the
-// bug that severed traces at every HTTP→Kafka boundary.
-//
-// server.OTelMiddleware installs otelgin, which puts a span in the NATIVE OTel context
-// and never touches fit-go's private span key. InjectTraceHeaders looks the span up via
-// tracing.SpanFromContext; before the native-adoption fix that returned nil, so the
-// message shipped with NO traceparent and the consumer began a brand-new trace.
-//
-// Concretely in metroplex: POST /engine/send-async → produce to the router topic →
-// router consumer → channel topics produced THREE unrelated traces instead of one.
+// TestInjectTraceHeaders_FromNativeHTTPSpan protects HTTP-to-Kafka trace
+// continuity when the server span exists only in the native OTel context.
 func TestInjectTraceHeaders_FromNativeHTTPSpan(t *testing.T) {
 	tracingtest.EnabledGlobal(t)
 

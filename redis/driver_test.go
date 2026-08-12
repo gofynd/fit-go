@@ -139,6 +139,7 @@ func TestDefaultDialFunc_AppliesAllOptions(t *testing.T) {
 		PoolSize:           50,
 		MinIdleConns:       10,
 		ReadOnly:           false,
+		Protocol:           RedisProtocolRESP2,
 	}
 
 	conn, err := dial(fastDialCtx(t), opts)
@@ -188,6 +189,9 @@ func TestDefaultDialFunc_AppliesAllOptions(t *testing.T) {
 	if redisOpts.MinIdleConns != 10 {
 		t.Errorf("MinIdleConns = %d, want 10", redisOpts.MinIdleConns)
 	}
+	if redisOpts.Protocol != 2 {
+		t.Errorf("Protocol = %d, want RESP2", redisOpts.Protocol)
+	}
 	if redisOpts.ConnMaxIdleTime != 30*time.Second {
 		t.Errorf("ConnMaxIdleTime = %v, want 30s", redisOpts.ConnMaxIdleTime)
 	}
@@ -220,8 +224,24 @@ func TestDefaultDialFunc_ZeroValues(t *testing.T) {
 	if redisOpts.DB != 0 {
 		t.Errorf("DB should be 0, got %d", redisOpts.DB)
 	}
+	if redisOpts.Protocol != 3 {
+		t.Errorf("Protocol = %d, want go-redis's current default RESP3", redisOpts.Protocol)
+	}
 
 	_ = conn.Close()
+}
+
+func TestDefaultDialFunctionsRejectUnsupportedProtocol(t *testing.T) {
+	ctx := context.Background()
+	if _, err := DefaultDialFunc()(ctx, &DialOptions{Protocol: 4}); err == nil {
+		t.Fatal("standalone dial accepted unsupported protocol")
+	}
+	if _, err := DefaultClusterDialFunc()(ctx, &ClusterDialOptions{Protocol: 4}); err == nil {
+		t.Fatal("cluster dial accepted unsupported protocol")
+	}
+	if _, err := DefaultSentinelDialFunc()(ctx, &SentinelDialOptions{Protocol: 4}); err == nil {
+		t.Fatal("sentinel dial accepted unsupported protocol")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +297,7 @@ func TestDefaultClusterDialFunc_AppliesOptions(t *testing.T) {
 		Password:           "pass",
 		Username:           "admin",
 		ClientName:         "cluster-client",
+		Protocol:           RedisProtocolRESP2,
 		TLSConfig:          tlsCfg,
 		ConnectTimeout:     3 * time.Second,
 		SocketTimeout:      5 * time.Second,
@@ -307,6 +328,9 @@ func TestDefaultClusterDialFunc_AppliesOptions(t *testing.T) {
 	}
 	if clusterRedisOpts.DialerRetries != 1 || clusterRedisOpts.DialerRetryTimeout != 75*time.Millisecond {
 		t.Errorf("cluster dial retry options = %+v, want 1/75ms", clusterRedisOpts)
+	}
+	if clusterRedisOpts.Protocol != int(RedisProtocolRESP2) {
+		t.Errorf("cluster protocol = %d, want RESP2", clusterRedisOpts.Protocol)
 	}
 
 	// Verify it implements ClusterConnection.
@@ -376,6 +400,7 @@ func TestDefaultSentinelDialFunc_AppliesAllOptions(t *testing.T) {
 		SentinelUsername:     "sentinel-user",
 		DB:                   1,
 		ClientName:           "sentinel-client",
+		Protocol:             RedisProtocolRESP2,
 		TLSConfig:            tlsCfg,
 		EnableTLSForSentinel: true,
 		ConnectTimeout:       3 * time.Second,
@@ -411,6 +436,9 @@ func TestDefaultSentinelDialFunc_AppliesAllOptions(t *testing.T) {
 	}
 	if redisOpts.DialerRetries != 1 || redisOpts.DialerRetryTimeout != 75*time.Millisecond {
 		t.Errorf("sentinel dial retry options = %+v, want 1/75ms", redisOpts)
+	}
+	if redisOpts.Protocol != int(RedisProtocolRESP2) {
+		t.Errorf("sentinel protocol = %d, want RESP2", redisOpts.Protocol)
 	}
 
 	_ = conn.Close()

@@ -87,6 +87,9 @@ type Options struct {
 	RequireInitialState bool
 	InitTimeout         time.Duration
 	ReconnectInterval   time.Duration
+	// DefaultAttributes are included in every evaluation context. Values are
+	// copied during initialization and cannot be mutated through this map later.
+	DefaultAttributes map[string][]string
 }
 
 // Init creates and starts a FeatureHub client. It returns nil when feature
@@ -120,7 +123,7 @@ func InitWithOptions(options Options) (*Client, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defaults := defaultAttributes()
+	defaults := defaultAttributes(options.DefaultAttributes)
 	client := &Client{
 		url:             normalizeFeatureHubURL(serverURL),
 		apiKey:          strings.TrimLeft(apiKey, "/"),
@@ -708,23 +711,30 @@ func (c *Client) lastError() error {
 	return c.lastStreamingErr
 }
 
-func defaultAttributes() map[string][]string {
-	attributes := make(map[string][]string)
+func defaultAttributes(configured map[string][]string) map[string][]string {
+	attributes := cloneAttributes(configured)
 	serviceName := strings.TrimSpace(os.Getenv("SERVICE_NAME"))
 	if serviceName == "" {
-		serviceName = strings.TrimSpace(os.Getenv("METROPLEX_MODULE"))
+		serviceName = legacyDefaultServiceName()
 	}
-	if serviceName != "" {
+	if serviceName != "" && len(attributes["service_name"]) == 0 {
 		attributes["service_name"] = []string{serviceName}
 	}
 	if platformVersion := strings.TrimSpace(os.Getenv("PLATFORM_VERSION")); platformVersion != "" {
-		attributes["platform_version"] = []string{strings.Split(platformVersion, "-")[0]}
-		attributes["release_candidate_version"] = []string{platformVersion}
+		if len(attributes["platform_version"]) == 0 {
+			attributes["platform_version"] = []string{strings.Split(platformVersion, "-")[0]}
+		}
+		if len(attributes["release_candidate_version"]) == 0 {
+			attributes["release_candidate_version"] = []string{platformVersion}
+		}
 	}
 	return attributes
 }
 
 func cloneAttributes(source map[string][]string) map[string][]string {
+	if source == nil {
+		return make(map[string][]string)
+	}
 	cloned := make(map[string][]string, len(source))
 	for key, values := range source {
 		cloned[key] = append([]string(nil), values...)

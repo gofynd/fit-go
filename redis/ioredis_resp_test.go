@@ -34,8 +34,8 @@ import (
 	"time"
 )
 
-func TestSlingshotIORedisRESPCodec(t *testing.T) {
-	encoded, err := encodeSlingshotIORedisRESPCommands([][]string{{"SET", "snowman", "☃"}, {"GET", "snowman"}})
+func TestIORedisRESPCodec(t *testing.T) {
+	encoded, err := encodeIORedisRESPCommands([][]string{{"SET", "snowman", "☃"}, {"GET", "snowman"}})
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -43,7 +43,7 @@ func TestSlingshotIORedisRESPCodec(t *testing.T) {
 	if string(encoded) != wantEncoded {
 		t.Fatalf("encoded bytes = %q, want %q", encoded, wantEncoded)
 	}
-	if _, err := encodeSlingshotIORedisRESPCommands([][]string{{}}); err == nil {
+	if _, err := encodeIORedisRESPCommands([][]string{{}}); err == nil {
 		t.Fatal("empty command accepted")
 	}
 
@@ -70,7 +70,7 @@ func TestSlingshotIORedisRESPCodec(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			value, replyErr, fatalErr := readSlingshotIORedisRESPValue(bufio.NewReader(strings.NewReader(test.wire)))
+			value, replyErr, fatalErr := readIORedisRESPValue(bufio.NewReader(strings.NewReader(test.wire)))
 			if test.wantFatal != "" {
 				if fatalErr == nil || !strings.Contains(fatalErr.Error(), test.wantFatal) {
 					t.Fatalf("fatal error = %v, want substring %q", fatalErr, test.wantFatal)
@@ -93,39 +93,39 @@ func TestSlingshotIORedisRESPCodec(t *testing.T) {
 	}
 }
 
-func TestSlingshotIORedisRESPOptionsFailClosed(t *testing.T) {
+func TestIORedisRESPOptionsFailClosed(t *testing.T) {
 	tests := []struct {
 		name    string
-		options SlingshotIORedisRESPOptions
+		options IORedisRESPOptions
 	}{
 		{name: "missing address"},
-		{name: "negative database", options: SlingshotIORedisRESPOptions{Addr: "localhost:6379", DB: -1}},
-		{name: "negative connect timeout", options: SlingshotIORedisRESPOptions{Addr: "localhost:6379", ConnectTimeout: -1}},
-		{name: "negative socket timeout", options: SlingshotIORedisRESPOptions{Addr: "localhost:6379", SocketTimeout: -1}},
-		{name: "negative keepalive", options: SlingshotIORedisRESPOptions{Addr: "localhost:6379", KeepAlive: -1}},
-		{name: "negative loading retry", options: SlingshotIORedisRESPOptions{Addr: "localhost:6379", MaxLoadingRetryTime: -1}},
+		{name: "negative database", options: IORedisRESPOptions{Addr: "localhost:6379", DB: -1}},
+		{name: "negative connect timeout", options: IORedisRESPOptions{Addr: "localhost:6379", ConnectTimeout: -1}},
+		{name: "negative socket timeout", options: IORedisRESPOptions{Addr: "localhost:6379", SocketTimeout: -1}},
+		{name: "negative keepalive", options: IORedisRESPOptions{Addr: "localhost:6379", KeepAlive: -1}},
+		{name: "negative loading retry", options: IORedisRESPOptions{Addr: "localhost:6379", MaxLoadingRetryTime: -1}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if _, err := NewSlingshotIORedisRESPTransportFactory(test.options); err == nil {
+			if _, err := NewIORedisRESPTransportFactory(test.options); err == nil {
 				t.Fatal("invalid options accepted")
 			}
 		})
 	}
-	factory, err := NewSlingshotIORedisRESPTransportFactory(SlingshotIORedisRESPOptions{Addr: "localhost:6379"})
+	factory, err := NewIORedisRESPTransportFactory(IORedisRESPOptions{Addr: "localhost:6379"})
 	if err != nil {
 		t.Fatalf("defaults: %v", err)
 	}
 	if factory.options.ConnectTimeout != 10*time.Second || factory.options.MaxLoadingRetryTime != 10*time.Second || factory.options.readyWait == nil {
 		t.Fatalf("defaults = %+v", factory.options)
 	}
-	if _, err := (*SlingshotIORedisRESPTransportFactory)(nil).Connect(context.Background()); err == nil {
+	if _, err := (*IORedisRESPTransportFactory)(nil).Connect(context.Background()); err == nil {
 		t.Fatal("nil factory connected")
 	}
 }
 
-func TestSlingshotIORedisRESPConnectTimeoutAndIdleClose(t *testing.T) {
-	factory, err := NewSlingshotIORedisRESPTransportFactory(SlingshotIORedisRESPOptions{
+func TestIORedisRESPConnectTimeoutAndIdleClose(t *testing.T) {
+	factory, err := NewIORedisRESPTransportFactory(IORedisRESPOptions{
 		Addr: "ignored:0", ConnectTimeout: 20 * time.Millisecond,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			<-ctx.Done()
@@ -139,14 +139,14 @@ func TestSlingshotIORedisRESPConnectTimeoutAndIdleClose(t *testing.T) {
 		t.Fatalf("connect error = %v, want deadline", err)
 	}
 
-	server := startSlingshotRESPScenarioServer(t, nil, func(command []string) (string, bool) {
+	server := startIORedisRESPScenarioServer(t, nil, func(command []string) (string, bool) {
 		if strings.EqualFold(command[0], "INFO") {
 			return "$11\r\nloading:0\r\n\r\n", true
 		}
 		return "+OK\r\n", false
 	})
 	defer server.stop()
-	transportFactory, err := NewSlingshotIORedisRESPTransportFactory(SlingshotIORedisRESPOptions{
+	transportFactory, err := NewIORedisRESPTransportFactory(IORedisRESPOptions{
 		Addr: server.addr, DisableClientInfo: true,
 	})
 	if err != nil {
@@ -165,7 +165,7 @@ func TestSlingshotIORedisRESPConnectTimeoutAndIdleClose(t *testing.T) {
 	_ = transport.Close()
 }
 
-func TestSlingshotIORedisRESPConvenienceConstructorRemainsExplicit(t *testing.T) {
+func TestIORedisRESPConvenienceConstructorRemainsExplicit(t *testing.T) {
 	clientSide, serverSide := net.Pipe()
 	defer serverSide.Close()
 	go func() {
@@ -180,20 +180,20 @@ func TestSlingshotIORedisRESPConvenienceConstructorRemainsExplicit(t *testing.T)
 			}
 		}
 	}()
-	client, err := NewSlingshotIORedisRESPCompatClient(SlingshotIORedisRESPOptions{
+	client, err := NewIORedisRESPCompatClient(IORedisRESPOptions{
 		Addr: "pipe:0", DisableClientInfo: true, DisableReadyCheck: true,
 		DialContext: func(context.Context, string, string) (net.Conn, error) { return clientSide, nil },
 	})
 	if err != nil {
 		t.Fatalf("constructor: %v", err)
 	}
-	assertSlingshotFutureOK(t, client.Submit("PING"), "PONG", 0, 0)
+	assertIORedisFutureOK(t, client.Submit("PING"), "PONG", 0, 0)
 	client.Disconnect()
 }
 
-func TestSlingshotIORedisRESPSocketTimeoutDoesNotCloseIdleReadyClient(t *testing.T) {
+func TestIORedisRESPSocketTimeoutDoesNotCloseIdleReadyClient(t *testing.T) {
 	var infoCalls atomic.Int32
-	server := startSlingshotRESPScenarioServer(t, nil, func(command []string) (string, bool) {
+	server := startIORedisRESPScenarioServer(t, nil, func(command []string) (string, bool) {
 		if strings.EqualFold(command[0], "INFO") {
 			infoCalls.Add(1)
 			return "$11\r\nloading:0\r\n\r\n", false
@@ -204,24 +204,24 @@ func TestSlingshotIORedisRESPSocketTimeoutDoesNotCloseIdleReadyClient(t *testing
 		return "+OK\r\n", false
 	})
 	defer server.stop()
-	client, err := NewSlingshotIORedisRESPCompatClient(SlingshotIORedisRESPOptions{
+	client, err := NewIORedisRESPCompatClient(IORedisRESPOptions{
 		Addr: server.addr, DisableClientInfo: true, SocketTimeout: 20 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("constructor: %v", err)
 	}
 	defer client.Disconnect()
-	assertSlingshotFutureOK(t, client.Submit("PING"), "PONG", 0, 0)
+	assertIORedisFutureOK(t, client.Submit("PING"), "PONG", 0, 0)
 	time.Sleep(60 * time.Millisecond)
-	assertSlingshotFutureOK(t, client.Submit("PING"), "PONG", 0, 0)
+	assertIORedisFutureOK(t, client.Submit("PING"), "PONG", 0, 0)
 	if got := infoCalls.Load(); got != 1 {
 		t.Fatalf("ready-check INFO calls = %d, want one connection across idle socket timeout", got)
 	}
 }
 
-func TestSlingshotIORedisRESPStartupMatchesFITJSOrderAndTolerance(t *testing.T) {
+func TestIORedisRESPStartupMatchesFITJSOrderAndTolerance(t *testing.T) {
 	var infoCalls int
-	server := startSlingshotRESPScenarioServer(t, nil, func(command []string) (string, bool) {
+	server := startIORedisRESPScenarioServer(t, nil, func(command []string) (string, bool) {
 		switch strings.ToUpper(command[0]) {
 		case "AUTH", "SELECT":
 			return "+OK\r\n", false
@@ -242,19 +242,19 @@ func TestSlingshotIORedisRESPStartupMatchesFITJSOrderAndTolerance(t *testing.T) 
 	defer server.stop()
 
 	var delays []time.Duration
-	factory, err := NewSlingshotIORedisRESPTransportFactory(SlingshotIORedisRESPOptions{
+	factory, err := NewIORedisRESPTransportFactory(IORedisRESPOptions{
 		Addr:           server.addr,
 		Username:       "legacy-user",
 		Password:       "legacy-pass",
 		DB:             4,
-		ConnectionName: "uat-slingshot",
+		ConnectionName: "uat-cache",
 		readyWait: func(_ context.Context, delay time.Duration) bool {
 			delays = append(delays, delay)
 			return true
 		},
 	})
 	if err != nil {
-		t.Fatalf("NewSlingshotIORedisRESPTransportFactory: %v", err)
+		t.Fatalf("NewIORedisRESPTransportFactory: %v", err)
 	}
 	transport, err := factory.Connect(context.Background())
 	if err != nil {
@@ -269,7 +269,7 @@ func TestSlingshotIORedisRESPStartupMatchesFITJSOrderAndTolerance(t *testing.T) 
 	wantCommands := [][]string{
 		{"auth", "legacy-user", "legacy-pass"},
 		{"select", "4"},
-		{"client", "setname", "uat-slingshot"},
+		{"client", "setname", "uat-cache"},
 		{"client", "SETINFO", "LIB-NAME", "ioredis"},
 		{"client", "SETINFO", "LIB-VER", "5.11.1"},
 		{"info"}, {"info"}, {"PING"},
@@ -282,17 +282,17 @@ func TestSlingshotIORedisRESPStartupMatchesFITJSOrderAndTolerance(t *testing.T) 
 	}
 }
 
-func TestSlingshotIORedisRESPStartupErrorBoundaries(t *testing.T) {
+func TestIORedisRESPStartupErrorBoundaries(t *testing.T) {
 	tests := []struct {
 		name       string
-		options    SlingshotIORedisRESPOptions
+		options    IORedisRESPOptions
 		reply      func([]string) string
 		wantErr    string
 		wantAccept bool
 	}{
 		{
 			name:    "auth rejected",
-			options: SlingshotIORedisRESPOptions{Password: "wrong", DisableClientInfo: true},
+			options: IORedisRESPOptions{Password: "wrong", DisableClientInfo: true},
 			reply: func(command []string) string {
 				if strings.EqualFold(command[0], "AUTH") {
 					return "-WRONGPASS invalid username-password pair\r\n"
@@ -303,7 +303,7 @@ func TestSlingshotIORedisRESPStartupErrorBoundaries(t *testing.T) {
 		},
 		{
 			name:    "auth unnecessary warning tolerated",
-			options: SlingshotIORedisRESPOptions{Password: "unused", DisableClientInfo: true},
+			options: IORedisRESPOptions{Password: "unused", DisableClientInfo: true},
 			reply: func(command []string) string {
 				if strings.EqualFold(command[0], "AUTH") {
 					return "-ERR Client sent AUTH, but no password is set\r\n"
@@ -314,7 +314,7 @@ func TestSlingshotIORedisRESPStartupErrorBoundaries(t *testing.T) {
 		},
 		{
 			name:    "select rejects FIT startup",
-			options: SlingshotIORedisRESPOptions{DB: 99, DisableClientInfo: true},
+			options: IORedisRESPOptions{DB: 99, DisableClientInfo: true},
 			reply: func(command []string) string {
 				if strings.EqualFold(command[0], "SELECT") {
 					return "-ERR DB index is out of range\r\n"
@@ -325,7 +325,7 @@ func TestSlingshotIORedisRESPStartupErrorBoundaries(t *testing.T) {
 		},
 		{
 			name:    "info noperm is ready",
-			options: SlingshotIORedisRESPOptions{DisableClientInfo: true},
+			options: IORedisRESPOptions{DisableClientInfo: true},
 			reply: func([]string) string {
 				return "-NOPERM this user has no permissions to run the 'info' command\r\n"
 			},
@@ -333,7 +333,7 @@ func TestSlingshotIORedisRESPStartupErrorBoundaries(t *testing.T) {
 		},
 		{
 			name:    "info other error rejects",
-			options: SlingshotIORedisRESPOptions{DisableClientInfo: true},
+			options: IORedisRESPOptions{DisableClientInfo: true},
 			reply: func([]string) string {
 				return "-ERR ready check failed\r\n"
 			},
@@ -342,12 +342,12 @@ func TestSlingshotIORedisRESPStartupErrorBoundaries(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			server := startSlingshotRESPScenarioServer(t, nil, func(command []string) (string, bool) {
+			server := startIORedisRESPScenarioServer(t, nil, func(command []string) (string, bool) {
 				return test.reply(command), false
 			})
 			defer server.stop()
 			test.options.Addr = server.addr
-			factory, err := NewSlingshotIORedisRESPTransportFactory(test.options)
+			factory, err := NewIORedisRESPTransportFactory(test.options)
 			if err != nil {
 				t.Fatalf("factory: %v", err)
 			}
@@ -366,17 +366,17 @@ func TestSlingshotIORedisRESPStartupErrorBoundaries(t *testing.T) {
 	}
 }
 
-func TestSlingshotIORedisRESPWriteDispositionFaultMatrix(t *testing.T) {
+func TestIORedisRESPWriteDispositionFaultMatrix(t *testing.T) {
 	t.Run("not written", func(t *testing.T) {
 		client, peer := net.Pipe()
 		defer peer.Close()
-		factory := newPipeSlingshotRESPFactory(t, &slingshotWriteFaultConn{Conn: client, failAfter: 0, err: errors.New("before write")})
+		factory := newPipeIORedisRESPFactory(t, &ioredisWriteFaultConn{Conn: client, failAfter: 0, err: errors.New("before write")})
 		transport, err := factory.Connect(context.Background())
 		if err != nil {
 			t.Fatalf("Connect: %v", err)
 		}
 		exchange := transport.Exchange(context.Background(), [][]string{{"SET", "key", "value"}})
-		if exchange.WriteDisposition != SlingshotIORedisNotWritten || exchange.MayHaveExecuted || exchange.BytesWritten != 0 || exchange.NetworkBytesWritten != 0 || exchange.Error == nil {
+		if exchange.WriteDisposition != IORedisNotWritten || exchange.MayHaveExecuted || exchange.BytesWritten != 0 || exchange.NetworkBytesWritten != 0 || exchange.Error == nil {
 			t.Fatalf("not-written exchange = %+v", exchange)
 		}
 	})
@@ -385,20 +385,20 @@ func TestSlingshotIORedisRESPWriteDispositionFaultMatrix(t *testing.T) {
 		client, peer := net.Pipe()
 		defer peer.Close()
 		go io.Copy(io.Discard, peer)
-		factory := newPipeSlingshotRESPFactory(t, &slingshotWriteFaultConn{Conn: client, failAfter: 7, err: errors.New("partial write")})
+		factory := newPipeIORedisRESPFactory(t, &ioredisWriteFaultConn{Conn: client, failAfter: 7, err: errors.New("partial write")})
 		transport, err := factory.Connect(context.Background())
 		if err != nil {
 			t.Fatalf("Connect: %v", err)
 		}
 		exchange := transport.Exchange(context.Background(), [][]string{{"SET", "key", "value"}})
-		if exchange.WriteDisposition != SlingshotIORedisPartiallyWritten || !exchange.MayHaveExecuted || exchange.BytesWritten != 7 || exchange.NetworkBytesWritten != 7 || exchange.BytesTotal <= exchange.BytesWritten || exchange.Error == nil {
+		if exchange.WriteDisposition != IORedisPartiallyWritten || !exchange.MayHaveExecuted || exchange.BytesWritten != 7 || exchange.NetworkBytesWritten != 7 || exchange.BytesTotal <= exchange.BytesWritten || exchange.Error == nil {
 			t.Fatalf("partial-write exchange = %+v", exchange)
 		}
 	})
 
 	t.Run("fully written lost reply", func(t *testing.T) {
 		client, peer := net.Pipe()
-		factory := newPipeSlingshotRESPFactory(t, client)
+		factory := newPipeIORedisRESPFactory(t, client)
 		go func() {
 			_, _ = readRESPCommand(bufio.NewReader(peer))
 			_ = peer.Close()
@@ -408,14 +408,14 @@ func TestSlingshotIORedisRESPWriteDispositionFaultMatrix(t *testing.T) {
 			t.Fatalf("Connect: %v", err)
 		}
 		exchange := transport.Exchange(context.Background(), [][]string{{"INCR", "counter"}})
-		if exchange.WriteDisposition != SlingshotIORedisFullyWritten || !exchange.MayHaveExecuted || exchange.BytesWritten != exchange.BytesTotal || exchange.NetworkBytesWritten != int64(exchange.BytesTotal) || len(exchange.Replies) != 0 || exchange.Error == nil {
+		if exchange.WriteDisposition != IORedisFullyWritten || !exchange.MayHaveExecuted || exchange.BytesWritten != exchange.BytesTotal || exchange.NetworkBytesWritten != int64(exchange.BytesTotal) || len(exchange.Replies) != 0 || exchange.Error == nil {
 			t.Fatalf("lost-reply exchange = %+v", exchange)
 		}
 	})
 
 	t.Run("partial pipeline reply", func(t *testing.T) {
 		client, peer := net.Pipe()
-		factory := newPipeSlingshotRESPFactory(t, client)
+		factory := newPipeIORedisRESPFactory(t, client)
 		go func() {
 			reader := bufio.NewReader(peer)
 			_, _ = readRESPCommand(reader)
@@ -428,17 +428,17 @@ func TestSlingshotIORedisRESPWriteDispositionFaultMatrix(t *testing.T) {
 			t.Fatalf("Connect: %v", err)
 		}
 		exchange := transport.Exchange(context.Background(), [][]string{{"SET", "one", "1"}, {"SET", "two", "2"}})
-		if exchange.WriteDisposition != SlingshotIORedisFullyWritten || len(exchange.Replies) != 1 || exchange.Replies[0].Value != "OK" || exchange.Error == nil {
+		if exchange.WriteDisposition != IORedisFullyWritten || len(exchange.Replies) != 1 || exchange.Replies[0].Value != "OK" || exchange.Error == nil {
 			t.Fatalf("partial-reply exchange = %+v", exchange)
 		}
 	})
 }
 
-func TestSlingshotIORedisRESPSocketTimeoutAndPartialReadActivity(t *testing.T) {
+func TestIORedisRESPSocketTimeoutAndPartialReadActivity(t *testing.T) {
 	t.Run("exact timeout error", func(t *testing.T) {
 		client, peer := net.Pipe()
 		defer peer.Close()
-		factory := newPipeSlingshotRESPFactory(t, client)
+		factory := newPipeIORedisRESPFactory(t, client)
 		factory.options.SocketTimeout = 20 * time.Millisecond
 		go func() {
 			_, _ = readRESPCommand(bufio.NewReader(peer))
@@ -450,14 +450,14 @@ func TestSlingshotIORedisRESPSocketTimeoutAndPartialReadActivity(t *testing.T) {
 		}
 		exchange := transport.Exchange(context.Background(), [][]string{{"GET", "never-replies"}})
 		want := "Socket timeout. Expecting data, but didn't receive any in 20ms."
-		if exchange.Error == nil || exchange.Error.Error() != want || exchange.WriteDisposition != SlingshotIORedisFullyWritten {
+		if exchange.Error == nil || exchange.Error.Error() != want || exchange.WriteDisposition != IORedisFullyWritten {
 			t.Fatalf("timeout exchange = %+v, want %q", exchange, want)
 		}
 	})
 
 	t.Run("partial bytes refresh timeout", func(t *testing.T) {
 		client, peer := net.Pipe()
-		factory := newPipeSlingshotRESPFactory(t, client)
+		factory := newPipeIORedisRESPFactory(t, client)
 		factory.options.SocketTimeout = 25 * time.Millisecond
 		go func() {
 			_, _ = readRESPCommand(bufio.NewReader(peer))
@@ -478,11 +478,11 @@ func TestSlingshotIORedisRESPSocketTimeoutAndPartialReadActivity(t *testing.T) {
 	})
 }
 
-func TestSlingshotIORedisRESPTLSAndQuit(t *testing.T) {
-	certificate := newSlingshotTestCertificate(t)
+func TestIORedisRESPTLSAndQuit(t *testing.T) {
+	certificate := newIORedisTestCertificate(t)
 	serverTLS := &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
 	clientTLS := &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12} // test-only certificate
-	server := startSlingshotRESPScenarioServer(t, serverTLS, func(command []string) (string, bool) {
+	server := startIORedisRESPScenarioServer(t, serverTLS, func(command []string) (string, bool) {
 		switch strings.ToUpper(command[0]) {
 		case "INFO":
 			return "$11\r\nloading:0\r\n\r\n", false
@@ -493,14 +493,14 @@ func TestSlingshotIORedisRESPTLSAndQuit(t *testing.T) {
 		}
 	})
 	defer server.stop()
-	factory, err := NewSlingshotIORedisRESPTransportFactory(SlingshotIORedisRESPOptions{
+	factory, err := NewIORedisRESPTransportFactory(IORedisRESPOptions{
 		Addr: server.addr, TLSConfig: clientTLS, DisableClientInfo: true,
 	})
 	if err != nil {
 		t.Fatalf("factory: %v", err)
 	}
-	client := newFastSlingshotIORedisClient(t, factory)
-	assertSlingshotFutureOK(t, client.Submit("PING"), "OK", 0, 0)
+	client := newFastIORedisClient(t, factory)
+	assertIORedisFutureOK(t, client.Submit("PING"), "OK", 0, 0)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if err := client.Quit(ctx); err != nil {
@@ -511,10 +511,10 @@ func TestSlingshotIORedisRESPTLSAndQuit(t *testing.T) {
 	}
 }
 
-func TestSlingshotIORedisRESPTransportReplaysCompleteUnfulfilledSet(t *testing.T) {
+func TestIORedisRESPTransportReplaysCompleteUnfulfilledSet(t *testing.T) {
 	var connectionNumber int
 	var mu sync.Mutex
-	server := startSlingshotRESPScenarioServer(t, nil, func(command []string) (string, bool) {
+	server := startIORedisRESPScenarioServer(t, nil, func(command []string) (string, bool) {
 		mu.Lock()
 		defer mu.Unlock()
 		if strings.EqualFold(command[0], "INFO") {
@@ -533,26 +533,26 @@ func TestSlingshotIORedisRESPTransportReplaysCompleteUnfulfilledSet(t *testing.T
 		return "+OK\r\n", false
 	})
 	defer server.stop()
-	factory, err := NewSlingshotIORedisRESPTransportFactory(SlingshotIORedisRESPOptions{
-		Addr: server.addr, ConnectionName: "slingshot",
+	factory, err := NewIORedisRESPTransportFactory(IORedisRESPOptions{
+		Addr: server.addr, ConnectionName: "cache",
 	})
 	if err != nil {
 		t.Fatalf("factory: %v", err)
 	}
-	client := newFastSlingshotIORedisClient(t, factory)
+	client := newFastIORedisClient(t, factory)
 	defer client.Disconnect()
 	first := client.Submit("INCR", "first")
 	second := client.Submit("INCR", "second")
-	assertSlingshotFutureOK(t, first, int64(1), 1, 1)
-	assertSlingshotFutureOK(t, second, int64(1), 1, 1)
+	assertIORedisFutureOK(t, first, int64(1), 1, 1)
+	assertIORedisFutureOK(t, second, int64(1), 1, 1)
 	wantCommands := [][]string{
-		{"client", "setname", "slingshot"},
+		{"client", "setname", "cache"},
 		{"client", "SETINFO", "LIB-NAME", "ioredis"},
 		{"client", "SETINFO", "LIB-VER", "5.11.1"},
 		{"info"},
 		{"incr", "first"},
 		{"incr", "second"},
-		{"client", "setname", "slingshot"},
+		{"client", "setname", "cache"},
 		{"client", "SETINFO", "LIB-NAME", "ioredis"},
 		{"client", "SETINFO", "LIB-VER", "5.11.1"},
 		{"info"},
@@ -564,10 +564,10 @@ func TestSlingshotIORedisRESPTransportReplaysCompleteUnfulfilledSet(t *testing.T
 	}
 }
 
-func TestSlingshotIORedisRESPDuplexPartialPipelineAbortsUnreadSuffix(t *testing.T) {
+func TestIORedisRESPDuplexPartialPipelineAbortsUnreadSuffix(t *testing.T) {
 	var connectionNumber int
 	var mu sync.Mutex
-	server := startSlingshotRESPScenarioServer(t, nil, func(command []string) (string, bool) {
+	server := startIORedisRESPScenarioServer(t, nil, func(command []string) (string, bool) {
 		mu.Lock()
 		defer mu.Unlock()
 		if strings.EqualFold(command[0], "INFO") {
@@ -583,16 +583,16 @@ func TestSlingshotIORedisRESPDuplexPartialPipelineAbortsUnreadSuffix(t *testing.
 		return "+OK\r\n", false
 	})
 	defer server.stop()
-	factory, err := NewSlingshotIORedisRESPTransportFactory(SlingshotIORedisRESPOptions{
+	factory, err := NewIORedisRESPTransportFactory(IORedisRESPOptions{
 		Addr: server.addr, DisableClientInfo: true,
 	})
 	if err != nil {
 		t.Fatalf("factory: %v", err)
 	}
-	client := newFastSlingshotIORedisClient(t, factory)
+	client := newFastIORedisClient(t, factory)
 	defer client.Disconnect()
 
-	result, err := waitSlingshotFuture(t, client.SubmitPipeline(
+	result, err := waitIORedisFuture(t, client.SubmitPipeline(
 		[]string{"SET", "first", "1"},
 		[]string{"SET", "second", "2"},
 		[]string{"SET", "third", "3"},
@@ -604,15 +604,15 @@ func TestSlingshotIORedisRESPDuplexPartialPipelineAbortsUnreadSuffix(t *testing.
 		t.Fatalf("pipeline replies = %#v", result.Replies)
 	}
 	for index := 1; index < len(result.Replies); index++ {
-		var abort SlingshotIORedisAbortError
+		var abort IORedisAbortError
 		if !errors.As(result.Replies[index].Error, &abort) {
-			t.Fatalf("pipeline reply %d error = %T %v, want SlingshotIORedisAbortError", index, result.Replies[index].Error, result.Replies[index].Error)
+			t.Fatalf("pipeline reply %d error = %T %v, want IORedisAbortError", index, result.Replies[index].Error, result.Replies[index].Error)
 		}
 	}
 	if result.ReplayCount != 0 || result.AmbiguousReplays != 0 {
 		t.Fatalf("pipeline replay counters = %+v, want zero", result)
 	}
-	assertSlingshotFutureOK(t, client.Submit("SET", "later", "4"), "OK", 0, 0)
+	assertIORedisFutureOK(t, client.Submit("SET", "later", "4"), "OK", 0, 0)
 
 	var keys []string
 	for _, command := range server.commandsSnapshot() {
@@ -625,9 +625,9 @@ func TestSlingshotIORedisRESPDuplexPartialPipelineAbortsUnreadSuffix(t *testing.
 	}
 }
 
-func newPipeSlingshotRESPFactory(t *testing.T, connection net.Conn) *SlingshotIORedisRESPTransportFactory {
+func newPipeIORedisRESPFactory(t *testing.T, connection net.Conn) *IORedisRESPTransportFactory {
 	t.Helper()
-	factory, err := NewSlingshotIORedisRESPTransportFactory(SlingshotIORedisRESPOptions{
+	factory, err := NewIORedisRESPTransportFactory(IORedisRESPOptions{
 		Addr: "pipe:0", DisableClientInfo: true, DisableReadyCheck: true,
 		DialContext: func(context.Context, string, string) (net.Conn, error) {
 			return connection, nil
@@ -639,14 +639,14 @@ func newPipeSlingshotRESPFactory(t *testing.T, connection net.Conn) *SlingshotIO
 	return factory
 }
 
-type slingshotWriteFaultConn struct {
+type ioredisWriteFaultConn struct {
 	net.Conn
 	failAfter int
 	err       error
 	written   int
 }
 
-func (c *slingshotWriteFaultConn) Write(buffer []byte) (int, error) {
+func (c *ioredisWriteFaultConn) Write(buffer []byte) (int, error) {
 	remaining := c.failAfter - c.written
 	if remaining <= 0 {
 		return 0, c.err
@@ -661,7 +661,7 @@ func (c *slingshotWriteFaultConn) Write(buffer []byte) (int, error) {
 	return count, err
 }
 
-type slingshotRESPScenarioServer struct {
+type ioredisRESPScenarioServer struct {
 	listener net.Listener
 	addr     string
 	tls      *tls.Config
@@ -673,13 +673,13 @@ type slingshotRESPScenarioServer struct {
 	done        chan struct{}
 }
 
-func startSlingshotRESPScenarioServer(t *testing.T, tlsConfig *tls.Config, handler func([]string) (string, bool)) *slingshotRESPScenarioServer {
+func startIORedisRESPScenarioServer(t *testing.T, tlsConfig *tls.Config, handler func([]string) (string, bool)) *ioredisRESPScenarioServer {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	server := &slingshotRESPScenarioServer{
+	server := &ioredisRESPScenarioServer{
 		listener: listener, addr: listener.Addr().String(), tls: tlsConfig, handler: handler,
 		connections: make(map[net.Conn]struct{}), done: make(chan struct{}),
 	}
@@ -687,7 +687,7 @@ func startSlingshotRESPScenarioServer(t *testing.T, tlsConfig *tls.Config, handl
 	return server
 }
 
-func (s *slingshotRESPScenarioServer) serve() {
+func (s *ioredisRESPScenarioServer) serve() {
 	defer close(s.done)
 	for {
 		connection, err := s.listener.Accept()
@@ -704,7 +704,7 @@ func (s *slingshotRESPScenarioServer) serve() {
 	}
 }
 
-func (s *slingshotRESPScenarioServer) serveConnection(connection net.Conn) {
+func (s *ioredisRESPScenarioServer) serveConnection(connection net.Conn) {
 	defer func() {
 		_ = connection.Close()
 		s.mu.Lock()
@@ -732,7 +732,7 @@ func (s *slingshotRESPScenarioServer) serveConnection(connection net.Conn) {
 	}
 }
 
-func (s *slingshotRESPScenarioServer) commandsSnapshot() [][]string {
+func (s *ioredisRESPScenarioServer) commandsSnapshot() [][]string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	commands := make([][]string, len(s.commands))
@@ -742,7 +742,7 @@ func (s *slingshotRESPScenarioServer) commandsSnapshot() [][]string {
 	return commands
 }
 
-func (s *slingshotRESPScenarioServer) commandNames() []string {
+func (s *ioredisRESPScenarioServer) commandNames() []string {
 	commands := s.commandsSnapshot()
 	names := make([]string, len(commands))
 	for index := range commands {
@@ -751,7 +751,7 @@ func (s *slingshotRESPScenarioServer) commandNames() []string {
 	return names
 }
 
-func (s *slingshotRESPScenarioServer) stop() {
+func (s *ioredisRESPScenarioServer) stop() {
 	_ = s.listener.Close()
 	s.mu.Lock()
 	connections := make([]net.Conn, 0, len(s.connections))
@@ -768,7 +768,7 @@ func (s *slingshotRESPScenarioServer) stop() {
 	}
 }
 
-func newSlingshotTestCertificate(t *testing.T) tls.Certificate {
+func newIORedisTestCertificate(t *testing.T) tls.Certificate {
 	t.Helper()
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {

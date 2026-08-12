@@ -88,7 +88,7 @@ func TestBuildResourceKeepsPartialEnvironmentResource(t *testing.T) {
 func TestBuildResourceAddsReleaseRevisionAndDeploymentIdentity(t *testing.T) {
 	t.Setenv("SENTRY_RELEASE", "release-from-env")
 	t.Setenv("GITSHA", "0123456789abcdef")
-	t.Setenv("SENTRY_ENVIRONMENT", "fyndz0")
+	t.Setenv("SENTRY_ENVIRONMENT", "staging-cluster")
 	// OTel's standard resource input must retain precedence over inferred values.
 	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "service.version=release-from-resource")
 
@@ -100,7 +100,7 @@ func TestBuildResourceAddsReleaseRevisionAndDeploymentIdentity(t *testing.T) {
 		"service.version":             "release-from-resource",
 		"vcs.ref.head.revision":       "0123456789abcdef",
 		"deployment.environment":      "production",
-		"deployment.environment.name": "fyndz0",
+		"deployment.environment.name": "staging-cluster",
 	}
 	for key, expected := range want {
 		value, ok := values[key]

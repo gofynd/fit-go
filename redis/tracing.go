@@ -151,7 +151,7 @@ func startIORedisCompatibilitySpan(ctx context.Context, commands [][]string, pip
 	return span
 }
 
-func finishIORedisCompatibilitySpan(span trace.Span, replies []SlingshotIORedisReply, err error) {
+func finishIORedisCompatibilitySpan(span trace.Span, replies []IORedisReply, err error) {
 	if span == nil {
 		return
 	}
