@@ -565,14 +565,19 @@ func kafkaJSOffsetCommitResponseError(response *kmsg.OffsetCommitResponse) error
 }
 
 // classifyKafkaJSTransientConsumerError turns only transport and Kafka
-// protocol retry classes into the exported typed boundary. Permanent broker
-// responses (authorization, invalid topic/config, oversized records) retain
-// their original error identity and continue to fail fast in callers.
+// consumer-run recovery classes into the exported typed boundary. In addition
+// to errors Kafka marks retriable for the same request, KafkaJS explicitly
+// rejoins the group for UNKNOWN_MEMBER_ID, ILLEGAL_GENERATION, and
+// REBALANCE_IN_PROGRESS. Those responses are non-retriable at the individual
+// request level, but recoverable after replacing the stale group member.
+// Permanent broker responses (authorization, invalid topic/config, oversized
+// records) retain their original error identity and continue to fail fast in
+// callers.
 func classifyKafkaJSTransientConsumerError(err error) error {
 	if err == nil || IsTransientConsumerError(err) || errors.Is(err, context.Canceled) {
 		return err
 	}
-	if kerr.IsRetriable(err) || errors.Is(err, context.DeadlineExceeded) {
+	if kerr.IsRetriable(err) || isKafkaJSGroupRejoinError(err) || errors.Is(err, context.DeadlineExceeded) {
 		return NewTransientConsumerError(err)
 	}
 	var networkErr net.Error
@@ -580,6 +585,18 @@ func classifyKafkaJSTransientConsumerError(err error) error {
 		return NewTransientConsumerError(err)
 	}
 	return err
+}
+
+// isKafkaJSGroupRejoinError mirrors KafkaJS' consumer runner rather than
+// Kafka's per-request retriable flag. Reissuing the failed request with the
+// same member identity cannot succeed; ending the run and rebuilding the
+// franz-go client creates a fresh member that can join and resume from the
+// committed offset. Keep this list deliberately narrow so authorization and
+// configuration failures are never hidden behind a reconnect loop.
+func isKafkaJSGroupRejoinError(err error) bool {
+	return errors.Is(err, kerr.UnknownMemberID) ||
+		errors.Is(err, kerr.IllegalGeneration) ||
+		errors.Is(err, kerr.RebalanceInProgress)
 }
 
 func (c *kafkaJSCompatibleConsumer) ConsumeBatch(handler BatchHandler, opts ConsumerOptions) error {

@@ -145,7 +145,12 @@ func TestKafkaJSTransientConsumerErrorClassification(t *testing.T) {
 	}{
 		{name: "dial failure", err: fmt.Errorf("post-handler commit failed: %w", networkCause), transient: true},
 		{name: "retriable protocol failure", err: fmt.Errorf("commit failed: %w", kerr.CoordinatorNotAvailable), transient: true},
+		{name: "unknown member rejoins", err: fmt.Errorf("join failed: %w", kerr.UnknownMemberID), transient: true},
+		{name: "illegal generation rejoins", err: fmt.Errorf("heartbeat failed: %w", kerr.IllegalGeneration), transient: true},
+		{name: "rebalance in progress rejoins", err: fmt.Errorf("fetch failed: %w", kerr.RebalanceInProgress), transient: true},
 		{name: "permanent protocol failure", err: fmt.Errorf("commit failed: %w", kerr.GroupAuthorizationFailed), transient: false},
+		{name: "invalid group remains permanent", err: fmt.Errorf("join failed: %w", kerr.InvalidGroupID), transient: false},
+		{name: "incompatible protocol remains permanent", err: fmt.Errorf("join failed: %w", kerr.InconsistentGroupProtocol), transient: false},
 		{name: "handler failure", err: errors.New("validation failed"), transient: false},
 	}
 	for _, tc := range tests {
@@ -157,6 +162,43 @@ func TestKafkaJSTransientConsumerErrorClassification(t *testing.T) {
 			}
 			if !errors.Is(got, tc.err) {
 				t.Fatalf("classified error no longer unwraps to original: %v", got)
+			}
+		})
+	}
+}
+
+func TestKafkaJSGroupRejoinErrorsRestartFromConsumerPollBoundary(t *testing.T) {
+	for _, groupErr := range []error{
+		kerr.UnknownMemberID,
+		kerr.IllegalGeneration,
+		kerr.RebalanceInProgress,
+	} {
+		t.Run(groupErr.Error(), func(t *testing.T) {
+			client := &fakeKafkaJSConsumerClient{pollFn: func(context.Context, int) kgo.Fetches {
+				// This is the exact wrapper franz-go injects into PollRecords when a
+				// member is kicked from, or cannot join, its consumer group.
+				return kgo.NewErrFetch(&kgo.ErrGroupSession{Err: groupErr})
+			}}
+			consumer := newKafkaJSLifecycleTestConsumer(t, client, ConsumerShutdownCancelInFlight)
+			handlerCalled := false
+
+			got := consumer.ConsumeCtx(func(context.Context, MessagePayload) error {
+				handlerCalled = true
+				return nil
+			}, ConsumerOptions{PollTimeout: time.Second})
+
+			if !IsTransientConsumerError(got) || !errors.Is(got, groupErr) {
+				t.Fatalf("consume error = %v, want transient error preserving %v", got, groupErr)
+			}
+			if consumer.client != nil {
+				t.Fatal("group-rejoin failure retained the stale consumer client")
+			}
+			allowRebalances, closes, _, _ := client.snapshot()
+			if allowRebalances != 1 || closes != 1 {
+				t.Fatalf("rebalance/close calls = %d/%d, want 1/1", allowRebalances, closes)
+			}
+			if handlerCalled {
+				t.Fatal("consumer invoked the handler for a group-session error")
 			}
 		})
 	}
