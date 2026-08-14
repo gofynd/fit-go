@@ -148,8 +148,8 @@ type ConsumerConfig struct {
 	GroupID string
 
 	// Backend selects the consumer implementation. The zero value retains the
-	// production Confluent/librdkafka backend. KafkaJSCompatible is an explicit
-	// migration-only backend whose group protocol name matches KafkaJS 2.x's
+	// production Confluent/librdkafka backend. FranzKafkaJS2Compat is an explicit
+	// compatibility backend whose group protocol name matches KafkaJS 2.x's
 	// literal "RoundRobinAssigner", allowing old and new members to overlap in
 	// one group during a rolling cutover. All members in such a mixed group must
 	// subscribe to the same topic set. franz-go and KafkaJS intentionally differ
@@ -160,7 +160,7 @@ type ConsumerConfig struct {
 	// PartitionAssignmentStrategy selects the group protocol assignor advertised
 	// to Kafka. Empty preserves the driver default. Librdkafka's "roundrobin"
 	// protocol is not wire-compatible with KafkaJS 2.x's literal
-	// "RoundRobinAssigner" protocol name; use ConsumerBackendKafkaJSCompatible
+	// "RoundRobinAssigner" protocol name; use ConsumerBackendFranzKafkaJS2Compat
 	// for a mixed-runtime rolling cutover.
 	PartitionAssignmentStrategy string
 
@@ -252,12 +252,12 @@ type ConsumerBackend uint8
 
 const (
 	ConsumerBackendConfluent ConsumerBackend = iota
-	ConsumerBackendKafkaJSCompatible
+	ConsumerBackendFranzKafkaJS2Compat
 )
 
 // ConsumerShutdownPolicy controls the active-run shutdown boundary of the
-// KafkaJS-compatible consumer. Existing consumers retain cancel-in-flight
-// semantics unless they explicitly opt in to draining.
+// franz-go backend's KafkaJS 2.x compatibility consumer. Existing consumers
+// retain cancel-in-flight semantics unless they explicitly opt in to draining.
 type ConsumerShutdownPolicy uint8
 
 const (

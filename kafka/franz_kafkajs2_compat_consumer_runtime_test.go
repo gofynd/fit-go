@@ -21,13 +21,13 @@ import (
 	"github.com/gofynd/fit-go/logging"
 )
 
-// TestKafkaJSCompatibleUnresolvedFinalizerMultiRecordLive proves the exact
+// TestFranzKafkaJS2CompatUnresolvedFinalizerMultiRecordLive proves the exact
 // compatibility behavior against a disposable broker. Two same-partition
 // records are present before the first poll (and MaxRecords is two), so the
 // failed N and following N+1 are returned in one PollRecords batch. The opt-in
 // must stop that batch, replay N, then deliver N+1. The default-false case pins
 // the existing behavior for every consumer that does not request compatibility.
-func TestKafkaJSCompatibleUnresolvedFinalizerMultiRecordLive(t *testing.T) {
+func TestFranzKafkaJS2CompatUnresolvedFinalizerMultiRecordLive(t *testing.T) {
 	broker := strings.TrimSpace(os.Getenv("FIT_GO_KAFKA_RUNTIME_BROKER"))
 	if broker == "" {
 		t.Skip("set FIT_GO_KAFKA_RUNTIME_BROKER to a disposable Kafka broker")
@@ -47,11 +47,230 @@ func TestKafkaJSCompatibleUnresolvedFinalizerMultiRecordLive(t *testing.T) {
 	}
 }
 
-// TestKafkaJSCompatibleCloseDrainsInFlightHandlerLive proves the shutdown
+// TestFranzKafkaJS2CompatReadCommittedTransactionsLive proves the KafkaJS
+// transaction contract against a disposable broker: aborted records and
+// control records never reach handlers, while the consumer group advances
+// through the final control-record offset.
+func TestFranzKafkaJS2CompatReadCommittedTransactionsLive(t *testing.T) {
+	broker := strings.TrimSpace(os.Getenv("FIT_GO_KAFKA_RUNTIME_BROKER"))
+	if broker == "" {
+		t.Skip("set FIT_GO_KAFKA_RUNTIME_BROKER to a disposable Kafka broker")
+	}
+	cases := []struct {
+		name      string
+		auto      bool
+		finalizer bool
+		batch     bool
+	}{
+		{name: "automatic_message_offsets", auto: true},
+		{name: "manual_message_offsets"},
+		{name: "exact_finalizer_offsets", finalizer: true},
+		{name: "manual_batch_offsets", batch: true},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			runKafkaJSReadCommittedFixture(t, broker, test.auto, test.finalizer, test.batch)
+		})
+	}
+}
+
+func runKafkaJSReadCommittedFixture(t *testing.T, broker string, auto, finalizer, batch bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	topic := "fit-go-read-committed-" + suffix
+	group := "fit-go-read-committed-group-" + suffix
+	createKafkaJSRuntimeTopic(t, ctx, broker, topic, 1)
+	produceKafkaJSTransactionFixture(t, ctx, broker, topic, "fit-go-transaction-"+suffix)
+	if end := kafkaJSRuntimeLogEnd(t, broker, topic); end != 4 {
+		t.Fatalf("transaction fixture log end = %d, want 4", end)
+	}
+
+	logger, err := logging.New(logging.Options{Level: "error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := DefaultConsumerConfig(group)
+	config.Backend = ConsumerBackendFranzKafkaJS2Compat
+	config.AutoCommit = auto
+	config.AutoCommitInterval = 100 * time.Millisecond
+	consumer, err := newFranzKafkaJS2CompatConsumer([]string{broker}, &Config{ClientID: "fit-go-read-committed-test"}, config, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := consumer.Connect([]TopicConfig{{Topic: topic, FromBeginning: true}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = consumer.Close() })
+
+	var valuesMu sync.Mutex
+	values := make([]string, 0, 1)
+	recordValue := func(value []byte) {
+		valuesMu.Lock()
+		values = append(values, string(value))
+		valuesMu.Unlock()
+	}
+	opts := ConsumerOptions{PollTimeout: 100 * time.Millisecond, MaxRecords: 10}
+	if finalizer {
+		opts.OffsetFinalizer = func(_ context.Context, payload MessagePayload, handlerErr error, commit ExactOffsetCommit) error {
+			if handlerErr != nil {
+				return handlerErr
+			}
+			return commit(payload.Offset)
+		}
+		opts.ResolveAfterSuccessfulFinalizer = true
+		opts.NullOffsetCommitMetadata = true
+	}
+
+	runDone := make(chan error, 1)
+	if batch {
+		batchConsumer, ok := consumer.(KafkaBatchConsumerCtx)
+		if !ok {
+			t.Fatalf("KafkaJS-compatible consumer %T does not implement KafkaBatchConsumerCtx", consumer)
+		}
+		go func() {
+			runDone <- batchConsumer.ConsumeBatchCtx(func(_ context.Context, payload BatchPayload) error {
+				for _, message := range payload.Messages {
+					recordValue(message.Value)
+				}
+				return nil
+			}, opts)
+		}()
+	} else {
+		go func() {
+			runDone <- consumer.ConsumeCtx(func(_ context.Context, payload MessagePayload) error {
+				recordValue(payload.Value)
+				return nil
+			}, opts)
+		}()
+	}
+
+	waitForKafkaJSCommittedOffset(t, ctx, broker, group, topic, 4)
+	if err := consumer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("consumer shutdown: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("consumer did not stop")
+	}
+
+	valuesMu.Lock()
+	got := append([]string(nil), values...)
+	valuesMu.Unlock()
+	if want := []string{"committed"}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("handler values = %v, want %v; aborted and control records must remain internal", got, want)
+	}
+}
+
+func TestFranzKafkaJS2CompatControlRecordDoesNotAdvancePastFailedMessageLive(t *testing.T) {
+	broker := strings.TrimSpace(os.Getenv("FIT_GO_KAFKA_RUNTIME_BROKER"))
+	if broker == "" {
+		t.Skip("set FIT_GO_KAFKA_RUNTIME_BROKER to a disposable Kafka broker")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	topic := "fit-go-read-committed-failure-" + suffix
+	group := "fit-go-read-committed-failure-group-" + suffix
+	createKafkaJSRuntimeTopic(t, ctx, broker, topic, 1)
+	produceKafkaJSTransactionFixture(t, ctx, broker, topic, "fit-go-transaction-failure-"+suffix)
+
+	logger, err := logging.New(logging.Options{Level: "error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := DefaultConsumerConfig(group)
+	config.Backend = ConsumerBackendFranzKafkaJS2Compat
+	config.AutoCommit = false
+	consumer, err := newFranzKafkaJS2CompatConsumer([]string{broker}, &Config{ClientID: "fit-go-read-committed-failure-test"}, config, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := consumer.Connect([]TopicConfig{{Topic: topic, FromBeginning: true}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = consumer.Close() })
+
+	wantHandlerErr := errors.New("controlled handler failure")
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- consumer.ConsumeCtx(func(_ context.Context, payload MessagePayload) error {
+			if string(payload.Value) != "committed" {
+				return fmt.Errorf("unexpected handler value %q", payload.Value)
+			}
+			return wantHandlerErr
+		}, ConsumerOptions{PollTimeout: 100 * time.Millisecond, MaxRecords: 10})
+	}()
+
+	select {
+	case err := <-runDone:
+		if !errors.Is(err, wantHandlerErr) {
+			t.Fatalf("consumer error = %v, want controlled handler failure", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("consumer did not return the handler failure")
+	}
+	// Offset 1 is the abort marker, so resolving it commits 2. The failed
+	// visible record is offset 2 and its trailing commit marker is offset 3;
+	// neither may advance the group after the handler fails.
+	waitForKafkaJSCommittedOffset(t, ctx, broker, group, topic, 2)
+}
+
+func produceKafkaJSTransactionFixture(t *testing.T, ctx context.Context, broker, topic, transactionalID string) {
+	t.Helper()
+	producer, err := kgo.NewClient(
+		kgo.SeedBrokers(broker),
+		kgo.TransactionalID(transactionalID),
+		kgo.TransactionTimeout(30*time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer producer.Close()
+	produce := func(value string, end kgo.TransactionEndTry) {
+		t.Helper()
+		if err := producer.BeginTransaction(); err != nil {
+			t.Fatalf("begin transaction for %q: %v", value, err)
+		}
+		if err := producer.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte(value)}).FirstErr(); err != nil {
+			t.Fatalf("produce transaction value %q: %v", value, err)
+		}
+		if err := producer.EndTransaction(ctx, end); err != nil {
+			t.Fatalf("end transaction for %q: %v", value, err)
+		}
+	}
+	produce("aborted", kgo.TryAbort)
+	produce("committed", kgo.TryCommit)
+}
+
+func kafkaJSRuntimeLogEnd(t *testing.T, broker, topic string) int64 {
+	t.Helper()
+	reader, err := confluentKafka.NewConsumer(&confluentKafka.ConfigMap{
+		"bootstrap.servers":  broker,
+		"group.id":           "fit-go-log-end-" + fmt.Sprintf("%d", time.Now().UnixNano()),
+		"enable.auto.commit": false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	_, high, err := reader.QueryWatermarkOffsets(topic, 0, 5000)
+	if err != nil {
+		t.Fatalf("query transaction fixture log end: %v", err)
+	}
+	return high
+}
+
+// TestFranzKafkaJS2CompatCloseDrainsInFlightHandlerLive proves the shutdown
 // ordering required by BlockRebalanceOnPoll. Close must cancel the handler but
 // retain the assignment until that handler reaches its offset boundary; only
 // then may it allow the final rebalance and close the client.
-func TestKafkaJSCompatibleCloseDrainsInFlightHandlerLive(t *testing.T) {
+func TestFranzKafkaJS2CompatCloseDrainsInFlightHandlerLive(t *testing.T) {
 	broker := strings.TrimSpace(os.Getenv("FIT_GO_KAFKA_RUNTIME_BROKER"))
 	if broker == "" {
 		t.Skip("set FIT_GO_KAFKA_RUNTIME_BROKER to a disposable Kafka broker")
@@ -90,12 +309,12 @@ func TestKafkaJSCompatibleCloseDrainsInFlightHandlerLive(t *testing.T) {
 	}
 	firstRevoked := make(chan []PartitionAssignment, 4)
 	consumerConfig := DefaultConsumerConfig(group)
-	consumerConfig.Backend = ConsumerBackendKafkaJSCompatible
+	consumerConfig.Backend = ConsumerBackendFranzKafkaJS2Compat
 	consumerConfig.AutoCommit = false
 	consumerConfig.OnPartitionsRevoked = func(revoked []PartitionAssignment) {
 		firstRevoked <- append([]PartitionAssignment(nil), revoked...)
 	}
-	consumer, err := newKafkaJSCompatibleConsumer([]string{broker}, &Config{ClientID: "fit-go-close-drain-test"}, consumerConfig, logger)
+	consumer, err := newFranzKafkaJS2CompatConsumer([]string{broker}, &Config{ClientID: "fit-go-close-drain-test"}, consumerConfig, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,12 +355,12 @@ func TestKafkaJSCompatibleCloseDrainsInFlightHandlerLive(t *testing.T) {
 	// boundary.
 	peerAssigned := make(chan []PartitionAssignment, 4)
 	peerConfig := DefaultConsumerConfig(group)
-	peerConfig.Backend = ConsumerBackendKafkaJSCompatible
+	peerConfig.Backend = ConsumerBackendFranzKafkaJS2Compat
 	peerConfig.AutoCommit = false
 	peerConfig.OnPartitionsAssigned = func(assigned []PartitionAssignment) {
 		peerAssigned <- append([]PartitionAssignment(nil), assigned...)
 	}
-	peer, err := newKafkaJSCompatibleConsumer([]string{broker}, &Config{ClientID: "fit-go-close-drain-peer"}, peerConfig, logger)
+	peer, err := newFranzKafkaJS2CompatConsumer([]string{broker}, &Config{ClientID: "fit-go-close-drain-peer"}, peerConfig, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,11 +431,11 @@ func TestKafkaJSCompatibleCloseDrainsInFlightHandlerLive(t *testing.T) {
 	}
 }
 
-// TestKafkaJSCompatibleNullOffsetCommitMetadataLive exercises the supported
+// TestFranzKafkaJS2CompatNullOffsetCommitMetadataLive exercises the supported
 // franz-go pre-commit hook used for KafkaJS's null offset metadata. It proves
 // that an exact N+1 finalizer commit reaches the coordinator with nil metadata,
 // rather than relying only on a request-construction unit test.
-func TestKafkaJSCompatibleNullOffsetCommitMetadataLive(t *testing.T) {
+func TestFranzKafkaJS2CompatNullOffsetCommitMetadataLive(t *testing.T) {
 	broker := strings.TrimSpace(os.Getenv("FIT_GO_KAFKA_RUNTIME_BROKER"))
 	if broker == "" {
 		t.Skip("set FIT_GO_KAFKA_RUNTIME_BROKER to a disposable Kafka broker")
@@ -243,9 +462,9 @@ func TestKafkaJSCompatibleNullOffsetCommitMetadataLive(t *testing.T) {
 		t.Fatal(err)
 	}
 	consumerConfig := DefaultConsumerConfig(group)
-	consumerConfig.Backend = ConsumerBackendKafkaJSCompatible
+	consumerConfig.Backend = ConsumerBackendFranzKafkaJS2Compat
 	consumerConfig.AutoCommit = false
-	consumer, err := newKafkaJSCompatibleConsumer([]string{broker}, &Config{ClientID: "fit-go-null-offset-metadata-test"}, consumerConfig, logger)
+	consumer, err := newFranzKafkaJS2CompatConsumer([]string{broker}, &Config{ClientID: "fit-go-null-offset-metadata-test"}, consumerConfig, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,11 +527,11 @@ func TestKafkaJSCompatibleNullOffsetCommitMetadataLive(t *testing.T) {
 	}
 }
 
-// TestKafkaJSCompatibleMixedLegacyGroupLive runs the actual legacy KafkaJS
+// TestFranzKafkaJS2CompatMixedLegacyGroupLive runs the actual legacy KafkaJS
 // round-robin assigner and the franz-go compatibility backend in one classic
 // consumer group. It proves join, split assignment, rebalance, and leave using
 // the literal protocol that must remain compatible during a Node-to-Go rollout.
-func TestKafkaJSCompatibleMixedLegacyGroupLive(t *testing.T) {
+func TestFranzKafkaJS2CompatMixedLegacyGroupLive(t *testing.T) {
 	broker := strings.TrimSpace(os.Getenv("FIT_GO_KAFKA_RUNTIME_BROKER"))
 	kafkaJSModule := strings.TrimSpace(os.Getenv("FIT_GO_KAFKAJS_NODE_MODULE"))
 	expectedVersion := strings.TrimSpace(os.Getenv("FIT_GO_KAFKAJS_EXPECTED_VERSION"))
@@ -352,7 +571,7 @@ func runKafkaJSMixedLegacyGroupFixture(
 			t.Fatal(err)
 		}
 		consumerConfig := DefaultConsumerConfig(group)
-		consumerConfig.Backend = ConsumerBackendKafkaJSCompatible
+		consumerConfig.Backend = ConsumerBackendFranzKafkaJS2Compat
 		consumerConfig.AutoCommit = false
 		consumerConfig.OnPartitionsAssigned = func(assigned []PartitionAssignment) {
 			goAssignments <- append([]PartitionAssignment(nil), assigned...)
@@ -360,7 +579,7 @@ func runKafkaJSMixedLegacyGroupFixture(
 		consumerConfig.OnPartitionsRevoked = func(revoked []PartitionAssignment) {
 			goRevocations <- append([]PartitionAssignment(nil), revoked...)
 		}
-		consumer, err := newKafkaJSCompatibleConsumer([]string{broker}, &Config{ClientID: "franz-go-live-test"}, consumerConfig, logger)
+		consumer, err := newFranzKafkaJS2CompatConsumer([]string{broker}, &Config{ClientID: "franz-go-live-test"}, consumerConfig, logger)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -796,9 +1015,9 @@ func runKafkaJSUnresolvedMultiRecordFixture(t *testing.T, broker string, redeliv
 		t.Fatal(err)
 	}
 	consumerConfig := DefaultConsumerConfig(group)
-	consumerConfig.Backend = ConsumerBackendKafkaJSCompatible
+	consumerConfig.Backend = ConsumerBackendFranzKafkaJS2Compat
 	consumerConfig.AutoCommit = false
-	consumer, err := newKafkaJSCompatibleConsumer([]string{broker}, &Config{ClientID: "fit-go-redelivery-test"}, consumerConfig, logger)
+	consumer, err := newFranzKafkaJS2CompatConsumer([]string{broker}, &Config{ClientID: "fit-go-redelivery-test"}, consumerConfig, logger)
 	if err != nil {
 		t.Fatal(err)
 	}

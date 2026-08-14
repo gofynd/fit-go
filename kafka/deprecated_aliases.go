@@ -17,3 +17,7 @@ package kafka
 // ProducerPartitionerKafkaJSLegacy is retained for source compatibility.
 // Deprecated: use ProducerPartitionerKafkaJSCompatible.
 const ProducerPartitionerKafkaJSLegacy = ProducerPartitionerKafkaJSCompatible
+
+// ConsumerBackendKafkaJSCompatible is retained for source compatibility.
+// Deprecated: use ConsumerBackendFranzKafkaJS2Compat.
+const ConsumerBackendKafkaJSCompatible = ConsumerBackendFranzKafkaJS2Compat

@@ -21,8 +21,8 @@ import (
 )
 
 var (
-	_ KafkaConsumer         = (*kafkaJSCompatibleConsumer)(nil)
-	_ KafkaBatchConsumerCtx = (*kafkaJSCompatibleConsumer)(nil)
+	_ KafkaConsumer         = (*franzKafkaJS2CompatConsumer)(nil)
+	_ KafkaBatchConsumerCtx = (*franzKafkaJS2CompatConsumer)(nil)
 )
 
 // kafkaJSRoundRobinBalancer delegates the standard round-robin plan and wire
@@ -33,10 +33,11 @@ type kafkaJSRoundRobinBalancer struct{ kgo.GroupBalancer }
 
 func (kafkaJSRoundRobinBalancer) ProtocolName() string { return "RoundRobinAssigner" }
 
-// kafkaJSConsumerClient is the narrow franz-go surface used by the compatibility
-// loop. Keeping the boundary explicit makes shutdown ordering testable without
-// a broker while *kgo.Client remains the only production implementation.
-type kafkaJSConsumerClient interface {
+// franzKafkaJS2CompatClient is the narrow franz-go surface used by the
+// compatibility loop. Keeping the boundary explicit makes shutdown ordering
+// testable without a broker while *kgo.Client remains the only production
+// implementation.
+type franzKafkaJS2CompatClient interface {
 	PollRecords(context.Context, int) kgo.Fetches
 	AllowRebalance()
 	CommitRecords(context.Context, ...*kgo.Record) error
@@ -50,14 +51,14 @@ type kafkaJSConsumerClient interface {
 	CloseAllowingRebalance()
 }
 
-type kafkaJSCompatibleConsumer struct {
+type franzKafkaJS2CompatConsumer struct {
 	brokers []string
 	fitCfg  *Config
 	config  ConsumerConfig
 	logger  *logging.Logger
 
 	mu        sync.Mutex
-	client    kafkaJSConsumerClient
+	client    franzKafkaJS2CompatClient
 	topics    []TopicConfig
 	cancelRun context.CancelFunc
 	stopPoll  context.CancelFunc
@@ -67,7 +68,7 @@ type kafkaJSCompatibleConsumer struct {
 	closeDone chan struct{}
 }
 
-func newKafkaJSCompatibleConsumer(
+func newFranzKafkaJS2CompatConsumer(
 	brokers []string,
 	fitCfg *Config,
 	config ConsumerConfig,
@@ -85,7 +86,7 @@ func newKafkaJSCompatibleConsumer(
 	if !validConsumerShutdownPolicy(config.ShutdownPolicy) {
 		return nil, fmt.Errorf("kafka/kafkajs: unsupported shutdown policy %d", config.ShutdownPolicy)
 	}
-	return &kafkaJSCompatibleConsumer{
+	return &franzKafkaJS2CompatConsumer{
 		brokers: append([]string(nil), brokers...),
 		fitCfg:  fitCfg,
 		config:  config,
@@ -97,7 +98,7 @@ func validConsumerShutdownPolicy(policy ConsumerShutdownPolicy) bool {
 	return policy == ConsumerShutdownCancelInFlight || policy == ConsumerShutdownDrainInFlight
 }
 
-func (c *kafkaJSCompatibleConsumer) Connect(topics []TopicConfig) error {
+func (c *franzKafkaJS2CompatConsumer) Connect(topics []TopicConfig) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
@@ -134,7 +135,7 @@ func (c *kafkaJSCompatibleConsumer) Connect(topics []TopicConfig) error {
 	return nil
 }
 
-func (c *kafkaJSCompatibleConsumer) clientOptions(topics []TopicConfig) ([]kgo.Opt, error) {
+func (c *franzKafkaJS2CompatConsumer) clientOptions(topics []TopicConfig) ([]kgo.Opt, error) {
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(c.brokers...),
 		kgo.ClientID(c.fitCfg.ClientID),
@@ -142,6 +143,11 @@ func (c *kafkaJSCompatibleConsumer) clientOptions(topics []TopicConfig) ([]kgo.O
 		kgo.ConsumeTopics(topicNames(topics)...),
 		kgo.Balancers(kafkaJSRoundRobinBalancer{kgo.RoundRobinBalancer()}),
 		kgo.BlockRebalanceOnPoll(),
+		// KafkaJS consumers default to read_committed. Retain transaction
+		// markers internally so their offsets can advance without exposing the
+		// marker records to application handlers.
+		kgo.FetchIsolationLevel(kgo.ReadCommitted()),
+		kgo.KeepControlRecords(),
 	}
 	// Manual consumers must disable franz-go's background auto-commit loop.
 	// AutoCommitMarks only changes which offsets that loop commits; on its own
@@ -267,7 +273,7 @@ func formatAssignments(assignments []PartitionAssignment) []string {
 	return result
 }
 
-func (c *kafkaJSCompatibleConsumer) Consume(handler MessageHandler, opts ConsumerOptions) error {
+func (c *franzKafkaJS2CompatConsumer) Consume(handler MessageHandler, opts ConsumerOptions) error {
 	if handler == nil {
 		return fmt.Errorf("kafka/kafkajs: message handler is nil")
 	}
@@ -276,7 +282,7 @@ func (c *kafkaJSCompatibleConsumer) Consume(handler MessageHandler, opts Consume
 	}, opts)
 }
 
-func (c *kafkaJSCompatibleConsumer) ConsumeCtx(handler MessageHandlerCtx, opts ConsumerOptions) error {
+func (c *franzKafkaJS2CompatConsumer) ConsumeCtx(handler MessageHandlerCtx, opts ConsumerOptions) error {
 	if handler == nil {
 		return fmt.Errorf("kafka/kafkajs: message handler is nil")
 	}
@@ -289,7 +295,7 @@ type kafkaJSMessageHandler func(context.Context, MessagePayload) error
 
 var errKafkaJSUnresolvedRecordRewound = errors.New("kafka/kafkajs: unresolved record rewound")
 
-func (c *kafkaJSCompatibleConsumer) consumeMessages(handler kafkaJSMessageHandler, opts ConsumerOptions) error {
+func (c *franzKafkaJS2CompatConsumer) consumeMessages(handler kafkaJSMessageHandler, opts ConsumerOptions) error {
 	isAutoCommit, pollTimeout, concurrency, err := validateConfluentConsumerOptions(c.config.AutoCommit, opts, 100*time.Millisecond)
 	if err != nil {
 		return err
@@ -348,7 +354,7 @@ func (c *kafkaJSCompatibleConsumer) consumeMessages(handler kafkaJSMessageHandle
 	}
 }
 
-func pollKafkaJSRecords(ctx context.Context, client kafkaJSConsumerClient, timeout time.Duration, maxRecords int) (kgo.Fetches, error) {
+func pollKafkaJSRecords(ctx context.Context, client franzKafkaJS2CompatClient, timeout time.Duration, maxRecords int) (kgo.Fetches, error) {
 	pollCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	fetches := client.PollRecords(pollCtx, maxRecords)
@@ -416,14 +422,17 @@ func runKafkaJSRecordGroups(ctx context.Context, groups [][]*kgo.Record, concurr
 	return nil
 }
 
-func (c *kafkaJSCompatibleConsumer) processRecord(
+func (c *franzKafkaJS2CompatConsumer) processRecord(
 	ctx context.Context,
-	client kafkaJSConsumerClient,
+	client franzKafkaJS2CompatClient,
 	record *kgo.Record,
 	handler kafkaJSMessageHandler,
 	isAutoCommit bool,
 	opts ConsumerOptions,
 ) error {
+	if record.Attrs.IsControl() {
+		return resolveKafkaJSRecord(ctx, client, record, isAutoCommit, opts.NullOffsetCommitMetadata)
+	}
 	payload := kafkaJSPayload(record)
 	if !isAutoCommit && opts.CommitBeforeHandler {
 		if err := client.CommitRecords(ctx, record); err != nil {
@@ -480,7 +489,7 @@ func kafkaJSPayload(record *kgo.Record) MessagePayload {
 
 func resolveKafkaJSRecord(
 	ctx context.Context,
-	client kafkaJSConsumerClient,
+	client franzKafkaJS2CompatClient,
 	record *kgo.Record,
 	auto bool,
 	nullMetadata bool,
@@ -502,7 +511,7 @@ func resolveKafkaJSRecord(
 
 func commitKafkaJSExact(
 	ctx context.Context,
-	client kafkaJSConsumerClient,
+	client franzKafkaJS2CompatClient,
 	record *kgo.Record,
 	exact int64,
 	nullMetadata bool,
@@ -599,7 +608,7 @@ func isKafkaJSGroupRejoinError(err error) bool {
 		errors.Is(err, kerr.RebalanceInProgress)
 }
 
-func (c *kafkaJSCompatibleConsumer) ConsumeBatch(handler BatchHandler, opts ConsumerOptions) error {
+func (c *franzKafkaJS2CompatConsumer) ConsumeBatch(handler BatchHandler, opts ConsumerOptions) error {
 	if handler == nil {
 		return fmt.Errorf("kafka/kafkajs: batch handler is nil")
 	}
@@ -608,7 +617,7 @@ func (c *kafkaJSCompatibleConsumer) ConsumeBatch(handler BatchHandler, opts Cons
 	}, opts)
 }
 
-func (c *kafkaJSCompatibleConsumer) ConsumeBatchCtx(handler BatchHandlerCtx, opts ConsumerOptions) error {
+func (c *franzKafkaJS2CompatConsumer) ConsumeBatchCtx(handler BatchHandlerCtx, opts ConsumerOptions) error {
 	if handler == nil {
 		return fmt.Errorf("kafka/kafkajs: batch handler is nil")
 	}
@@ -619,7 +628,7 @@ func (c *kafkaJSCompatibleConsumer) ConsumeBatchCtx(handler BatchHandlerCtx, opt
 
 type kafkaJSBatchHandler func(context.Context, BatchPayload) error
 
-func (c *kafkaJSCompatibleConsumer) consumeBatches(handler kafkaJSBatchHandler, opts ConsumerOptions) error {
+func (c *franzKafkaJS2CompatConsumer) consumeBatches(handler kafkaJSBatchHandler, opts ConsumerOptions) error {
 	if opts.OffsetFinalizer != nil {
 		return fmt.Errorf("kafka/kafkajs: OffsetFinalizer is supported only for message consumption")
 	}
@@ -650,26 +659,42 @@ func (c *kafkaJSCompatibleConsumer) consumeBatches(handler kafkaJSBatchHandler, 
 			if len(group) == 0 {
 				return nil
 			}
-			messages := make([]MessagePayload, len(group))
-			for i, record := range group {
+			lastFetched := group[len(group)-1]
+			visible := make([]*kgo.Record, 0, len(group))
+			for _, record := range group {
+				if !record.Attrs.IsControl() {
+					visible = append(visible, record)
+				}
+			}
+			if len(visible) == 0 {
+				return resolveKafkaJSRecord(runCtx, client, lastFetched, isAutoCommit, false)
+			}
+			messages := make([]MessagePayload, len(visible))
+			for i, record := range visible {
 				messages[i] = kafkaJSPayload(record)
 			}
-			last := group[len(group)-1]
 			if !isAutoCommit && opts.CommitBeforeHandler {
-				if err := client.CommitRecords(runCtx, last); err != nil {
+				if err := client.CommitRecords(runCtx, lastFetched); err != nil {
 					return classifyKafkaJSTransientConsumerError(
 						fmt.Errorf("kafka/kafkajs: pre-handler batch commit failed: %w", err),
 					)
 				}
 			}
-			payload := BatchPayload{Topic: last.Topic, Partition: int(last.Partition), Messages: messages, FirstOffset: group[0].Offset, LastOffset: last.Offset}
+			lastVisible := visible[len(visible)-1]
+			payload := BatchPayload{
+				Topic:       lastVisible.Topic,
+				Partition:   int(lastVisible.Partition),
+				Messages:    messages,
+				FirstOffset: visible[0].Offset,
+				LastOffset:  lastVisible.Offset,
+			}
 			if err := handler(runCtx, payload); err != nil {
 				return fmt.Errorf("kafka/kafkajs: batch handler failed: %w", err)
 			}
 			if !isAutoCommit && opts.CommitBeforeHandler {
 				return nil
 			}
-			return resolveKafkaJSRecord(runCtx, client, last, isAutoCommit, false)
+			return resolveKafkaJSRecord(runCtx, client, lastFetched, isAutoCommit, false)
 		}); err != nil {
 			client.AllowRebalance()
 			if isKafkaJSRunCancellation(runCtx, err) {
@@ -698,7 +723,7 @@ func isKafkaJSRunCancellation(ctx context.Context, err error) bool {
 	return runErr != nil && errors.Is(err, runErr)
 }
 
-func (c *kafkaJSCompatibleConsumer) beginRun() (kafkaJSConsumerClient, context.Context, context.Context, func(), error) {
+func (c *franzKafkaJS2CompatConsumer) beginRun() (franzKafkaJS2CompatClient, context.Context, context.Context, func(), error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -765,7 +790,7 @@ func (c *kafkaJSCompatibleConsumer) beginRun() (kafkaJSConsumerClient, context.C
 // its runner from the group commit in this situation. Closing this client and
 // lazily rebuilding it in beginRun gives the caller the same replay boundary
 // without retrying permanent protocol or handler failures.
-func (c *kafkaJSCompatibleConsumer) prepareTransientRunRetry(runClient kafkaJSConsumerClient, err error) error {
+func (c *franzKafkaJS2CompatConsumer) prepareTransientRunRetry(runClient franzKafkaJS2CompatClient, err error) error {
 	if !IsTransientConsumerError(err) || runClient == nil {
 		return err
 	}
@@ -785,7 +810,7 @@ func (c *kafkaJSCompatibleConsumer) prepareTransientRunRetry(runClient kafkaJSCo
 	return err
 }
 
-func (c *kafkaJSCompatibleConsumer) Close() error {
+func (c *franzKafkaJS2CompatConsumer) Close() error {
 	c.mu.Lock()
 	if c.closed {
 		done := c.closeDone
