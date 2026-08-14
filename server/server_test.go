@@ -15,6 +15,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/hmac"
@@ -24,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1216,6 +1218,32 @@ func TestStaticHealthRoutesPreserveExpressConditionalRequests(t *testing.T) {
 	}
 }
 
+func TestStaticHealthRoutesCombineDuplicateConditionalHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	RegisterStaticHealthRoutes(engine)
+
+	request := httptest.NewRequest(http.MethodGet, "/_healthz", nil)
+	request.Header.Add("If-None-Match", `"stale"`)
+	request.Header.Add("If-None-Match", `W/"b-2F/2BWc0KYbtLqL5U2Kv5B6uQUQ"`)
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusNotModified {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNotModified)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/_healthz", nil)
+	request.Header.Set("If-None-Match", `W/"b-2F/2BWc0KYbtLqL5U2Kv5B6uQUQ"`)
+	request.Header.Add("Cache-Control", "max-age=0")
+	request.Header.Add("Cache-Control", "no-cache")
+	recorder = httptest.NewRecorder()
+	engine.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("duplicate Cache-Control status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+}
+
 func TestDeprecatedStaticHealthAliasUsesCanonicalBehavior(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
@@ -1286,6 +1314,9 @@ func TestNew(t *testing.T) {
 		if s.cfg.IdleTimeout != 120*time.Second {
 			t.Errorf("IdleTimeout = %v, want 120s", s.cfg.IdleTimeout)
 		}
+		if s.cfg.MaxHeaderBytes != 0 {
+			t.Errorf("MaxHeaderBytes = %d, want zero to preserve net/http default", s.cfg.MaxHeaderBytes)
+		}
 	})
 
 	t.Run("custom config", func(t *testing.T) {
@@ -1296,6 +1327,7 @@ func TestNew(t *testing.T) {
 			ReadHeaderTimeout: 15 * time.Second,
 			WriteTimeout:      60 * time.Second,
 			IdleTimeout:       300 * time.Second,
+			MaxHeaderBytes:    16 * 1024,
 		})
 
 		if s.cfg.ReadTimeout != 60*time.Second {
@@ -1309,6 +1341,9 @@ func TestNew(t *testing.T) {
 		}
 		if s.cfg.IdleTimeout != 300*time.Second {
 			t.Errorf("IdleTimeout = %v, want 300s", s.cfg.IdleTimeout)
+		}
+		if s.cfg.MaxHeaderBytes != 16*1024 {
+			t.Errorf("MaxHeaderBytes = %d, want 16384", s.cfg.MaxHeaderBytes)
 		}
 	})
 
@@ -1345,6 +1380,9 @@ func TestServerBuildHTTPServerTimeouts(t *testing.T) {
 		if httpServer.IdleTimeout != 120*time.Second {
 			t.Errorf("IdleTimeout = %v, want 120s", httpServer.IdleTimeout)
 		}
+		if httpServer.MaxHeaderBytes != 0 {
+			t.Errorf("MaxHeaderBytes = %d, want zero", httpServer.MaxHeaderBytes)
+		}
 	})
 
 	t.Run("custom values reach net http", func(t *testing.T) {
@@ -1353,6 +1391,7 @@ func TestServerBuildHTTPServerTimeouts(t *testing.T) {
 			ReadHeaderTimeout: time.Minute,
 			WriteTimeout:      2 * time.Minute,
 			IdleTimeout:       5 * time.Second,
+			MaxHeaderBytes:    16 * 1024,
 		})
 		s.App = http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
 		httpServer := s.buildHTTPServer(":0")
@@ -1369,6 +1408,9 @@ func TestServerBuildHTTPServerTimeouts(t *testing.T) {
 		if httpServer.IdleTimeout != 5*time.Second {
 			t.Errorf("IdleTimeout = %v, want 5s", httpServer.IdleTimeout)
 		}
+		if httpServer.MaxHeaderBytes != 16*1024 {
+			t.Errorf("MaxHeaderBytes = %d, want 16384", httpServer.MaxHeaderBytes)
+		}
 	})
 
 	t.Run("write timeout disable takes precedence", func(t *testing.T) {
@@ -1383,6 +1425,128 @@ func TestServerBuildHTTPServerTimeouts(t *testing.T) {
 			t.Errorf("WriteTimeout = %v, want disabled", httpServer.WriteTimeout)
 		}
 	})
+}
+
+func TestServerMaxHeaderBytesEnforced(t *testing.T) {
+	fitServer := New(Config{MaxHeaderBytes: 16 * 1024})
+	fitServer.App = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	configured := fitServer.buildHTTPServer("")
+	server := httptest.NewUnstartedServer(configured.Handler)
+	server.Config.MaxHeaderBytes = configured.MaxHeaderBytes
+	server.Start()
+	defer server.Close()
+
+	request := func(size int) *http.Response {
+		req, err := http.NewRequest(http.MethodGet, server.URL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-Large", strings.Repeat("a", size))
+		response, err := server.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { response.Body.Close() })
+		return response
+	}
+
+	if got := request(16_000).StatusCode; got != http.StatusOK {
+		t.Fatalf("16000-byte header status = %d, want 200", got)
+	}
+	for _, size := range []int{16_384, 20_000, 65_536} {
+		response := request(size)
+		if response.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
+			t.Fatalf("%d-byte header status = %d, want 431", size, response.StatusCode)
+		}
+		if !response.Close {
+			t.Fatalf("%d-byte header response kept the connection alive", size)
+		}
+		if size <= 20_000 {
+			body, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(body) != 0 {
+				t.Fatalf("%d-byte compatibility 431 body = %q, want empty", size, body)
+			}
+		}
+	}
+}
+
+func TestServerMaxHeaderBytesCoversRawNormalizedAndRepeatedFields(t *testing.T) {
+	fitServer := New(Config{MaxHeaderBytes: 16 * 1024})
+	fitServer.App = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	configured := fitServer.buildHTTPServer("")
+	server := httptest.NewUnstartedServer(configured.Handler)
+	server.Config.MaxHeaderBytes = configured.MaxHeaderBytes
+	server.Start()
+	defer server.Close()
+
+	request := func(target string, headerLines ...string) *http.Response {
+		t.Helper()
+		connection, err := net.Dial("tcp", server.Listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = connection.Close() })
+		wire := "GET " + target + " HTTP/1.1\r\nHost: audit.test\r\n" + strings.Join(headerLines, "\r\n") + "\r\nConnection: close\r\n\r\n"
+		if _, err := io.WriteString(connection, wire); err != nil {
+			t.Fatal(err)
+		}
+		response, err := http.ReadResponse(bufio.NewReader(connection), &http.Request{Method: http.MethodGet})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { response.Body.Close() })
+		return response
+	}
+
+	if got := request("/", "X-Pad: "+strings.Repeat("a", 16_000)).StatusCode; got != http.StatusOK {
+		t.Fatalf("raw 16000-byte value status = %d, want 200", got)
+	}
+	for name, response := range map[string]*http.Response{
+		"normalized whitespace": request("/", "X-Pad: "+strings.Repeat(" ", 65_536)),
+		"repeated fields":       request("/", "X-Pad: "+strings.Repeat("a", 8_200), "X-Pad: "+strings.Repeat("b", 8_200)),
+		"long target":           request("/" + strings.Repeat("a", 16_384)),
+	} {
+		if response.StatusCode != http.StatusRequestHeaderFieldsTooLarge || !response.Close {
+			t.Fatalf("%s status/close = %d/%v, want 431/true", name, response.StatusCode, response.Close)
+		}
+	}
+
+	connection, err := net.Dial("tcp", server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	reader := bufio.NewReader(connection)
+	if _, err := io.WriteString(connection, "GET / HTTP/1.1\r\nHost: audit.test\r\nX-Pad: ok\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	first, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Body.Close()
+	if first.StatusCode != http.StatusOK || first.Close {
+		t.Fatalf("keep-alive baseline status/close = %d/%v", first.StatusCode, first.Close)
+	}
+	if _, err := io.WriteString(connection, "GET / HTTP/1.1\r\nHost: audit.test\r\nX-Pad: "+strings.Repeat("a", 16_384)+"\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	second, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusRequestHeaderFieldsTooLarge || !second.Close {
+		t.Fatalf("reused oversized status/close = %d/%v, want 431/true", second.StatusCode, second.Close)
+	}
 }
 
 func TestServer_Init(t *testing.T) {

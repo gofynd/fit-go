@@ -192,12 +192,12 @@ func expressResponseIsFresh(request *http.Request, responseETag string) bool {
 	if request == nil {
 		return false
 	}
-	noneMatch := request.Header.Get("If-None-Match")
+	noneMatch := strings.Join(request.Header.Values("If-None-Match"), ", ")
 	modifiedSince := request.Header.Get("If-Modified-Since")
 	if noneMatch == "" && modifiedSince == "" {
 		return false
 	}
-	for _, directive := range strings.Split(request.Header.Get("Cache-Control"), ",") {
+	for _, directive := range strings.Split(strings.Join(request.Header.Values("Cache-Control"), ", "), ",") {
 		if strings.TrimSpace(directive) == "no-cache" {
 			return false
 		}

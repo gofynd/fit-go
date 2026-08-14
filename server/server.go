@@ -75,6 +75,11 @@ type Config struct {
 	// when keep-alives are enabled.
 	IdleTimeout time.Duration
 
+	// MaxHeaderBytes configures net/http's request-header parse limit. A zero
+	// value preserves net/http's default. Set this only for compatibility with a
+	// service whose deployed legacy runtime used a smaller limit.
+	MaxHeaderBytes int
+
 	// MaxPayloadSize limits request body size. Accepts human-readable strings
 	// like "2mb", "500kb". Defaults to MAX_REQUEST_PAYLOAD_SIZE env var or "2mb".
 	MaxPayloadSize string
@@ -371,12 +376,46 @@ func (s *Server) Start() error {
 func (s *Server) buildHTTPServer(addr string) *http.Server {
 	return &http.Server{
 		Addr:              addr,
-		Handler:           s.App,
+		Handler:           limitRequestHeaderBytes(s.App, s.cfg.MaxHeaderBytes),
 		ReadTimeout:       s.cfg.ReadTimeout,
 		ReadHeaderTimeout: s.cfg.ReadHeaderTimeout,
 		WriteTimeout:      s.cfg.WriteTimeout,
 		IdleTimeout:       s.cfg.IdleTimeout,
+		MaxHeaderBytes:    s.cfg.MaxHeaderBytes,
 	}
+}
+
+func limitRequestHeaderBytes(next http.Handler, maxBytes int) http.Handler {
+	if next == nil || maxBytes <= 0 {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if requestHeaderBytes(request) > maxBytes {
+			w.Header().Set("Connection", "close")
+			w.WriteHeader(http.StatusRequestHeaderFieldsTooLarge)
+			return
+		}
+		next.ServeHTTP(w, request)
+	})
+}
+
+func requestHeaderBytes(request *http.Request) int {
+	if request == nil {
+		return 0
+	}
+	// Count the minimum HTTP/1 request line and serialized header fields. Using
+	// the compact "name:value" form avoids rejecting a raw request that is still
+	// within the configured limit; net/http separately bounds raw parsing.
+	size := len(request.Method) + 1 + len(request.RequestURI) + 1 + len(request.Proto) + 2
+	if request.Host != "" {
+		size += len("Host") + 1 + len(request.Host) + 2
+	}
+	for name, values := range request.Header {
+		for _, value := range values {
+			size += len(name) + 1 + len(value) + 2
+		}
+	}
+	return size + 2
 }
 
 // Shutdown gracefully shuts down the server.
