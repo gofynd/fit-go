@@ -270,6 +270,13 @@ only `postgresql operation failed` (except the fixed no-rows sentinel), so a
 provider error that echoes SQL or values cannot enter an exception event or span
 status description.
 
+Each native pgxpool also publishes connection counts, acquisition counts,
+cancelled acquisitions, pool-exhaustion counts, and pool wait time through the
+active OpenTelemetry meter provider. Attributes are limited to the configured
+fit-go service name and read/write access role; database hosts, ports, database
+names, usernames, and connection strings are never used as metric attributes.
+Pool callbacks are unregistered before the corresponding pool is closed.
+
 ## Redis
 
 Redis uses a package-owned go-redis hook instead of `redisotel`. The upstream

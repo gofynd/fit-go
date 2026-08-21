@@ -11,7 +11,7 @@ A batteries-included Go framework for building scalable microservices. Provides 
 | `grpc` | gRPC server plus traced outbound clients via `fitgrpc.NewClient` or `TracingDialOptions`, middleware chains, health checks, and reflection |
 | `fitgraphql` | Privacy-safe gqlgen operation and resolver tracing |
 | `mongo` | MongoDB connection manager with read/write splitting and pool tuning |
-| `postgres` | PostgreSQL client via `lib/pq` with connection pooling |
+| `postgres` | PostgreSQL client with native pgx/v5 read/write pools, health checks, tracing, and pool metrics |
 | `mysql` | MySQL client via `go-sql-driver/mysql` |
 | `redis` | Redis client supporting standalone, cluster, and sentinel modes |
 | `kafka` | Kafka producer/consumer with SASL/SSL and OpenTelemetry tracing |
@@ -261,9 +261,22 @@ POSTGRES_ORDERS_READ_ONLY=postgres://reader:secret@localhost:5432/orders?sslmode
 ```go
 client, err := postgres.InitDefault()
 conn := client.Service("orders")
-write := conn.Write // *sql.DB for writes
-read := conn.Read   // *sql.DB for reads
+write := conn.Write // *pgxpool.Pool for writes
+read := conn.Read   // *pgxpool.Pool for reads
 ```
+
+PostgreSQL initialization is explicit. To let the top-level framework own the
+pools, health check, metrics lifecycle, and shutdown, opt in during `fit.Init`:
+
+```go
+framework, err := fit.Init(ctx, fit.WithPostgres(postgres.ConnectionOptions{}))
+orders := framework.Postgres.Service("orders")
+defer framework.Shutdown(ctx)
+```
+
+Calling `fit.Init(ctx)` without `fit.WithPostgres(...)` does not connect to
+PostgreSQL. Direct `postgres.InitWithContext` usage remains supported for
+applications that manage database lifecycle themselves.
 
 ### Redis
 

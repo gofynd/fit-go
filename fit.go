@@ -33,6 +33,7 @@ import (
 	"github.com/gofynd/fit-go/logging"
 	"github.com/gofynd/fit-go/metrics"
 	"github.com/gofynd/fit-go/otelmetrics"
+	"github.com/gofynd/fit-go/postgres"
 	"github.com/gofynd/fit-go/profiling"
 	"github.com/gofynd/fit-go/redact"
 	"github.com/gofynd/fit-go/tracing"
@@ -43,7 +44,7 @@ import (
 type Connections struct {
 	Mongo       interface{} // MongoDB connections (read/write per service)
 	MySQL       interface{} // MySQL connections via database/sql
-	Postgres    interface{} // PostgreSQL connections via database/sql
+	Postgres    interface{} // PostgreSQL read/write pools via pgxpool
 	Redis       interface{} // Redis connections (standalone or cluster)
 	FeatureFlag interface{} // Feature flag client
 	Kafka       interface{} // Kafka client
@@ -59,6 +60,7 @@ type Fit struct {
 	Tracer           *tracing.Tracer
 	Metrics          *metrics.Registry
 	OTelMetrics      *otelmetrics.Provider
+	Postgres         *postgres.Client
 	Instrumentations *instrumentation.Manager
 	Health           *health.Checker
 	Profiler         *profiling.Profiler
@@ -101,6 +103,7 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 		f.Health.Reset()
 	}
 	f.Connections = Connections{}
+	f.Postgres = nil
 	f.Health = health.NewChecker()
 	f.Errors = nil
 	f.Profiler = nil
@@ -262,6 +265,20 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 		f.Instrumentations = manager
 	}
 
+	// PostgreSQL is opt-in because discovering connection variables must not make
+	// an otherwise optional dependency mandatory. Initialization happens after
+	// tracing and OTel metrics so pgx pools bind to the active providers.
+	if o.PostgresOptions != nil {
+		postgresClient, postgresErr := postgres.InitWithContext(ctx, *o.PostgresOptions)
+		if postgresErr != nil {
+			cleanupErr := f.cleanupFailedInit(ctx)
+			return nil, stderrors.Join(fmt.Errorf("fit: failed to init PostgreSQL: %w", postgresErr), cleanupErr)
+		}
+		f.Connections.Postgres = postgresClient
+		f.Postgres = postgresClient
+		f.Health.AddCheck(postgresClient.HealthCheck())
+	}
+
 	// 6. Initialize legacy FIT Prometheus metrics if enabled.
 	if cfg.GetBool("FIT_PROMETHEUS_ENABLED", false) {
 		metricsDir := cfg.GetString("METRICS_DIR", "")
@@ -404,6 +421,13 @@ func (f *Fit) Shutdown(ctx context.Context) error {
 		}
 		f.Instrumentations = nil
 	}
+	if f.Postgres != nil {
+		if err := f.Postgres.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		f.Postgres = nil
+		f.Connections.Postgres = nil
+	}
 	f.stopFeatureFlags()
 	if f.Profiler != nil {
 		f.Profiler.Stop()
@@ -499,6 +523,11 @@ func (f *Fit) stopFeatureFlags() {
 
 func (f *Fit) cleanupFailedInit(ctx context.Context) error {
 	var cleanupErrors []error
+	if f.Postgres != nil {
+		cleanupErrors = append(cleanupErrors, f.Postgres.Close())
+		f.Postgres = nil
+		f.Connections.Postgres = nil
+	}
 	if f.Instrumentations != nil {
 		cleanupErrors = append(cleanupErrors, f.Instrumentations.Shutdown(ctx))
 		f.Instrumentations = nil
@@ -540,6 +569,7 @@ type options struct {
 	ConfigPaths             []string
 	InstrumentationRegistry *instrumentation.Registry
 	InstrumentationOptions  instrumentation.Options
+	PostgresOptions         *postgres.ConnectionOptions
 }
 
 // WithInstrumentationRegistry installs statically linked instrumentation
@@ -555,6 +585,17 @@ func WithInstrumentationRegistry(registry *instrumentation.Registry) Option {
 func WithInstrumentations(configuration instrumentation.Options) Option {
 	return func(target *options) {
 		target.InstrumentationOptions = configuration
+	}
+}
+
+// WithPostgres enables explicit PostgreSQL initialization during Init. It
+// discovers POSTGRES_*_READ_WRITE and POSTGRES_*_READ_ONLY connections, adds
+// their health check, and closes all pools during Shutdown. PostgreSQL remains
+// disabled unless this option is supplied.
+func WithPostgres(configuration postgres.ConnectionOptions) Option {
+	return func(target *options) {
+		copy := configuration
+		target.PostgresOptions = &copy
 	}
 }
 

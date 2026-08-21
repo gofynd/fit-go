@@ -32,10 +32,15 @@
 // # Pool tuning environment variables
 //
 //	POSTGRES_{SERVICE}_{TYPE}_MAX_POOL_SIZE - max connections in the pool
-//	POSTGRES_{SERVICE}_{TYPE}_MIN_POOL_SIZE - min idle connections maintained
+//	POSTGRES_{SERVICE}_{TYPE}_MIN_POOL_SIZE - minimum total connections maintained
+//	POSTGRES_{SERVICE}_{TYPE}_MIN_IDLE_CONNECTIONS - minimum idle connections maintained
 //	POSTGRES_{SERVICE}_{TYPE}_MAX_IDLE_TIME - max idle time in ms
-//	POSTGRES_{SERVICE}_{TYPE}_CONNECTION_TIMEOUT - max connection lifetime in ms
+//	POSTGRES_{SERVICE}_{TYPE}_CONNECTION_TIMEOUT - deprecated max connection lifetime in ms
+//	POSTGRES_{SERVICE}_{TYPE}_CONNECT_TIMEOUT - connection establishment timeout in ms
+//	POSTGRES_{SERVICE}_{TYPE}_MAX_CONNECTION_LIFETIME - max connection lifetime in ms
+//	POSTGRES_{SERVICE}_{TYPE}_MAX_CONNECTION_LIFETIME_JITTER - max lifetime jitter in ms
 //	POSTGRES_{SERVICE}_{TYPE}_HEALTH_CHECK_PERIOD - health check interval in ms
+//	POSTGRES_{SERVICE}_{TYPE}_PING_TIMEOUT - health-check ping timeout in ms
 //
 // Where {TYPE} is READ_WRITE or READ_ONLY.
 //
@@ -57,7 +62,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -66,6 +70,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // ServiceConnection holds read and write *pgxpool.Pool connections for a single service.
@@ -78,16 +83,24 @@ type ServiceConnection struct {
 type ConnectionOptions struct {
 	// MaxConns is the maximum number of connections per pool. Defaults to 20.
 	MaxConns int32
-	// MinConns is the minimum number of idle connections per pool. Defaults to 5.
+	// MinConns is the minimum number of total connections per pool. Defaults to 5.
 	MinConns int32
+	// MinIdleConns is the minimum number of idle connections per pool. Defaults to 0.
+	MinIdleConns int32
+	// ConnectTimeout is the maximum time allowed to establish a connection.
+	// A zero value preserves pgx's no-timeout default.
+	ConnectTimeout time.Duration
 	// MaxConnLifetime is the maximum lifetime of a connection. Defaults to 1 hour.
 	MaxConnLifetime time.Duration
+	// MaxConnLifetimeJitter spreads connection retirement over this duration.
+	// A zero value disables jitter.
+	MaxConnLifetimeJitter time.Duration
 	// MaxConnIdleTime is the maximum idle time of a connection. Defaults to 30 minutes.
 	MaxConnIdleTime time.Duration
 	// HealthCheckPeriod is the interval between health checks. Defaults to 1 minute.
 	HealthCheckPeriod time.Duration
-	// Context for connection establishment and initial pings.
-	Context context.Context
+	// PingTimeout limits an individual pool health-check ping. A zero value means no timeout.
+	PingTimeout time.Duration
 	// PerService allows per-service pool overrides.
 	PerService map[string]ServicePoolOverrides
 }
@@ -100,17 +113,23 @@ type ServicePoolOverrides struct {
 
 // PoolOverrides holds optional pool tuning values. Zero values are ignored.
 type PoolOverrides struct {
-	MaxConns          int32
-	MinConns          int32
-	MaxConnLifetime   time.Duration
-	MaxConnIdleTime   time.Duration
-	HealthCheckPeriod time.Duration
+	MaxConns              int32
+	MinConns              int32
+	MinIdleConns          int32
+	ConnectTimeout        time.Duration
+	MaxConnLifetime       time.Duration
+	MaxConnLifetimeJitter time.Duration
+	MaxConnIdleTime       time.Duration
+	HealthCheckPeriod     time.Duration
+	PingTimeout           time.Duration
 }
 
 // Client manages PostgreSQL connections for all discovered services.
 type Client struct {
-	mu       sync.RWMutex
-	services map[string]*ServiceConnection
+	mu                   sync.RWMutex
+	services             map[string]*ServiceConnection
+	metricRegistrations  []metric.Registration
+	poolMetricsRegistrar func(serviceName, accessRole string, pool *pgxpool.Pool) error
 }
 
 var envRegex = regexp.MustCompile(`^POSTGRES_(.+)_READ_(WRITE|ONLY)$`)
@@ -131,6 +150,7 @@ func InitWithContext(ctx context.Context, opts ConnectionOptions) (*Client, erro
 	c := &Client{
 		services: make(map[string]*ServiceConnection),
 	}
+	c.poolMetricsRegistrar = c.registerPoolMetrics
 
 	type connEntry struct {
 		readRef  string
@@ -180,20 +200,32 @@ func InitWithContext(ctx context.Context, opts ConnectionOptions) (*Client, erro
 
 	for serviceName, entry := range connMap {
 		serviceNameUpper := upperNames[serviceName]
-		tlsCfg := loadPostgresTLSConfig(serviceNameUpper)
+		tlsCfg, err := loadPostgresTLSConfig(serviceNameUpper)
+		if err != nil {
+			_ = c.Close()
+			return nil, fmt.Errorf("postgres: TLS configuration for %s: %w", serviceName, err)
+		}
 
 		sc := &ServiceConnection{}
 
 		if entry.writeRef != "" {
 			writeConnStr, err := resolveConnectionString(entry.writeRef)
 			if err != nil {
+				_ = c.Close()
 				return nil, fmt.Errorf("postgres: resolve write connection for %s: %w", serviceName, err)
 			}
-			writePool, err := createPool(ctx, writeConnStr, appName, tlsCfg, poolSettingsFromEnv(serviceNameUpper, "WRITE", opts, serviceName, "write"))
+			writeSettings, settingsErr := poolSettingsFromEnv(serviceNameUpper, "WRITE", opts, serviceName, "write")
+			if settingsErr != nil {
+				_ = c.Close()
+				return nil, settingsErr
+			}
+			writePool, err := createPool(ctx, writeConnStr, appName, tlsCfg, writeSettings)
 			if err != nil {
+				_ = c.Close()
 				return nil, fmt.Errorf("postgres: create write pool for %s: %w", serviceName, err)
 			}
 			sc.Write = writePool
+			c.tryRegisterPoolMetrics(serviceName, "write", writePool)
 		}
 
 		if entry.readRef != "" {
@@ -202,16 +234,27 @@ func InitWithContext(ctx context.Context, opts ConnectionOptions) (*Client, erro
 				if sc.Write != nil {
 					sc.Write.Close()
 				}
+				_ = c.Close()
 				return nil, fmt.Errorf("postgres: resolve read connection for %s: %w", serviceName, err)
 			}
-			readPool, err := createPool(ctx, readConnStr, appName, tlsCfg, poolSettingsFromEnv(serviceNameUpper, "ONLY", opts, serviceName, "read"))
+			readSettings, settingsErr := poolSettingsFromEnv(serviceNameUpper, "ONLY", opts, serviceName, "read")
+			if settingsErr != nil {
+				if sc.Write != nil {
+					sc.Write.Close()
+				}
+				_ = c.Close()
+				return nil, settingsErr
+			}
+			readPool, err := createPool(ctx, readConnStr, appName, tlsCfg, readSettings)
 			if err != nil {
 				if sc.Write != nil {
 					sc.Write.Close()
 				}
+				_ = c.Close()
 				return nil, fmt.Errorf("postgres: create read pool for %s: %w", serviceName, err)
 			}
 			sc.Read = readPool
+			c.tryRegisterPoolMetrics(serviceName, "read", readPool)
 		}
 
 		// If only one connection is provided, use it for both.
@@ -286,6 +329,16 @@ func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	var closeErrs []error
+	for _, registration := range c.metricRegistrations {
+		if registration != nil {
+			if err := registration.Unregister(); err != nil {
+				closeErrs = append(closeErrs, err)
+			}
+		}
+	}
+	c.metricRegistrations = nil
+
 	for _, sc := range c.services {
 		if sc.Read != nil {
 			sc.Read.Close()
@@ -295,6 +348,9 @@ func (c *Client) Close() error {
 		}
 	}
 	c.services = make(map[string]*ServiceConnection)
+	if len(closeErrs) != 0 {
+		return fmt.Errorf("postgres: unregister pool metrics: %v", closeErrs)
+	}
 	return nil
 }
 
@@ -315,26 +371,26 @@ func (c *Client) HealthCheck() func() string {
 // ---------------------------------------------------------------------------
 
 type poolSettings struct {
-	MaxConns          int32
-	MinConns          int32
-	MaxConnLifetime   time.Duration
-	MaxConnIdleTime   time.Duration
-	HealthCheckPeriod time.Duration
+	MaxConns              int32
+	MinConns              int32
+	MinIdleConns          int32
+	ConnectTimeout        time.Duration
+	MaxConnLifetime       time.Duration
+	MaxConnLifetimeJitter time.Duration
+	MaxConnIdleTime       time.Duration
+	HealthCheckPeriod     time.Duration
+	PingTimeout           time.Duration
 }
 
 func createPool(ctx context.Context, connStr, appName string, tlsCfg *tls.Config, settings poolSettings) (*pgxpool.Pool, error) {
-	// Append application_name to connection string if not present.
-	if appName != "" && !strings.Contains(connStr, "application_name") {
-		sep := "?"
-		if strings.Contains(connStr, "?") {
-			sep = "&"
-		}
-		connStr += sep + "application_name=" + url.QueryEscape(appName)
-	}
-
 	poolCfg, err := pgxpool.ParseConfig(connStr)
 	if err != nil {
 		return nil, fmt.Errorf("parse connection string: %w", err)
+	}
+	if appName != "" {
+		if _, configured := poolCfg.ConnConfig.RuntimeParams["application_name"]; !configured {
+			poolCfg.ConnConfig.RuntimeParams["application_name"] = appName
+		}
 	}
 
 	poolCfg.MaxConns = settings.MaxConns
@@ -342,6 +398,20 @@ func createPool(ctx context.Context, connStr, appName string, tlsCfg *tls.Config
 	poolCfg.MaxConnLifetime = settings.MaxConnLifetime
 	poolCfg.MaxConnIdleTime = settings.MaxConnIdleTime
 	poolCfg.HealthCheckPeriod = settings.HealthCheckPeriod
+	// New optional settings preserve values parsed from the DSN unless the
+	// caller or environment supplies an explicit positive override.
+	if settings.MinIdleConns > 0 {
+		poolCfg.MinIdleConns = settings.MinIdleConns
+	}
+	if settings.ConnectTimeout > 0 {
+		poolCfg.ConnConfig.ConnectTimeout = settings.ConnectTimeout
+	}
+	if settings.MaxConnLifetimeJitter > 0 {
+		poolCfg.MaxConnLifetimeJitter = settings.MaxConnLifetimeJitter
+	}
+	if settings.PingTimeout > 0 {
+		poolCfg.PingTimeout = settings.PingTimeout
+	}
 
 	if tlsCfg != nil {
 		poolCfg.ConnConfig.TLSConfig = tlsCfg
@@ -362,41 +432,72 @@ func createPool(ctx context.Context, connStr, appName string, tlsCfg *tls.Config
 	return pool, nil
 }
 
-func poolSettingsFromEnv(serviceNameUpper, connTypeEnv string, opts ConnectionOptions, serviceName, connType string) poolSettings {
+func poolSettingsFromEnv(serviceNameUpper, connTypeEnv string, opts ConnectionOptions, serviceName, connType string) (poolSettings, error) {
 	ps := poolSettings{
-		MaxConns:          opts.MaxConns,
-		MinConns:          opts.MinConns,
-		MaxConnLifetime:   opts.MaxConnLifetime,
-		MaxConnIdleTime:   opts.MaxConnIdleTime,
-		HealthCheckPeriod: opts.HealthCheckPeriod,
+		MaxConns:              opts.MaxConns,
+		MinConns:              opts.MinConns,
+		MinIdleConns:          opts.MinIdleConns,
+		ConnectTimeout:        opts.ConnectTimeout,
+		MaxConnLifetime:       opts.MaxConnLifetime,
+		MaxConnLifetimeJitter: opts.MaxConnLifetimeJitter,
+		MaxConnIdleTime:       opts.MaxConnIdleTime,
+		HealthCheckPeriod:     opts.HealthCheckPeriod,
+		PingTimeout:           opts.PingTimeout,
 	}
 
 	prefix := fmt.Sprintf("POSTGRES_%s_READ_%s_", serviceNameUpper, connTypeEnv)
 
-	if v := os.Getenv(prefix + "MAX_POOL_SIZE"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			ps.MaxConns = int32(n)
-		}
+	if n, configured, err := poolInt32Env(prefix + "MAX_POOL_SIZE"); err != nil {
+		return poolSettings{}, err
+	} else if configured {
+		ps.MaxConns = n
 	}
-	if v := os.Getenv(prefix + "MIN_POOL_SIZE"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			ps.MinConns = int32(n)
-		}
+	if n, configured, err := poolInt32Env(prefix + "MIN_POOL_SIZE"); err != nil {
+		return poolSettings{}, err
+	} else if configured {
+		ps.MinConns = n
 	}
-	if v := os.Getenv(prefix + "MAX_IDLE_TIME"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			ps.MaxConnIdleTime = time.Duration(n) * time.Millisecond
-		}
+	if n, configured, err := poolInt32Env(prefix + "MIN_IDLE_CONNECTIONS"); err != nil {
+		return poolSettings{}, err
+	} else if configured {
+		ps.MinIdleConns = n
 	}
-	if v := os.Getenv(prefix + "CONNECTION_TIMEOUT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			ps.MaxConnLifetime = time.Duration(n) * time.Millisecond
-		}
+	if duration, configured, err := poolDurationEnv(prefix + "MAX_IDLE_TIME"); err != nil {
+		return poolSettings{}, err
+	} else if configured {
+		ps.MaxConnIdleTime = duration
 	}
-	if v := os.Getenv(prefix + "HEALTH_CHECK_PERIOD"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			ps.HealthCheckPeriod = time.Duration(n) * time.Millisecond
-		}
+	// CONNECTION_TIMEOUT historically configured connection lifetime. Preserve
+	// that behavior and prefer the accurately named setting when both exist.
+	if duration, configured, err := poolDurationEnv(prefix + "CONNECTION_TIMEOUT"); err != nil {
+		return poolSettings{}, err
+	} else if configured {
+		ps.MaxConnLifetime = duration
+	}
+	if duration, configured, err := poolDurationEnv(prefix + "CONNECT_TIMEOUT"); err != nil {
+		return poolSettings{}, err
+	} else if configured {
+		ps.ConnectTimeout = duration
+	}
+	if duration, configured, err := poolDurationEnv(prefix + "MAX_CONNECTION_LIFETIME"); err != nil {
+		return poolSettings{}, err
+	} else if configured {
+		ps.MaxConnLifetime = duration
+	}
+	if duration, configured, err := poolDurationEnv(prefix + "MAX_CONNECTION_LIFETIME_JITTER"); err != nil {
+		return poolSettings{}, err
+	} else if configured {
+		ps.MaxConnLifetimeJitter = duration
+	}
+	if duration, configured, err := poolDurationEnv(prefix + "HEALTH_CHECK_PERIOD"); err != nil {
+		return poolSettings{}, err
+	} else if configured {
+		ps.HealthCheckPeriod = duration
+	}
+	if duration, configured, err := poolDurationEnv(prefix + "PING_TIMEOUT"); err != nil {
+		return poolSettings{}, err
+	} else if configured {
+		ps.PingTimeout = duration
 	}
 
 	// Apply caller overrides.
@@ -415,8 +516,17 @@ func poolSettingsFromEnv(serviceNameUpper, connTypeEnv string, opts ConnectionOp
 				if po.MinConns > 0 {
 					ps.MinConns = po.MinConns
 				}
+				if po.MinIdleConns > 0 {
+					ps.MinIdleConns = po.MinIdleConns
+				}
+				if po.ConnectTimeout > 0 {
+					ps.ConnectTimeout = po.ConnectTimeout
+				}
 				if po.MaxConnLifetime > 0 {
 					ps.MaxConnLifetime = po.MaxConnLifetime
+				}
+				if po.MaxConnLifetimeJitter > 0 {
+					ps.MaxConnLifetimeJitter = po.MaxConnLifetimeJitter
 				}
 				if po.MaxConnIdleTime > 0 {
 					ps.MaxConnIdleTime = po.MaxConnIdleTime
@@ -424,18 +534,86 @@ func poolSettingsFromEnv(serviceNameUpper, connTypeEnv string, opts ConnectionOp
 				if po.HealthCheckPeriod > 0 {
 					ps.HealthCheckPeriod = po.HealthCheckPeriod
 				}
+				if po.PingTimeout > 0 {
+					ps.PingTimeout = po.PingTimeout
+				}
 			}
 		}
 	}
 
-	return ps
+	if err := validatePoolSettings(serviceName, connType, ps); err != nil {
+		return poolSettings{}, err
+	}
+	return ps, nil
+}
+
+func poolInt32Env(name string) (int32, bool, error) {
+	value, configured := os.LookupEnv(name)
+	if !configured || strings.TrimSpace(value) == "" {
+		return 0, false, nil
+	}
+	number, err := strconv.ParseInt(strings.TrimSpace(value), 10, 32)
+	if err != nil {
+		return 0, false, fmt.Errorf("postgres: %s must be an integer", name)
+	}
+	return int32(number), true, nil
+}
+
+func poolDurationEnv(name string) (time.Duration, bool, error) {
+	value, configured := os.LookupEnv(name)
+	if !configured || strings.TrimSpace(value) == "" {
+		return 0, false, nil
+	}
+	milliseconds, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil {
+		return 0, false, fmt.Errorf("postgres: %s must be an integer number of milliseconds", name)
+	}
+	if milliseconds > int64((1<<63-1)/time.Millisecond) || milliseconds < int64((-1<<63)/time.Millisecond) {
+		return 0, false, fmt.Errorf("postgres: %s is outside the supported duration range", name)
+	}
+	return time.Duration(milliseconds) * time.Millisecond, true, nil
+}
+
+func validatePoolSettings(serviceName, connType string, settings poolSettings) error {
+	prefix := fmt.Sprintf("postgres: %s %s pool", serviceName, connType)
+	if settings.MaxConns <= 0 {
+		return fmt.Errorf("%s: maximum connections must be greater than zero", prefix)
+	}
+	if settings.MinConns < 0 {
+		return fmt.Errorf("%s: minimum connections cannot be negative", prefix)
+	}
+	if settings.MinIdleConns < 0 {
+		return fmt.Errorf("%s: minimum idle connections cannot be negative", prefix)
+	}
+	if settings.MinConns > settings.MaxConns {
+		return fmt.Errorf("%s: minimum connections %d exceeds maximum connections %d", prefix, settings.MinConns, settings.MaxConns)
+	}
+	if settings.MinIdleConns > settings.MaxConns {
+		return fmt.Errorf("%s: minimum idle connections %d exceeds maximum connections %d", prefix, settings.MinIdleConns, settings.MaxConns)
+	}
+	for name, duration := range map[string]time.Duration{
+		"connect timeout":                    settings.ConnectTimeout,
+		"maximum connection lifetime":        settings.MaxConnLifetime,
+		"maximum connection lifetime jitter": settings.MaxConnLifetimeJitter,
+		"maximum connection idle time":       settings.MaxConnIdleTime,
+		"health check period":                settings.HealthCheckPeriod,
+		"ping timeout":                       settings.PingTimeout,
+	} {
+		if duration < 0 {
+			return fmt.Errorf("%s: %s cannot be negative", prefix, name)
+		}
+	}
+	if settings.HealthCheckPeriod == 0 {
+		return fmt.Errorf("%s: health check period must be greater than zero", prefix)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
 // TLS
 // ---------------------------------------------------------------------------
 
-func loadPostgresTLSConfig(serviceNameUpper string) *tls.Config {
+func loadPostgresTLSConfig(serviceNameUpper string) (*tls.Config, error) {
 	serverName := os.Getenv(fmt.Sprintf("POSTGRES_%s_SSL_SERVER_NAME", serviceNameUpper))
 	caPath := envWithFallback(
 		fmt.Sprintf("POSTGRES_%s_SSL_CA", serviceNameUpper),
@@ -450,29 +628,40 @@ func loadPostgresTLSConfig(serviceNameUpper string) *tls.Config {
 		"POSTGRES_SSL_KEY",
 	)
 
-	if caPath == "" || certPath == "" || keyPath == "" || serverName == "" {
-		return nil
+	configuredValues := 0
+	for _, value := range []string{caPath, certPath, keyPath, serverName} {
+		if value != "" {
+			configuredValues++
+		}
+	}
+	if configuredValues == 0 {
+		return nil, nil
+	}
+	if configuredValues != 4 {
+		return nil, fmt.Errorf("CA, certificate, key, and server name must all be configured")
 	}
 
 	caCert, err := os.ReadFile(caPath)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("read CA certificate: %w", err)
 	}
 
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("load client certificate: %w", err)
 	}
 
 	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(caCert)
+	if ok := caCertPool.AppendCertsFromPEM(caCert); !ok {
+		return nil, fmt.Errorf("CA certificate contains no valid PEM certificates")
+	}
 
 	return &tls.Config{
 		ServerName:   serverName,
 		RootCAs:      caCertPool,
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
-	}
+	}, nil
 }
 
 // ---------------------------------------------------------------------------
