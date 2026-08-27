@@ -202,3 +202,114 @@ func TestOTelMiddleware_EnabledSkipsHealthPaths(t *testing.T) {
 		assert.Equal(t, zeroTraceID, w.Body.String(), p+" must be filtered (no span)")
 	}
 }
+
+func TestNormalizeW3CTraceHeaders(t *testing.T) {
+	header := http.Header{}
+	header.Add("traceparent", "first-parent")
+	header.Add("traceparent", "second-parent")
+	header.Add("tracestate", "first=one")
+	header.Add("tracestate", "second=two")
+	header.Add("baggage", "first=one")
+	header.Add("baggage", "second=two")
+
+	normalizeW3CTraceHeaders(header)
+
+	assert.Equal(t, []string{"first-parent, second-parent"}, header.Values("traceparent"))
+	assert.Equal(t, []string{"first=one, second=two"}, header.Values("tracestate"))
+	assert.Equal(t, []string{"first=one", "second=two"}, header.Values("baggage"))
+}
+
+func TestOTelMiddleware_RepeatedW3CTraceHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tracingtest.EnabledGlobal(t)
+
+	const (
+		firstTraceID  = "11111111111111111111111111111111"
+		secondTraceID = "33333333333333333333333333333333"
+		firstParent   = "00-" + firstTraceID + "-2222222222222222-01"
+		secondParent  = "00-" + secondTraceID + "-4444444444444444-01"
+	)
+
+	tests := []struct {
+		name             string
+		traceparents     []string
+		tracestates      []string
+		wantTraceID      string
+		unwantedTraceIDs []string
+		wantTraceparent  string
+		wantTracestate   string
+		wantRequestState string
+	}{
+		{
+			name:            "single parent continues trace",
+			traceparents:    []string{firstParent},
+			wantTraceID:     firstTraceID,
+			wantTraceparent: firstParent,
+		},
+		{
+			name:             "distinct parents start new trace",
+			traceparents:     []string{firstParent, secondParent},
+			unwantedTraceIDs: []string{firstTraceID, secondTraceID},
+			wantTraceparent:  firstParent + ", " + secondParent,
+		},
+		{
+			name:             "reversed parents start new trace",
+			traceparents:     []string{secondParent, firstParent},
+			unwantedTraceIDs: []string{firstTraceID, secondTraceID},
+			wantTraceparent:  secondParent + ", " + firstParent,
+		},
+		{
+			name:             "identical parents start new trace",
+			traceparents:     []string{firstParent, firstParent},
+			unwantedTraceIDs: []string{firstTraceID},
+			wantTraceparent:  firstParent + ", " + firstParent,
+		},
+		{
+			name:             "repeated state members are retained",
+			traceparents:     []string{firstParent},
+			tracestates:      []string{"vendor1=one", "vendor2=two"},
+			wantTraceID:      firstTraceID,
+			wantTraceparent:  firstParent,
+			wantTracestate:   "vendor1=one,vendor2=two",
+			wantRequestState: "vendor1=one, vendor2=two",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotTraceContext trace.SpanContext
+			var gotTraceparent string
+			var gotTracestate string
+			engine := gin.New()
+			engine.Use(OTelMiddleware())
+			engine.GET("/test", func(c *gin.Context) {
+				gotTraceContext = trace.SpanContextFromContext(c.Request.Context())
+				gotTraceparent = c.Request.Header.Get("traceparent")
+				gotTracestate = c.Request.Header.Get("tracestate")
+				c.Status(http.StatusNoContent)
+			})
+
+			request := httptest.NewRequest(http.MethodGet, "/test", nil)
+			for _, value := range tt.traceparents {
+				request.Header.Add("traceparent", value)
+			}
+			for _, value := range tt.tracestates {
+				request.Header.Add("tracestate", value)
+			}
+			recorder := httptest.NewRecorder()
+			engine.ServeHTTP(recorder, request)
+
+			assert.Equal(t, http.StatusNoContent, recorder.Code)
+			assert.True(t, gotTraceContext.IsValid())
+			if tt.wantTraceID != "" {
+				assert.Equal(t, tt.wantTraceID, gotTraceContext.TraceID().String())
+			}
+			for _, unwantedTraceID := range tt.unwantedTraceIDs {
+				assert.NotEqual(t, unwantedTraceID, gotTraceContext.TraceID().String())
+			}
+			assert.Equal(t, tt.wantTraceparent, gotTraceparent)
+			assert.Equal(t, tt.wantTracestate, gotTraceContext.TraceState().String())
+			assert.Equal(t, tt.wantRequestState, gotTracestate)
+		})
+	}
+}

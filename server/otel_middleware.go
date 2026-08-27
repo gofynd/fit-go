@@ -17,6 +17,7 @@
 package server
 
 import (
+	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -42,7 +43,7 @@ func OTelMiddleware() gin.HandlerFunc {
 	if t := tracing.Global(); t == nil || !t.IsEnabled() {
 		return func(c *gin.Context) { c.Next() }
 	}
-	return otelgin.Middleware(
+	instrumentRequest := otelgin.Middleware(
 		// The first otelgin argument is the primary HTTP server address, not the
 		// OTel resource service.name. Empty makes otelgin derive server.address
 		// from Request.Host instead of incorrectly exporting SERVICE_NAME there.
@@ -52,6 +53,24 @@ func OTelMiddleware() gin.HandlerFunc {
 			return tracing.ShouldTrace(c.Request.URL.Path)
 		}),
 	)
+	return func(c *gin.Context) {
+		normalizeW3CTraceHeaders(c.Request.Header)
+		instrumentRequest(c)
+	}
+}
+
+// normalizeW3CTraceHeaders combines repeated W3C trace-context field-lines
+// before propagation extracts them. HTTP defines repeated field-lines as one
+// comma-separated field value, but propagation.HeaderCarrier.Get otherwise
+// exposes only the first value. Combining them preserves every tracestate
+// member and causes an invalid repeated traceparent to be rejected as a whole.
+func normalizeW3CTraceHeaders(header http.Header) {
+	for _, name := range []string{"traceparent", "tracestate"} {
+		values := header.Values(name)
+		if len(values) > 1 {
+			header.Set(name, strings.Join(values, ", "))
+		}
+	}
 }
 
 // OTelRouteMiddleware updates the active HTTP server span after Gin resolves the
