@@ -16,6 +16,7 @@ package server
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -73,29 +74,153 @@ func SetHealthChecker(hc HealthChecker) {
 	}
 }
 
-// RegisterHealthRoutes registers the /_healthz and /_readyz endpoints on the
-// given gin.Engine. These endpoints are
+// RegisterHealthRoutes registers /_healthz and /_readyz.
 func RegisterHealthRoutes(engine *gin.Engine) {
-	engine.GET("/_healthz", ginHealthHandler)
-	engine.GET("/_readyz", ginHealthHandler)
+	RegisterHealthRoutesWithCheckers(engine, nil, nil)
+}
+
+// RegisterStaticHealthRoutes registers unconditional Express-compatible health
+// responses with the exact body {"ok":"ok"}.
+func RegisterStaticHealthRoutes(engine *gin.Engine) {
+	// Express routes are case-insensitive and non-strict and automatically use
+	// GET for HEAD. Gin's exact-path GET registration provides none of those
+	// behaviors, so install the compatibility boundary before registering the
+	// canonical routes. Other methods continue to NoRoute so an application's
+	// catch-all may own them.
+	engine.Use(func(c *gin.Context) {
+		path := strings.TrimSuffix(c.Request.URL.Path, "/")
+		if !strings.EqualFold(path, "/_healthz") && !strings.EqualFold(path, "/_readyz") {
+			c.Next()
+			return
+		}
+		if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
+			c.Next()
+			return
+		}
+		staticHealthHandler()(c)
+		c.Abort()
+	})
+	engine.GET("/_healthz", staticHealthHandler())
+	engine.GET("/_healthz/", staticHealthHandler())
+	engine.GET("/_readyz", staticHealthHandler())
+	engine.GET("/_readyz/", staticHealthHandler())
+	engine.HEAD("/_healthz", staticHealthHandler())
+	engine.HEAD("/_healthz/", staticHealthHandler())
+	engine.HEAD("/_readyz", staticHealthHandler())
+	engine.HEAD("/_readyz/", staticHealthHandler())
+}
+
+// RegisterHealthRoutesWithCheckers registers independent liveness and
+// readiness checkers. A nil health checker uses the package default; a nil
+// readiness checker reuses the selected health checker for fit.js compatibility.
+func RegisterHealthRoutesWithCheckers(engine *gin.Engine, health, readiness HealthChecker) {
+	if health == nil {
+		health = healthChecker
+	}
+	if readiness == nil {
+		readiness = health
+	}
+	engine.GET("/_healthz", healthHandler(health))
+	engine.GET("/_readyz", healthHandler(readiness))
 }
 
 // ginHealthHandler returns {"status":"healthy","ok":"ok"} when all checks pass,
 // or {"status":"unhealthy","meta":{"error_messages":"..."}} with 400 on failure.
 func ginHealthHandler(c *gin.Context) {
-	errorMsgs := healthChecker.Check()
-	if len(errorMsgs) > 0 {
-		c.JSON(http.StatusBadRequest, map[string]interface{}{
-			"status": "unhealthy",
-			"meta": map[string]interface{}{
-				"error_messages": strings.Join(errorMsgs, ", "),
-			},
-		})
-		return
-	}
+	healthHandler(healthChecker)(c)
+}
 
-	c.JSON(http.StatusOK, map[string]interface{}{
-		"status": "healthy",
-		"ok":     "ok",
-	})
+func healthHandler(checker HealthChecker) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		errorMsgs := checker.Check()
+		if len(errorMsgs) > 0 {
+			c.JSON(http.StatusBadRequest, map[string]interface{}{
+				"status": "unhealthy",
+				"meta": map[string]interface{}{
+					"error_messages": strings.Join(errorMsgs, ", "),
+				},
+			})
+			return
+		}
+
+		c.JSON(http.StatusOK, map[string]interface{}{
+			"status": "healthy",
+			"ok":     "ok",
+		})
+	}
+}
+
+func staticHealthHandler() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Do not use c.JSON here: this is a byte-level compatibility mode for
+		// fit.js services whose health endpoint returned this exact object.
+		body := []byte(`{"ok":"ok"}`)
+		etag := `W/"b-2F/2BWc0KYbtLqL5U2Kv5B6uQUQ"`
+		c.Header("X-Powered-By", "Express")
+		c.Header("Content-Type", "application/json; charset=utf-8")
+		c.Header("Content-Length", strconv.Itoa(len(body)))
+		c.Header("ETag", etag)
+		// Express/http emits persistent-connection response headers for HTTP/1.1
+		// unless the request explicitly asks to close the connection. net/http
+		// normally owns these transport headers and omits them from ResponseWriter,
+		// so the opt-in legacy boundary must supply the bytes clients observed.
+		c.Header("Keep-Alive", "")
+		if c.Request.Close || strings.EqualFold(c.GetHeader("Connection"), "close") {
+			c.Header("Connection", "close")
+		} else {
+			c.Header("Connection", "keep-alive")
+			c.Header("Keep-Alive", "timeout=5")
+		}
+		if expressResponseIsFresh(c.Request, etag) {
+			// Express strips entity headers when res.send changes a fresh GET/HEAD
+			// response to 304, while retaining ETag and X-Powered-By.
+			c.Writer.Header().Del("Content-Type")
+			c.Writer.Header().Del("Content-Length")
+			c.Writer.Header().Del("Transfer-Encoding")
+			c.Status(http.StatusNotModified)
+			return
+		}
+		if c.Request.Method == http.MethodHead {
+			c.Status(http.StatusOK)
+			return
+		}
+		c.Data(http.StatusOK, "application/json; charset=utf-8", body)
+	}
+}
+
+func expressResponseIsFresh(request *http.Request, responseETag string) bool {
+	if request == nil {
+		return false
+	}
+	noneMatch := strings.Join(request.Header.Values("If-None-Match"), ", ")
+	modifiedSince := request.Header.Get("If-Modified-Since")
+	if noneMatch == "" && modifiedSince == "" {
+		return false
+	}
+	for _, directive := range strings.Split(strings.Join(request.Header.Values("Cache-Control"), ", "), ",") {
+		if strings.TrimSpace(directive) == "no-cache" {
+			return false
+		}
+	}
+	if noneMatch != "" && noneMatch != "*" {
+		matched := false
+		for _, candidate := range strings.Split(noneMatch, ",") {
+			// fresh@0.5.x trims ASCII spaces here, not arbitrary whitespace.
+			candidate = strings.Trim(candidate, " ")
+			if candidate == responseETag || candidate == "W/"+responseETag || "W/"+candidate == responseETag {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	// The static response has no Last-Modified header. The fresh package used by
+	// Express therefore treats every If-Modified-Since request as stale, even
+	// when If-None-Match matched.
+	if modifiedSince != "" {
+		return false
+	}
+	return true
 }

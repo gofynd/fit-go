@@ -15,10 +15,12 @@
 package metrics
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -157,6 +159,24 @@ func TestRecordServerMetrics(t *testing.T) {
 	if !strings.Contains(output, "_sum") {
 		t.Error("Output should contain _sum metric")
 	}
+
+	families, err := registry.promRegistry.Gather()
+	if err != nil {
+		t.Fatalf("Gather() error = %v", err)
+	}
+	for _, family := range families {
+		if family.GetName() != "fit_http_request_duration_ms" {
+			continue
+		}
+		if family.GetHelp() != "HTTP request duration in milliseconds" {
+			t.Fatalf("metric help = %q, want fit.js help text", family.GetHelp())
+		}
+		if got := family.GetMetric()[0].GetHistogram().GetSampleSum(); got != 100 {
+			t.Fatalf("histogram sum = %v, want 100 milliseconds", got)
+		}
+		return
+	}
+	t.Fatal("server histogram family not found")
 }
 
 func TestRecordServerMetrics_Disabled(t *testing.T) {
@@ -338,11 +358,12 @@ func TestParseBuckets(t *testing.T) {
 		{"", defaultServerBuckets},
 		{"invalid,bucket,values", defaultServerBuckets},
 		{"1,invalid,10", []float64{1, 10}},
+		{"10,1,-5,1,0", []float64{1, 10}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			got := parseBuckets(tt.input)
+			got := parseBuckets(tt.input, defaultServerBuckets)
 			if len(got) != len(tt.expected) {
 				t.Errorf("parseBuckets(%q) length = %d, want %d", tt.input, len(got), len(tt.expected))
 				return
@@ -353,6 +374,210 @@ func TestParseBuckets(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestParseBuckets_UsesCallerDefaults(t *testing.T) {
+	got := parseBuckets("invalid", defaultClientBuckets)
+	if len(got) != len(defaultClientBuckets) || got[0] != defaultClientBuckets[0] {
+		t.Fatalf("client fallback buckets = %v, want %v", got, defaultClientBuckets)
+	}
+}
+
+func TestFileOutput_ImmediateAndAtomicRefresh(t *testing.T) {
+	dir := t.TempDir()
+	registry, err := New(Options{
+		MetricsDir:         dir,
+		MetricsFile:        "fit-test.prom",
+		FlushInterval:      time.Hour,
+		ServerEnabled:      true,
+		DeploymentName:     "test-deployment",
+		PrometheusRegistry: prometheus.NewRegistry(),
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer registry.Shutdown()
+
+	path := filepath.Join(dir, "fit-test.prom")
+	if registry.MetricsFile() != path {
+		t.Fatalf("MetricsFile() = %q, want %q", registry.MetricsFile(), path)
+	}
+	// prom-file-client 0.1.1 waits for its first 4s tick. Creating the file
+	// immediately is an intentional fit-go startup-readiness fix.
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("initial textfile was not created: %v", err)
+	}
+
+	registry.RecordServerMetrics(ServerMetrics{
+		Method:     http.MethodGet,
+		Route:      "/orders/:id",
+		StatusCode: http.StatusOK,
+		Duration:   25 * time.Millisecond,
+	})
+	if err := registry.Flush(); err != nil {
+		t.Fatalf("Flush() error = %v", err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	output := string(body)
+	if !strings.Contains(output, "fit_http_request_duration_ms") ||
+		!strings.Contains(output, `deployment_name="test-deployment"`) {
+		t.Fatalf("textfile output missing metric labels:\n%s", output)
+	}
+	if err := registry.LastFlushError(); err != nil {
+		t.Fatalf("LastFlushError() = %v", err)
+	}
+
+	registry.RecordServerMetrics(ServerMetrics{
+		Method:     http.MethodPost,
+		Route:      "/orders",
+		StatusCode: http.StatusCreated,
+		Duration:   30 * time.Millisecond,
+	})
+	if err := registry.Flush(); err != nil {
+		t.Fatalf("second Flush() error = %v", err)
+	}
+	body, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() after second flush error = %v", err)
+	}
+	// The deployed writer opens with wx, so this refresh fails after its first
+	// successful write. Atomic replacement intentionally fixes that defect.
+	if !strings.Contains(string(body), `status_code="201"`) {
+		t.Fatalf("second atomic refresh did not replace textfile:\n%s", body)
+	}
+}
+
+func TestFileOutput_DeployedKubernetesContract(t *testing.T) {
+	t.Setenv("K8S_POD_NAME", "example-api-abc123")
+	dir := t.TempDir()
+	registry, err := New(Options{
+		MetricsDir:         dir,
+		ServerEnabled:      true,
+		PrometheusRegistry: prometheus.NewRegistry(),
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer registry.Shutdown()
+
+	wantFile := filepath.Join(dir, fmt.Sprintf("example-api-abc123-%d.prom", os.Getpid()))
+	if registry.MetricsFile() != wantFile {
+		t.Fatalf("MetricsFile() = %q, want deployed podname-pid contract %q", registry.MetricsFile(), wantFile)
+	}
+	if registry.flushInterval != 4*time.Second {
+		t.Fatalf("flush interval = %v, want deployed 4s contract", registry.flushInterval)
+	}
+}
+
+func TestFileOutput_NonKubernetesFallbackIsDocumentedDivergence(t *testing.T) {
+	t.Setenv("K8S_POD_NAME", "")
+	dir := t.TempDir()
+	registry, err := New(Options{
+		MetricsDir:         dir,
+		PrometheusRegistry: prometheus.NewRegistry(),
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer registry.Shutdown()
+
+	wantBase := fmt.Sprintf("metrics-%d.prom", os.Getpid())
+	if got := filepath.Base(registry.MetricsFile()); got != wantBase {
+		t.Fatalf("fallback filename = %q, want deterministic fit-go fallback %q", got, wantBase)
+	}
+}
+
+func TestFileOutput_InvalidDirectory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if _, err := New(Options{MetricsDir: path, ServerEnabled: true}); err == nil {
+		t.Fatal("New() should reject a non-directory MetricsDir")
+	}
+}
+
+func TestFileOutput_PeriodicAndFinalFlush(t *testing.T) {
+	dir := t.TempDir()
+	registry, err := New(Options{
+		MetricsDir:         dir,
+		MetricsFile:        "periodic.prom",
+		FlushInterval:      5 * time.Millisecond,
+		HTTPClientEnabled:  true,
+		PrometheusRegistry: prometheus.NewRegistry(),
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	registry.RecordHTTPClientMetrics(HTTPClientMetrics{
+		Method:     http.MethodGet,
+		Host:       "api.example.com",
+		StatusCode: http.StatusOK,
+		Duration:   15 * time.Millisecond,
+	})
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		body, readErr := os.ReadFile(registry.MetricsFile())
+		if readErr == nil && strings.Contains(string(body), `status_code="200"`) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("periodic output was not refreshed: read error=%v body=%q", readErr, body)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	registry.RecordHTTPClientMetrics(HTTPClientMetrics{
+		Method:     http.MethodPost,
+		Host:       "api.example.com",
+		StatusCode: http.StatusCreated,
+		Duration:   20 * time.Millisecond,
+	})
+	if err := registry.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+	body, err := os.ReadFile(registry.MetricsFile())
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if !strings.Contains(string(body), `status_code="201"`) {
+		t.Fatalf("shutdown did not perform final flush:\n%s", body)
+	}
+}
+
+func TestSetDefault_RestoresPreviousRegistry(t *testing.T) {
+	previous := Default()
+	first, _ := New(Options{ServerEnabled: true})
+	restore := SetDefault(first)
+	if Default() != first {
+		t.Fatal("SetDefault did not install registry")
+	}
+	restore()
+	restore()
+	if Default() != previous {
+		t.Fatal("default registry was not restored")
+	}
+}
+
+func TestSetDefault_RestoresBaselineAfterOutOfOrderOwners(t *testing.T) {
+	baseline := Default()
+	first, _ := New(Options{ServerEnabled: true})
+	second, _ := New(Options{HTTPClientEnabled: true})
+	restoreFirst := SetDefault(first)
+	restoreSecond := SetDefault(second)
+
+	restoreFirst()
+	if Default() != second {
+		t.Fatal("restoring the older owner clobbered the newer registry")
+	}
+	restoreSecond()
+	if Default() != baseline {
+		t.Fatal("newer owner restored the inactive older registry instead of the baseline")
 	}
 }
 
@@ -375,6 +600,9 @@ func TestShutdown(t *testing.T) {
 	if len(registry.collectors) != 0 {
 		t.Errorf("collectors length = %d, want 0 after Shutdown", len(registry.collectors))
 	}
+	if err := registry.Shutdown(); err != nil {
+		t.Errorf("second Shutdown() error = %v", err)
+	}
 }
 
 func TestShutdown_NilRegistry(t *testing.T) {
@@ -382,6 +610,88 @@ func TestShutdown_NilRegistry(t *testing.T) {
 	err := registry.Shutdown()
 	if err != nil {
 		t.Errorf("Shutdown() on nil registry error = %v", err)
+	}
+}
+
+func TestRegister_CustomCollectorIndependentOfHTTPFlags(t *testing.T) {
+	registry, err := New(Options{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	counter := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "legacy_direct_event_total",
+		Help: "legacy direct counter",
+	}, []string{"type"})
+	if err := registry.Register(counter); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	counter.WithLabelValues("email").Inc()
+
+	output := registry.GetMetricsOutput()
+	if !strings.Contains(output, `legacy_direct_event_total{type="email"} 1`) {
+		t.Fatalf("custom counter missing from output:\n%s", output)
+	}
+	if registry.ShouldRecordServerMetrics() || registry.ShouldRecordHTTPClientMetrics() {
+		t.Fatal("custom collector must not enable FIT HTTP histograms")
+	}
+}
+
+func TestRegister_RollsBackAndRejectsAfterShutdown(t *testing.T) {
+	registry, err := New(Options{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	first := prometheus.NewCounter(prometheus.CounterOpts{Name: "register_rollback_total", Help: "first"})
+	duplicate := prometheus.NewCounter(prometheus.CounterOpts{Name: "register_rollback_total", Help: "duplicate"})
+	if err := registry.Register(first, duplicate); err == nil {
+		t.Fatal("Register duplicate: expected error")
+	}
+	if strings.Contains(registry.GetMetricsOutput(), "register_rollback_total") {
+		t.Fatal("failed multi-collector registration was not rolled back")
+	}
+	if err := registry.Shutdown(); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if err := registry.Register(prometheus.NewCounter(prometheus.CounterOpts{Name: "after_shutdown_total", Help: "closed"})); err == nil {
+		t.Fatal("Register after shutdown: expected error")
+	}
+}
+
+func TestPeriodicFlushFailureIsVisible(t *testing.T) {
+	dir := t.TempDir()
+	errCh := make(chan error, 1)
+	registry, err := New(Options{
+		MetricsDir:    dir,
+		MetricsFile:   "periodic.prom",
+		FlushInterval: 10 * time.Millisecond,
+		OnFlushError: func(err error) {
+			select {
+			case errCh <- err:
+			default:
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if err := os.Remove(registry.MetricsFile()); err != nil {
+		t.Fatalf("remove metrics file: %v", err)
+	}
+	if err := os.Mkdir(registry.MetricsFile(), 0o755); err != nil {
+		t.Fatalf("replace metrics file with directory: %v", err)
+	}
+
+	select {
+	case flushErr := <-errCh:
+		if flushErr == nil || registry.LastFlushError() == nil {
+			t.Fatal("periodic flush failure was not retained")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("periodic flush failure was not reported")
+	}
+	if err := registry.Shutdown(); err == nil {
+		t.Fatal("Shutdown should report the final textfile flush failure")
 	}
 }
 

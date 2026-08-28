@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Package kafka provides Kafka client initialization, producer, and consumer
-// abstractions for the fit.go framework. It is the Go implementation modules/kafka/index.ts.
+// abstractions.
 //
 // This package defines interfaces (KafkaClient, KafkaProducer, KafkaConsumer)
 // that decouple business logic from the concrete Kafka driver. When a real
@@ -31,6 +31,7 @@
 package kafka
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -39,10 +40,6 @@ import (
 
 	"github.com/gofynd/fit-go/logging"
 )
-
-// ---------------------------------------------------------------------------
-// Log-level mapping (mirrors logLevelMapping)
-// ---------------------------------------------------------------------------
 
 // LogLevel represents Kafka-client log verbosity.
 type LogLevel int
@@ -55,8 +52,8 @@ const (
 	LogLevelDebug
 )
 
-// ParseLogLevel converts the LOG_LEVEL env-var value used across Fynd Commerce
-// into a Kafka LogLevel. Unknown values map to LogLevelNothing.
+// ParseLogLevel converts a LOG_LEVEL-style value into a Kafka LogLevel.
+// Unknown values map to LogLevelNothing.
 func ParseLogLevel(s string) LogLevel {
 	switch strings.ToUpper(strings.TrimSpace(s)) {
 	case "ERROR":
@@ -72,10 +69,6 @@ func ParseLogLevel(s string) LogLevel {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Compression codec (interface for LZ4 / Snappy / GZIP / etc.)
-// ---------------------------------------------------------------------------
-
 // CompressionType identifies a Kafka message compression algorithm.
 type CompressionType int
 
@@ -88,19 +81,12 @@ const (
 )
 
 // CompressionCodec compresses and decompresses message payloads.
-// Register an LZ4 implementation via Config.Compression when the driver is
-// wired up. defaults to LZ4 for all produce calls.
 type CompressionCodec interface {
 	Compress(data []byte) ([]byte, error)
 	Decompress(data []byte) ([]byte, error)
 }
 
-// ---------------------------------------------------------------------------
-// SASL configuration
-// ---------------------------------------------------------------------------
-
 // SASLConfig holds SASL authentication credentials.
-// Mirrors the SASL options used.
 type SASLConfig struct {
 	// Mechanism is the SASL mechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512).
 	// Defaults to "PLAIN" when not set.
@@ -108,10 +94,6 @@ type SASLConfig struct {
 	Username  string
 	Password  string
 }
-
-// ---------------------------------------------------------------------------
-// TLS configuration
-// ---------------------------------------------------------------------------
 
 // TLSConfig holds mutual-TLS file paths for Kafka SSL connections.
 // The paths point to PEM-encoded certificate/key files on disk.
@@ -121,9 +103,7 @@ type TLSConfig struct {
 	KeyFile  string // Path to the client private key file
 }
 
-// BuildTLSConfig reads PEM files and returns a *tls.Config ready for use with
-// a Kafka driver. It of reading files at init time
-// with rejectUnauthorized: false (InsecureSkipVerify in Go).
+// BuildTLSConfig reads PEM files and builds Kafka TLS configuration.
 func (t *TLSConfig) BuildTLSConfig() (*tls.Config, error) {
 	if t == nil {
 		return nil, nil
@@ -134,7 +114,6 @@ func (t *TLSConfig) BuildTLSConfig() (*tls.Config, error) {
 		InsecureSkipVerify: true, // matches rejectUnauthorized: false
 	}
 
-	// Load CA certificate
 	if t.CAFile != "" {
 		caPEM, err := os.ReadFile(t.CAFile)
 		if err != nil {
@@ -147,7 +126,6 @@ func (t *TLSConfig) BuildTLSConfig() (*tls.Config, error) {
 		tlsCfg.RootCAs = pool
 	}
 
-	// Load client certificate + key (mutual TLS)
 	if t.CertFile != "" && t.KeyFile != "" {
 		cert, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile)
 		if err != nil {
@@ -158,10 +136,6 @@ func (t *TLSConfig) BuildTLSConfig() (*tls.Config, error) {
 
 	return tlsCfg, nil
 }
-
-// ---------------------------------------------------------------------------
-// Client configuration
-// ---------------------------------------------------------------------------
 
 // Config holds all parameters needed to create a Kafka client.
 // Fields can be set explicitly or resolved from environment variables via
@@ -185,8 +159,6 @@ type Config struct {
 	TLS *TLSConfig
 
 	// Compression selects the default compression for produced messages.
-	// defaults to LZ4. The actual codec must be provided by the
-	// driver integration layer.
 	Compression CompressionType
 
 	// CompressionCodec is an optional codec implementation for the selected
@@ -216,16 +188,35 @@ type KafkaClient interface {
 	Close() error
 }
 
+// KafkaHealthChecker is implemented by drivers that can perform a broker
+// metadata round trip without producing or consuming a message.
+type KafkaHealthChecker interface {
+	Ping(context.Context) error
+}
+
 // KafkaProducer is the interface a driver's producer must implement.
 type KafkaProducer interface {
 	// Connect establishes the producer connection to the brokers.
 	Connect() error
 
-	// Produce sends messages to a single topic.
+	// Produce sends messages to a single topic. When FIT has installed an active
+	// goroutine context it receives the same automatic producer tracing as legacy
+	// KafkaJS; use ProduceCtx when cancellation or explicit context propagation is
+	// required.
 	Produce(topic string, messages []Message, acks int) error
 
-	// ProduceBatch sends messages to multiple topics in one call.
+	// ProduceBatch sends messages to multiple topics with the same automatic
+	// tracing behavior as Produce.
 	ProduceBatch(topicMessages []TopicMessages, acks int) error
+
+	// ProduceCtx is the canonical single-topic producer API. When tracing is
+	// enabled it creates one producer span per message and injects the configured
+	// propagator fields; tracing-disabled behavior is a broker-call passthrough.
+	ProduceCtx(ctx context.Context, topic string, messages []Message, acks int) error
+
+	// ProduceBatchCtx is the canonical multi-topic producer API and applies the
+	// same per-message span and propagation behavior as ProduceCtx.
+	ProduceBatchCtx(ctx context.Context, topicMessages []TopicMessages, acks int) error
 
 	// Close disconnects the producer gracefully.
 	Close() error
@@ -236,14 +227,44 @@ type KafkaConsumer interface {
 	// Connect subscribes to the given topics and starts the consumer.
 	Connect(topics []TopicConfig) error
 
-	// Consume processes messages one at a time via the handler.
+	// Consume processes messages with automatic consumer spans. The active FIT
+	// goroutine context is installed around the handler for source-compatible raw
+	// handlers; use ConsumeCtx when the handler needs the context value directly.
 	Consume(handler MessageHandler, opts ConsumerOptions) error
 
-	// ConsumeBatch processes messages in batches via the handler.
+	// ConsumeCtx is Consume with a context-aware handler: it opens a consumer span
+	// per message from the extracted producer context and threads the span context
+	// into the handler, so consumer-side logs and downstream spans join the trace.
+	// It is a transparent passthrough when tracing is off.
+	ConsumeCtx(handler MessageHandlerCtx, opts ConsumerOptions) error
+
+	// ConsumeBatch processes messages in batches with automatic batch tracing but
+	// does not expose the span context. Use ConsumeBatchCtx when the handler needs it.
 	ConsumeBatch(handler BatchHandler, opts ConsumerOptions) error
 
 	// Close disconnects the consumer gracefully.
 	Close() error
+}
+
+// KafkaBatchConsumerCtx is the optional context-aware batch extension. It is
+// separate from KafkaConsumer so adding batch tracing does not break alternate
+// drivers that already implement the original public interface.
+type KafkaBatchConsumerCtx interface {
+	ConsumeBatchCtx(handler BatchHandlerCtx, opts ConsumerOptions) error
+}
+
+// ConsumeBatchCtx is the canonical context-aware batch entry point. Native
+// implementations can provide KafkaBatchConsumerCtx; older/alternate drivers are
+// adapted through their existing ConsumeBatch method without a source-breaking
+// interface change.
+func ConsumeBatchCtx(consumer KafkaConsumer, handler BatchHandlerCtx, opts ConsumerOptions) error {
+	if consumer == nil {
+		return fmt.Errorf("kafka: consumer is nil")
+	}
+	if contextConsumer, ok := consumer.(KafkaBatchConsumerCtx); ok {
+		return contextConsumer.ConsumeBatchCtx(handler, opts)
+	}
+	return consumer.ConsumeBatch(TracedBatchHandlerCtx(handler), opts)
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +281,26 @@ type Client struct {
 	// concrete driver is registered. Code that only needs the config (e.g.
 	// config validation at startup) can use Client without a driver.
 	Driver KafkaClient
+}
+
+// Ping verifies broker reachability through the configured driver. Drivers
+// that do not expose a metadata health check return an explicit error rather
+// than reporting a false healthy state.
+func (c *Client) Ping(ctx context.Context) error {
+	if c == nil || c.Driver == nil {
+		return fmt.Errorf("kafka: driver is not initialized")
+	}
+	checker, ok := c.Driver.(KafkaHealthChecker)
+	if !ok {
+		return fmt.Errorf("kafka: driver does not support health checks")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := checker.Ping(ctx); err != nil {
+		return newKafkaHealthError("kafka health check failed", err)
+	}
+	return nil
 }
 
 // NewClient creates a Kafka Client from the given config. If cfg is nil,

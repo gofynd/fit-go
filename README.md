@@ -6,11 +6,12 @@ A batteries-included Go framework for building scalable microservices. Provides 
 
 | Module | Description |
 |---|---|
-| `config` | Type-safe config from env vars, `.env`, JSON, and YAML files |
+| `config` | Type-safe config from env vars, `.env`, JSON, and YAML files, with strict schema validation |
 | `server` | Gin-based HTTP server with multi-type routing, middleware, and payload limits |
-| `grpc` | gRPC server with middleware chains, health checks, and reflection |
+| `grpc` | gRPC server plus traced outbound clients via `fitgrpc.NewClient` or `TracingDialOptions`, middleware chains, health checks, and reflection |
+| `fitgraphql` | Privacy-safe gqlgen operation and resolver tracing |
 | `mongo` | MongoDB connection manager with read/write splitting and pool tuning |
-| `postgres` | PostgreSQL client via `lib/pq` with connection pooling |
+| `postgres` | PostgreSQL client with native pgx/v5 read/write pools, health checks, tracing, and pool metrics |
 | `mysql` | MySQL client via `go-sql-driver/mysql` |
 | `redis` | Redis client supporting standalone, cluster, and sentinel modes |
 | `kafka` | Kafka producer/consumer with SASL/SSL and OpenTelemetry tracing |
@@ -18,11 +19,15 @@ A batteries-included Go framework for building scalable microservices. Provides 
 | `logging` | Structured JSON logger with timezone support and trace propagation |
 | `tracing` | OpenTelemetry tracing with OTLP export |
 | `metrics` | Prometheus metrics for HTTP server and client instrumentation |
+| `otelmetrics` | Generic OpenTelemetry metrics SDK with OTLP and console export |
+| `instrumentation` | Statically linked, typed instrumentation extension registry |
 | `profiling` | Continuous profiling via Pyroscope (CPU, heap, wall-clock) |
 | `errors` | Structured error codes with multilingual messages and Sentry integration |
 | `encryption` | AES-256-GCM encryption with Vault and GCP KMS key providers |
-| `feature` | Feature flag client with periodic refresh |
+| `feature` | FeatureHub SSE client with client/server evaluation contexts |
 | `health` | Health check orchestration across all connections |
+| `migration` | Compiled, checkpointed migrations with local, GCS, and S3 state stores |
+| `protofetch` | Safe `fitproto`-compatible contract fetching and Go generation |
 | `utils` | HTTP client, string helpers, and input sanitization |
 
 ## Quick Start
@@ -96,7 +101,7 @@ but all of them compile and start without extra setup.
 | [03-logging](examples/03-logging) | `logging` | Structured JSON logging, derived loggers, trace context |
 | [04-http-server](examples/04-http-server) | `server` | Gin-based HTTP server, routing by ServerType, health routes |
 | [05-databases](examples/05-databases) | `mongo`, `postgres`, `redis`, `health` | Connect with read/write split and aggregate health checks |
-| [06-kafka](examples/06-kafka) | `kafka` | Produce and consume messages with the confluent driver |
+| [06-kafka](examples/06-kafka) | `kafka` | Context-aware produce and consume with the confluent driver |
 | [07-caching](examples/07-caching) | `groupcache` | Read-through distributed cache with a single-flight loader |
 | [08-encryption](examples/08-encryption) | `encryption` | AES-256-GCM encrypt/decrypt with pluggable key providers |
 | [09-errors](examples/09-errors) | `errors` | Structured error codes with localized messages |
@@ -124,6 +129,109 @@ name := cfg.GetString("SERVICE_NAME", "my-service")
 hosts := cfg.GetStringSlice("ALLOWED_HOSTS", []string{"localhost"})
 ttl := cfg.GetDuration("CACHE_TTL", 5 * time.Minute)
 ```
+
+For Convict/Pydantic-style validation, define a strict schema and apply it
+before constructing dependencies. Defaults are installed only after the whole
+snapshot validates, and sensitive custom-validation failures are redacted.
+
+```go
+schema, err := config.NewSchema(
+    config.SchemaField{Key: "PORT", Kind: config.IntKind, Required: true},
+    config.SchemaField{Key: "CACHE_TTL", Kind: config.DurationKind,
+        Default: "5m", HasDefault: true},
+)
+if err != nil { return err }
+resolved, err := cfg.ApplySchema(schema)
+if err != nil { return err }
+```
+
+Application-specific Convict/Pydantic formats still require an explicit
+`SchemaField.Parser`; fit-go does not guess language-specific coercion.
+
+## Platform Boundaries And Tooling
+
+### GraphQL
+
+Register `fitgraphql.New` on each gqlgen server. It creates operation and
+resolver spans but deliberately cannot capture GraphQL documents, variables,
+arguments, response values, or raw error text. Client-supplied operation names
+are omitted by default; `Options.OperationName` may map persisted or allowlisted
+names to bounded telemetry identities.
+
+```go
+graphqlServer := handler.NewDefaultServer(schema)
+graphqlServer.Use(fitgraphql.New(fitgraphql.Options{}))
+```
+
+### Workers, Crons, And Jobs
+
+Non-HTTP entry points need an explicit boundary. Names and attributes must be
+stable operational metadata, never payloads or user identifiers.
+
+```go
+err := tracing.RunBoundary(ctx, tracing.BoundaryOptions{
+    Type: tracing.BoundaryCron,
+    Name: "expire-orders",
+}, func(ctx context.Context) error {
+    return expireOrders(ctx)
+})
+```
+
+The wrapper keeps the native OTel span active, bridges fit-go logging and
+transport context, marks generic failures, rethrows panics, and preserves the
+original result or error.
+
+### Typed Instrumentation Extensions
+
+Go cannot safely reproduce TraceClue's runtime `package:Class` loader. Register
+known factories at compile time, then allow the legacy env variables to select
+only those names and aliases:
+
+```go
+registry := instrumentation.NewRegistry()
+err := registry.Register(instrumentation.Registration{
+    Name: "custom-client",
+    Aliases: []string{"company/client:Instrumentation"},
+    Factory: newCustomClientHook,
+})
+framework, err := fit.Init(ctx, fit.WithInstrumentationRegistry(registry))
+```
+
+Unknown names/config fail startup. Hooks start deterministically, roll back on
+partial failure, and stop in reverse order. Legacy TraceClue env is interpreted
+only when a registry/options or `FIT_INSTRUMENTATION_ENABLED=true` explicitly
+activates this facility, so stale legacy variables do not break unrelated boots.
+
+### Migrations
+
+Applications compile migration functions into their own command and construct a
+`migration.Runner` with an explicit store and lock. Local state uses atomic
+JSON replacement and a sibling advisory lock. `migration/cloudstore` supports
+`gs://` and `s3://` buckets, but cloud runs require a renewable `LeaseLocker`, a
+monotonic fence token, and an application-owned `FencedWriteFunc` that validates
+the token atomically with each state write. A plain object write or expiring
+`SET NX` mutex is not sufficient because a stale runner can outlive its lock.
+
+The runner imports legacy Node/pyfit state, normalizes their migration IDs,
+checks optional checksums, checkpoints each successful step, and refuses
+unknown applied migrations. Every `Up` and `Down` must remain idempotent because
+an application mutation can succeed before a state-store checkpoint fails.
+Cloud migration functions can read `migration.FenceTokenFromContext`; they must
+validate that token in the same datastore transaction or conditional mutation
+when stale application writes also need to be prevented.
+`migration/migrationcli` supplies `list`, `run`, `revert`, `revert-one`, and
+safe Go skeleton creation for an application-linked binary.
+
+### Proto Contracts
+
+`go run github.com/gofynd/fit-go/cmd/fitproto get` and `getall` read the legacy
+`fit.config.json` API specification. The tool clones without a shell, rejects
+path traversal, unsafe output roots, symlinks, and non-regular generated files;
+serializes writers; fsyncs staged output; and transactionally replaces the
+output with sibling-renamed backup recovery. Generator or replacement failures
+preserve or restore the prior output. It can invoke `buf` with an explicit
+template or `protoc`. CI should pin the contract repository branch or revision
+policy and review generated diffs.
 
 ## Database Clients
 
@@ -153,9 +261,22 @@ POSTGRES_ORDERS_READ_ONLY=postgres://reader:secret@localhost:5432/orders?sslmode
 ```go
 client, err := postgres.InitDefault()
 conn := client.Service("orders")
-write := conn.Write // *sql.DB for writes
-read := conn.Read   // *sql.DB for reads
+write := conn.Write // *pgxpool.Pool for writes
+read := conn.Read   // *pgxpool.Pool for reads
 ```
+
+PostgreSQL initialization is explicit. To let the top-level framework own the
+pools, health check, metrics lifecycle, and shutdown, opt in during `fit.Init`:
+
+```go
+framework, err := fit.Init(ctx, fit.WithPostgres(postgres.ConnectionOptions{}))
+orders := framework.Postgres.Service("orders")
+defer framework.Shutdown(ctx)
+```
+
+Calling `fit.Init(ctx)` without `fit.WithPostgres(...)` does not connect to
+PostgreSQL. Direct `postgres.InitWithContext` usage remains supported for
+applications that manage database lifecycle themselves.
 
 ### Redis
 
@@ -172,9 +293,71 @@ conn := client.Service("cache")
 write := conn.Write // Connection for writes
 ```
 
+## gRPC
+
+Use the fit-go client helper for every outbound gRPC connection. Calling
+`google.golang.org/grpc.NewClient` directly without `TracingDialOptions` does
+not install the OpenTelemetry client handler, so it creates no client span and
+does not propagate the active trace to the server.
+
+```go
+import (
+    fitgrpc "github.com/gofynd/fit-go/grpc"
+    grpc "google.golang.org/grpc"
+    "google.golang.org/grpc/credentials/insecure"
+)
+
+conn, err := fitgrpc.NewClient(
+    "dns:///orders:50051",
+    grpc.WithTransportCredentials(insecure.NewCredentials()),
+)
+if err != nil {
+    return err
+}
+defer conn.Close()
+
+// Pass a context carrying the active span to each RPC.
+response, err := orders.NewOrdersClient(conn).GetOrder(ctx, request)
+```
+
+An RPC context with its own span remains authoritative. When it has no span,
+the fit-go client can fill the missing parent from a fit-go consumer or worker
+boundary active on the same goroutine while retaining the supplied context's
+cancellation, deadline, and values.
+
+Code that must call the upstream `grpc.NewClient` directly should append
+`fitgrpc.TracingDialOptions()` to its dial options instead:
+
+```go
+opts := []grpc.DialOption{grpc.WithTransportCredentials(credentials)}
+opts = append(opts, fitgrpc.TracingDialOptions()...)
+conn, err := grpc.NewClient(target, opts...)
+```
+
+For FIT-style runtime proto loading, call `AddServiceDefinitions` before
+`Start`. fit-go lazily compiles the configured proto at dynamic registration,
+registers unary methods on the native server, and executes callback middleware
+such as `AuthorizeJWTToken` on the real network path. Generated-only users of
+`GRPCServer()` do not require the source proto or its imports at runtime.
+
+Dynamic handler maps preserve FIT/proto-loader semantics: proto field names,
+string representations for 64-bit integers and enums, byte slices, collection
+defaults, oneof discriminator fields, and JSON-compatible Struct/Value/ListValue
+well-known types. Unknown response keys are ignored so additive application data
+does not break an older wire contract. Internal, Unknown, and DataLoss status text
+is sanitized before it crosses the network.
+Companion `.type.json` files are optional validation input rather than a
+runtime requirement; descriptor validation remains authoritative.
+
+Use `AddServiceDefinitionsWithOptions` for a custom error mapper. Streaming
+services use generated registration through `GRPCServer()`;
+`Config.UnaryInterceptors` and `Config.StreamInterceptors` apply to both
+generated and dynamic registrations.
+
 ## Kafka
 
 ```go
+ctx := context.Background()
 client, err := kafka.NewConfluentClient(&kafka.Config{
     Brokers:  []string{"localhost:9092"},
     ClientID: "my-service",
@@ -185,10 +368,27 @@ producer, err := client.Producer(kafka.ProducerConfig{})
 defer producer.Close()
 
 // acks: -1 = all in-sync replicas, 1 = leader only, 0 = fire-and-forget.
-err = producer.Produce("my-topic", []kafka.Message{
+// ProduceCtx creates one producer span per message and injects the configured
+// propagator fields without changing keys, values, partitions or acks.
+err = producer.ProduceCtx(ctx, "my-topic", []kafka.Message{
     {Key: []byte("k"), Value: []byte(`{"hello":"world"}`)},
 }, -1)
 ```
+
+Use `ProduceCtx`, `ProduceBatchCtx`, and `ConsumeCtx` for application code. For
+batch handlers, call `kafka.ConsumeBatchCtx(consumer, handler, opts)`; it works
+with the built-in Confluent consumer and adapts alternate drivers without
+changing the base interface. The raw `Produce`, `ProduceBatch`, `Consume`, and
+`ConsumeBatch` methods are compatibility escape hatches: when called in the
+same goroutine as a fit-go callback they discover its active trace, while calls
+outside a fit-go boundary start or receive an independent boundary.
+
+The Confluent driver honors the `acks` argument on every produce call. Because
+librdkafka configures acknowledgements per producer rather than per request,
+fit-go caches one otherwise-identical producer per requested acknowledgement
+level and closes all of them during shutdown. Set `ProducerConfig.AcksSet=true`
+when the producer's default must explicitly be `0`; a zero-value config keeps
+the safe `-1` default.
 
 ## Observability
 
@@ -204,8 +404,16 @@ logger, _ := logging.New(logging.Options{
 })
 
 logger.Info("request processed", "user_id", "u123", "duration_ms", 42)
-// {"level":"info","timestamp":"2025-01-15T10:30:00Z","msg":"request processed","user_id":"u123","duration_ms":42}
+// TraceClue JSON: {"body":"request processed","severity_text":"info",...
+// "attributes":{"user_id":"u123","duration_ms":42},...}
 ```
+
+The TraceClue envelope is the global default. Set `FIT_LOG_SCHEMA=platform` or
+`SchemaPlatform` explicitly when the platform envelope is required.
+`FIT_LOG_SCHEMA=traceclue` selects it explicitly as well. Its default body
+policy matches TraceClue 3.1.3 (`debug-only`); use `always` for TraceClue
+3.0.5/2.1.x or `non-debug` for pyfit 1.10 queue formatting. See
+[TraceClue compatibility](docs/TRACECLUE_COMPATIBILITY.md).
 
 ### Tracing
 
@@ -213,7 +421,21 @@ logger.Info("request processed", "user_id", "u123", "duration_ms", 42)
 TRACING_ENABLED=true
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
 OTEL_SERVICE_NAME=my-service
+# Optional: tracecontext,baggage (default), b3, b3multi, jaeger, or none
+OTEL_PROPAGATORS=tracecontext,baggage
 ```
+
+The default activation contract requires `TRACING_ENABLED=true`. A pyfit port
+that must preserve pyfit's historical activation behavior can opt in with
+`FIT_TRACING_ACTIVATION_MODE=pyfit`: tracing is enabled when
+`OTEL_SDK_DISABLED` is absent or empty and disabled by every non-empty value,
+including the literal value `false`. Root `fit.Init` and direct `tracing.New`
+use the same rule.
+
+When `fit.Init` receives `WithConfigPaths`, the OTel tracing, sampler,
+propagator, exporter, endpoint/protocol, resource-attribute, and SDK-disable
+settings are resolved from the merged config as well as the process environment;
+an explicitly set environment variable retains precedence.
 
 ```go
 tracer, _ := tracing.New(ctx, tracing.Options{
@@ -226,26 +448,113 @@ span.SetAttribute("order.id", "o-123")
 defer span.End()
 ```
 
+Trace resource identity precedence is `tracing.Options.ServiceName`,
+`OTEL_SERVICE_NAME`, `Options.Attributes["service.name"]`,
+`OTEL_RESOURCE_ATTRIBUTES=service.name=...`, `SERVICE_NAME`, then
+`unknown_service`. `SERVICE_NAME` remains the case-sensitive application
+identity used by FIT configuration and is only a telemetry fallback; setting an
+explicit `OTEL_SERVICE_NAME` intentionally moves telemetry to that dashboard
+identity. The `SERVICE_NAME` fallback is an explicit fit-go improvement over
+legacy TraceClue processes that reported `unknown_service:*` when only the FIT
+application identity was configured.
+
+Calling `fit.Init` twice without an intervening `Shutdown` returns an error.
+Shutdown restores process-global tracing, propagation, metrics, and slog state,
+stops periodic health work, clears lifecycle-owned connections/errors/checks,
+and permits a clean reinitialization.
+
 ### Metrics
+
+Generic OpenTelemetry metrics are separate from the legacy FIT Prometheus
+histograms and can be enabled independently:
+
+```bash
+OTEL_METRICS_EXPORTER=otlp
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+OTEL_METRIC_EXPORT_INTERVAL=60000
+OTEL_METRIC_EXPORT_TIMEOUT=30000
+```
+
+`fit.Init` installs the resulting meter provider process-wide and shuts it down
+with ownership-safe restoration. A stable routing provider rebinds synchronous
+instruments and observable callbacks across repeated SDK lifecycles, including
+instruments created before initialization; equivalent meter scopes are reused.
+`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` and
+`OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` override their common equivalents.
+`console`, comma-separated exporters, injected readers/exporters, views, and
+`OTEL_SDK_DISABLED` are supported. Supplying a custom reader/exporter enables
+the provider unless `Enabled=false` is explicit. Runtime/exporter errors can be
+routed through `Options.ErrorHandler`; root `fit.Init` logs only their type.
+Export remains opt-in so upgrading fit-go does not unexpectedly connect a
+service to a local collector.
+
+The deployed FIT Prometheus contract remains available separately:
 
 ```bash
 FIT_PROMETHEUS_ENABLED=true
+METRICS_DIR=/var/data/metrics
 ```
 
 ```go
-registry, _ := metrics.New(metrics.Options{
-    ServerEnabled:     true,
-    HTTPClientEnabled: true,
-})
-// Prometheus metrics are automatically collected for HTTP server and client
+framework, _ := fit.Init(ctx)
+defer framework.Shutdown(ctx)
+
+// fit.Init installs the enabled registry for fit servers and both HTTP clients.
+client := httpclient.NewHTTPClient()
 ```
+
+Instrumented outbound clients preserve an explicit request context as the
+source of truth. If it has no span while running inside a fit-go consumer or
+worker boundary, HTTP and the fit-go database/gRPC/Kafka clients adopt the
+same-goroutine active span and baggage without replacing the supplied context's
+cancellation, deadline, or values. This compatibility bridge does not cross a
+new goroutine; detached work must carry an explicit retained context.
+
+With `METRICS_DIR`, fit creates and atomically refreshes a
+node-exporter-compatible `.prom` textfile every four seconds. The deployed Node
+`prom-file-client` 0.1.1 also uses four seconds and
+`<K8S_POD_NAME>-<pid>.prom`, but waits for the first tick and opens with `wx`, so
+later refreshes fail. Immediate creation and atomic replacement are intentional
+bug fixes, not byte parity. Direct `metrics.New` users may instead expose
+`registry.Handler()` for scraping and call `metrics.SetDefault(registry)` to opt
+into automatic server/client recording. Periodic write failures are retained by
+`LastFlushError` and reported through `Options.OnFlushError` (or a generic safe
+error log). See
+[the transport and metrics parity notes](docs/OBSERVABILITY_TRANSPORT_METRICS.md).
 
 ### Profiling
 
 ```bash
 PROFILING_ENABLED=true
 PROFILING_DISTRIBUTOR_ADDRESS=http://pyroscope:4040
+PROFILING_SAMPLE_RATE=10
 ```
+
+`PROFILING_SAMPLE_RATE` is retained as a legacy requested value. The current
+`pyroscope-go` runtime samples at a fixed effective 100 Hz and ignores its
+deprecated sample-rate field, so profiler status reports `requested`,
+`effective`, and `configurable=false` separately instead of claiming the legacy
+value changed collection behavior.
+
+Use `profiling.TagWrapper` to attach scoped Pyroscope and pprof labels to a
+work unit without mutating process-global profiling state.
+
+### Error Reporting
+
+`errors.InitSentryWithConfig` is retryable when the DSN is initially absent or
+SDK initialization fails. Error events and explicitly enabled transaction
+events are sanitized both before and after optional caller hooks: request
+bodies/query strings/cookies and user data are removed, while sensitive keyed
+values and secret or PII text are redacted. Bounded reflection also sanitizes
+typed nested values and cycles without invoking custom string or marshal code.
+Sentry logs and metrics are disabled because fit-go uses OpenTelemetry for
+those signals.
+
+Use `errors.WithSentryContext` for request-local tags, extras, correlation IDs,
+and breadcrumbs. It clones the request hub so concurrent requests do not share
+scope mutation. Capture methods retain the original Go error object for Sentry
+grouping and application control flow.
 
 ## Encryption
 
@@ -263,15 +572,27 @@ decrypted, _ := mgr.Decrypt(encrypted)
 
 ```bash
 FEATURE_FLAG_ENABLED=true
-FEATURE_FLAG_SERVER_URL=http://featurehub:8085
+# A trailing /features or /features/ is also accepted, as in the JS SDK.
+FEATURE_FLAG_URL=http://featurehub:8085
+# Keys containing * use client-side rollout evaluation. Other keys use
+# server-side evaluation and send x-featurehub context as both the legacy
+# EventSource query parameter and request header.
 FEATURE_FLAG_API_KEY=your-sdk-key
+# Optional: make initial FeatureHub state a required startup dependency.
+FEATURE_FLAG_REQUIRE_INITIAL_STATE=false
 ```
 
 ```go
 client, _ := feature.Init()
+defer client.Stop()
 if client.IsEnabled("dark-mode") {
     // feature is on
 }
+
+ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+defer cancel()
+requestFlags := client.NewContext().UserKey("user-123").Attribute("plan", "gold")
+if err := requestFlags.Build(ctx); err != nil { ... }
 ```
 
 ## Health Checks
@@ -286,7 +607,14 @@ checker.AddCheck(func() string {
 })
 
 errors := checker.Check() // empty slice = healthy
+
+checker.StartPeriodicCheck(30)
+defer checker.StopPeriodicCheck()
 ```
+
+`Fit.Shutdown` calls `Health.Reset` automatically. Direct checker owners can
+call `Reset` to stop periodic work, remove registered checks, and clear the
+health file before reusing the checker.
 
 ## Requirements
 

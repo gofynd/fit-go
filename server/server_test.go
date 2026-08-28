@@ -15,6 +15,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/hmac"
@@ -24,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -33,6 +35,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gofynd/fit-go/errors"
+	"github.com/gofynd/fit-go/metrics"
+	"github.com/gofynd/fit-go/profiling"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 func init() {
@@ -60,6 +65,7 @@ func TestParseServerType(t *testing.T) {
 		{"panel", ServerTypePanel, false},
 		{"dev", ServerTypeDev, false},
 		{"common", ServerTypeCommon, false},
+		{"central", ServerTypeCentral, false},
 		{" Platform ", ServerTypePlatform, false},
 		{"APPLICATION", ServerTypeApplication, false},
 		{"", ServerTypeDefault, true},
@@ -132,6 +138,7 @@ func TestServerType_String(t *testing.T) {
 		{ServerTypePanel, "panel"},
 		{ServerTypeDev, "dev"},
 		{ServerTypeCommon, "common"},
+		{ServerTypeCentral, "central"},
 		{ServerTypeDefault, "default"},
 		{ServerType(999), "default"},
 	}
@@ -147,8 +154,8 @@ func TestServerType_String(t *testing.T) {
 
 func TestAllServerTypes(t *testing.T) {
 	types := AllServerTypes()
-	if len(types) != 11 {
-		t.Errorf("AllServerTypes() returned %d types, want 11", len(types))
+	if len(types) != 12 {
+		t.Errorf("AllServerTypes() returned %d types, want 12", len(types))
 	}
 
 	for _, st := range types {
@@ -457,6 +464,61 @@ func TestRequestID(t *testing.T) {
 			t.Errorf("RequestID = %q, want %q", capturedID, existingID)
 		}
 	})
+}
+
+func TestInitCanDisableRequestIDWithoutChangingDefault(t *testing.T) {
+	t.Setenv("SERVER_TYPE", "platform")
+	router := http.NewServeMux()
+	router.HandleFunc("/probe", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	disabled := false
+	server := New(Config{Port: "0", RequestID: &disabled})
+	if err := server.Init(map[ServerType]http.Handler{ServerTypePlatform: router}, nil, nil); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	server.App.ServeHTTP(recorder, request)
+	if got := recorder.Header().Get("X-Request-ID"); got != "" {
+		t.Fatalf("X-Request-ID = %q, want absent", got)
+	}
+}
+
+func TestInitCanDisableRequestLoggingWhileRetainingMetrics(t *testing.T) {
+	t.Setenv("SERVER_TYPE", "platform")
+	var logBuffer bytes.Buffer
+	metricsCalls := 0
+	router := http.NewServeMux()
+	router.HandleFunc("/probe", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	disabled := false
+	server := New(Config{
+		Port:           "0",
+		Logger:         slog.New(slog.NewJSONHandler(&logBuffer, nil)),
+		RequestLogging: &disabled,
+		MetricsRecorder: func(_, _, _ string, _ float64) {
+			metricsCalls++
+		},
+	})
+	if err := server.Init(map[ServerType]http.Handler{ServerTypePlatform: router}, nil, nil); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	server.App.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNoContent)
+	}
+	if strings.Contains(logBuffer.String(), "[REQ]") || strings.Contains(logBuffer.String(), "[RES]") {
+		t.Fatalf("request logs must be absent when disabled: %s", logBuffer.String())
+	}
+	if metricsCalls != 1 {
+		t.Fatalf("metrics calls = %d, want 1", metricsCalls)
+	}
 }
 
 func TestCORS(t *testing.T) {
@@ -1007,6 +1069,222 @@ func TestHealthRoutes(t *testing.T) {
 	})
 }
 
+type staticHealthChecker []string
+
+func (checker staticHealthChecker) Check() []string { return checker }
+
+func TestHealthAndReadinessCanUseIndependentCheckers(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	RegisterHealthRoutesWithCheckers(
+		engine,
+		staticHealthChecker(nil),
+		staticHealthChecker([]string{"dependencies are not ready"}),
+	)
+
+	health := httptest.NewRecorder()
+	engine.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/_healthz", nil))
+	if health.Code != http.StatusOK {
+		t.Fatalf("health status = %d; want 200", health.Code)
+	}
+
+	readiness := httptest.NewRecorder()
+	engine.ServeHTTP(readiness, httptest.NewRequest(http.MethodGet, "/_readyz", nil))
+	if readiness.Code != http.StatusBadRequest {
+		t.Fatalf("readiness status = %d; want 400", readiness.Code)
+	}
+}
+
+func TestStaticHealthRoutesPreserveExpressBytes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	RegisterStaticHealthRoutes(engine)
+
+	for _, path := range []string{
+		"/_healthz",
+		"/_healthz/",
+		"/_readyz",
+		"/_readyz/",
+		"/_HEALTHZ/",
+		"/_READYZ/",
+	} {
+		t.Run(path, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("GET %s = %d, want 200", path, recorder.Code)
+			}
+			if got := recorder.Body.String(); got != `{"ok":"ok"}` {
+				t.Fatalf("GET %s body = %q, want exact fit.js body", path, got)
+			}
+			wantHeaders := map[string]string{
+				"Content-Type":   "application/json; charset=utf-8",
+				"Content-Length": "11",
+				"ETag":           `W/"b-2F/2BWc0KYbtLqL5U2Kv5B6uQUQ"`,
+				"X-Powered-By":   "Express",
+				"Connection":     "keep-alive",
+				"Keep-Alive":     "timeout=5",
+			}
+			for name, want := range wantHeaders {
+				if got := recorder.Header().Get(name); got != want {
+					t.Fatalf("GET %s %s = %q, want %q", path, name, got, want)
+				}
+			}
+		})
+	}
+
+	for _, path := range []string{"/_healthz", "/_healthz/", "/_READYZ/"} {
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodHead, path, nil))
+		if recorder.Code != http.StatusOK || recorder.Body.Len() != 0 {
+			t.Fatalf("HEAD %s = %d body %q", path, recorder.Code, recorder.Body.String())
+		}
+		if recorder.Header().Get("Content-Length") != "11" ||
+			recorder.Header().Get("ETag") != `W/"b-2F/2BWc0KYbtLqL5U2Kv5B6uQUQ"` ||
+			recorder.Header().Get("Connection") != "keep-alive" ||
+			recorder.Header().Get("Keep-Alive") != "timeout=5" {
+			t.Fatalf("HEAD %s headers = %#v", path, recorder.Header())
+		}
+	}
+
+	t.Run("request connection close", func(t *testing.T) {
+		request := httptest.NewRequest(http.MethodGet, "/_healthz", nil)
+		request.Close = true
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, request)
+		if got := recorder.Header().Get("Connection"); got != "close" {
+			t.Fatalf("Connection = %q, want close", got)
+		}
+		if got := recorder.Header().Get("Keep-Alive"); got != "" {
+			t.Fatalf("Keep-Alive = %q, want absent", got)
+		}
+	})
+}
+
+func TestStaticHealthRoutesPreserveExpressConditionalRequests(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	RegisterStaticHealthRoutes(engine)
+	legacyETag := `W/"b-2F/2BWc0KYbtLqL5U2Kv5B6uQUQ"`
+
+	for _, test := range []struct {
+		name         string
+		method       string
+		ifNoneMatch  string
+		cacheControl string
+		modified     string
+		wantStatus   int
+	}{
+		{name: "weak match", method: http.MethodGet, ifNoneMatch: legacyETag, wantStatus: http.StatusNotModified},
+		{name: "strong match", method: http.MethodGet, ifNoneMatch: strings.TrimPrefix(legacyETag, "W/"), wantStatus: http.StatusNotModified},
+		{name: "token list", method: http.MethodGet, ifNoneMatch: `"other", ` + legacyETag, wantStatus: http.StatusNotModified},
+		{name: "wildcard", method: http.MethodHead, ifNoneMatch: "*", wantStatus: http.StatusNotModified},
+		{name: "mismatch", method: http.MethodGet, ifNoneMatch: `W/"different"`, wantStatus: http.StatusOK},
+		{name: "reload remains stale", method: http.MethodGet, ifNoneMatch: legacyETag, cacheControl: "max-age=0, no-cache", wantStatus: http.StatusOK},
+		{name: "fresh package no-cache token is case sensitive", method: http.MethodGet, ifNoneMatch: legacyETag, cacheControl: "No-Cache", wantStatus: http.StatusNotModified},
+		{name: "if modified since remains stale without last modified", method: http.MethodGet, ifNoneMatch: legacyETag, modified: "Wed, 21 Oct 2015 07:28:00 GMT", wantStatus: http.StatusOK},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, "/_healthz", nil)
+			if test.ifNoneMatch != "" {
+				request.Header.Set("If-None-Match", test.ifNoneMatch)
+			}
+			if test.cacheControl != "" {
+				request.Header.Set("Cache-Control", test.cacheControl)
+			}
+			if test.modified != "" {
+				request.Header.Set("If-Modified-Since", test.modified)
+			}
+			recorder := httptest.NewRecorder()
+			engine.ServeHTTP(recorder, request)
+			if recorder.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d", recorder.Code, test.wantStatus)
+			}
+			if recorder.Header().Get("ETag") != legacyETag || recorder.Header().Get("X-Powered-By") != "Express" {
+				t.Fatalf("compatibility headers = %#v", recorder.Header())
+			}
+			if test.wantStatus == http.StatusNotModified {
+				if recorder.Body.Len() != 0 {
+					t.Fatalf("304 body = %q, want empty", recorder.Body.String())
+				}
+				if got := recorder.Header().Get("Content-Type"); got != "" {
+					t.Fatalf("304 Content-Type = %q, want absent", got)
+				}
+				if got := recorder.Header().Get("Content-Length"); got != "" {
+					t.Fatalf("304 Content-Length = %q, want absent", got)
+				}
+			}
+		})
+	}
+}
+
+func TestStaticHealthRoutesCombineDuplicateConditionalHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	RegisterStaticHealthRoutes(engine)
+
+	request := httptest.NewRequest(http.MethodGet, "/_healthz", nil)
+	request.Header.Add("If-None-Match", `"stale"`)
+	request.Header.Add("If-None-Match", `W/"b-2F/2BWc0KYbtLqL5U2Kv5B6uQUQ"`)
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusNotModified {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNotModified)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/_healthz", nil)
+	request.Header.Set("If-None-Match", `W/"b-2F/2BWc0KYbtLqL5U2Kv5B6uQUQ"`)
+	request.Header.Add("Cache-Control", "max-age=0")
+	request.Header.Add("Cache-Control", "no-cache")
+	recorder = httptest.NewRecorder()
+	engine.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("duplicate Cache-Control status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+}
+
+func TestDeprecatedStaticHealthAliasUsesCanonicalBehavior(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	RegisterLegacyStaticHealthRoutes(engine)
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/_healthz", nil))
+	if recorder.Code != http.StatusOK || recorder.Body.String() != `{"ok":"ok"}` {
+		t.Fatalf("deprecated health alias = %d %q", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestProfileRoutesControlTheProvidedProfiler(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	profiler := profiling.New(profiling.Config{
+		Enabled:                   true,
+		HeapEnabled:               true,
+		HeapSamplingIntervalBytes: 524288,
+	})
+	defer profiler.Stop()
+	engine := gin.New()
+	RegisterProfileRoutesWithProfiler(engine, profiler)
+
+	start := httptest.NewRecorder()
+	engine.ServeHTTP(start, httptest.NewRequest(http.MethodGet, "/_profiling/start_heap", nil))
+	if start.Code != http.StatusOK || !profiler.IsHeapProfilingRunning() {
+		t.Fatalf("start_heap status/running = %d/%v", start.Code, profiler.IsHeapProfilingRunning())
+	}
+
+	status := httptest.NewRecorder()
+	engine.ServeHTTP(status, httptest.NewRequest(http.MethodGet, "/_profiling/status", nil))
+	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"overall":{"message":"Profiling is active","running":true}`) {
+		t.Fatalf("status response = %d %s", status.Code, status.Body.String())
+	}
+
+	stop := httptest.NewRecorder()
+	engine.ServeHTTP(stop, httptest.NewRequest(http.MethodGet, "/_profiling/stop_heap", nil))
+	if stop.Code != http.StatusOK || profiler.IsHeapProfilingRunning() {
+		t.Fatalf("stop_heap status/running = %d/%v", stop.Code, profiler.IsHeapProfilingRunning())
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Server lifecycle tests
 // ---------------------------------------------------------------------------
@@ -1024,27 +1302,251 @@ func TestNew(t *testing.T) {
 		if s.cfg.ReadTimeout != 30*time.Second {
 			t.Errorf("ReadTimeout = %v, want 30s", s.cfg.ReadTimeout)
 		}
+		if s.cfg.ReadHeaderTimeout != 0 {
+			t.Errorf("ReadHeaderTimeout = %v, want zero to preserve the ReadTimeout fallback", s.cfg.ReadHeaderTimeout)
+		}
 		if s.cfg.WriteTimeout != 30*time.Second {
 			t.Errorf("WriteTimeout = %v, want 30s", s.cfg.WriteTimeout)
 		}
+		if s.cfg.DisableWriteTimeout {
+			t.Error("DisableWriteTimeout = true, want false")
+		}
 		if s.cfg.IdleTimeout != 120*time.Second {
 			t.Errorf("IdleTimeout = %v, want 120s", s.cfg.IdleTimeout)
+		}
+		if s.cfg.MaxHeaderBytes != 0 {
+			t.Errorf("MaxHeaderBytes = %d, want zero to preserve net/http default", s.cfg.MaxHeaderBytes)
 		}
 	})
 
 	t.Run("custom config", func(t *testing.T) {
 		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 		s := New(Config{
-			Logger:       logger,
-			ReadTimeout:  60 * time.Second,
-			WriteTimeout: 60 * time.Second,
-			IdleTimeout:  300 * time.Second,
+			Logger:            logger,
+			ReadTimeout:       60 * time.Second,
+			ReadHeaderTimeout: 15 * time.Second,
+			WriteTimeout:      60 * time.Second,
+			IdleTimeout:       300 * time.Second,
+			MaxHeaderBytes:    16 * 1024,
 		})
 
 		if s.cfg.ReadTimeout != 60*time.Second {
 			t.Errorf("ReadTimeout = %v, want 60s", s.cfg.ReadTimeout)
 		}
+		if s.cfg.ReadHeaderTimeout != 15*time.Second {
+			t.Errorf("ReadHeaderTimeout = %v, want 15s", s.cfg.ReadHeaderTimeout)
+		}
+		if s.cfg.WriteTimeout != 60*time.Second {
+			t.Errorf("WriteTimeout = %v, want 60s", s.cfg.WriteTimeout)
+		}
+		if s.cfg.IdleTimeout != 300*time.Second {
+			t.Errorf("IdleTimeout = %v, want 300s", s.cfg.IdleTimeout)
+		}
+		if s.cfg.MaxHeaderBytes != 16*1024 {
+			t.Errorf("MaxHeaderBytes = %d, want 16384", s.cfg.MaxHeaderBytes)
+		}
 	})
+
+	t.Run("write timeout explicitly disabled", func(t *testing.T) {
+		s := New(Config{
+			WriteTimeout:        60 * time.Second,
+			DisableWriteTimeout: true,
+		})
+
+		if s.cfg.WriteTimeout != 0 {
+			t.Errorf("WriteTimeout = %v, want disabled", s.cfg.WriteTimeout)
+		}
+		if !s.cfg.DisableWriteTimeout {
+			t.Error("DisableWriteTimeout = false, want true")
+		}
+	})
+}
+
+func TestServerBuildHTTPServerTimeouts(t *testing.T) {
+	t.Run("default values preserve existing net http behavior", func(t *testing.T) {
+		s := New(Config{})
+		s.App = http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+		httpServer := s.buildHTTPServer(":0")
+
+		if httpServer.ReadTimeout != 30*time.Second {
+			t.Errorf("ReadTimeout = %v, want 30s", httpServer.ReadTimeout)
+		}
+		if httpServer.ReadHeaderTimeout != 0 {
+			t.Errorf("ReadHeaderTimeout = %v, want zero", httpServer.ReadHeaderTimeout)
+		}
+		if httpServer.WriteTimeout != 30*time.Second {
+			t.Errorf("WriteTimeout = %v, want 30s", httpServer.WriteTimeout)
+		}
+		if httpServer.IdleTimeout != 120*time.Second {
+			t.Errorf("IdleTimeout = %v, want 120s", httpServer.IdleTimeout)
+		}
+		if httpServer.MaxHeaderBytes != 0 {
+			t.Errorf("MaxHeaderBytes = %d, want zero", httpServer.MaxHeaderBytes)
+		}
+	})
+
+	t.Run("custom values reach net http", func(t *testing.T) {
+		s := New(Config{
+			ReadTimeout:       5 * time.Minute,
+			ReadHeaderTimeout: time.Minute,
+			WriteTimeout:      2 * time.Minute,
+			IdleTimeout:       5 * time.Second,
+			MaxHeaderBytes:    16 * 1024,
+		})
+		s.App = http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+		httpServer := s.buildHTTPServer(":0")
+
+		if httpServer.ReadTimeout != 5*time.Minute {
+			t.Errorf("ReadTimeout = %v, want 5m", httpServer.ReadTimeout)
+		}
+		if httpServer.ReadHeaderTimeout != time.Minute {
+			t.Errorf("ReadHeaderTimeout = %v, want 1m", httpServer.ReadHeaderTimeout)
+		}
+		if httpServer.WriteTimeout != 2*time.Minute {
+			t.Errorf("WriteTimeout = %v, want 2m", httpServer.WriteTimeout)
+		}
+		if httpServer.IdleTimeout != 5*time.Second {
+			t.Errorf("IdleTimeout = %v, want 5s", httpServer.IdleTimeout)
+		}
+		if httpServer.MaxHeaderBytes != 16*1024 {
+			t.Errorf("MaxHeaderBytes = %d, want 16384", httpServer.MaxHeaderBytes)
+		}
+	})
+
+	t.Run("write timeout disable takes precedence", func(t *testing.T) {
+		s := New(Config{
+			WriteTimeout:        time.Minute,
+			DisableWriteTimeout: true,
+		})
+		s.App = http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+		httpServer := s.buildHTTPServer(":0")
+
+		if httpServer.WriteTimeout != 0 {
+			t.Errorf("WriteTimeout = %v, want disabled", httpServer.WriteTimeout)
+		}
+	})
+}
+
+func TestServerMaxHeaderBytesEnforced(t *testing.T) {
+	fitServer := New(Config{MaxHeaderBytes: 16 * 1024})
+	fitServer.App = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	configured := fitServer.buildHTTPServer("")
+	server := httptest.NewUnstartedServer(configured.Handler)
+	server.Config.MaxHeaderBytes = configured.MaxHeaderBytes
+	server.Start()
+	defer server.Close()
+
+	request := func(size int) *http.Response {
+		req, err := http.NewRequest(http.MethodGet, server.URL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("X-Large", strings.Repeat("a", size))
+		response, err := server.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { response.Body.Close() })
+		return response
+	}
+
+	if got := request(16_000).StatusCode; got != http.StatusOK {
+		t.Fatalf("16000-byte header status = %d, want 200", got)
+	}
+	for _, size := range []int{16_384, 20_000, 65_536} {
+		response := request(size)
+		if response.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
+			t.Fatalf("%d-byte header status = %d, want 431", size, response.StatusCode)
+		}
+		if !response.Close {
+			t.Fatalf("%d-byte header response kept the connection alive", size)
+		}
+		if size <= 20_000 {
+			body, err := io.ReadAll(response.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(body) != 0 {
+				t.Fatalf("%d-byte compatibility 431 body = %q, want empty", size, body)
+			}
+		}
+	}
+}
+
+func TestServerMaxHeaderBytesCoversRawNormalizedAndRepeatedFields(t *testing.T) {
+	fitServer := New(Config{MaxHeaderBytes: 16 * 1024})
+	fitServer.App = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	configured := fitServer.buildHTTPServer("")
+	server := httptest.NewUnstartedServer(configured.Handler)
+	server.Config.MaxHeaderBytes = configured.MaxHeaderBytes
+	server.Start()
+	defer server.Close()
+
+	request := func(target string, headerLines ...string) *http.Response {
+		t.Helper()
+		connection, err := net.Dial("tcp", server.Listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = connection.Close() })
+		wire := "GET " + target + " HTTP/1.1\r\nHost: audit.test\r\n" + strings.Join(headerLines, "\r\n") + "\r\nConnection: close\r\n\r\n"
+		if _, err := io.WriteString(connection, wire); err != nil {
+			t.Fatal(err)
+		}
+		response, err := http.ReadResponse(bufio.NewReader(connection), &http.Request{Method: http.MethodGet})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { response.Body.Close() })
+		return response
+	}
+
+	if got := request("/", "X-Pad: "+strings.Repeat("a", 16_000)).StatusCode; got != http.StatusOK {
+		t.Fatalf("raw 16000-byte value status = %d, want 200", got)
+	}
+	for name, response := range map[string]*http.Response{
+		"normalized whitespace": request("/", "X-Pad: "+strings.Repeat(" ", 65_536)),
+		"repeated fields":       request("/", "X-Pad: "+strings.Repeat("a", 8_200), "X-Pad: "+strings.Repeat("b", 8_200)),
+		"long target":           request("/" + strings.Repeat("a", 16_384)),
+	} {
+		if response.StatusCode != http.StatusRequestHeaderFieldsTooLarge || !response.Close {
+			t.Fatalf("%s status/close = %d/%v, want 431/true", name, response.StatusCode, response.Close)
+		}
+	}
+
+	connection, err := net.Dial("tcp", server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	reader := bufio.NewReader(connection)
+	if _, err := io.WriteString(connection, "GET / HTTP/1.1\r\nHost: audit.test\r\nX-Pad: ok\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	first, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Body.Close()
+	if first.StatusCode != http.StatusOK || first.Close {
+		t.Fatalf("keep-alive baseline status/close = %d/%v", first.StatusCode, first.Close)
+	}
+	if _, err := io.WriteString(connection, "GET / HTTP/1.1\r\nHost: audit.test\r\nX-Pad: "+strings.Repeat("a", 16_384)+"\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	second, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusRequestHeaderFieldsTooLarge || !second.Close {
+		t.Fatalf("reused oversized status/close = %d/%v, want 431/true", second.StatusCode, second.Close)
+	}
 }
 
 func TestServer_Init(t *testing.T) {
@@ -1295,5 +1797,37 @@ func TestConcurrentServerAccess(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		<-done
+	}
+}
+
+func TestServerInit_UsesProcessDefaultMetrics(t *testing.T) {
+	t.Setenv("SERVER_TYPE", "application")
+	t.Setenv("NODE_ENV", "production")
+	registry, err := metrics.New(metrics.Options{
+		ServerEnabled:      true,
+		DeploymentName:     "test",
+		PrometheusRegistry: prometheus.NewRegistry(),
+	})
+	if err != nil {
+		t.Fatalf("metrics.New: %v", err)
+	}
+	defer registry.Shutdown()
+	restore := metrics.SetDefault(registry)
+	defer restore()
+
+	s := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	if err := s.Init(map[ServerType]http.Handler{ServerTypeApplication: handler}, nil, nil); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	s.App.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/orders/123", nil))
+
+	output := registry.GetMetricsOutput()
+	if !strings.Contains(output, "fit_http_request_duration_ms") ||
+		!strings.Contains(output, `status_code="204"`) {
+		t.Fatalf("server did not use process-default metrics:\n%s", output)
 	}
 }

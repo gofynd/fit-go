@@ -17,6 +17,55 @@ package kafka
 
 import "time"
 
+// ProducerClosePolicy controls what Close waits for after it stops accepting
+// new produce calls. The zero value preserves fit-go's synchronous bounded
+// delivery drain.
+type ProducerClosePolicy uint8
+
+const (
+	ProducerCloseWaitForDelivery ProducerClosePolicy = iota
+	// ProducerCloseKafkaJSDisconnect returns after admission is stopped while
+	// already accepted deliveries and driver teardown complete in the
+	// background, matching KafkaJS producer.disconnect startup-failure behavior.
+	ProducerCloseKafkaJSDisconnect
+	// ProducerCloseKafkaJSAwaitDelivery stops admission, waits boundedly for
+	// accepted produce calls and their delivery reports, and then closes the
+	// driver without requiring a separate broker-responsive Flush round trip.
+	// This matches KafkaJS callers that await producer.disconnect after their
+	// in-flight work has reached its delivery boundary. If the bound expires,
+	// Close reports the outstanding accepted
+	// count while the ordered drain and driver cleanup continue in the background.
+	ProducerCloseKafkaJSAwaitDelivery
+)
+
+// ProducerPartitioner selects the driver partitioning strategy for records
+// without an explicit partition. The zero value preserves the driver's
+// existing default.
+type ProducerPartitioner string
+
+const (
+	// ProducerPartitionerDefault preserves librdkafka's configured/default
+	// partitioner.
+	ProducerPartitionerDefault ProducerPartitioner = ""
+	// ProducerPartitionerKafkaJSCompatible selects librdkafka's Java-compatible
+	// murmur2 partitioning for keyed records and KafkaJS 2.2.4's per-topic,
+	// randomly seeded round-robin selection for keyless records.
+	ProducerPartitionerKafkaJSCompatible ProducerPartitioner = "kafkajs-legacy"
+)
+
+// ProducerTraceHeaderPolicy controls automatic trace propagation performed by
+// fit-go producer entry points. The zero value preserves the existing behavior.
+type ProducerTraceHeaderPolicy uint8
+
+const (
+	// ProducerTraceHeadersInject creates producer spans and injects configured
+	// propagation headers into each record.
+	ProducerTraceHeadersInject ProducerTraceHeaderPolicy = iota
+	// ProducerTraceHeadersPreserve creates the same producer spans but leaves
+	// caller-provided record headers byte-for-byte unchanged.
+	ProducerTraceHeadersPreserve
+)
+
 // ---------------------------------------------------------------------------
 // Message types
 // ---------------------------------------------------------------------------
@@ -49,6 +98,27 @@ type Message struct {
 	Timestamp time.Time
 }
 
+// NewMessage creates a keyless message whose partition is selected by the
+// configured producer partitioner. Message's zero value still means explicit
+// partition 0 for backward compatibility; callers that want automatic
+// partitioning should use this constructor.
+func NewMessage(value []byte) Message {
+	return Message{Value: value, Partition: -1}
+}
+
+// NewKeyedMessage creates a keyed message whose partition is selected by the
+// configured producer partitioner. A present empty key remains distinct from a
+// missing key, matching KafkaJS.
+func NewKeyedMessage(key, value []byte) Message {
+	return Message{Key: key, Value: value, Partition: -1}
+}
+
+// NewPartitionedMessage creates a message with an explicit partition override,
+// including partition 0.
+func NewPartitionedMessage(partition int, value []byte) Message {
+	return Message{Value: value, Partition: partition}
+}
+
 // TopicMessages groups messages destined for a single topic.
 // Used by ProduceBatch to send to multiple topics in one call.
 // Mirrors the TopicMessages interface.
@@ -57,11 +127,21 @@ type TopicMessages struct {
 	Messages []Message
 }
 
-// RecordMetadata is returned for each message after a successful produce.
+// RecordMetadata is returned once per topic/partition acknowledged by a produce
+// request, matching KafkaJS-style grouped delivery metadata.
 type RecordMetadata struct {
-	Topic     string
-	Partition int
-	Offset    int64
+	// Topic and Offset are kept for Go callers that want typed access. They are
+	// not serialized because legacy fit.js/KafkaJS exposes topicName/baseOffset
+	// in HTTP responses.
+	Topic  string `json:"-"`
+	Offset int64  `json:"-"`
+
+	TopicName      string `json:"topicName"`
+	Partition      int    `json:"partition"`
+	ErrorCode      int    `json:"errorCode"`
+	BaseOffset     string `json:"baseOffset,omitempty"`
+	LogAppendTime  string `json:"logAppendTime,omitempty"`
+	LogStartOffset string `json:"logStartOffset,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -74,6 +154,10 @@ type ProducerConfig struct {
 	// Acks is the default acknowledgement level:
 	// 0 = fire-and-forget, 1 = leader only, -1 = all ISR (default).
 	Acks int
+	// AcksSet distinguishes an explicit fire-and-forget value (Acks=0) from
+	// the zero value of ProducerConfig, which inherits the safe default (-1).
+	// Non-zero Acks values remain implicitly set for backward compatibility.
+	AcksSet bool
 
 	// IdempotentProducer enables exactly-once semantics when true.
 	IdempotentProducer bool
@@ -81,13 +165,69 @@ type ProducerConfig struct {
 	// Timeout is the maximum time to wait for a produce request.
 	Timeout time.Duration
 
+	// DeliveryTimeout caps the complete lifetime of an accepted message,
+	// including broker discovery, reconnects and retries. This maps to
+	// librdkafka's message.timeout.ms and is intentionally separate from
+	// Timeout/request.timeout.ms: KafkaJS bounds individual socket requests and
+	// its retry loop independently, while librdkafka otherwise retains an
+	// accepted message for its much longer driver default.
+	DeliveryTimeout time.Duration
+
+	// MetadataTimeout bounds a broker metadata lookup performed by compatibility
+	// partitioners. Zero uses the KafkaJS-compatible default of 30 seconds. It is
+	// deliberately separate from Timeout so changing request delivery behavior
+	// cannot accidentally make metadata discovery unbounded or overly aggressive.
+	MetadataTimeout time.Duration
+
+	// MetadataMaxAge controls how long compatibility partitioners reuse topic
+	// metadata. Zero uses KafkaJS's five-minute default. Metadata is refreshed
+	// after expiry and invalidated after topology-related broker errors.
+	MetadataMaxAge time.Duration
+
 	// Compression overrides the client-level compression setting.
 	// Zero value inherits from the Client.
 	Compression CompressionType
 
 	// MaxRetries is the number of times a failed produce request is retried.
 	MaxRetries int
+	// MaxRetriesSet distinguishes an explicit zero-retry transport from the
+	// ProducerConfig zero value, which preserves the driver's default. This is
+	// useful for compatibility adapters that own their retry loop above the
+	// driver and must avoid multiplying two independent retry budgets.
+	MaxRetriesSet bool
 
 	// RetryBackoff is the delay between retries.
 	RetryBackoff time.Duration
+
+	// RetryBackoffMax is the maximum retry delay. It is separate from
+	// RetryBackoff because librdkafka defaults retry.backoff.max.ms to one
+	// second, which otherwise caps larger explicitly configured initial delays.
+	// Zero preserves librdkafka's default.
+	RetryBackoffMax time.Duration
+
+	// ReconnectBackoff is the initial delay before reconnecting a broker after
+	// a connection failure. It maps to librdkafka's reconnect.backoff.ms and is
+	// intentionally separate from message retry backoff. Zero preserves the
+	// driver default.
+	ReconnectBackoff time.Duration
+
+	// ReconnectBackoffMax caps the exponential delay between broker reconnect
+	// attempts. It maps to librdkafka's reconnect.backoff.max.ms. Keeping this
+	// producer-scoped lets callers bound transient recovery without changing
+	// every client created from the shared fit-go Kafka configuration. Zero
+	// preserves the driver default.
+	ReconnectBackoffMax time.Duration
+
+	// Partitioner optionally selects a compatibility partitioner. Zero preserves
+	// the existing librdkafka default.
+	Partitioner ProducerPartitioner
+
+	// TraceHeaderPolicy controls only automatic record-header injection. Producer
+	// spans are still created when headers are preserved. Zero preserves fit-go's
+	// existing automatic injection behavior.
+	TraceHeaderPolicy ProducerTraceHeaderPolicy
+
+	// ClosePolicy is opt-in. Its zero value retains the existing fit-go close
+	// contract for every caller that does not request KafkaJS compatibility.
+	ClosePolicy ProducerClosePolicy
 }

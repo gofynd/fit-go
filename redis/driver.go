@@ -24,6 +24,8 @@ package redis
 import (
 	"context"
 	"fmt"
+	"strings"
+	"time"
 
 	goredis "github.com/redis/go-redis/v9"
 )
@@ -151,8 +153,14 @@ func (c *sentinelConnection) IsCluster() bool {
 // go-redis/v9. It maps the framework's DialOptions to go-redis Options.
 func DefaultDialFunc() DialFunc {
 	return func(ctx context.Context, opts *DialOptions) (Connection, error) {
+		if err := validateRedisProtocol(opts.Protocol); err != nil {
+			return nil, err
+		}
 		redisOpts := &goredis.Options{
 			Addr: opts.Addr,
+		}
+		if opts.Protocol != RedisProtocolDefault {
+			redisOpts.Protocol = int(opts.Protocol)
 		}
 
 		if opts.Password != "" {
@@ -186,6 +194,18 @@ func DefaultDialFunc() DialFunc {
 		if opts.MaxRetries > 0 {
 			redisOpts.MaxRetries = opts.MaxRetries
 		}
+		if opts.MinRetryBackoff > 0 {
+			redisOpts.MinRetryBackoff = opts.MinRetryBackoff
+		}
+		if opts.MaxRetryBackoff > 0 {
+			redisOpts.MaxRetryBackoff = opts.MaxRetryBackoff
+		}
+		if opts.DialerRetries > 0 {
+			redisOpts.DialerRetries = opts.DialerRetries
+		}
+		if opts.DialerRetryTimeout > 0 {
+			redisOpts.DialerRetryTimeout = opts.DialerRetryTimeout
+		}
 		if opts.PoolSize > 0 {
 			redisOpts.PoolSize = opts.PoolSize
 		}
@@ -195,8 +215,81 @@ func DefaultDialFunc() DialFunc {
 
 		client := goredis.NewClient(redisOpts)
 
+		// Some managed/proxied Redis deployments reject the CLIENT command, so
+		// go-redis's CLIENT SETNAME (from ClientName) / SETINFO (identity) handshake
+		// fails the very first command — surfacing as "ERR unknown command 'client'
+		// ... 'setname'". Legacy ioredis set no client name and disabled the lib
+		// handshake, so it never hit this.
+		//
+		// We probe whenever go-redis WOULD send a CLIENT command — i.e. a client
+		// name is set, or identity (SETINFO) is enabled, which is the default. So
+		// this synchronous one-shot PING runs on essentially every dial, not only
+		// against proxies: that is the cost of detecting the rejection up-front (the
+		// alternative is the handshake failing on the first real command in
+		// production). On that specific rejection we transparently rebuild without
+		// the client name and with identity disabled. The cluster and sentinel dial
+		// funcs below apply the same fallback.
+		if redisOpts.ClientName != "" || !redisOpts.DisableIdentity {
+			if clientHandshakeRejected(ctx, client) {
+				_ = client.Close()
+				redisOpts.ClientName = ""
+				redisOpts.DisableIdentity = true
+				client = goredis.NewClient(redisOpts)
+			}
+		}
+
+		attachTracingHook(client)
 		return &standaloneConnection{client: client}, nil
 	}
+}
+
+// isClientCommandUnsupported reports whether err is the server rejecting go-redis's
+// CLIENT SETNAME/SETINFO handshake because it does not support the CLIENT command
+// (e.g. a restricted Redis-compatible proxy). Matched on the redis-server error
+// text "ERR unknown command 'client' ...". Returns false for nil and for any
+// other error (network, auth, a different unknown command), so the fallback only
+// triggers for this specific, recoverable case.
+func isClientCommandUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Anchor on "client" being the REJECTED command (quoted right after "unknown
+	// command"), not merely present somewhere — otherwise a different unknown
+	// command whose args happen to include "client" would false-positive and
+	// wrongly strip the client name. Redis quotes with backticks or single quotes
+	// depending on version; the message is lower-cased above.
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "unknown command `client`") ||
+		strings.Contains(msg, "unknown command 'client'") {
+		return true
+	}
+	// Redis < 7.2 supports CLIENT but not the SETINFO subcommand go-redis sends for
+	// lib identity; it rejects with "unknown subcommand ... 'setinfo'" (SETNAME is
+	// also subcommand-gated on some proxies). Same recoverable case — rebuild
+	// without the identity handshake — so match it too.
+	if strings.Contains(msg, "unknown subcommand") &&
+		(strings.Contains(msg, "setinfo") || strings.Contains(msg, "setname")) {
+		return true
+	}
+	return false
+}
+
+// pinger is the subset of a go-redis client (standalone, cluster, failover) used
+// to probe the CLIENT handshake.
+type pinger interface {
+	Ping(context.Context) *goredis.StatusCmd
+}
+
+// clientHandshakeRejected probes c with a short one-shot PING and reports whether
+// the server rejected go-redis's CLIENT SETNAME/SETINFO handshake — i.e. the
+// caller should rebuild the client without the client name and with identity
+// disabled. Call only when a CLIENT command would actually be sent (ClientName
+// set or identity enabled). Any non-rejection ping error (network, auth, …) is
+// treated as "not rejected" and left for the caller's health check to surface.
+func clientHandshakeRejected(ctx context.Context, c pinger) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return isClientCommandUnsupported(c.Ping(probeCtx).Err())
 }
 
 // ---------------------------------------------------------------------------
@@ -205,11 +298,18 @@ func DefaultDialFunc() DialFunc {
 
 // DefaultClusterDialFunc returns a ClusterDialFunc for Redis Cluster connections
 // using go-redis/v9. It maps the framework's ClusterDialOptions to go-redis
-// ClusterOptions.
+// ClusterOptions. Like the standalone path, it probes for and recovers from a
+// proxy that rejects the CLIENT SETNAME/SETINFO handshake.
 func DefaultClusterDialFunc() ClusterDialFunc {
 	return func(ctx context.Context, opts *ClusterDialOptions) (Connection, error) {
+		if err := validateRedisProtocol(opts.Protocol); err != nil {
+			return nil, err
+		}
 		clusterOpts := &goredis.ClusterOptions{
 			Addrs: opts.Addrs,
+		}
+		if opts.Protocol != RedisProtocolDefault {
+			clusterOpts.Protocol = int(opts.Protocol)
 		}
 
 		if opts.Password != "" {
@@ -234,6 +334,21 @@ func DefaultClusterDialFunc() ClusterDialFunc {
 		if opts.KeepAlive > 0 {
 			clusterOpts.ConnMaxIdleTime = opts.KeepAlive
 		}
+		if opts.MaxRetries > 0 {
+			clusterOpts.MaxRetries = opts.MaxRetries
+		}
+		if opts.MinRetryBackoff > 0 {
+			clusterOpts.MinRetryBackoff = opts.MinRetryBackoff
+		}
+		if opts.MaxRetryBackoff > 0 {
+			clusterOpts.MaxRetryBackoff = opts.MaxRetryBackoff
+		}
+		if opts.DialerRetries > 0 {
+			clusterOpts.DialerRetries = opts.DialerRetries
+		}
+		if opts.DialerRetryTimeout > 0 {
+			clusterOpts.DialerRetryTimeout = opts.DialerRetryTimeout
+		}
 		if opts.SlotsRefreshInterval > 0 {
 			// go-redis does not expose a direct slot refresh interval on
 			// ClusterOptions. The RouteRandomly and RouteByLatency options
@@ -252,6 +367,18 @@ func DefaultClusterDialFunc() ClusterDialFunc {
 
 		client := goredis.NewClusterClient(clusterOpts)
 
+		// Recover from a proxy that rejects the CLIENT handshake (see the
+		// standalone path for the rationale).
+		if clusterOpts.ClientName != "" || !clusterOpts.DisableIdentity {
+			if clientHandshakeRejected(ctx, client) {
+				_ = client.Close()
+				clusterOpts.ClientName = ""
+				clusterOpts.DisableIdentity = true
+				client = goredis.NewClusterClient(clusterOpts)
+			}
+		}
+
+		attachTracingHook(client)
 		return &clusterConnection{client: client}, nil
 	}
 }
@@ -261,13 +388,20 @@ func DefaultClusterDialFunc() ClusterDialFunc {
 // ---------------------------------------------------------------------------
 
 // DefaultSentinelDialFunc returns a SentinelDialFunc for Redis Sentinel
-// connections using go-redis/v9. It maps the framework's SentinelDialOptions
-// to go-redis FailoverOptions.
+// connections using go-redis/v9. It maps the framework's SentinelDialOptions to
+// go-redis FailoverOptions. Like the standalone path, it probes for and recovers
+// from a proxy that rejects the CLIENT SETNAME/SETINFO handshake.
 func DefaultSentinelDialFunc() SentinelDialFunc {
 	return func(ctx context.Context, opts *SentinelDialOptions) (Connection, error) {
+		if err := validateRedisProtocol(opts.Protocol); err != nil {
+			return nil, err
+		}
 		failoverOpts := &goredis.FailoverOptions{
 			MasterName:    opts.MasterName,
 			SentinelAddrs: opts.SentinelAddrs,
+		}
+		if opts.Protocol != RedisProtocolDefault {
+			failoverOpts.Protocol = int(opts.Protocol)
 		}
 
 		if opts.Password != "" {
@@ -304,6 +438,21 @@ func DefaultSentinelDialFunc() SentinelDialFunc {
 		if opts.KeepAlive > 0 {
 			failoverOpts.ConnMaxIdleTime = opts.KeepAlive
 		}
+		if opts.MaxRetries > 0 {
+			failoverOpts.MaxRetries = opts.MaxRetries
+		}
+		if opts.MinRetryBackoff > 0 {
+			failoverOpts.MinRetryBackoff = opts.MinRetryBackoff
+		}
+		if opts.MaxRetryBackoff > 0 {
+			failoverOpts.MaxRetryBackoff = opts.MaxRetryBackoff
+		}
+		if opts.DialerRetries > 0 {
+			failoverOpts.DialerRetries = opts.DialerRetries
+		}
+		if opts.DialerRetryTimeout > 0 {
+			failoverOpts.DialerRetryTimeout = opts.DialerRetryTimeout
+		}
 		if opts.PoolSize > 0 {
 			failoverOpts.PoolSize = opts.PoolSize
 		}
@@ -311,18 +460,23 @@ func DefaultSentinelDialFunc() SentinelDialFunc {
 			failoverOpts.MinIdleConns = opts.MinIdleConns
 		}
 
-		var client *goredis.Client
-		if opts.ReadOnly {
-			// Use NewFailoverClusterClient for read-only routing to replicas,
-			// but wrap it in a regular Client for interface compatibility.
-			// Actually, go-redis's FailoverOptions does not support ReadOnly
-			// directly. For read replicas, we create a standard failover client
-			// and rely on the application to route reads appropriately.
-			client = goredis.NewFailoverClient(failoverOpts)
-		} else {
-			client = goredis.NewFailoverClient(failoverOpts)
+		// Note: go-redis FailoverOptions does not support ReadOnly directly; reads
+		// to replicas are left to the application to route. Both modes use a
+		// standard failover client.
+		client := goredis.NewFailoverClient(failoverOpts)
+
+		// Recover from a proxy that rejects the CLIENT handshake (see the
+		// standalone path for the rationale).
+		if failoverOpts.ClientName != "" || !failoverOpts.DisableIdentity {
+			if clientHandshakeRejected(ctx, client) {
+				_ = client.Close()
+				failoverOpts.ClientName = ""
+				failoverOpts.DisableIdentity = true
+				client = goredis.NewFailoverClient(failoverOpts)
+			}
 		}
 
+		attachTracingHook(client)
 		return &sentinelConnection{client: client}, nil
 	}
 }

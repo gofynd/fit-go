@@ -15,6 +15,8 @@
 package kafka
 
 import (
+	"context"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -231,6 +233,33 @@ func TestConfluentClient_ConfigFromEnv(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestConfluentProducer_MessageMapping(t *testing.T) {
+	t.Run("message constructors preserve partition intent", func(t *testing.T) {
+		value := []byte("payload")
+		key := []byte("entity-42")
+
+		keyless := NewMessage(value)
+		if keyless.Partition != -1 || keyless.Key != nil || string(keyless.Value) != string(value) {
+			t.Fatalf("NewMessage() = %#v, want keyless automatic partition", keyless)
+		}
+
+		keyed := NewKeyedMessage(key, value)
+		if keyed.Partition != -1 || string(keyed.Key) != string(key) || string(keyed.Value) != string(value) {
+			t.Fatalf("NewKeyedMessage() = %#v, want keyed automatic partition", keyed)
+		}
+
+		explicit := NewPartitionedMessage(0, value)
+		if explicit.Partition != 0 || explicit.Key != nil || string(explicit.Value) != string(value) {
+			t.Fatalf("NewPartitionedMessage() = %#v, want explicit partition zero", explicit)
+		}
+
+		if got := buildConfluentMessage("events", Message{Value: value}).TopicPartition.Partition; got != 0 {
+			t.Fatalf("literal zero-value partition = %d, want explicit partition zero", got)
+		}
+		if got := buildConfluentMessage("events", keyless).TopicPartition.Partition; got != ckafka.PartitionAny {
+			t.Fatalf("automatic message partition = %d, want PartitionAny", got)
+		}
+	})
+
 	t.Run("basic message", func(t *testing.T) {
 		msg := Message{
 			Key:   []byte("partition-key"),
@@ -314,6 +343,19 @@ func TestConfluentProducer_MessageMapping(t *testing.T) {
 		}
 	})
 
+	t.Run("message with an empty but present key", func(t *testing.T) {
+		msg := Message{
+			Key:   []byte{},
+			Value: []byte("payload"),
+		}
+
+		km := buildConfluentMessage("events", msg)
+
+		if km.Key == nil || len(km.Key) != 0 {
+			t.Fatalf("Key = %#v, want a present empty key", km.Key)
+		}
+	})
+
 	t.Run("message with no headers", func(t *testing.T) {
 		msg := Message{
 			Value: []byte("payload"),
@@ -340,6 +382,43 @@ func TestConfluentProducer_MessageMapping(t *testing.T) {
 			t.Errorf("Partition = %d, want PartitionAny (%d)", km.TopicPartition.Partition, ckafka.PartitionAny)
 		}
 	})
+}
+
+func TestConfluentProducer_RecordMetadataMapping(t *testing.T) {
+	topic := "events"
+	km := &ckafka.Message{
+		TopicPartition: ckafka.TopicPartition{
+			Topic:     &topic,
+			Partition: 3,
+			Offset:    42,
+		},
+	}
+
+	metadata := mapConfluentToRecordMetadata(km)
+
+	if metadata.Topic != topic {
+		t.Errorf("Topic = %q, want %q", metadata.Topic, topic)
+	}
+	if metadata.TopicName != topic {
+		t.Errorf("TopicName = %q, want %q", metadata.TopicName, topic)
+	}
+	if metadata.Partition != 3 {
+		t.Errorf("Partition = %d, want 3", metadata.Partition)
+	}
+	if metadata.Offset != 42 {
+		t.Errorf("Offset = %d, want 42", metadata.Offset)
+	}
+	if metadata.BaseOffset != "42" {
+		t.Errorf("BaseOffset = %q, want 42", metadata.BaseOffset)
+	}
+
+	blob, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if string(blob) != `{"topicName":"events","partition":3,"errorCode":0,"baseOffset":"42"}` {
+		t.Fatalf("json = %s", string(blob))
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -374,16 +453,18 @@ func TestConfluentConsumer_TopicConfig(t *testing.T) {
 		}
 
 		consumerCfg := ConsumerConfig{
-			GroupID:              "test-group",
-			SessionTimeout:       45 * time.Second,
-			HeartbeatInterval:    5 * time.Second,
-			RebalanceTimeout:     120 * time.Second,
-			MaxBytesPerPartition: 2 << 20, // 2 MB
-			MinBytes:             512,
-			MaxBytes:             20 << 20, // 20 MB
-			MaxWaitTime:          10 * time.Second,
-			AutoCommit:           true,
-			AutoCommitInterval:   10 * time.Second,
+			GroupID:                     "test-group",
+			PartitionAssignmentStrategy: "roundrobin",
+			SessionTimeout:              45 * time.Second,
+			HeartbeatInterval:           5 * time.Second,
+			RebalanceTimeout:            120 * time.Second,
+			MaxPollInterval:             3 * time.Minute,
+			MaxBytesPerPartition:        2 << 20, // 2 MB
+			MinBytes:                    512,
+			MaxBytes:                    20 << 20, // 20 MB
+			MaxWaitTime:                 10 * time.Second,
+			AutoCommit:                  true,
+			AutoCommitInterval:          10 * time.Second,
 		}
 
 		consumer, err := client.Consumer(consumerCfg)
@@ -400,6 +481,10 @@ func TestConfluentConsumer_TopicConfig(t *testing.T) {
 		if groupID != "test-group" {
 			t.Errorf("group.id = %q, want 'test-group'", groupID)
 		}
+		assignmentStrategy, _ := cc.configMap.Get("partition.assignment.strategy", "")
+		if assignmentStrategy != "roundrobin" {
+			t.Errorf("partition.assignment.strategy = %q, want roundrobin", assignmentStrategy)
+		}
 
 		sessionTimeout, _ := cc.configMap.Get("session.timeout.ms", 0)
 		if sessionTimeout != 45000 {
@@ -412,8 +497,8 @@ func TestConfluentConsumer_TopicConfig(t *testing.T) {
 		}
 
 		rebalance, _ := cc.configMap.Get("max.poll.interval.ms", 0)
-		if rebalance != 120000 {
-			t.Errorf("max.poll.interval.ms = %v, want 120000", rebalance)
+		if rebalance != 180000 {
+			t.Errorf("max.poll.interval.ms = %v, want 180000", rebalance)
 		}
 
 		maxPartFetch, _ := cc.configMap.Get("max.partition.fetch.bytes", 0)
@@ -439,6 +524,10 @@ func TestConfluentConsumer_TopicConfig(t *testing.T) {
 		autoCommit, _ := cc.configMap.Get("enable.auto.commit", false)
 		if autoCommit != true {
 			t.Error("enable.auto.commit should be true")
+		}
+		autoStore, _ := cc.configMap.Get("enable.auto.offset.store", true)
+		if autoStore != false {
+			t.Error("enable.auto.offset.store should be false so handlers resolve offsets")
 		}
 
 		autoCommitInterval, _ := cc.configMap.Get("auto.commit.interval.ms", 0)
@@ -836,6 +925,24 @@ func TestProducerConfigOverrides(t *testing.T) {
 		}
 	})
 
+	t.Run("producer explicitly configures fire and forget", func(t *testing.T) {
+		producer, err := client.Producer(ProducerConfig{Acks: 0, AcksSet: true})
+		if err != nil {
+			t.Fatalf("Producer() error = %v", err)
+		}
+		cp := producer.(*ConfluentProducer)
+		acksVal, _ := cp.configMap.Get("acks", "")
+		if acksVal != "0" || cp.configuredAcks != 0 {
+			t.Errorf("explicit acks=0 resolved to config=%v default=%d", acksVal, cp.configuredAcks)
+		}
+	})
+
+	t.Run("producer rejects unsupported acks", func(t *testing.T) {
+		if _, err := client.Producer(ProducerConfig{Acks: 2}); err == nil {
+			t.Fatal("Producer() accepted unsupported acks=2")
+		}
+	})
+
 	t.Run("idempotent producer forces acks=all", func(t *testing.T) {
 		producer, err := client.Producer(ProducerConfig{
 			IdempotentProducer: true,
@@ -863,9 +970,15 @@ func TestProducerConfigOverrides(t *testing.T) {
 
 	t.Run("producer with timeout and retry settings", func(t *testing.T) {
 		producer, err := client.Producer(ProducerConfig{
-			Timeout:      15 * time.Second,
-			MaxRetries:   5,
-			RetryBackoff: 500 * time.Millisecond,
+			Timeout:             15 * time.Second,
+			DeliveryTimeout:     8 * time.Second,
+			MetadataTimeout:     2 * time.Second,
+			MetadataMaxAge:      time.Minute,
+			MaxRetries:          5,
+			RetryBackoff:        500 * time.Millisecond,
+			RetryBackoffMax:     2 * time.Second,
+			ReconnectBackoff:    300 * time.Millisecond,
+			ReconnectBackoffMax: time.Second,
 		})
 		if err != nil {
 			t.Fatalf("Producer() error = %v", err)
@@ -876,6 +989,16 @@ func TestProducerConfigOverrides(t *testing.T) {
 		if timeout != 15000 {
 			t.Errorf("request.timeout.ms = %v, want 15000", timeout)
 		}
+		deliveryTimeout, _ := cp.configMap.Get("message.timeout.ms", 0)
+		if deliveryTimeout != 8000 {
+			t.Errorf("message.timeout.ms = %v, want 8000", deliveryTimeout)
+		}
+		if cp.metadataTimeout != 2*time.Second {
+			t.Errorf("metadata timeout = %v, want 2s", cp.metadataTimeout)
+		}
+		if cp.metadataMaxAge != time.Minute {
+			t.Errorf("metadata max age = %v, want 1m", cp.metadataMaxAge)
+		}
 
 		retries, _ := cp.configMap.Get("message.send.max.retries", 0)
 		if retries != 5 {
@@ -885,6 +1008,70 @@ func TestProducerConfigOverrides(t *testing.T) {
 		backoff, _ := cp.configMap.Get("retry.backoff.ms", 0)
 		if backoff != 500 {
 			t.Errorf("retry.backoff.ms = %v, want 500", backoff)
+		}
+		backoffMax, _ := cp.configMap.Get("retry.backoff.max.ms", 0)
+		if backoffMax != 2000 {
+			t.Errorf("retry.backoff.max.ms = %v, want 2000", backoffMax)
+		}
+		reconnectBackoff, _ := cp.configMap.Get("reconnect.backoff.ms", 0)
+		if reconnectBackoff != 300 {
+			t.Errorf("reconnect.backoff.ms = %v, want 300", reconnectBackoff)
+		}
+		reconnectBackoffMax, _ := cp.configMap.Get("reconnect.backoff.max.ms", 0)
+		if reconnectBackoffMax != 1000 {
+			t.Errorf("reconnect.backoff.max.ms = %v, want 1000", reconnectBackoffMax)
+		}
+	})
+
+	t.Run("producer reconnect defaults remain inherited", func(t *testing.T) {
+		producer, err := client.Producer(ProducerConfig{})
+		if err != nil {
+			t.Fatalf("Producer() error = %v", err)
+		}
+		cp := producer.(*ConfluentProducer)
+		reconnectBackoff, _ := cp.configMap.Get("reconnect.backoff.ms", nil)
+		if reconnectBackoff != nil {
+			t.Errorf("reconnect.backoff.ms = %v, want inherited default", reconnectBackoff)
+		}
+		reconnectBackoffMax, _ := cp.configMap.Get("reconnect.backoff.max.ms", nil)
+		if reconnectBackoffMax != nil {
+			t.Errorf("reconnect.backoff.max.ms = %v, want inherited default", reconnectBackoffMax)
+		}
+	})
+
+	t.Run("producer permits an explicit zero driver retry budget", func(t *testing.T) {
+		producer, err := client.Producer(ProducerConfig{
+			MaxRetries:    0,
+			MaxRetriesSet: true,
+		})
+		if err != nil {
+			t.Fatalf("Producer() error = %v", err)
+		}
+
+		cp := producer.(*ConfluentProducer)
+		retries, _ := cp.configMap.Get("message.send.max.retries", -1)
+		if retries != 0 {
+			t.Errorf("message.send.max.retries = %v, want explicit 0", retries)
+		}
+	})
+
+	t.Run("producer rejects negative metadata durations", func(t *testing.T) {
+		if _, err := client.Producer(ProducerConfig{MetadataTimeout: -time.Second}); err == nil {
+			t.Fatal("Producer() accepted a negative metadata timeout")
+		}
+		if _, err := client.Producer(ProducerConfig{MetadataMaxAge: -time.Second}); err == nil {
+			t.Fatal("Producer() accepted a negative metadata max age")
+		}
+	})
+
+	t.Run("request timeout does not implicitly change metadata timeout", func(t *testing.T) {
+		producer, err := client.Producer(ProducerConfig{Timeout: time.Second})
+		if err != nil {
+			t.Fatalf("Producer() error = %v", err)
+		}
+		cp := producer.(*ConfluentProducer)
+		if cp.metadataTimeout != 0 {
+			t.Fatalf("metadata timeout = %v, want zero/default when only request timeout is set", cp.metadataTimeout)
 		}
 	})
 
@@ -1076,6 +1263,18 @@ func TestConfluentProducer_NotConnected(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "not connected") {
 		t.Errorf("Expected 'not connected' error, got: %v", err)
 	}
+
+	// Canonical context-aware calls retain the same broker error contract.
+	err = producer.ProduceCtx(context.Background(), "topic", []Message{{Value: []byte("test")}}, 0)
+	if err == nil || !strings.Contains(err.Error(), "not connected") {
+		t.Errorf("Expected context produce 'not connected' error, got: %v", err)
+	}
+	err = producer.ProduceBatchCtx(context.Background(), []TopicMessages{
+		{Topic: "topic", Messages: []Message{{Value: []byte("test")}}},
+	}, 0)
+	if err == nil || !strings.Contains(err.Error(), "not connected") {
+		t.Errorf("Expected context batch produce 'not connected' error, got: %v", err)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1107,6 +1306,13 @@ func TestConfluentConsumer_NotConnected(t *testing.T) {
 	err = consumer.ConsumeBatch(func(p BatchPayload) error { return nil }, ConsumerOptions{})
 	if err == nil || !strings.Contains(err.Error(), "not connected") {
 		t.Errorf("Expected 'not connected' error, got: %v", err)
+	}
+
+	// The canonical package-level context-aware adapter must preserve the
+	// concrete consumer's broker error instead of hiding or rewriting it.
+	err = ConsumeBatchCtx(consumer, func(context.Context, BatchPayload) error { return nil }, ConsumerOptions{})
+	if err == nil || !strings.Contains(err.Error(), "not connected") {
+		t.Errorf("Expected context batch 'not connected' error, got: %v", err)
 	}
 }
 
@@ -1206,4 +1412,71 @@ func mustLogger() *logging.Logger {
 		panic(err)
 	}
 	return l
+}
+
+// TestFormatAndConvertPartitions covers the rebalance helper functions.
+func TestFormatAndConvertPartitions(t *testing.T) {
+	tA, tB := "orders", "clicks"
+	parts := []ckafka.TopicPartition{
+		{Topic: &tA, Partition: 0},
+		{Topic: &tB, Partition: 3},
+		{Topic: nil, Partition: 7}, // nil topic must not panic
+	}
+
+	got := formatPartitions(parts)
+	want := []string{"orders[0]", "clicks[3]", "[7]"}
+	if len(got) != len(want) {
+		t.Fatalf("formatPartitions len = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("formatPartitions[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	pa := toPartitionAssignments(parts)
+	if len(pa) != 3 || pa[0].Topic != "orders" || pa[0].Partition != 0 || pa[1].Topic != "clicks" || pa[1].Partition != 3 || pa[2].Topic != "" {
+		t.Fatalf("toPartitionAssignments = %+v", pa)
+	}
+}
+
+func TestGroupConfluentBatchMessagesSplitsTopicPartitions(t *testing.T) {
+	message := func(topic string, partition int32, offset int64) *ckafka.Message {
+		return &ckafka.Message{TopicPartition: ckafka.TopicPartition{
+			Topic: &topic, Partition: partition, Offset: ckafka.Offset(offset),
+		}}
+	}
+	groups := groupConfluentBatchMessages([]*ckafka.Message{
+		message("orders", 0, 1),
+		message("clicks", 0, 4),
+		message("orders", 0, 2),
+		message("orders", 1, 9),
+	})
+	if len(groups) != 3 {
+		t.Fatalf("groups = %d, want 3", len(groups))
+	}
+	wants := []struct {
+		topic       string
+		partition   int
+		offsets     []int64
+		first, last int64
+	}{
+		{topic: "orders", partition: 0, offsets: []int64{1, 2}, first: 1, last: 2},
+		{topic: "clicks", partition: 0, offsets: []int64{4}, first: 4, last: 4},
+		{topic: "orders", partition: 1, offsets: []int64{9}, first: 9, last: 9},
+	}
+	for i, want := range wants {
+		got := groups[i].payload
+		if got.Topic != want.topic || got.Partition != want.partition || got.FirstOffset != want.first || got.LastOffset != want.last {
+			t.Errorf("group[%d] = %+v, want topic=%s partition=%d offsets=%d..%d", i, got, want.topic, want.partition, want.first, want.last)
+		}
+		if len(got.Messages) != len(want.offsets) {
+			t.Fatalf("group[%d] messages = %d, want %d", i, len(got.Messages), len(want.offsets))
+		}
+		for j, offset := range want.offsets {
+			if got.Messages[j].Topic != want.topic || got.Messages[j].Partition != want.partition || got.Messages[j].Offset != offset {
+				t.Errorf("group[%d].message[%d] = %+v, want homogeneous offset %d", i, j, got.Messages[j], offset)
+			}
+		}
+	}
 }

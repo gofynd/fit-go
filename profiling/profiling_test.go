@@ -15,15 +15,35 @@
 package profiling
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"runtime"
+	"runtime/pprof"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestTagWrapperScopesProfilingLabels(t *testing.T) {
+	var observed map[string]string
+	TagWrapper(context.Background(), map[string]string{"region": "us-east-1", "vehicle": "car"}, func(ctx context.Context) {
+		observed = map[string]string{}
+		pprof.ForLabels(ctx, func(key, value string) bool {
+			observed[key] = value
+			return true
+		})
+	})
+	if observed["region"] != "us-east-1" || observed["vehicle"] != "car" {
+		t.Fatalf("profiling labels = %#v", observed)
+	}
+}
+
+func TestTagWrapperNilCallbackIsNoop(t *testing.T) {
+	TagWrapper(nil, map[string]string{"key": "value"}, nil)
+}
 
 // ---------------------------------------------------------------------------
 // Config tests
@@ -53,6 +73,9 @@ func TestProfilerConfig(t *testing.T) {
 		if cfg.FlushIntervalMs != 10000 {
 			t.Errorf("Expected FlushIntervalMs=10000, got %d", cfg.FlushIntervalMs)
 		}
+		if cfg.SampleRate != 10 || cfg.EffectiveSampleRate != 100 || cfg.SampleRateConfigurable {
+			t.Errorf("unexpected sample-rate compatibility config: %+v", cfg)
+		}
 		if cfg.HeapSamplingIntervalBytes != 524288 {
 			t.Errorf("Expected HeapSamplingIntervalBytes=524288, got %d", cfg.HeapSamplingIntervalBytes)
 		}
@@ -75,6 +98,7 @@ func TestProfilerConfig(t *testing.T) {
 		t.Setenv("PROFILING_DISTRIBUTOR_ADDRESS", "http://test:4040")
 		t.Setenv("PROFILING_CPU_ENABLED", "false")
 		t.Setenv("PROFILING_FLUSH_INTERVAL_MS", "5000")
+		t.Setenv("PROFILING_SAMPLE_RATE", "25")
 		t.Setenv("PROFILING_HEAP_SAMPLING_INTERVAL_BYTES", "1048576")
 		t.Setenv("PROFILING_WALL_COLLECT_CPU_TIME", "true")
 
@@ -91,6 +115,9 @@ func TestProfilerConfig(t *testing.T) {
 		}
 		if cfg.FlushIntervalMs != 5000 {
 			t.Errorf("Expected FlushIntervalMs=5000, got %d", cfg.FlushIntervalMs)
+		}
+		if cfg.SampleRate != 25 || cfg.EffectiveSampleRate != 100 || cfg.SampleRateConfigurable {
+			t.Errorf("unexpected sample-rate compatibility config: %+v", cfg)
 		}
 		if cfg.HeapSamplingIntervalBytes != 1048576 {
 			t.Errorf("Expected HeapSamplingIntervalBytes=1048576, got %d", cfg.HeapSamplingIntervalBytes)
@@ -123,7 +150,7 @@ func TestProfilerConfig(t *testing.T) {
 	})
 
 	t.Run("application name with explicit deployment name", func(t *testing.T) {
-		t.Setenv("PROJECT_NAME", "commerce")
+		t.Setenv("PROJECT_NAME", "example")
 		t.Setenv("DEPLOYMENT_NAME", "api-server")
 		t.Setenv("DEPLOYMENT_TYPE", "server")
 
@@ -134,8 +161,19 @@ func TestProfilerConfig(t *testing.T) {
 		p.Start()
 		defer p.Stop()
 
-		if p.GetApplicationName() != "commerce-api-server-Server" {
-			t.Errorf("Expected 'commerce-api-server-Server', got %s", p.GetApplicationName())
+		if p.GetApplicationName() != "example-api-server-Server" {
+			t.Errorf("Expected 'example-api-server-Server', got %s", p.GetApplicationName())
+		}
+	})
+
+	t.Run("empty deployment type uses server", func(t *testing.T) {
+		t.Setenv("PROJECT_NAME", "example")
+		t.Setenv("DEPLOYMENT_NAME", "api")
+		t.Setenv("DEPLOYMENT_TYPE", "")
+
+		p := New(Config{})
+		if got := p.buildAppName(); got != "example-api-Server" {
+			t.Fatalf("application name = %q, want %q", got, "example-api-Server")
 		}
 	})
 
@@ -419,6 +457,10 @@ func TestProfilerStatus(t *testing.T) {
 		if cpuStatus["running"] != true {
 			t.Error("Expected cpu.running=true")
 		}
+		sampleRate, ok := s["sampleRate"].(map[string]interface{})
+		if !ok || sampleRate["requested"] != 10 || sampleRate["effective"] != 100 || sampleRate["configurable"] != false {
+			t.Errorf("unexpected sample-rate status: %#v", s["sampleRate"])
+		}
 	})
 
 	t.Run("default profiler exists", func(t *testing.T) {
@@ -427,6 +469,23 @@ func TestProfilerStatus(t *testing.T) {
 			t.Error("Expected default profiler to exist")
 		}
 	})
+}
+
+func TestSetDefaultRestoresPreviousProfiler(t *testing.T) {
+	baseline := Default()
+	first := New(Config{Enabled: true})
+	second := New(Config{Enabled: true})
+	restoreFirst := SetDefault(first)
+	restoreSecond := SetDefault(second)
+
+	restoreFirst()
+	if Default() != second {
+		t.Fatal("restoring an older owner clobbered the active profiler")
+	}
+	restoreSecond()
+	if Default() != baseline {
+		t.Fatal("restoring the active owner did not restore the baseline profiler")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -612,6 +671,7 @@ func clearProfilingEnv(t *testing.T) {
 		"PROFILING_ENABLED", "PROFILING_DISTRIBUTOR_ADDRESS", "PROFILING_CPU_ENABLED",
 		"PROFILING_HEAP_ENABLED", "PROFILING_CPU_WALL_ENABLED", "PROFILING_TAGS_JSON",
 		"PROFILING_FLUSH_INTERVAL_MS", "PROFILING_HEAP_SAMPLING_INTERVAL_BYTES",
+		"PROFILING_SAMPLE_RATE",
 		"PROFILING_HEAP_STACK_DEPTH", "PROFILING_WALL_SAMPLING_DURATION_MS",
 		"PROFILING_WALL_SAMPLING_INTERVAL_MICROS", "PROFILING_WALL_COLLECT_CPU_TIME",
 	} {

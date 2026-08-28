@@ -99,8 +99,16 @@ func (m *Manager) Init() error {
 	if len(m.dek) != 32 {
 		return fmt.Errorf("encryption: DEK must be 32 bytes (AES-256), got %d", len(m.dek))
 	}
-	if len(m.iv) != 12 {
-		return fmt.Errorf("encryption: IV must be 12 bytes (GCM nonce), got %d", len(m.iv))
+	// GCM nonce length: the platform's canonical fit encryption — Node `fit/encryption`
+	// (OpenSSL) and `pyfit` (cryptography `modes.GCM`) — uses the fixed IV from Vault
+	// verbatim, whatever length the secret is (commonly NOT 12, e.g. 9 bytes). Go's
+	// cipher.NewGCM hardcodes a 12-byte nonce, making fit-go the only implementation
+	// that rejects those IVs and cannot decrypt PII the other languages already wrote.
+	// Accept any non-empty IV and build the GCM with NewGCMWithNonceSize(len(iv))
+	// below, so fit-go interoperates byte-for-byte with Node/pyfit (same DEK, IV and
+	// "ciphertext.tag" format). 12 bytes remains the cryptographically recommended size.
+	if len(m.iv) == 0 {
+		return fmt.Errorf("encryption: IV (GCM nonce) must not be empty")
 	}
 
 	// Initialize LRU caches.
@@ -157,7 +165,9 @@ func (m *Manager) Encrypt(message string) (string, error) {
 		return "", fmt.Errorf("encryption: cipher init failed: %w", err)
 	}
 
-	gcm, err := cipher.NewGCM(block)
+	// NewGCMWithNonceSize (not NewGCM, which forces 12 bytes and would panic on
+	// Seal with a shorter IV); see Init() for the variable-nonce interop rationale.
+	gcm, err := cipher.NewGCMWithNonceSize(block, len(iv))
 	if err != nil {
 		return "", fmt.Errorf("encryption: GCM init failed: %w", err)
 	}
@@ -222,7 +232,8 @@ func (m *Manager) Decrypt(encrypted string) (string, error) {
 		return "", fmt.Errorf("encryption: cipher init failed: %w", err)
 	}
 
-	gcm, err := cipher.NewGCM(block)
+	// Variable nonce size (see Init()) so fit-go can Open ciphertext Node/pyfit produced.
+	gcm, err := cipher.NewGCMWithNonceSize(block, len(iv))
 	if err != nil {
 		return "", fmt.Errorf("encryption: GCM init failed: %w", err)
 	}

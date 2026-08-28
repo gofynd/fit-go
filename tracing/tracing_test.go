@@ -18,7 +18,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"sync"
 	"testing"
 	"time"
 
@@ -28,8 +27,12 @@ import (
 
 // resetGlobalTracer resets the global tracer for test isolation.
 func resetGlobalTracer() {
-	globalTracer = nil
-	globalTracerOnce = sync.Once{}
+	globalTracerMu.Lock()
+	defer globalTracerMu.Unlock()
+	globalTracer.Store(nil)
+	globalInitErr = nil
+	globalTracerOwners.current = nil
+	globalTracerOwners.active = make(map[*globalTracerOwner]struct{})
 }
 
 // ---------------------------------------------------------------------------
@@ -329,7 +332,7 @@ func TestDecorators(t *testing.T) {
 		UseSimpleSpanProcessor: true,
 	})
 	// Set as global tracer.
-	globalTracer = tracer
+	globalTracer.Store(tracer)
 
 	t.Run("Trace decorator success", func(t *testing.T) {
 		called := false

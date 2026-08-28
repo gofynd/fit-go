@@ -17,11 +17,14 @@ package errors
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	sentrylib "github.com/getsentry/sentry-go"
+
+	"github.com/gofynd/fit-go/redact"
 )
 
 // mockTransport captures events sent to Sentry for test assertions.
@@ -50,7 +53,7 @@ func (t *mockTransport) Events() []*sentrylib.Event {
 	return copied
 }
 
-// newTestSentry creates a fresh sentrySdk (bypassing the sync.Once of the global).
+// newTestSentry creates a fresh reporter independent of the package global.
 func newTestSentry() *sentrySdk {
 	return &sentrySdk{}
 }
@@ -73,6 +76,42 @@ func TestSentryInit_NoDSN(t *testing.T) {
 	s.CaptureError(fmt.Errorf("test error"))
 	s.CaptureMessage("test message")
 	s.Flush()
+}
+
+func TestSentryInit_CanRetryAfterMissingDSN(t *testing.T) {
+	s := newTestSentry()
+	if err := s.InitWithConfig(SentryConfig{}); err != nil {
+		t.Fatalf("empty init: %v", err)
+	}
+	transport := &mockTransport{}
+	if err := s.InitWithConfig(SentryConfig{
+		DSN:       "https://examplePublicKey@o0.ingest.sentry.io/0",
+		Transport: transport,
+	}); err != nil {
+		t.Fatalf("retry init: %v", err)
+	}
+	if !s.IsInitialized() {
+		t.Fatal("Sentry did not initialize after configuration became available")
+	}
+}
+
+func TestSentryInit_CanRetryAfterInitializationFailure(t *testing.T) {
+	s := newTestSentry()
+	if err := s.InitWithConfig(SentryConfig{DSN: "://invalid"}); err == nil {
+		t.Fatal("invalid DSN initialization unexpectedly succeeded")
+	}
+	if s.IsInitialized() {
+		t.Fatal("Sentry marked initialized after SDK initialization failed")
+	}
+	if err := s.InitWithConfig(SentryConfig{
+		DSN:       "https://examplePublicKey@o0.ingest.sentry.io/0",
+		Transport: &mockTransport{},
+	}); err != nil {
+		t.Fatalf("retry init: %v", err)
+	}
+	if !s.IsInitialized() {
+		t.Fatal("Sentry did not initialize after a failed attempt was corrected")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +192,187 @@ func TestCaptureError_Regular(t *testing.T) {
 	}
 }
 
+func TestSentryBeforeSendSanitizesPIIAndSecrets(t *testing.T) {
+	transport := &mockTransport{}
+	s := newTestSentry()
+	var customHookSawSanitized bool
+	if err := s.InitWithConfig(SentryConfig{
+		DSN:       "https://examplePublicKey@o0.ingest.sentry.io/0",
+		Transport: transport,
+		BeforeSend: func(event *sentrylib.Event, _ *sentrylib.EventHint) *sentrylib.Event {
+			serialized := fmt.Sprintf("%#v", event)
+			customHookSawSanitized = !strings.Contains(serialized, "private@example.com") &&
+				!strings.Contains(serialized, "secret-token")
+			return event
+		},
+	}); err != nil {
+		t.Fatalf("InitWithConfig: %v", err)
+	}
+	s.SetUser("user-1", "private@example.com", "private-user")
+	s.SetExtra("authorization_token", "secret-token")
+	s.CaptureError(fmt.Errorf("request failed for private@example.com with Bearer secret-token"))
+	s.Flush()
+
+	events := transport.Events()
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1", len(events))
+	}
+	serialized := fmt.Sprintf("%#v", events[0])
+	if strings.Contains(serialized, "private@example.com") || strings.Contains(serialized, "secret-token") {
+		t.Fatalf("Sentry event leaked PII or secret: %s", serialized)
+	}
+	if !events[0].User.IsEmpty() {
+		t.Fatalf("Sentry user was not removed: %#v", events[0].User)
+	}
+	if !customHookSawSanitized {
+		t.Fatal("custom BeforeSend ran before fit-go sanitization")
+	}
+}
+
+func TestSentrySanitizesAfterCallerHook(t *testing.T) {
+	transport := &mockTransport{}
+	s := newTestSentry()
+	if err := s.InitWithConfig(SentryConfig{
+		DSN:       "https://examplePublicKey@o0.ingest.sentry.io/0",
+		Transport: transport,
+		BeforeSend: func(event *sentrylib.Event, _ *sentrylib.EventHint) *sentrylib.Event {
+			event.Extra["authorization_token"] = "hook-secret-token"
+			event.Message = "private@example.com"
+			event.Logger = "private@example.com"
+			event.Logs = []sentrylib.Log{{Body: "hook-secret-token"}}
+			event.Metrics = []sentrylib.Metric{{Name: "private@example.com"}}
+			return event
+		},
+	}); err != nil {
+		t.Fatalf("InitWithConfig: %v", err)
+	}
+	s.CaptureMessage("safe")
+	s.Flush()
+
+	events := transport.Events()
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1", len(events))
+	}
+	serialized := fmt.Sprintf("%#v", events[0])
+	if strings.Contains(serialized, "hook-secret-token") || strings.Contains(serialized, "private@example.com") {
+		t.Fatalf("post-hook sanitizer leaked caller data: %s", serialized)
+	}
+	if len(events[0].Logs) != 0 || len(events[0].Metrics) != 0 {
+		t.Fatalf("post-hook sanitizer retained unsupported signals: %#v", events[0])
+	}
+}
+
+func TestSentryTransactionUsesMandatorySanitizer(t *testing.T) {
+	transport := &mockTransport{}
+	s := newTestSentry()
+	if err := s.InitWithConfig(SentryConfig{
+		DSN:              "https://examplePublicKey@o0.ingest.sentry.io/0",
+		Transport:        transport,
+		TracesSampleRate: 1,
+		BeforeSendTransaction: func(event *sentrylib.Event, _ *sentrylib.EventHint) *sentrylib.Event {
+			event.Extra["password"] = "transaction-secret"
+			return event
+		},
+	}); err != nil {
+		t.Fatalf("InitWithConfig: %v", err)
+	}
+	sentrylib.CurrentHub().CaptureEvent(&sentrylib.Event{
+		Type:        "transaction",
+		Transaction: "checkout private@example.com",
+		Extra:       map[string]interface{}{"api_key": "original-secret"},
+	})
+	s.Flush()
+
+	events := transport.Events()
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1", len(events))
+	}
+	serialized := fmt.Sprintf("%#v", events[0])
+	for _, secret := range []string{"transaction-secret", "original-secret", "private@example.com"} {
+		if strings.Contains(serialized, secret) {
+			t.Fatalf("transaction sanitizer leaked %q: %s", secret, serialized)
+		}
+	}
+}
+
+func TestSanitizeSentryValueHandlesTypedValuesAndCycles(t *testing.T) {
+	type credentials struct {
+		Name     string `json:"name"`
+		Password string `json:"password"`
+		Nested   *credentials
+	}
+	value := &credentials{Name: "private@example.com", Password: "typed-secret"}
+	value.Nested = value
+	sanitized := sanitizeSentryValue("metadata", value)
+	serialized := fmt.Sprintf("%#v", sanitized)
+	if strings.Contains(serialized, "private@example.com") || strings.Contains(serialized, "typed-secret") {
+		t.Fatalf("typed value sanitizer leaked data: %s", serialized)
+	}
+	if !strings.Contains(serialized, redact.Mask) {
+		t.Fatalf("typed value sanitizer did not filter sensitive/cyclic data: %s", serialized)
+	}
+}
+
+func TestWithSentryContextIsolatesConcurrentRequestScopes(t *testing.T) {
+	transport := &mockTransport{}
+	s := newTestSentry()
+	if err := s.InitWithConfig(SentryConfig{
+		DSN:       "https://examplePublicKey@o0.ingest.sentry.io/0",
+		Transport: transport,
+	}); err != nil {
+		t.Fatalf("InitWithConfig: %v", err)
+	}
+
+	ctxOne := WithSentryContext(context.Background(), SentryContext{CorrelationID: "request-one"})
+	ctxTwo := WithSentryContext(context.Background(), SentryContext{CorrelationID: "request-two"})
+	s.CaptureErrorWithContext(ctxOne, fmt.Errorf("first"))
+	s.CaptureErrorWithContext(ctxTwo, fmt.Errorf("second"))
+	s.Flush()
+
+	events := transport.Events()
+	if len(events) != 2 {
+		t.Fatalf("events = %d, want 2", len(events))
+	}
+	if events[0].Tags["correlation_id"] != "request-one" || events[1].Tags["correlation_id"] != "request-two" {
+		t.Fatalf("request scopes leaked: %#v, %#v", events[0].Tags, events[1].Tags)
+	}
+}
+
+func TestSanitizeSentryEventCoversNestedRuntimeData(t *testing.T) {
+	event := &sentrylib.Event{
+		Fingerprint: []string{"private@example.com"},
+		Transaction: "checkout for private@example.com",
+		Exception: []sentrylib.Exception{{
+			Value: "Bearer secret-token",
+			Stacktrace: &sentrylib.Stacktrace{Frames: []sentrylib.Frame{{
+				ContextLine: `token := "secret-token"`,
+				Vars:        map[string]interface{}{"authorization": "Bearer secret-token"},
+			}}},
+		}},
+		Threads: []sentrylib.Thread{{
+			Name: "private@example.com",
+			Stacktrace: &sentrylib.Stacktrace{Frames: []sentrylib.Frame{{
+				Vars: map[string]interface{}{"email": "private@example.com"},
+			}}},
+		}},
+		Spans: []*sentrylib.Span{{
+			Description: "request for private@example.com",
+			Data:        map[string]interface{}{"payload": "secret-token"},
+			Tags:        map[string]string{"api_key": "secret-token"},
+		}},
+		Attachments: []*sentrylib.Attachment{{Filename: "raw-request.txt"}},
+	}
+
+	sanitized := sanitizeSentryEvent(event)
+	serialized := fmt.Sprintf("%#v", sanitized)
+	if strings.Contains(serialized, "private@example.com") || strings.Contains(serialized, "secret-token") {
+		t.Fatalf("nested Sentry data leaked PII or secrets: %s", serialized)
+	}
+	if len(sanitized.Attachments) != 0 {
+		t.Fatalf("opaque attachments were retained: %#v", sanitized.Attachments)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // TestCaptureErrorWithContext
 // ---------------------------------------------------------------------------
@@ -171,6 +391,23 @@ func TestCaptureErrorWithContext(t *testing.T) {
 
 	if len(transport.Events()) == 0 {
 		t.Error("Expected event from CaptureErrorWithContext")
+	}
+}
+
+func TestCaptureErrorWithNilContext(t *testing.T) {
+	transport := &mockTransport{}
+	s := newTestSentry()
+	if err := s.InitWithConfig(SentryConfig{
+		DSN:       "https://examplePublicKey@o0.ingest.sentry.io/0",
+		Transport: transport,
+	}); err != nil {
+		t.Fatalf("InitWithConfig: %v", err)
+	}
+
+	s.CaptureErrorWithContext(nil, fmt.Errorf("nil context error"))
+	s.Flush()
+	if len(transport.Events()) != 1 {
+		t.Fatalf("events = %d, want 1", len(transport.Events()))
 	}
 }
 

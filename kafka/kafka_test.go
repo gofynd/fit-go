@@ -15,11 +15,49 @@
 package kafka
 
 import (
+	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
 	"time"
 )
+
+type healthDriver struct{ err error }
+
+func (d *healthDriver) Producer(ProducerConfig) (KafkaProducer, error) { return nil, nil }
+func (d *healthDriver) Consumer(ConsumerConfig) (KafkaConsumer, error) { return nil, nil }
+func (d *healthDriver) Close() error                                   { return nil }
+func (d *healthDriver) Ping(context.Context) error                     { return d.err }
+
+type noHealthDriver struct{}
+
+func (*noHealthDriver) Producer(ProducerConfig) (KafkaProducer, error) { return nil, nil }
+func (*noHealthDriver) Consumer(ConsumerConfig) (KafkaConsumer, error) { return nil, nil }
+func (*noHealthDriver) Close() error                                   { return nil }
+
+func TestClientPing(t *testing.T) {
+	want := errors.New("broker unavailable password=hunter2 for user@example.com")
+	client := &Client{Driver: &healthDriver{err: want}}
+	err := client.Ping(context.Background())
+	if !errors.Is(err, want) {
+		t.Fatalf("Ping error = %v, want %v", err, want)
+	}
+	for _, secret := range []string{"hunter2", "user@example.com"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("Ping error leaked %q: %v", secret, err)
+		}
+	}
+	if got := safeKafkaHealthMessage("SASL password=hunter2 owner=user@example.com"); strings.Contains(got, "hunter2") || strings.Contains(got, "user@example.com") {
+		t.Fatalf("safeKafkaHealthMessage leaked health details: %q", got)
+	}
+	if err := (&Client{Driver: &noHealthDriver{}}).Ping(context.Background()); err == nil {
+		t.Fatal("Ping unsupported driver: expected error")
+	}
+	if err := (&Client{}).Ping(context.Background()); err == nil {
+		t.Fatal("Ping missing driver: expected error")
+	}
+}
 
 // ---------------------------------------------------------------------------
 // LogLevel tests

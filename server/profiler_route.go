@@ -5,270 +5,174 @@
 // You may obtain a copy of the License at
 //
 // http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
 
 package server
 
 import (
 	"net/http"
-	"runtime"
 	"runtime/pprof"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gofynd/fit-go/profiling"
 )
 
-// ProfilerState tracks the state of profiling endpoints.
-// This is a port profiler.route.ts. In Go, we use runtime/pprof
-// and provide on-demand profiling control rather than wrapping Pyroscope.
-type ProfilerState struct {
-	mu          sync.Mutex
-	cpuRunning  atomic.Bool
-	heapRunning atomic.Bool
-	wallRunning atomic.Bool
-	cpuFile     *profilerBuffer
-	enabled     bool
-}
-
-// profilerBuffer is an in-memory buffer for pprof output.
-type profilerBuffer struct {
-	buf []byte
-}
-
-// Write implements io.Writer for pprof capture.
-func (pb *profilerBuffer) Write(p []byte) (int, error) {
-	pb.buf = append(pb.buf, p...)
-	return len(p), nil
-}
-
-// globalProfiler holds the singleton profiler state.
-var globalProfiler = &ProfilerState{}
-
-// RegisterProfileRoutes registers the /_profiling/* endpoints on the given
-// gin.Engine. These are only functional when PROFILING_ENABLED=true.
+// RegisterProfileRoutes registers the legacy FIT.js profiling control surface
+// against the process-default profiler.
 func RegisterProfileRoutes(engine *gin.Engine) {
-	p := globalProfiler
-	p.enabled = envGetBool("PROFILING_ENABLED")
-
-	engine.GET("/_profiling/start", p.ginHandleStart)
-	engine.GET("/_profiling/stop", p.ginHandleStop)
-	engine.GET("/_profiling/start_cpu", p.ginHandleStartCPU)
-	engine.GET("/_profiling/stop_cpu", p.ginHandleStopCPU)
-	engine.GET("/_profiling/start_heap", p.ginHandleStartHeap)
-	engine.GET("/_profiling/stop_heap", p.ginHandleStopHeap)
-	engine.GET("/_profiling/start_wall", p.ginHandleStartWall)
-	engine.GET("/_profiling/stop_wall", p.ginHandleStopWall)
-	engine.GET("/_profiling/status", p.ginHandleStatus)
-	engine.GET("/_profiling/config", p.ginHandleConfig)
+	RegisterProfileRoutesWithProfiler(engine, profiling.Default())
 }
 
-func (p *ProfilerState) ginJSONOK(c *gin.Context, message string) {
-	c.JSON(http.StatusOK, map[string]string{"status": "ok", "message": message})
-}
+// RegisterProfileRoutesWithProfiler registers profiling routes against one
+// explicit profiler. This keeps route state, Pyroscope state, and framework
+// shutdown ownership on the same instance.
+func RegisterProfileRoutesWithProfiler(engine *gin.Engine, profiler *profiling.Profiler) {
+	if profiler == nil {
+		profiler = profiling.New(profiling.Config{})
+	}
 
-func (p *ProfilerState) ginJSONErr(c *gin.Context, message string, err error) {
-	c.JSON(http.StatusInternalServerError, map[string]interface{}{
-		"status":  "error",
-		"message": message,
-		"error":   err.Error(),
+	engine.GET("/_profiling/start", func(c *gin.Context) {
+		if profiler.IsProfilingDisabled() {
+			profilingOK(c, "Profiling is not enabled by global configuration")
+			return
+		}
+		if profiler.IsCPUProfilingRunning() && profiler.IsHeapProfilingRunning() && profiler.IsWallProfilingRunning() {
+			profilingOK(c, "Profiling is already running")
+			return
+		}
+		profiler.Start()
+		profilingOK(c, "Profiling started")
+	})
+
+	engine.GET("/_profiling/stop", func(c *gin.Context) {
+		if !profiler.IsRunning() {
+			profilingOK(c, "Profiling is not running")
+			return
+		}
+		profiler.Stop()
+		profilingOK(c, "Profiling stopped")
+	})
+
+	engine.GET("/_profiling/start_cpu", func(c *gin.Context) {
+		if profiler.IsProfilingDisabled() {
+			profilingOK(c, "Profiling is not enabled by global configuration")
+			return
+		}
+		if profiler.IsCPUProfilingRunning() && profiler.IsWallProfilingRunning() {
+			profilingOK(c, "CPU profiling is already running")
+			return
+		}
+		if !profiler.IsCPUProfilingRunning() {
+			profiler.StartCPUProfiling()
+		}
+		if !profiler.IsWallProfilingRunning() {
+			profiler.StartWallProfiling()
+		}
+		profilingOK(c, "CPU profiling started")
+	})
+
+	engine.GET("/_profiling/stop_cpu", func(c *gin.Context) {
+		if !profiler.IsCPUProfilingRunning() && !profiler.IsWallProfilingRunning() {
+			profilingOK(c, "CPU profiling is not running")
+			return
+		}
+		if profiler.IsCPUProfilingRunning() {
+			profiler.StopCPUProfiling()
+		}
+		if profiler.IsWallProfilingRunning() {
+			profiler.StopWallProfiling()
+		}
+		profilingOK(c, "CPU profiling stopped")
+	})
+
+	engine.GET("/_profiling/start_heap", func(c *gin.Context) {
+		if profiler.IsProfilingDisabled() {
+			profilingOK(c, "Profiling is not enabled by global configuration")
+			return
+		}
+		if profiler.IsHeapProfilingRunning() {
+			profilingOK(c, "Heap profiling is already running")
+			return
+		}
+		profiler.StartHeapProfiling()
+		profilingOK(c, "Heap profiling started")
+	})
+
+	engine.GET("/_profiling/stop_heap", func(c *gin.Context) {
+		if !profiler.IsHeapProfilingRunning() {
+			profilingOK(c, "Heap profiling is not running")
+			return
+		}
+		profiler.StopHeapProfiling()
+		profilingOK(c, "Heap profiling stopped")
+	})
+
+	engine.GET("/_profiling/start_wall", func(c *gin.Context) {
+		if profiler.IsProfilingDisabled() {
+			profilingOK(c, "Profiling is not enabled by global configuration")
+			return
+		}
+		if profiler.IsWallProfilingRunning() {
+			profilingOK(c, "Wall profiling is already running")
+			return
+		}
+		profiler.StartWallProfiling()
+		profilingOK(c, "Wall profiling started")
+	})
+
+	engine.GET("/_profiling/stop_wall", func(c *gin.Context) {
+		if !profiler.IsWallProfilingRunning() {
+			profilingOK(c, "Wall profiling is not running")
+			return
+		}
+		profiler.StopWallProfiling()
+		profilingOK(c, "Wall profiling stopped")
+	})
+
+	engine.GET("/_profiling/status", func(c *gin.Context) {
+		status := profiler.GetDetailedStatus()
+		message := "Profiling is not running"
+		if status.Overall {
+			message = "Profiling is active"
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"status": "ok",
+			"profiling": gin.H{
+				"overall": gin.H{"running": status.Overall, "message": message},
+				"types": gin.H{
+					"cpu":  gin.H{"enabled": status.CPU.Enabled, "running": status.CPU.Running, "description": "CPU profiling using Go runtime/pprof"},
+					"heap": gin.H{"enabled": status.Heap.Enabled, "running": status.Heap.Running, "description": "Heap profiling for memory allocation analysis"},
+					"wall": gin.H{"enabled": status.Wall.Enabled, "running": status.Wall.Running, "description": "Wall profiling for goroutine/wall-clock analysis"},
+				},
+			},
+		})
+	})
+
+	engine.GET("/_profiling/config", func(c *gin.Context) {
+		config := profiler.GetConfig()
+		c.JSON(http.StatusOK, gin.H{
+			"status": "ok",
+			"configuration": gin.H{"profiler": gin.H{
+				"enabled": config.Enabled, "server": config.Server,
+				"cpuEnabled": config.CPUEnabled, "heapEnabled": config.HeapEnabled,
+				"cpuWallEnabled": config.WallEnabled, "tagsJson": config.TagsJSON,
+				"flushIntervalMs":            config.FlushIntervalMs,
+				"heapSamplingIntervalBytes":  config.HeapSamplingIntervalBytes,
+				"heapStackDepth":             config.HeapStackDepth,
+				"wallSamplingDurationMs":     config.WallSamplingDurationMs,
+				"wallSamplingIntervalMicros": config.WallSamplingIntervalMicros,
+				"wallCollectCpuTime":         config.WallCollectCPUTime,
+			}},
+		})
 	})
 }
 
-// ginHandleStart starts all profiling types.
-func (p *ProfilerState) ginHandleStart(c *gin.Context) {
-	if !p.enabled {
-		p.ginJSONOK(c, "Profiling is not enabled by global configuration")
-		return
-	}
-	if p.cpuRunning.Load() && p.heapRunning.Load() && p.wallRunning.Load() {
-		p.ginJSONOK(c, "Profiling is already running")
-		return
-	}
-	p.startCPU()
-	p.heapRunning.Store(true)
-	p.wallRunning.Store(true)
-	p.ginJSONOK(c, "Profiling started")
+func profilingOK(c *gin.Context, message string) {
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "message": message})
 }
 
-// ginHandleStop stops all profiling types.
-func (p *ProfilerState) ginHandleStop(c *gin.Context) {
-	if !p.cpuRunning.Load() && !p.heapRunning.Load() && !p.wallRunning.Load() {
-		p.ginJSONOK(c, "Profiling is not running")
-		return
-	}
-	p.stopCPU()
-	p.heapRunning.Store(false)
-	p.wallRunning.Store(false)
-	p.ginJSONOK(c, "Profiling stopped")
-}
-
-// ginHandleStartCPU starts CPU profiling (and wall as).
-func (p *ProfilerState) ginHandleStartCPU(c *gin.Context) {
-	if !p.enabled {
-		p.ginJSONOK(c, "Profiling is not enabled by global configuration")
-		return
-	}
-	if p.cpuRunning.Load() && p.wallRunning.Load() {
-		p.ginJSONOK(c, "CPU profiling is already running")
-		return
-	}
-	p.startCPU()
-	p.wallRunning.Store(true)
-	p.ginJSONOK(c, "CPU profiling started")
-}
-
-// ginHandleStopCPU stops CPU profiling.
-func (p *ProfilerState) ginHandleStopCPU(c *gin.Context) {
-	if !p.cpuRunning.Load() && !p.wallRunning.Load() {
-		p.ginJSONOK(c, "CPU profiling is not running")
-		return
-	}
-	p.stopCPU()
-	p.wallRunning.Store(false)
-	p.ginJSONOK(c, "CPU profiling stopped")
-}
-
-// ginHandleStartHeap starts heap profiling.
-func (p *ProfilerState) ginHandleStartHeap(c *gin.Context) {
-	if !p.enabled {
-		p.ginJSONOK(c, "Profiling is not enabled by global configuration")
-		return
-	}
-	if p.heapRunning.Load() {
-		p.ginJSONOK(c, "Heap profiling is already running")
-		return
-	}
-	runtime.MemProfileRate = 512 * 1024
-	p.heapRunning.Store(true)
-	p.ginJSONOK(c, "Heap profiling started")
-}
-
-// ginHandleStopHeap stops heap profiling.
-func (p *ProfilerState) ginHandleStopHeap(c *gin.Context) {
-	if !p.heapRunning.Load() {
-		p.ginJSONOK(c, "Heap profiling is not running")
-		return
-	}
-	runtime.MemProfileRate = 0
-	p.heapRunning.Store(false)
-	p.ginJSONOK(c, "Heap profiling stopped")
-}
-
-// ginHandleStartWall starts wall profiling (goroutine profile in Go).
-func (p *ProfilerState) ginHandleStartWall(c *gin.Context) {
-	if !p.enabled {
-		p.ginJSONOK(c, "Profiling is not enabled by global configuration")
-		return
-	}
-	if p.wallRunning.Load() {
-		p.ginJSONOK(c, "Wall profiling is already running")
-		return
-	}
-	p.wallRunning.Store(true)
-	p.ginJSONOK(c, "Wall profiling started")
-}
-
-// ginHandleStopWall stops wall profiling.
-func (p *ProfilerState) ginHandleStopWall(c *gin.Context) {
-	if !p.wallRunning.Load() {
-		p.ginJSONOK(c, "Wall profiling is not running")
-		return
-	}
-	p.wallRunning.Store(false)
-	p.ginJSONOK(c, "Wall profiling stopped")
-}
-
-// ginHandleStatus returns the profiling status.
-func (p *ProfilerState) ginHandleStatus(c *gin.Context) {
-	overall := p.cpuRunning.Load() || p.heapRunning.Load() || p.wallRunning.Load()
-	msg := "Profiling is not running"
-	if overall {
-		msg = "Profiling is active"
-	}
-
-	c.JSON(http.StatusOK, map[string]interface{}{
-		"status": "ok",
-		"profiling": map[string]interface{}{
-			"overall": map[string]interface{}{
-				"running": overall,
-				"message": msg,
-			},
-			"types": map[string]interface{}{
-				"cpu": map[string]interface{}{
-					"enabled":     p.enabled,
-					"running":     p.cpuRunning.Load(),
-					"description": "CPU profiling using Go runtime/pprof",
-				},
-				"heap": map[string]interface{}{
-					"enabled":     p.enabled,
-					"running":     p.heapRunning.Load(),
-					"description": "Heap profiling for memory allocation analysis",
-				},
-				"wall": map[string]interface{}{
-					"enabled":     p.enabled,
-					"running":     p.wallRunning.Load(),
-					"description": "Wall profiling for goroutine/wall-clock analysis",
-				},
-			},
-		},
-	})
-}
-
-// ginHandleConfig returns the profiling configuration.
-func (p *ProfilerState) ginHandleConfig(c *gin.Context) {
-	c.JSON(http.StatusOK, map[string]interface{}{
-		"status": "ok",
-		"configuration": map[string]interface{}{
-			"profiler": map[string]interface{}{
-				"enabled":          p.enabled,
-				"cpuEnabled":       p.cpuRunning.Load(),
-				"heapEnabled":      p.heapRunning.Load(),
-				"wallEnabled":      p.wallRunning.Load(),
-				"memProfileRate":   runtime.MemProfileRate,
-				"numGoroutine":     runtime.NumGoroutine(),
-				"goVersion":        runtime.Version(),
-				"numCPU":           runtime.NumCPU(),
-				"blockProfileRate": 0,
-				"mutexProfileFrac": 0,
-			},
-		},
-	})
-}
-
-// startCPU begins CPU profiling into an in-memory buffer.
-func (p *ProfilerState) startCPU() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.cpuRunning.Load() {
-		return
-	}
-	p.cpuFile = &profilerBuffer{}
-	_ = pprof.StartCPUProfile(p.cpuFile)
-	p.cpuRunning.Store(true)
-}
-
-// stopCPU stops CPU profiling.
-func (p *ProfilerState) stopCPU() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if !p.cpuRunning.Load() {
-		return
-	}
-	pprof.StopCPUProfile()
-	p.cpuRunning.Store(false)
-	p.cpuFile = nil
-}
-
-// pprofHandler returns an http.Handler that serves Go's built-in pprof data.
-// This can be optionally mounted alongside the profiler routes for full
-// pprof compatibility (e.g. go tool pprof).
+// pprofHandler serves Go's built-in profiles for callers that explicitly mount
+// it. It is separate from the Pyroscope control API but owns no profile state.
 func pprofHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /debug/pprof/", func(w http.ResponseWriter, r *http.Request) {
@@ -276,38 +180,22 @@ func pprofHandler() http.Handler {
 		if name == "" {
 			profiles := pprof.Profiles()
 			names := make([]string, 0, len(profiles))
-			for _, p := range profiles {
-				names = append(names, p.Name())
+			for _, profile := range profiles {
+				names = append(names, profile.Name())
 			}
-			JSON(w, http.StatusOK, map[string]interface{}{
-				"profiles": names,
-			})
+			JSON(w, http.StatusOK, map[string]interface{}{"profiles": names})
 			return
 		}
-		prof := pprof.Lookup(name)
-		if prof == nil {
+		profile := pprof.Lookup(name)
+		if profile == nil {
 			JSON(w, http.StatusNotFound, map[string]string{"error": "profile not found: " + name})
 			return
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
-		_ = prof.WriteTo(w, 0)
+		_ = profile.WriteTo(w, 0)
 	})
 	return mux
 }
 
-// ProfileSnapshotDuration is the default duration for on-demand CPU profile snapshots.
+// ProfileSnapshotDuration is the default duration for on-demand CPU snapshots.
 const ProfileSnapshotDuration = 30 * time.Second
-
-// Legacy net/http handlers kept for backward compatibility.
-
-func (p *ProfilerState) jsonOK(w http.ResponseWriter, message string) {
-	JSON(w, http.StatusOK, map[string]string{"status": "ok", "message": message})
-}
-
-func (p *ProfilerState) jsonErr(w http.ResponseWriter, message string, err error) {
-	JSON(w, http.StatusInternalServerError, map[string]interface{}{
-		"status":  "error",
-		"message": message,
-		"error":   err.Error(),
-	})
-}

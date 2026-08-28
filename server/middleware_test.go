@@ -17,9 +17,13 @@ package server
 import (
 	"bytes"
 	"crypto/hmac"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log/slog"
@@ -32,6 +36,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gofynd/fit-go/errors"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // ---------------------------------------------------------------------------
@@ -345,6 +350,121 @@ func TestAuthorizeJWT_PayloadMismatch(t *testing.T) {
 	}
 }
 
+func TestAuthorizeJWT_AlgorithmsAndRegisteredClaims(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	secret := "test-hs512-secret"
+	claims := jwt.MapClaims{
+		"company_id": "123",
+		"iss":        "fit-issuer",
+		"aud":        "fit-audience",
+		"sub":        "fit-subject",
+		"exp":        time.Now().Add(time.Minute).Unix(),
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS512, claims)
+	signed, err := token.SignedString([]byte(secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	engine := gin.New()
+	engine.Use(AuthorizeJWTToken(JWTOptions{
+		Secret: secret, AllowedAlgorithms: []string{"HS512"},
+		Issuer: "fit-issuer", Audience: "fit-audience", Subject: "fit-subject",
+		ExpectedPayload: map[string]interface{}{"company_id": "123"},
+	}))
+	engine.GET("/test", func(c *gin.Context) { c.Status(http.StatusOK) })
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+signed)
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200", recorder.Code)
+	}
+}
+
+func TestAuthorizeJWT_RSA(t *testing.T) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicKey := pem.EncodeToMemory(&pem.Block{
+		Type:  "PUBLIC KEY",
+		Bytes: x509.MarshalPKCS1PublicKey(&privateKey.PublicKey),
+	})
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
+		"company_id": "123",
+		"exp":        time.Now().Add(time.Minute).Unix(),
+	})
+	signed, err := token.SignedString(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	engine := gin.New()
+	engine.Use(AuthorizeJWTToken(JWTOptions{
+		RSAPublicKeyPEM:   string(publicKey),
+		AllowedAlgorithms: []string{"RS256"},
+		ExpectedPayload:   map[string]interface{}{"company_id": "123"},
+	}))
+	engine.GET("/test", func(c *gin.Context) { c.Status(http.StatusOK) })
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+signed)
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200", recorder.Code)
+	}
+}
+
+func TestAuthorizeJWT_ClockSkew(t *testing.T) {
+	secret := "clock-skew-secret"
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"company_id": "123", "exp": time.Now().Add(-time.Second).Unix(),
+	})
+	signed, err := token.SignedString([]byte(secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := gin.New()
+	engine.Use(AuthorizeJWTToken(JWTOptions{
+		Secret: secret, AllowedClockSkew: 2 * time.Second,
+		ExpectedPayload: map[string]interface{}{"company_id": "123"},
+	}))
+	engine.GET("/test", func(c *gin.Context) { c.Status(http.StatusOK) })
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+signed)
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200 with clock skew", recorder.Code)
+	}
+}
+
+func TestAuthorizeJWT_StringPayload(t *testing.T) {
+	secret := "string-payload-secret"
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`"expected-value"`))
+	signingInput := header + "." + payload
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(signingInput))
+	token := signingInput + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+
+	var decoded interface{}
+	engine := gin.New()
+	engine.Use(AuthorizeJWTToken(JWTOptions{Secret: secret, ExpectedPayload: "expected-value"}))
+	engine.GET("/test", func(c *gin.Context) {
+		decoded = DecodedTokenValueFromContext(c.Request.Context())
+		c.Status(http.StatusOK)
+	})
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK || decoded != "expected-value" {
+		t.Fatalf("status/decoded = %d/%#v", recorder.Code, decoded)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // LogRequestResponse tests (gin middleware)
 // ---------------------------------------------------------------------------
@@ -392,12 +512,84 @@ func TestLogRequestResponse_Middleware(t *testing.T) {
 		}
 	})
 
+	t.Run("metrics use route template and integer milliseconds", func(t *testing.T) {
+		var gotRoute string
+		var gotDuration float64
+		engine := gin.New()
+		engine.Use(LogRequestResponse(LogRequestResponseConfig{
+			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			MetricsRecorder: func(_, route, _ string, durationMs float64) {
+				gotRoute = route
+				gotDuration = durationMs
+			},
+		}))
+		platform := engine.Group("/service/platform")
+		platform.GET("/companies/:companyID/orders/:orderID", func(c *gin.Context) {
+			time.Sleep(5 * time.Millisecond)
+			c.Status(http.StatusNoContent)
+		})
+
+		request := httptest.NewRequest(http.MethodGet, "/service/platform/companies/acme/orders/order-abc", nil)
+		engine.ServeHTTP(httptest.NewRecorder(), request)
+
+		if gotRoute != "/service/platform/companies/:companyID/orders/:orderID" {
+			t.Fatalf("route = %q, want registered route template", gotRoute)
+		}
+		if gotDuration < 1 || gotDuration != float64(int64(gotDuration)) {
+			t.Fatalf("duration = %v, want elapsed whole milliseconds", gotDuration)
+		}
+	})
+
+	t.Run("metrics normalize path when route template is unavailable", func(t *testing.T) {
+		var gotRoute string
+		engine := gin.New()
+		engine.Use(LogRequestResponse(LogRequestResponseConfig{
+			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			MetricsRecorder: func(_, route, _ string, _ float64) {
+				gotRoute = route
+			},
+		}))
+		engine.NoRoute(func(c *gin.Context) { c.Status(http.StatusNotFound) })
+
+		request := httptest.NewRequest(http.MethodGet, "/orders/123/550e8400-e29b-41d4-a716-446655440000", nil)
+		engine.ServeHTTP(httptest.NewRecorder(), request)
+
+		if gotRoute != "/orders/:id/:uuid" {
+			t.Fatalf("route = %q, want normalized fallback", gotRoute)
+		}
+	})
+
+	t.Run("metrics ignore fit server catch-all route", func(t *testing.T) {
+		var gotRoute string
+		engine := gin.New()
+		engine.Use(LogRequestResponse(LogRequestResponseConfig{
+			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			MetricsRecorder: func(_, route, _ string, _ float64) {
+				gotRoute = route
+			},
+		}))
+		engine.GET("/application/*path", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+		request := httptest.NewRequest(http.MethodGet, "/application/orders/123", nil)
+		engine.ServeHTTP(httptest.NewRecorder(), request)
+
+		if gotRoute != "/application/orders/:id" {
+			t.Fatalf("route = %q, want normalized mounted-handler fallback", gotRoute)
+		}
+	})
+
 	t.Run("skips health check paths", func(t *testing.T) {
 		var logBuf bytes.Buffer
 		logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+		metricsCalls := 0
 
 		engine := gin.New()
-		engine.Use(LogRequestResponse(LogRequestResponseConfig{Logger: logger}))
+		engine.Use(LogRequestResponse(LogRequestResponseConfig{
+			Logger: logger,
+			MetricsRecorder: func(_, _, _ string, _ float64) {
+				metricsCalls++
+			},
+		}))
 		engine.GET("/_healthz", func(c *gin.Context) { c.Status(http.StatusOK) })
 		engine.GET("/_readyz", func(c *gin.Context) { c.Status(http.StatusOK) })
 
@@ -411,9 +603,14 @@ func TestLogRequestResponse_Middleware(t *testing.T) {
 				t.Errorf("Path %s should not be logged", path)
 			}
 		}
+		if metricsCalls != 0 {
+			t.Fatalf("health probes recorded %d metrics, want none", metricsCalls)
+		}
 	})
 
-	t.Run("error level for 5xx", func(t *testing.T) {
+	// Legacy parity (fit.js/pyfit): every access-log line is INFO, regardless of
+	// status — there is no level-by-status.
+	t.Run("info level for 5xx (parity)", func(t *testing.T) {
 		var logBuf bytes.Buffer
 		logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
 
@@ -428,12 +625,12 @@ func TestLogRequestResponse_Middleware(t *testing.T) {
 		engine.ServeHTTP(rec, req)
 
 		logStr := logBuf.String()
-		if !strings.Contains(logStr, "ERROR") {
-			t.Error("5xx responses should be logged at ERROR level")
+		if strings.Contains(logStr, `"level":"ERROR"`) {
+			t.Error("parity: 5xx must be logged at INFO, not ERROR")
 		}
 	})
 
-	t.Run("warn level for 4xx", func(t *testing.T) {
+	t.Run("info level for 4xx (parity)", func(t *testing.T) {
 		var logBuf bytes.Buffer
 		logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
 
@@ -448,8 +645,8 @@ func TestLogRequestResponse_Middleware(t *testing.T) {
 		engine.ServeHTTP(rec, req)
 
 		logStr := logBuf.String()
-		if !strings.Contains(logStr, "WARN") {
-			t.Error("4xx responses should be logged at WARN level")
+		if strings.Contains(logStr, `"level":"WARN"`) {
+			t.Error("parity: 4xx must be logged at INFO, not WARN")
 		}
 	})
 

@@ -18,6 +18,8 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -27,20 +29,20 @@ import (
 // ---------------------------------------------------------------------------
 
 type mockConnection struct {
-	pingCalled  bool
-	closeCalled bool
+	pingCalled  atomic.Bool
+	closeCalled atomic.Bool
 	pingErr     error
 	closeErr    error
 	isCluster   bool
 }
 
 func (m *mockConnection) Ping(ctx context.Context) error {
-	m.pingCalled = true
+	m.pingCalled.Store(true)
 	return m.pingErr
 }
 
 func (m *mockConnection) Close() error {
-	m.closeCalled = true
+	m.closeCalled.Store(true)
 	return m.closeErr
 }
 
@@ -248,6 +250,11 @@ func TestGetRedisEnvOptions(t *testing.T) {
 		"REDIS_CACHE_READ_WRITE_CONNECTION_TIMEOUT",
 		"REDIS_CACHE_READ_WRITE_SOCKET_TIMEOUT",
 		"REDIS_CACHE_READ_WRITE_KEEP_ALIVE",
+		"REDIS_CACHE_READ_WRITE_COMMAND_MAX_RETRIES",
+		"REDIS_CACHE_READ_WRITE_COMMAND_MIN_RETRY_BACKOFF",
+		"REDIS_CACHE_READ_WRITE_COMMAND_MAX_RETRY_BACKOFF",
+		"REDIS_CACHE_READ_WRITE_DIALER_RETRIES",
+		"REDIS_CACHE_READ_WRITE_DIALER_RETRY_TIMEOUT",
 	}
 	origVals := make(map[string]string)
 	for _, k := range envs {
@@ -267,6 +274,11 @@ func TestGetRedisEnvOptions(t *testing.T) {
 		os.Setenv("REDIS_CACHE_READ_WRITE_CONNECTION_TIMEOUT", "5000")
 		os.Setenv("REDIS_CACHE_READ_WRITE_SOCKET_TIMEOUT", "10000")
 		os.Setenv("REDIS_CACHE_READ_WRITE_KEEP_ALIVE", "30000")
+		os.Setenv("REDIS_CACHE_READ_WRITE_COMMAND_MAX_RETRIES", "20")
+		os.Setenv("REDIS_CACHE_READ_WRITE_COMMAND_MIN_RETRY_BACKOFF", "50")
+		os.Setenv("REDIS_CACHE_READ_WRITE_COMMAND_MAX_RETRY_BACKOFF", "2000")
+		os.Setenv("REDIS_CACHE_READ_WRITE_DIALER_RETRIES", "1")
+		os.Setenv("REDIS_CACHE_READ_WRITE_DIALER_RETRY_TIMEOUT", "75")
 
 		opts := getRedisEnvOptions("CACHE", "write")
 
@@ -278,6 +290,21 @@ func TestGetRedisEnvOptions(t *testing.T) {
 		}
 		if opts.KeepAlive != 30*time.Second {
 			t.Errorf("KeepAlive = %v, want 30s", opts.KeepAlive)
+		}
+		if opts.MaxRetries != 20 {
+			t.Errorf("MaxRetries = %d, want 20", opts.MaxRetries)
+		}
+		if opts.MinRetryBackoff != 50*time.Millisecond {
+			t.Errorf("MinRetryBackoff = %v, want 50ms", opts.MinRetryBackoff)
+		}
+		if opts.MaxRetryBackoff != 2*time.Second {
+			t.Errorf("MaxRetryBackoff = %v, want 2s", opts.MaxRetryBackoff)
+		}
+		if opts.DialerRetries != 1 {
+			t.Errorf("DialerRetries = %d, want 1", opts.DialerRetries)
+		}
+		if opts.DialerRetryTimeout != 75*time.Millisecond {
+			t.Errorf("DialerRetryTimeout = %v, want 75ms", opts.DialerRetryTimeout)
 		}
 	})
 
@@ -301,6 +328,25 @@ func TestGetRedisEnvOptions(t *testing.T) {
 
 		if opts.ConnectTimeout != 0 {
 			t.Errorf("ConnectTimeout = %v, want 0 (unset)", opts.ConnectTimeout)
+		}
+		if opts.MaxRetries != 0 || opts.MinRetryBackoff != 0 || opts.MaxRetryBackoff != 0 || opts.DialerRetries != 0 || opts.DialerRetryTimeout != 0 {
+			t.Errorf("retry options = %+v, want zero values when unset", opts)
+		}
+	})
+
+	t.Run("invalid and non-positive retry values retain defaults", func(t *testing.T) {
+		for _, k := range envs {
+			os.Unsetenv(k)
+		}
+		os.Setenv("REDIS_CACHE_READ_WRITE_COMMAND_MAX_RETRIES", "0")
+		os.Setenv("REDIS_CACHE_READ_WRITE_COMMAND_MIN_RETRY_BACKOFF", "-1")
+		os.Setenv("REDIS_CACHE_READ_WRITE_COMMAND_MAX_RETRY_BACKOFF", "invalid")
+		os.Setenv("REDIS_CACHE_READ_WRITE_DIALER_RETRIES", "-2")
+		os.Setenv("REDIS_CACHE_READ_WRITE_DIALER_RETRY_TIMEOUT", "0")
+
+		opts := getRedisEnvOptions("CACHE", "write")
+		if opts.MaxRetries != 0 || opts.MinRetryBackoff != 0 || opts.MaxRetryBackoff != 0 || opts.DialerRetries != 0 || opts.DialerRetryTimeout != 0 {
+			t.Errorf("retry options = %+v, want zero values for invalid/non-positive input", opts)
 		}
 	})
 }
@@ -490,10 +536,10 @@ func TestClient_Close(t *testing.T) {
 		t.Errorf("Close() error = %v, want nil", err)
 	}
 
-	if !read.closeCalled {
+	if !read.closeCalled.Load() {
 		t.Error("Read connection Close() should be called")
 	}
-	if !write.closeCalled {
+	if !write.closeCalled.Load() {
 		t.Error("Write connection Close() should be called")
 	}
 
@@ -600,6 +646,64 @@ func TestInit(t *testing.T) {
 		}
 	})
 
+	t.Run("applies service-scoped protocol without changing other services", func(t *testing.T) {
+		os.Setenv("REDIS_LEGACY_READ_WRITE", "redis://legacy.example:6379/0")
+		os.Setenv("REDIS_NATIVE_READ_WRITE", "redis://native.example:6379/0")
+		defer func() {
+			os.Unsetenv("REDIS_LEGACY_READ_WRITE")
+			os.Unsetenv("REDIS_NATIVE_READ_WRITE")
+		}()
+
+		captured := make(map[string]RedisProtocol)
+		var capturedMu sync.Mutex
+		_, err := Init(ConnectionOptions{
+			Dial: func(_ context.Context, opts *DialOptions) (Connection, error) {
+				capturedMu.Lock()
+				captured[opts.Addr] = opts.Protocol
+				capturedMu.Unlock()
+				return &mockConnection{}, nil
+			},
+			ProtocolByService: map[string]RedisProtocol{"LeGaCy": RedisProtocolRESP2},
+		})
+		if err != nil {
+			t.Fatalf("Init() error = %v", err)
+		}
+		capturedMu.Lock()
+		legacy := captured["legacy.example:6379"]
+		native := captured["native.example:6379"]
+		capturedMu.Unlock()
+		if legacy != RedisProtocolRESP2 || native != RedisProtocolDefault {
+			t.Fatalf("captured protocols = %#v, want legacy=RESP2 and native=default", captured)
+		}
+	})
+
+	t.Run("rejects unsupported service protocol", func(t *testing.T) {
+		os.Setenv("REDIS_CACHE_READ_WRITE", "redis://localhost:6379/0")
+		defer os.Unsetenv("REDIS_CACHE_READ_WRITE")
+		_, err := Init(ConnectionOptions{
+			Dial:              mockDial,
+			ProtocolByService: map[string]RedisProtocol{"cache": 4},
+		})
+		if err == nil || !strings.Contains(err.Error(), "unsupported Redis protocol 4") {
+			t.Fatalf("Init error = %v, want unsupported protocol", err)
+		}
+	})
+
+	t.Run("rejects conflicting case-insensitive service protocols", func(t *testing.T) {
+		os.Setenv("REDIS_CACHE_READ_WRITE", "redis://localhost:6379/0")
+		defer os.Unsetenv("REDIS_CACHE_READ_WRITE")
+		_, err := Init(ConnectionOptions{
+			Dial: mockDial,
+			ProtocolByService: map[string]RedisProtocol{
+				"cache": RedisProtocolRESP2,
+				"CACHE": RedisProtocolRESP3,
+			},
+		})
+		if err == nil || !strings.Contains(err.Error(), "conflicting Redis protocols") {
+			t.Fatalf("Init error = %v, want conflicting protocols", err)
+		}
+	})
+
 	t.Run("routes to cluster dial", func(t *testing.T) {
 		os.Setenv("REDIS_CLUSTER_READ_WRITE", "redis://host1:6379,host2:6379,host3:6379")
 		defer os.Unsetenv("REDIS_CLUSTER_READ_WRITE")
@@ -610,12 +714,16 @@ func TestInit(t *testing.T) {
 			if len(opts.Addrs) != 3 {
 				t.Errorf("Cluster addrs = %d, want 3", len(opts.Addrs))
 			}
+			if opts.Protocol != RedisProtocolRESP2 {
+				t.Errorf("Cluster protocol = %d, want RESP2", opts.Protocol)
+			}
 			return &mockConnection{isCluster: true}, nil
 		}
 
 		_, err := Init(ConnectionOptions{
-			Dial:        mockDial,
-			ClusterDial: clusterDial,
+			Dial:              mockDial,
+			ClusterDial:       clusterDial,
+			ProtocolByService: map[string]RedisProtocol{"cluster": RedisProtocolRESP2},
 		})
 		if err != nil {
 			t.Fatalf("Init() error = %v", err)
@@ -636,12 +744,16 @@ func TestInit(t *testing.T) {
 			if opts.MasterName != "mymaster" {
 				t.Errorf("MasterName = %q, want 'mymaster'", opts.MasterName)
 			}
+			if opts.Protocol != RedisProtocolRESP2 {
+				t.Errorf("Sentinel protocol = %d, want RESP2", opts.Protocol)
+			}
 			return &mockConnection{}, nil
 		}
 
 		_, err := Init(ConnectionOptions{
-			Dial:         mockDial,
-			SentinelDial: sentinelDial,
+			Dial:              mockDial,
+			SentinelDial:      sentinelDial,
+			ProtocolByService: map[string]RedisProtocol{"sentinel": RedisProtocolRESP2},
 		})
 		if err != nil {
 			t.Fatalf("Init() error = %v", err)
@@ -926,6 +1038,36 @@ func TestDialFromURI_Routing(t *testing.T) {
 
 		if !capturedOpts.ReadOnly {
 			t.Error("Read connection should set ReadOnly=true")
+		}
+	})
+
+	t.Run("standalone keeps command and dial retry controls distinct", func(t *testing.T) {
+		var capturedOpts *DialOptions
+		captureDial := func(ctx context.Context, opts *DialOptions) (Connection, error) {
+			copy := *opts
+			capturedOpts = &copy
+			return &mockConnection{}, nil
+		}
+		retryOpts := envPoolOpts{
+			MaxRetries:         20,
+			MinRetryBackoff:    50 * time.Millisecond,
+			MaxRetryBackoff:    2 * time.Second,
+			DialerRetries:      1,
+			DialerRetryTimeout: 75 * time.Millisecond,
+		}
+
+		_, err := dialFromURI(ctx, "redis://localhost:6379", job, ConnectionOptions{Dial: captureDial}, "client", nil, retryOpts)
+		if err != nil {
+			t.Fatalf("dialFromURI() error = %v", err)
+		}
+		if capturedOpts == nil {
+			t.Fatal("standalone dial options were not captured")
+		}
+		if capturedOpts.MaxRetries != 20 || capturedOpts.MinRetryBackoff != 50*time.Millisecond || capturedOpts.MaxRetryBackoff != 2*time.Second {
+			t.Errorf("command retry options = %+v, want 20/50ms/2s", capturedOpts)
+		}
+		if capturedOpts.DialerRetries != 1 || capturedOpts.DialerRetryTimeout != 75*time.Millisecond {
+			t.Errorf("dial retry options = %+v, want 1/75ms", capturedOpts)
 		}
 	})
 }

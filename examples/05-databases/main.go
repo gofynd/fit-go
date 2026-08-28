@@ -20,7 +20,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log"
 
@@ -57,10 +56,10 @@ func main() {
 	} else {
 		defer pgClient.Close()
 		if conn := pgClient.Service("orders"); conn != nil {
-			// Postgres exposes *sql.DB directly for Read and Write.
-			var rw *sql.DB = conn.Write
+			// Postgres exposes a *pgxpool.Pool (pgx v5) for Read and Write.
+			rw := conn.Write
 			_ = rw
-			fmt.Println("postgres 'orders' read/write *sql.DB ready")
+			fmt.Println("postgres 'orders' read/write *pgxpool.Pool ready")
 		}
 		checker.AddCheck(pgClient.HealthCheck())
 	}
