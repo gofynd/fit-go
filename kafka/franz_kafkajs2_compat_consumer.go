@@ -277,14 +277,23 @@ func (c *franzKafkaJS2CompatConsumer) Consume(handler MessageHandler, opts Consu
 	if handler == nil {
 		return fmt.Errorf("kafka/kafkajs: message handler is nil")
 	}
+	handlerWithContext := func(_ context.Context, payload MessagePayload) error {
+		return handler(payload)
+	}
+	if opts.OffsetFinalizer != nil {
+		return c.consumeMessages(handlerWithContext, opts)
+	}
 	return c.consumeMessages(func(ctx context.Context, payload MessagePayload) error {
-		return runTracedMessageHandler(ctx, payload, func(_ context.Context, traced MessagePayload) error { return handler(traced) })
+		return runTracedMessageHandler(ctx, payload, handlerWithContext)
 	}, opts)
 }
 
 func (c *franzKafkaJS2CompatConsumer) ConsumeCtx(handler MessageHandlerCtx, opts ConsumerOptions) error {
 	if handler == nil {
 		return fmt.Errorf("kafka/kafkajs: message handler is nil")
+	}
+	if opts.OffsetFinalizer != nil {
+		return c.consumeMessages(kafkaJSMessageHandler(handler), opts)
 	}
 	return c.consumeMessages(func(ctx context.Context, payload MessagePayload) error {
 		return runTracedMessageHandler(ctx, payload, handler)
@@ -441,31 +450,34 @@ func (c *franzKafkaJS2CompatConsumer) processRecord(
 			)
 		}
 	}
-	handlerErr := handler(ctx, payload)
 	if opts.OffsetFinalizer != nil {
-		commitCalled := false
-		commitExact := func(exact int64) error {
-			if commitCalled {
-				return fmt.Errorf("kafka/kafkajs: exact offset commit callback called more than once")
+		return runTracedMessageLifecycle(ctx, payload, MessageHandlerCtx(handler), func(messageCtx context.Context, handlerErr error) error {
+			commitCalled := false
+			commitExact := func(exact int64) error {
+				if commitCalled {
+					return fmt.Errorf("kafka/kafkajs: exact offset commit callback called more than once")
+				}
+				commitCalled = true
+				return commitKafkaJSExact(messageCtx, client, record, exact, opts.NullOffsetCommitMetadata)
 			}
-			commitCalled = true
-			return commitKafkaJSExact(ctx, client, record, exact, opts.NullOffsetCommitMetadata)
-		}
-		finalizerErr := opts.OffsetFinalizer(ctx, payload, handlerErr, commitExact)
-		if finalizerErr != nil {
-			return finalizerErr
-		}
-		if handlerErr == nil && opts.ResolveAfterSuccessfulFinalizer {
-			return resolveKafkaJSRecord(ctx, client, record, isAutoCommit, opts.NullOffsetCommitMetadata)
-		}
-		if handlerErr != nil && opts.RedeliverUnresolvedFinalizer {
-			client.SetOffsets(map[string]map[int32]kgo.EpochOffset{
-				record.Topic: {record.Partition: {Epoch: record.LeaderEpoch, Offset: record.Offset}},
-			})
-			return errKafkaJSUnresolvedRecordRewound
-		}
-		return nil
+			finalizerErr := opts.OffsetFinalizer(messageCtx, payload, handlerErr, commitExact)
+			if finalizerErr != nil {
+				return finalizerErr
+			}
+			if handlerErr == nil && opts.ResolveAfterSuccessfulFinalizer {
+				return resolveKafkaJSRecord(messageCtx, client, record, isAutoCommit, opts.NullOffsetCommitMetadata)
+			}
+			if handlerErr != nil && opts.RedeliverUnresolvedFinalizer {
+				client.SetOffsets(map[string]map[int32]kgo.EpochOffset{
+					record.Topic: {record.Partition: {Epoch: record.LeaderEpoch, Offset: record.Offset}},
+				})
+				return errKafkaJSUnresolvedRecordRewound
+			}
+			return nil
+		})
 	}
+
+	handlerErr := handler(ctx, payload)
 	if handlerErr != nil {
 		return fmt.Errorf("kafka/kafkajs: message handler failed: %w", handlerErr)
 	}

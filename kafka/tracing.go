@@ -134,6 +134,29 @@ func runTracedMessageHandler(base context.Context, msg MessagePayload, handler M
 	return err
 }
 
+// runTracedMessageLifecycle keeps the consumer span active through completion
+// work that belongs to the same delivered record, such as an exact offset
+// finalizer. Span status continues to reflect the handler result so extending
+// the context lifetime does not change existing error classification.
+func runTracedMessageLifecycle(
+	base context.Context,
+	msg MessagePayload,
+	handler MessageHandlerCtx,
+	complete func(context.Context, error) error,
+) error {
+	ctx, span := startConsumerSpanFromContext(base, msg)
+	cleanup := tracing.InjectContextIntoGoroutine(ctx)
+	defer cleanup()
+	if span != nil {
+		defer span.End()
+	}
+	handlerErr := handler(ctx, msg)
+	if span != nil {
+		recordSpanResult(span, handlerErr)
+	}
+	return complete(ctx, handlerErr)
+}
+
 // InjectTraceHeaders injects every field owned by the configured global
 // propagator from the current span in ctx. Before injection it removes all stale
 // propagation fields case-insensitively, including duplicates and fields absent

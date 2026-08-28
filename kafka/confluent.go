@@ -1106,16 +1106,23 @@ func (cc *ConfluentConsumer) Consume(handler MessageHandler, opts ConsumerOption
 	if handler == nil {
 		return fmt.Errorf("kafka/confluent: message handler is nil")
 	}
+	handlerWithContext := func(_ context.Context, payload MessagePayload) error {
+		return handler(payload)
+	}
+	if opts.OffsetFinalizer != nil {
+		return cc.consumeMessages(handlerWithContext, opts)
+	}
 	return cc.consumeMessages(func(ctx context.Context, payload MessagePayload) error {
-		return runTracedMessageHandler(ctx, payload, func(_ context.Context, traced MessagePayload) error {
-			return handler(traced)
-		})
+		return runTracedMessageHandler(ctx, payload, handlerWithContext)
 	}, opts)
 }
 
 func (cc *ConfluentConsumer) ConsumeCtx(handler MessageHandlerCtx, opts ConsumerOptions) error {
 	if handler == nil {
 		return fmt.Errorf("kafka/confluent: message handler is nil")
+	}
+	if opts.OffsetFinalizer != nil {
+		return cc.consumeMessages(confluentMessageHandler(handler), opts)
 	}
 	return cc.consumeMessages(func(ctx context.Context, payload MessagePayload) error {
 		return runTracedMessageHandler(ctx, payload, handler)
@@ -1204,57 +1211,64 @@ func (cc *ConfluentConsumer) processMessageGroup(
 			}
 		}
 
-		handlerErr := handler(ctx, payload)
 		if opts.OffsetFinalizer != nil {
-			commitCalled := false
-			commitExact := func(exact int64) error {
-				if commitCalled {
-					return fmt.Errorf("kafka/confluent: exact offset commit callback called more than once")
+			err := runTracedMessageLifecycle(ctx, payload, MessageHandlerCtx(handler), func(messageCtx context.Context, handlerErr error) error {
+				commitCalled := false
+				commitExact := func(exact int64) error {
+					if commitCalled {
+						return fmt.Errorf("kafka/confluent: exact offset commit callback called more than once")
+					}
+					commitCalled = true
+					offset := message.TopicPartition
+					offset.Offset = ckafka.Offset(exact)
+					if opts.NullOffsetCommitMetadata {
+						offset.Metadata = nil
+					}
+					if _, err := consumer.CommitOffsets([]ckafka.TopicPartition{offset}); err != nil {
+						return &exactOffsetCommitError{err: err}
+					}
+					return nil
 				}
-				commitCalled = true
-				offset := message.TopicPartition
-				offset.Offset = ckafka.Offset(exact)
-				if opts.NullOffsetCommitMetadata {
-					offset.Metadata = nil
+				finalizerErr := opts.OffsetFinalizer(messageCtx, payload, handlerErr, commitExact)
+				if finalizerErr != nil {
+					var commitErr *exactOffsetCommitError
+					if errors.As(finalizerErr, &commitErr) {
+						cc.logMessageFailure("kafka/confluent: exact offset commit failed", message, finalizerErr)
+						return fmt.Errorf("kafka/confluent: exact offset commit failed: %w", finalizerErr)
+					}
+					if handlerErr != nil && errors.Is(finalizerErr, handlerErr) {
+						cc.logMessageFailure("kafka/confluent: message handler error", message, finalizerErr)
+						return fmt.Errorf("kafka/confluent: message handler failed: %w", finalizerErr)
+					}
+					cc.logMessageFailure("kafka/confluent: offset finalizer failed", message, finalizerErr)
+					return fmt.Errorf("kafka/confluent: offset finalizer failed: %w", finalizerErr)
 				}
-				if _, err := consumer.CommitOffsets([]ckafka.TopicPartition{offset}); err != nil {
-					return &exactOffsetCommitError{err: err}
+				if handlerErr == nil && opts.ResolveAfterSuccessfulFinalizer {
+					var resolveErr error
+					if opts.NullOffsetCommitMetadata {
+						resolved := message.TopicPartition
+						resolved.Offset++
+						resolved.Metadata = nil
+						if _, commitErr := consumer.CommitOffsets([]ckafka.TopicPartition{resolved}); commitErr != nil {
+							resolveErr = fmt.Errorf("kafka/confluent: post-handler commit failed: %w", commitErr)
+						}
+					} else {
+						resolveErr = cc.resolveMessageOffset(consumer, message, isAutoCommit, false)
+					}
+					if resolveErr != nil {
+						cc.logMessageFailure("kafka/confluent: post-finalizer offset resolution failed", message, resolveErr)
+						return resolveErr
+					}
 				}
 				return nil
-			}
-			finalizerErr := opts.OffsetFinalizer(ctx, payload, handlerErr, commitExact)
-			if finalizerErr != nil {
-				var commitErr *exactOffsetCommitError
-				if errors.As(finalizerErr, &commitErr) {
-					cc.logMessageFailure("kafka/confluent: exact offset commit failed", message, finalizerErr)
-					return fmt.Errorf("kafka/confluent: exact offset commit failed: %w", finalizerErr)
-				}
-				if handlerErr != nil && errors.Is(finalizerErr, handlerErr) {
-					cc.logMessageFailure("kafka/confluent: message handler error", message, finalizerErr)
-					return fmt.Errorf("kafka/confluent: message handler failed: %w", finalizerErr)
-				}
-				cc.logMessageFailure("kafka/confluent: offset finalizer failed", message, finalizerErr)
-				return fmt.Errorf("kafka/confluent: offset finalizer failed: %w", finalizerErr)
-			}
-			if handlerErr == nil && opts.ResolveAfterSuccessfulFinalizer {
-				var err error
-				if opts.NullOffsetCommitMetadata {
-					resolved := message.TopicPartition
-					resolved.Offset++
-					resolved.Metadata = nil
-					if _, commitErr := consumer.CommitOffsets([]ckafka.TopicPartition{resolved}); commitErr != nil {
-						err = fmt.Errorf("kafka/confluent: post-handler commit failed: %w", commitErr)
-					}
-				} else {
-					err = cc.resolveMessageOffset(consumer, message, isAutoCommit, false)
-				}
-				if err != nil {
-					cc.logMessageFailure("kafka/confluent: post-finalizer offset resolution failed", message, err)
-					return err
-				}
+			})
+			if err != nil {
+				return err
 			}
 			continue
 		}
+
+		handlerErr := handler(ctx, payload)
 
 		if handlerErr != nil {
 			if ctx.Err() != nil {

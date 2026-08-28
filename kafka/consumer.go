@@ -106,6 +106,9 @@ func IsTransientConsumerError(err error) bool {
 // handler returns. handlerErr is the unmodified handler result. The finalizer
 // may skip the commit, await commit(exactOffset), perform post-commit work, and
 // then return the outcome whose precedence the legacy runtime requires.
+// The supplied context is the same message-span context passed to ConsumeCtx's
+// handler and remains active until the finalizer and any requested resolution
+// complete.
 //
 // This hook exists for compatibility consumers whose behavior cannot be
 // represented by automatic commit, commit-after-success or CommitBeforeHandler.

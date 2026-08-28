@@ -25,6 +25,7 @@ import (
 	ckafka "github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/gofynd/fit-go/tracing"
 	"github.com/stretchr/testify/require"
+	"github.com/twmb/franz-go/pkg/kgo"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/codes"
@@ -116,6 +117,67 @@ func spanByID(spans tracetest.SpanStubs, spanID string) (tracetest.SpanStub, boo
 		}
 	}
 	return tracetest.SpanStub{}, false
+}
+
+func TestOffsetFinalizerRunsInsideMessageTrace(t *testing.T) {
+	_, exporter := enabledKafkaTracer(t)
+
+	tests := []struct {
+		name string
+		run  func(MessageHandlerCtx, OffsetFinalizer) error
+	}{
+		{
+			name: "confluent",
+			run: func(handler MessageHandlerCtx, finalizer OffsetFinalizer) error {
+				topic := "discount-sync"
+				message := &ckafka.Message{TopicPartition: ckafka.TopicPartition{
+					Topic: &topic, Partition: 1, Offset: 42,
+				}}
+				group := groupConfluentBatchMessages([]*ckafka.Message{message})[0]
+				driver := &fakeConfluentConsumerDriver{}
+				return newTestConfluentConsumer(false, driver).processMessageGroup(
+					context.Background(), driver, group, confluentMessageHandler(handler), false,
+					ConsumerOptions{OffsetFinalizer: finalizer},
+				)
+			},
+		},
+		{
+			name: "kafkajs",
+			run: func(handler MessageHandlerCtx, finalizer OffsetFinalizer) error {
+				record := &kgo.Record{Topic: "discount-sync", Partition: 1, Offset: 42}
+				return (&franzKafkaJS2CompatConsumer{}).processRecord(
+					context.Background(), &fakeFranzKafkaJS2CompatClient{}, record,
+					kafkaJSMessageHandler(handler), false, ConsumerOptions{OffsetFinalizer: finalizer},
+				)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			exporter.Reset()
+			var handlerContext, finalizerContext oteltrace.SpanContext
+			err := test.run(
+				func(ctx context.Context, _ MessagePayload) error {
+					handlerContext = oteltrace.SpanContextFromContext(ctx)
+					require.True(t, handlerContext.IsValid())
+					require.Empty(t, exportedSpansNamed(exporter, "process "), "message span ended before finalizer")
+					return nil
+				},
+				func(ctx context.Context, _ MessagePayload, handlerErr error, _ ExactOffsetCommit) error {
+					require.NoError(t, handlerErr)
+					finalizerContext = oteltrace.SpanContextFromContext(ctx)
+					require.True(t, finalizerContext.IsValid())
+					require.Empty(t, exportedSpansNamed(exporter, "process "), "message span ended during finalizer")
+					return nil
+				},
+			)
+			require.NoError(t, err)
+			require.Equal(t, handlerContext.TraceID(), finalizerContext.TraceID())
+			require.Equal(t, handlerContext.SpanID(), finalizerContext.SpanID())
+			require.Len(t, exportedSpansNamed(exporter, "process "), 1)
+		})
+	}
 }
 
 func TestExplicitProducerSpanEntryPointsAdoptActiveGoroutineParent(t *testing.T) {
