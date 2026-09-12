@@ -109,10 +109,7 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 
 	// 4. Initialize tracing if enabled
 	if cfg.GetBool("TRACING_ENABLED", false) {
-		tracer, err := tracing.New(ctx, tracing.Options{
-			ServiceName: cfg.GetString("SERVICE_NAME", "unknown"),
-			Env:         cfg.GetString("NODE_ENV", "development"),
-		})
+		tracer, err := tracing.InitWithOptions(tracingOptionsFromConfig(cfg))
 		if err != nil {
 			logger.Warn("fit: tracing init failed, continuing without tracing", "error", err)
 		} else {
@@ -143,6 +140,13 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 	)
 
 	return f, nil
+}
+
+func tracingOptionsFromConfig(cfg *config.Config) tracing.Options {
+	opts := tracing.DefaultOptions()
+	opts.ServiceName = cfg.GetString("OTEL_SERVICE_NAME", cfg.GetString("SERVICE_NAME", opts.ServiceName))
+	opts.Env = cfg.GetString("GO_ENV", cfg.GetString("NODE_ENV", opts.Env))
+	return opts
 }
 
 // Shutdown gracefully shuts down all framework components.

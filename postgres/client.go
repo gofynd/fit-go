@@ -65,6 +65,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -76,6 +77,8 @@ type ServiceConnection struct {
 
 // ConnectionOptions configures the PostgreSQL client initialization.
 type ConnectionOptions struct {
+	// QueryTracer instruments every query executed by created pools.
+	QueryTracer pgx.QueryTracer
 	// MaxConns is the maximum number of connections per pool. Defaults to 20.
 	MaxConns int32
 	// MinConns is the minimum number of idle connections per pool. Defaults to 5.
@@ -315,6 +318,7 @@ func (c *Client) HealthCheck() func() string {
 // ---------------------------------------------------------------------------
 
 type poolSettings struct {
+	QueryTracer       pgx.QueryTracer
 	MaxConns          int32
 	MinConns          int32
 	MaxConnLifetime   time.Duration
@@ -323,6 +327,20 @@ type poolSettings struct {
 }
 
 func createPool(ctx context.Context, connStr, appName string, tlsCfg *tls.Config, settings poolSettings) (*pgxpool.Pool, error) {
+	poolCfg, err := buildPoolConfig(connStr, appName, tlsCfg, settings)
+	if err != nil {
+		return nil, err
+	}
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		return nil, fmt.Errorf("create pool: %w", err)
+	}
+
+	return pool, nil
+}
+
+func buildPoolConfig(connStr, appName string, tlsCfg *tls.Config, settings poolSettings) (*pgxpool.Config, error) {
 	// Append application_name to connection string if not present.
 	if appName != "" && !strings.Contains(connStr, "application_name") {
 		sep := "?"
@@ -346,17 +364,15 @@ func createPool(ctx context.Context, connStr, appName string, tlsCfg *tls.Config
 	if tlsCfg != nil {
 		poolCfg.ConnConfig.TLSConfig = tlsCfg
 	}
-
-	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
-	if err != nil {
-		return nil, fmt.Errorf("create pool: %w", err)
+	if settings.QueryTracer != nil {
+		poolCfg.ConnConfig.Tracer = settings.QueryTracer
 	}
-
-	return pool, nil
+	return poolCfg, nil
 }
 
 func poolSettingsFromEnv(serviceNameUpper, connTypeEnv string, opts ConnectionOptions, serviceName, connType string) poolSettings {
 	ps := poolSettings{
+		QueryTracer:       opts.QueryTracer,
 		MaxConns:          opts.MaxConns,
 		MinConns:          opts.MinConns,
 		MaxConnLifetime:   opts.MaxConnLifetime,

@@ -22,6 +22,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ---------------------------------------------------------------------------
@@ -343,6 +345,30 @@ func TestLogger_WithContext(t *testing.T) {
 	}
 	if entry["span_id"] != "span-456" {
 		t.Errorf("span_id = %v, want span-456", entry["span_id"])
+	}
+}
+
+func TestLogger_WithContextReadsOpenTelemetrySpanContext(t *testing.T) {
+	var buf bytes.Buffer
+	logger, _ := New(Options{Level: "info", Output: &buf, Env: "production"})
+
+	traceID, _ := trace.TraceIDFromHex("0af7651916cd43dd8448eb211c80319c")
+	spanID, _ := trace.SpanIDFromHex("b7ad6b7169203331")
+	spanContext := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID: traceID, SpanID: spanID, TraceFlags: trace.FlagsSampled,
+	})
+	ctx := trace.ContextWithSpanContext(context.Background(), spanContext)
+	logger.WithContext(ctx).Info("otel context")
+
+	var entry map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
+		t.Fatalf("decode log entry: %v", err)
+	}
+	if entry["trace_id"] != traceID.String() {
+		t.Fatalf("trace_id = %v, want %s", entry["trace_id"], traceID)
+	}
+	if entry["span_id"] != spanID.String() {
+		t.Fatalf("span_id = %v, want %s", entry["span_id"], spanID)
 	}
 }
 

@@ -28,6 +28,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 // Context keys for trace propagation. These match the OpenTelemetry context
@@ -146,7 +148,7 @@ type entry struct {
 // Logger is a structured, thread-safe JSON logger. It is the Go equivalent
 // of the Winston logger created tracing/index.ts.
 type Logger struct {
-	mu       sync.Mutex
+	mu       *sync.Mutex
 	level    Level
 	loc      *time.Location
 	env      string
@@ -202,6 +204,7 @@ func New(opts Options) (*Logger, error) {
 	}
 
 	return &Logger{
+		mu:       &sync.Mutex{},
 		level:    ParseLevel(opts.Level),
 		loc:      loc,
 		env:      opts.Env,
@@ -211,10 +214,15 @@ func New(opts Options) (*Logger, error) {
 	}, nil
 }
 
-// clone returns a shallow copy of the logger with its own mutex and a
-// deep-copied fields map so that derived loggers are independent.
+// clone returns a shallow copy with a shared output lock and a deep-copied
+// fields map. All derived loggers write to the same stream, so they must also
+// share its serialization boundary.
 func (l *Logger) clone() *Logger {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	c := &Logger{
+		mu:       l.mu,
 		level:    l.level,
 		loc:      l.loc,
 		env:      l.env,
@@ -238,6 +246,11 @@ func (l *Logger) clone() *Logger {
 // performs via the opentelemetryLogFormat Winston format.
 func (l *Logger) WithContext(ctx context.Context) *Logger {
 	c := l.clone()
+	if spanContext := oteltrace.SpanContextFromContext(ctx); spanContext.IsValid() {
+		c.traceID = spanContext.TraceID().String()
+		c.spanID = spanContext.SpanID().String()
+		return c
+	}
 	if v, ok := ctx.Value(ctxKeyTraceID).(string); ok && v != "" {
 		c.traceID = v
 	}

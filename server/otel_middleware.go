@@ -28,14 +28,33 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gofynd/fit-go/tracing"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 )
+
+// OTelMiddlewareConfig controls HTTP trace enrichment. Sensitive and
+// high-cardinality request metadata is excluded unless explicitly requested.
+type OTelMiddlewareConfig struct {
+	Tracer           *tracing.Tracer
+	CaptureFullURL   bool
+	CaptureUserAgent bool
+	CaptureClientIP  bool
+}
 
 // OTelMiddleware returns a Gin middleware that instruments each request
 // with an OpenTelemetry span. When tracing is disabled (TRACING_ENABLED=false),
 // the middleware is a no-op passthrough.
 func OTelMiddleware() gin.HandlerFunc {
+	return OTelMiddlewareWithConfig(OTelMiddlewareConfig{})
+}
+
+// OTelMiddlewareWithConfig returns configurable Gin OpenTelemetry middleware.
+func OTelMiddlewareWithConfig(config OTelMiddlewareConfig) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		tracer := tracing.Global()
+		tracer := config.Tracer
+		if tracer == nil {
+			tracer = tracing.Global()
+		}
 		if tracer == nil || !tracer.IsEnabled() {
 			c.Next()
 			return
@@ -47,40 +66,42 @@ func OTelMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// Extract W3C traceparent from incoming request.
-		traceparent := c.GetHeader("traceparent")
-		ctx := c.Request.Context()
-		if traceparent != "" {
-			traceID, spanID, _ := tracing.ExtractTraceContext(traceparent)
-			if traceID != "" {
-				ctx = tracing.ContextWithTrace(ctx, traceID, spanID)
-			}
-		}
+		ctx := otel.GetTextMapPropagator().Extract(
+			c.Request.Context(),
+			propagation.HeaderCarrier(c.Request.Header),
+		)
 
-		spanName := fmt.Sprintf("%s %s", c.Request.Method, normalizeRoutePath(path))
+		route := c.FullPath()
+		if route == "" {
+			route = "/unmatched"
+		}
+		spanName := fmt.Sprintf("%s %s", c.Request.Method, route)
 		ctx, span := tracer.StartSpan(ctx, spanName, tracing.SpanKindServer)
 		defer span.End()
 
 		// Set HTTP semantic convention attributes.
-		span.SetAttributes(map[string]any{
-			"http.method":     c.Request.Method,
-			"http.url":        c.Request.URL.String(),
-			"http.target":     path,
-			"http.host":       c.Request.Host,
-			"http.scheme":     httpScheme(c.Request),
-			"http.user_agent": c.Request.UserAgent(),
-			"http.request_id": c.GetHeader("x-request-id"),
-			"net.peer.ip":     c.ClientIP(),
-			"http.route":      normalizeRoutePath(path),
-		})
+		attributes := map[string]any{
+			"http.request.method": c.Request.Method,
+			"url.scheme":          httpScheme(c.Request),
+			"http.route":          route,
+			"http.request_id":     RequestIDFromContext(c.Request.Context()),
+		}
+		if config.CaptureFullURL {
+			attributes["url.full"] = c.Request.URL.String()
+		}
+		if config.CaptureUserAgent {
+			attributes["user_agent.original"] = c.Request.UserAgent()
+		}
+		if config.CaptureClientIP {
+			attributes["client.address"] = c.ClientIP()
+		}
+		span.SetAttributes(attributes)
 
 		// Propagate trace context into the request for downstream handlers.
 		c.Request = c.Request.WithContext(ctx)
 
-		// Inject traceparent into response headers for client correlation.
-		if span.TraceID() != "" && span.SpanID() != "" {
-			c.Header("traceparent", tracing.FormatTraceparent(span.TraceID(), span.SpanID(), true))
-		}
+		// Inject the real sampled state for client correlation.
+		otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(c.Writer.Header()))
 
 		c.Next()
 

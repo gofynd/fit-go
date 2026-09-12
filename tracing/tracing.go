@@ -46,6 +46,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
@@ -54,13 +55,19 @@ import (
 
 // Options configures the tracer.
 type Options struct {
-	ServiceName    string
-	Env            string
-	Endpoint       string            // OTLP endpoint
-	SampleRate     float64           // Sampling rate (0.0-1.0)
-	BatchTimeout   time.Duration     // Span batch export timeout
-	MaxExportBatch int               // Maximum spans per export batch
-	Attributes     map[string]string // Additional resource attributes
+	// Enabled explicitly controls SDK initialization. When nil, TRACING_ENABLED
+	// remains the backwards-compatible source of truth.
+	Enabled          *bool
+	ServiceName      string
+	Env              string
+	Endpoint         string            // OTLP endpoint
+	SampleRate       float64           // Sampling rate (0.0-1.0)
+	BatchTimeout     time.Duration     // Maximum delay before exporting a batch
+	ExportTimeout    time.Duration     // Timeout for an exporter call
+	MaxQueueSize     int               // Maximum number of queued spans
+	MaxExportBatch   int               // Maximum spans per export batch
+	BlockOnQueueFull bool              // Apply backpressure instead of dropping spans
+	Attributes       map[string]string // Additional resource attributes
 	// SpanExporter allows injecting a custom span exporter (useful for testing).
 	SpanExporter sdktrace.SpanExporter `json:"-"`
 	// UseSimpleSpanProcessor uses a synchronous span processor instead of batch.
@@ -70,12 +77,16 @@ type Options struct {
 
 // DefaultOptions returns default tracer options from environment.
 func DefaultOptions() Options {
+	enabled := isTracingEnabled()
 	return Options{
+		Enabled:        &enabled,
 		ServiceName:    envString("OTEL_SERVICE_NAME", envString("SERVICE_NAME", "unknown")),
 		Env:            envString("GO_ENV", envString("NODE_ENV", "development")),
 		Endpoint:       envString("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
 		SampleRate:     1.0,
 		BatchTimeout:   5 * time.Second,
+		ExportTimeout:  30 * time.Second,
+		MaxQueueSize:   2048,
 		MaxExportBatch: 512,
 	}
 }
@@ -186,6 +197,15 @@ func (s *Span) TraceID() string { return s.traceID }
 // SpanID returns the span's ID.
 func (s *Span) SpanID() string { return s.spanID }
 
+// IsSampled reports the recording decision carried by the real OpenTelemetry
+// span. Disabled/in-memory spans are never reported as sampled.
+func (s *Span) IsSampled() bool {
+	if s == nil || s.otelSpan == nil {
+		return false
+	}
+	return s.otelSpan.SpanContext().IsSampled()
+}
+
 // Tracer wraps OpenTelemetry tracing functionality.
 type Tracer struct {
 	serviceName string
@@ -205,10 +225,14 @@ var (
 // New creates a new tracer. When tracing is enabled, this initializes the
 // real OpenTelemetry SDK with an OTLP HTTP exporter.
 func New(ctx context.Context, opts Options) (*Tracer, error) {
+	enabled := isTracingEnabled()
+	if opts.Enabled != nil {
+		enabled = *opts.Enabled
+	}
 	t := &Tracer{
 		serviceName: opts.ServiceName,
 		env:         opts.Env,
-		enabled:     isTracingEnabled(),
+		enabled:     enabled,
 		options:     opts,
 	}
 
@@ -247,7 +271,11 @@ func (t *Tracer) initOTel(ctx context.Context, opts Options) error {
 	} else {
 		exporterOpts := []otlptracehttp.Option{}
 		if opts.Endpoint != "" {
-			exporterOpts = append(exporterOpts, otlptracehttp.WithEndpoint(opts.Endpoint))
+			if strings.Contains(opts.Endpoint, "://") {
+				exporterOpts = append(exporterOpts, otlptracehttp.WithEndpointURL(opts.Endpoint))
+			} else {
+				exporterOpts = append(exporterOpts, otlptracehttp.WithEndpoint(opts.Endpoint))
+			}
 		}
 		exp, err := otlptracehttp.New(ctx, exporterOpts...)
 		if err != nil {
@@ -269,17 +297,26 @@ func (t *Tracer) initOTel(ctx context.Context, opts Options) error {
 		if opts.MaxExportBatch > 0 {
 			bspOpts = append(bspOpts, sdktrace.WithMaxExportBatchSize(opts.MaxExportBatch))
 		}
+		if opts.MaxQueueSize > 0 {
+			bspOpts = append(bspOpts, sdktrace.WithMaxQueueSize(opts.MaxQueueSize))
+		}
+		if opts.ExportTimeout > 0 {
+			bspOpts = append(bspOpts, sdktrace.WithExportTimeout(opts.ExportTimeout))
+		}
+		if opts.BlockOnQueueFull {
+			bspOpts = append(bspOpts, sdktrace.WithBlocking())
+		}
 		sp = sdktrace.NewBatchSpanProcessor(exporter, bspOpts...)
 	}
 
 	// Configure sampler.
 	var sampler sdktrace.Sampler
 	if opts.SampleRate >= 1.0 {
-		sampler = sdktrace.AlwaysSample()
+		sampler = sdktrace.ParentBased(sdktrace.AlwaysSample())
 	} else if opts.SampleRate <= 0.0 {
-		sampler = sdktrace.NeverSample()
+		sampler = sdktrace.ParentBased(sdktrace.NeverSample())
 	} else {
-		sampler = sdktrace.TraceIDRatioBased(opts.SampleRate)
+		sampler = sdktrace.ParentBased(sdktrace.TraceIDRatioBased(opts.SampleRate))
 	}
 
 	tp := sdktrace.NewTracerProvider(
@@ -291,6 +328,10 @@ func (t *Tracer) initOTel(ctx context.Context, opts Options) error {
 	t.provider = tp
 	t.otelTracer = tp.Tracer("fit.go/" + opts.ServiceName)
 	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
 
 	return nil
 }
@@ -305,11 +346,12 @@ func Init() error {
 func InitWithOptions(opts Options) (*Tracer, error) {
 	var initErr error
 	globalTracerOnce.Do(func() {
-		var err error
-		globalTracer, err = New(context.Background(), opts)
+		candidate, err := New(context.Background(), opts)
 		if err != nil {
 			initErr = err
+			return
 		}
+		globalTracer = candidate
 	})
 	return globalTracer, initErr
 }
@@ -333,6 +375,14 @@ func Shutdown(ctx context.Context) error {
 // Shutdown gracefully shuts down this tracer, flushing any remaining spans.
 func (t *Tracer) Shutdown(ctx context.Context) error {
 	return t.shutdown(ctx)
+}
+
+// ForceFlush immediately exports all ended spans queued by the tracer.
+func (t *Tracer) ForceFlush(ctx context.Context) error {
+	if t == nil || !t.enabled || t.provider == nil {
+		return nil
+	}
+	return t.provider.ForceFlush(ctx)
 }
 
 func (t *Tracer) shutdown(ctx context.Context) error {
@@ -375,20 +425,16 @@ func (t *Tracer) StartSpan(ctx context.Context, name string, kind SpanKind) (con
 	}
 	span := &Span{
 		name:      name,
-		traceID:   TraceIDFromContext(ctx),
-		spanID:    generateID(8),
-		parentID:  SpanIDFromContext(ctx),
 		startTime: time.Now(),
 		kind:      kind,
 	}
 
-	// Generate new trace ID if not in existing trace
-	if span.traceID == "" {
-		span.traceID = generateID(16)
-	}
-
 	// If OTel is initialized, create a real span.
 	if t.otelTracer != nil {
+		parent := trace.SpanContextFromContext(ctx)
+		if parent.HasSpanID() {
+			span.parentID = parent.SpanID().String()
+		}
 		var otelCtx context.Context
 		var otelSpan trace.Span
 		otelCtx, otelSpan = t.otelTracer.Start(ctx, name,
@@ -406,6 +452,13 @@ func (t *Tracer) StartSpan(ctx context.Context, name string, kind SpanKind) (con
 		}
 
 		ctx = otelCtx
+	} else {
+		span.traceID = TraceIDFromContext(ctx)
+		span.spanID = generateID(8)
+		span.parentID = SpanIDFromContext(ctx)
+		if span.traceID == "" {
+			span.traceID = generateID(16)
+		}
 	}
 
 	// Add span to context for our own lookup as well.
@@ -466,6 +519,9 @@ func SetSpanAttributesWithStatus(ctx context.Context, attrs SpanAttributes, stat
 var IgnoredPaths = []*regexp.Regexp{
 	regexp.MustCompile(`^/_healthz(/.*)?$`),
 	regexp.MustCompile(`^/_readyz(/.*)?$`),
+	regexp.MustCompile(`^/health(/.*)?$`),
+	regexp.MustCompile(`^/ready(/.*)?$`),
+	regexp.MustCompile(`^/metrics(/.*)?$`),
 }
 
 // AddIgnoredPath adds a path pattern to the ignore list.

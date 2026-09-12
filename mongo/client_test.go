@@ -18,6 +18,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -27,6 +28,7 @@ import (
 // ---------------------------------------------------------------------------
 
 type mockConnection struct {
+	mu          sync.Mutex
 	pingCalled  bool
 	closeCalled bool
 	pingErr     error
@@ -34,11 +36,15 @@ type mockConnection struct {
 }
 
 func (m *mockConnection) Ping(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.pingCalled = true
 	return m.pingErr
 }
 
 func (m *mockConnection) Close(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.closeCalled = true
 	return m.closeErr
 }
