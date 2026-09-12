@@ -17,11 +17,15 @@ package tracing
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"sync"
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
@@ -73,6 +77,34 @@ func TestTracerInit_Disabled(t *testing.T) {
 	}
 }
 
+func TestTracerInit_ProgrammaticEnableOverridesEnvironment(t *testing.T) {
+	os.Unsetenv("TRACING_ENABLED")
+	defer os.Unsetenv("TRACING_ENABLED")
+
+	enabled := true
+	exporter := tracetest.NewInMemoryExporter()
+	tracer, err := New(context.Background(), Options{
+		Enabled:                &enabled,
+		ServiceName:            "programmatically-enabled",
+		SampleRate:             1,
+		SpanExporter:           exporter,
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = tracer.Shutdown(context.Background()) })
+
+	if !tracer.IsEnabled() {
+		t.Fatal("Tracer should honor Options.Enabled without mutating process environment")
+	}
+	_, span := tracer.StartSpan(context.Background(), "programmatic", SpanKindInternal)
+	span.End()
+	if got := len(exporter.GetSpans()); got != 1 {
+		t.Fatalf("exported spans = %d, want 1", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // TestTracerInit_Enabled
 // ---------------------------------------------------------------------------
@@ -119,6 +151,41 @@ func TestTracerInit_Enabled(t *testing.T) {
 	}
 
 	tracer.Shutdown(context.Background())
+}
+
+func TestTracerExporter_AppendsOTLPTracePathToBaseURL(t *testing.T) {
+	t.Setenv("TRACING_ENABLED", "true")
+
+	requestPath := make(chan string, 1)
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestPath <- r.URL.Path
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(receiver.Close)
+
+	tracer, err := New(context.Background(), Options{
+		ServiceName:            "endpoint-path-test",
+		Endpoint:               receiver.URL,
+		SampleRate:             1,
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = tracer.Shutdown(context.Background()) })
+
+	_, span := tracer.StartSpan(context.Background(), "export-path", SpanKindInternal)
+	span.End()
+
+	select {
+	case got := <-requestPath:
+		if got != "/v1/traces" {
+			t.Fatalf("OTLP request path = %q, want /v1/traces", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for OTLP export")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +481,10 @@ func TestShouldTrace(t *testing.T) {
 		{"/api/orders", true},
 		{"/_healthz", false},
 		{"/_readyz", false},
+		{"/health", false},
+		{"/health/live", false},
+		{"/ready", false},
+		{"/metrics", false},
 		{"/_healthz/detailed", false},
 		{"/_readyz/live", false},
 	}
@@ -685,5 +756,70 @@ func TestDefaultOptions(t *testing.T) {
 	}
 	if opts.Env != "production" {
 		t.Errorf("Env = %q, want production", opts.Env)
+	}
+}
+
+func TestTracerRegistersW3CPropagation(t *testing.T) {
+	t.Setenv("TRACING_ENABLED", "true")
+	exporter := tracetest.NewInMemoryExporter()
+
+	tracer, err := New(context.Background(), Options{
+		ServiceName:            "propagation-test",
+		SampleRate:             1,
+		SpanExporter:           exporter,
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = tracer.Shutdown(context.Background()) })
+
+	carrier := propagation.HeaderCarrier(http.Header{
+		"Traceparent": []string{"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"},
+	})
+	ctx := otel.GetTextMapPropagator().Extract(context.Background(), carrier)
+	ctx, span := tracer.StartSpan(ctx, "continued", SpanKindServer)
+	span.End()
+
+	spanContext := oteltrace.SpanContextFromContext(ctx)
+	if got := spanContext.TraceID().String(); got != "0af7651916cd43dd8448eb211c80319c" {
+		t.Fatalf("trace ID = %q, want incoming trace ID", got)
+	}
+	spans := exporter.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("exported spans = %d, want 1", len(spans))
+	}
+	if got := spans[0].Parent.SpanID().String(); got != "b7ad6b7169203331" {
+		t.Fatalf("parent span ID = %q, want incoming parent", got)
+	}
+}
+
+func TestSpanReportsActualSamplingDecision(t *testing.T) {
+	t.Setenv("TRACING_ENABLED", "true")
+
+	for _, test := range []struct {
+		name       string
+		sampleRate float64
+		want       bool
+	}{
+		{name: "sampled", sampleRate: 1, want: true},
+		{name: "not sampled", sampleRate: 0, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tracer, err := New(context.Background(), Options{
+				ServiceName:  "sampling-test",
+				SampleRate:   test.sampleRate,
+				SpanExporter: tracetest.NewInMemoryExporter(),
+			})
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			_, span := tracer.StartSpan(context.Background(), "sampling", SpanKindServer)
+			if got := span.IsSampled(); got != test.want {
+				t.Fatalf("IsSampled() = %t, want %t", got, test.want)
+			}
+			span.End()
+			_ = tracer.Shutdown(context.Background())
+		})
 	}
 }

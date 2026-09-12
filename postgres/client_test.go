@@ -7,7 +7,17 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
+
+type recordingQueryTracer struct{}
+
+func (recordingQueryTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceQueryStartData) context.Context {
+	return ctx
+}
+
+func (recordingQueryTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
 func TestInitDefault_NoEnv(t *testing.T) {
 	clearPostgresEnv(t)
@@ -307,6 +317,48 @@ func TestApplyOptionDefaults(t *testing.T) {
 	}
 	if opts.HealthCheckPeriod != time.Minute {
 		t.Errorf("HealthCheckPeriod = %v, want 1m", opts.HealthCheckPeriod)
+	}
+}
+
+func TestPoolConfigCarriesCallerQueryTracer(t *testing.T) {
+	tracer := recordingQueryTracer{}
+	settings := poolSettingsFromEnv(
+		"FORGE",
+		"WRITE",
+		applyOptionDefaults(ConnectionOptions{QueryTracer: tracer}),
+		"forge",
+		"write",
+	)
+	poolConfig, err := buildPoolConfig(
+		"postgres://forge:forge@localhost:5432/forge?sslmode=disable",
+		"forge-api",
+		nil,
+		settings,
+	)
+	if err != nil {
+		t.Fatalf("buildPoolConfig() error = %v", err)
+	}
+	if poolConfig.ConnConfig.Tracer != tracer {
+		t.Fatalf("query tracer = %#v, want caller tracer", poolConfig.ConnConfig.Tracer)
+	}
+}
+
+func TestNewOTelQueryTracerCoversPGXOperations(t *testing.T) {
+	tracer := NewOTelQueryTracer(OTelQueryTracerOptions{})
+	if tracer == nil {
+		t.Fatal("NewOTelQueryTracer() returned nil")
+	}
+	if _, ok := tracer.(pgx.BatchTracer); !ok {
+		t.Fatal("OTel tracer does not implement pgx.BatchTracer")
+	}
+	if _, ok := tracer.(pgx.CopyFromTracer); !ok {
+		t.Fatal("OTel tracer does not implement pgx.CopyFromTracer")
+	}
+	if _, ok := tracer.(pgx.PrepareTracer); !ok {
+		t.Fatal("OTel tracer does not implement pgx.PrepareTracer")
+	}
+	if _, ok := tracer.(pgx.ConnectTracer); !ok {
+		t.Fatal("OTel tracer does not implement pgx.ConnectTracer")
 	}
 }
 

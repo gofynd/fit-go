@@ -20,7 +20,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log"
 
@@ -28,6 +27,7 @@ import (
 	"github.com/gofynd/fit-go/mongo"
 	"github.com/gofynd/fit-go/postgres"
 	"github.com/gofynd/fit-go/redis"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func main() {
@@ -57,10 +57,10 @@ func main() {
 	} else {
 		defer pgClient.Close()
 		if conn := pgClient.Service("orders"); conn != nil {
-			// Postgres exposes *sql.DB directly for Read and Write.
-			var rw *sql.DB = conn.Write
+			// Postgres exposes pgx pools directly for Read and Write.
+			var rw *pgxpool.Pool = conn.Write
 			_ = rw
-			fmt.Println("postgres 'orders' read/write *sql.DB ready")
+			fmt.Println("postgres 'orders' read/write pgx pool ready")
 		}
 		checker.AddCheck(pgClient.HealthCheck())
 	}
