@@ -16,7 +16,11 @@ package redis
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -646,6 +650,25 @@ func TestInit(t *testing.T) {
 		}
 	})
 
+	t.Run("propagates TLS configuration errors before dialing", func(t *testing.T) {
+		os.Setenv("REDIS_TLSFAIL_READ_WRITE", "redis://localhost:6379/0")
+		os.Setenv("REDIS_TLSFAIL_SSL_CA", "/does/not/exist")
+		defer os.Unsetenv("REDIS_TLSFAIL_READ_WRITE")
+		defer os.Unsetenv("REDIS_TLSFAIL_SSL_CA")
+
+		dialCalled := atomic.Bool{}
+		_, err := Init(ConnectionOptions{Dial: func(context.Context, *DialOptions) (Connection, error) {
+			dialCalled.Store(true)
+			return &mockConnection{}, nil
+		}})
+		if err == nil || !strings.Contains(err.Error(), "TLS configuration") {
+			t.Fatalf("Init() error = %v, want TLS configuration error", err)
+		}
+		if dialCalled.Load() {
+			t.Fatal("Dial was called with an invalid TLS configuration")
+		}
+	})
+
 	t.Run("applies service-scoped protocol without changing other services", func(t *testing.T) {
 		os.Setenv("REDIS_LEGACY_READ_WRITE", "redis://legacy.example:6379/0")
 		os.Setenv("REDIS_NATIVE_READ_WRITE", "redis://native.example:6379/0")
@@ -897,20 +920,111 @@ func TestResolveConnectionString(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestLoadTLSConfig_NoCerts(t *testing.T) {
-	for _, k := range []string{
-		"REDIS_TEST_SSL_CA",
-		"REDIS_TEST_SSL_CERT",
-		"REDIS_TEST_SSL_KEY",
-		"REDIS_SSL_CA",
-		"REDIS_SSL_CERT",
-		"REDIS_SSL_KEY",
-	} {
-		os.Unsetenv(k)
-	}
+	clearRedisTLSEnv(t)
 
-	cfg := loadTLSConfig("REDIS", "TEST")
+	cfg, err := loadTLSConfig("REDIS", "TEST")
+	if err != nil {
+		t.Fatalf("loadTLSConfig() error = %v", err)
+	}
 	if cfg != nil {
 		t.Error("loadTLSConfig should return nil when no certs")
+	}
+}
+
+func TestLoadTLSConfig_FailsClosed(t *testing.T) {
+	t.Run("valid material verifies the server", func(t *testing.T) {
+		clearRedisTLSEnv(t)
+		tempDir := t.TempDir()
+		caPath := filepath.Join(tempDir, "ca.pem")
+		certPath := filepath.Join(tempDir, "cert.pem")
+		keyPath := filepath.Join(tempDir, "key.pem")
+		certificate := newIORedisTestCertificate(t)
+		keyDER, err := x509.MarshalPKCS8PrivateKey(certificate.PrivateKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for path, contents := range map[string][]byte{
+			caPath:   pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate[0]}),
+			certPath: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate[0]}),
+			keyPath:  pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}),
+		} {
+			if err := os.WriteFile(path, contents, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Setenv("REDIS_TEST_SSL_CA", caPath)
+		t.Setenv("REDIS_TEST_SSL_CERT", certPath)
+		t.Setenv("REDIS_TEST_SSL_KEY", keyPath)
+
+		cfg, err := loadTLSConfig("REDIS", "TEST")
+		if err != nil {
+			t.Fatalf("loadTLSConfig() error = %v", err)
+		}
+		if cfg == nil {
+			t.Fatal("loadTLSConfig() config = nil")
+		}
+		if cfg.InsecureSkipVerify {
+			t.Fatal("loadTLSConfig() disabled certificate or hostname verification")
+		}
+	})
+
+	t.Run("partial configuration", func(t *testing.T) {
+		clearRedisTLSEnv(t)
+		t.Setenv("REDIS_TEST_SSL_CA", "/does/not/exist")
+
+		cfg, err := loadTLSConfig("REDIS", "TEST")
+		if err == nil || !strings.Contains(err.Error(), "must all be configured") {
+			t.Fatalf("loadTLSConfig() error = %v, want incomplete configuration error", err)
+		}
+		if cfg != nil {
+			t.Fatal("loadTLSConfig() config is non-nil on error")
+		}
+	})
+
+	t.Run("unreadable material", func(t *testing.T) {
+		clearRedisTLSEnv(t)
+		t.Setenv("REDIS_TEST_SSL_CA", "/does/not/exist")
+		t.Setenv("REDIS_TEST_SSL_CERT", "/does/not/exist")
+		t.Setenv("REDIS_TEST_SSL_KEY", "/does/not/exist")
+
+		_, err := loadTLSConfig("REDIS", "TEST")
+		if err == nil || !strings.Contains(err.Error(), "read CA certificate") {
+			t.Fatalf("loadTLSConfig() error = %v, want CA read error", err)
+		}
+	})
+
+	t.Run("invalid PEM material", func(t *testing.T) {
+		clearRedisTLSEnv(t)
+		tempDir := t.TempDir()
+		caPath := tempDir + "/ca.pem"
+		certPath := tempDir + "/cert.pem"
+		keyPath := tempDir + "/key.pem"
+		for path, contents := range map[string]string{
+			caPath:   "not a certificate",
+			certPath: "not a certificate",
+			keyPath:  "not a key",
+		} {
+			if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Setenv("REDIS_TEST_SSL_CA", caPath)
+		t.Setenv("REDIS_TEST_SSL_CERT", certPath)
+		t.Setenv("REDIS_TEST_SSL_KEY", keyPath)
+
+		if _, err := loadTLSConfig("REDIS", "TEST"); err == nil {
+			t.Fatal("loadTLSConfig() error = nil, want invalid material error")
+		}
+	})
+}
+
+func clearRedisTLSEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{
+		"REDIS_TEST_SSL_CA", "REDIS_TEST_SSL_CERT", "REDIS_TEST_SSL_KEY",
+		"REDIS_SSL_CA", "REDIS_SSL_CERT", "REDIS_SSL_KEY",
+	} {
+		t.Setenv(key, "")
 	}
 }
 
@@ -978,6 +1092,46 @@ func TestDialFromURI_Routing(t *testing.T) {
 		}
 		if conn.IsCluster() {
 			t.Error("Standalone should not be cluster")
+		}
+	})
+
+	t.Run("rediss cannot fall through to plaintext", func(t *testing.T) {
+		var capturedOpts *DialOptions
+		captureDial := func(_ context.Context, opts *DialOptions) (Connection, error) {
+			capturedOpts = opts
+			return &mockConnection{}, nil
+		}
+		_, err := dialFromURI(ctx, "rediss://cache.internal:6380/0", job, ConnectionOptions{Dial: captureDial}, "client", nil, envPoolOpts{})
+		if err != nil {
+			t.Fatalf("dialFromURI() error = %v", err)
+		}
+		if capturedOpts == nil || capturedOpts.TLSConfig == nil {
+			t.Fatal("rediss:// connection reached the dialer without TLS")
+		}
+		if capturedOpts.TLSConfig.InsecureSkipVerify || capturedOpts.TLSConfig.MinVersion < tls.VersionTLS12 {
+			t.Fatalf("rediss:// TLS config = %+v, want verified TLS 1.2+", capturedOpts.TLSConfig)
+		}
+	})
+
+	t.Run("TLS query cannot fall through to plaintext", func(t *testing.T) {
+		var capturedOpts *DialOptions
+		captureDial := func(_ context.Context, opts *DialOptions) (Connection, error) {
+			capturedOpts = opts
+			return &mockConnection{}, nil
+		}
+		_, err := dialFromURI(ctx, "redis://cache.internal:6380/0?ssl=true&tls=true", job, ConnectionOptions{Dial: captureDial}, "client", nil, envPoolOpts{})
+		if err != nil {
+			t.Fatalf("dialFromURI() error = %v", err)
+		}
+		if capturedOpts == nil || capturedOpts.TLSConfig == nil {
+			t.Fatal("TLS query connection reached the dialer without TLS")
+		}
+	})
+
+	t.Run("invalid TLS query fails closed", func(t *testing.T) {
+		_, err := dialFromURI(ctx, "redis://cache.internal:6380/0?tls=maybe", job, opts, "client", nil, envPoolOpts{})
+		if err == nil || !strings.Contains(err.Error(), "invalid tls query value") {
+			t.Fatalf("dialFromURI() error = %v, want invalid TLS option error", err)
 		}
 	})
 

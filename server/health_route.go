@@ -88,8 +88,7 @@ func RegisterStaticHealthRoutes(engine *gin.Engine) {
 	// canonical routes. Other methods continue to NoRoute so an application's
 	// catch-all may own them.
 	engine.Use(func(c *gin.Context) {
-		path := strings.TrimSuffix(c.Request.URL.Path, "/")
-		if !strings.EqualFold(path, "/_healthz") && !strings.EqualFold(path, "/_readyz") {
+		if !isHealthRoutePath(c.Request.URL.Path) {
 			c.Next()
 			return
 		}
@@ -108,6 +107,24 @@ func RegisterStaticHealthRoutes(engine *gin.Engine) {
 	engine.HEAD("/_healthz/", staticHealthHandler())
 	engine.HEAD("/_readyz", staticHealthHandler())
 	engine.HEAD("/_readyz/", staticHealthHandler())
+}
+
+func isHealthRoutePath(path string) bool {
+	path = strings.TrimSuffix(path, "/")
+	return strings.EqualFold(path, "/_healthz") || strings.EqualFold(path, "/_readyz")
+}
+
+func isHealthProbeRequest(method, path string) bool {
+	if !isHealthRoutePath(path) {
+		return false
+	}
+
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	default:
+		return false
+	}
 }
 
 // RegisterHealthRoutesWithCheckers registers independent liveness and

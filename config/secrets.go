@@ -15,6 +15,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -92,17 +93,25 @@ func GetSecretFromGSM(secretName, version string) (string, error) {
 		)
 	}
 
+	return decodeSecretVersionResponse(body, secretPath)
+}
+
+func decodeSecretVersionResponse(body []byte, secretPath string) (string, error) {
 	var result secretVersionResponse
 	if err := json.Unmarshal(body, &result); err != nil {
 		return "", fmt.Errorf("gsm: failed to parse response: %w", err)
 	}
 
-	secretValue := result.Payload.Data
-	if secretValue == "" {
+	encoded := result.Payload.Data
+	if encoded == "" {
 		return "", fmt.Errorf("gsm: secret value is empty for %s", secretPath)
 	}
 
-	return secretValue, nil
+	secretValue, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("gsm: failed to decode secret payload for %s: %w", secretPath, err)
+	}
+	return string(secretValue), nil
 }
 
 // secretVersionResponse represents the JSON response from the Secret Manager
@@ -113,10 +122,9 @@ type secretVersionResponse struct {
 }
 
 type secretPayload struct {
-	// Data is the secret payload as a base64-encoded string. The GCP REST API
-	// returns it base64-encoded, but the Go JSON decoder handles this if the
-	// field is typed as string. In practice, the SecretManager API returns
-	// the data field as a base64 string which we decode.
+	// Data is the base64-encoded secret payload returned by the GCP REST API.
+	// JSON unmarshalling preserves the encoded string; GetSecretFromGSM decodes
+	// it before returning the secret to callers.
 	Data string `json:"data"`
 }
 

@@ -1598,6 +1598,104 @@ func TestServer_Init(t *testing.T) {
 	})
 }
 
+func TestServerInit_RequestMiddlewareAndBuiltInParsersBypassHealthRoutes(t *testing.T) {
+	t.Setenv("SERVER_TYPE", "platform")
+	t.Setenv("DISABLE_REQUEST_MIDDLEWARES", "false")
+	t.Setenv("DISABLE_RESPONSE_MIDDLEWARES", "true")
+
+	serviceRouter := http.NewServeMux()
+	serviceRouter.HandleFunc("/probe", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	requestMiddlewareCalls := 0
+	parseApplicationRequests := func(c *gin.Context) {
+		requestMiddlewareCalls++
+		if c.GetHeader("Content-Type") == "application/json" {
+			var payload interface{}
+			if err := json.NewDecoder(c.Request.Body).Decode(&payload); err != nil {
+				c.AbortWithStatus(http.StatusBadRequest)
+				return
+			}
+		}
+		c.Next()
+	}
+	responseMiddlewareCalls := 0
+	responseMiddlewareRequests := make(map[string]int)
+	readBody := func(c *gin.Context) {
+		if isHealthProbeRequest(c.Request.Method, c.Request.URL.Path) {
+			responseMiddlewareCalls++
+			responseMiddlewareRequests[c.Request.Method+" "+c.Request.URL.Path]++
+			if _, err := io.ReadAll(c.Request.Body); err != nil {
+				c.AbortWithStatus(http.StatusRequestEntityTooLarge)
+				return
+			}
+		}
+		c.Next()
+	}
+	s := New(Config{
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MaxPayloadSize: "1kb",
+		HealthChecker:  staticHealthChecker(nil),
+	})
+	if err := s.Init(
+		map[ServerType]http.Handler{ServerTypePlatform: serviceRouter},
+		[]Middleware{parseApplicationRequests},
+		[]Middleware{readBody},
+	); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	for _, path := range []string{"/_healthz", "/_healthz/", "/_readyz", "/_readyz/"} {
+		for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodOptions} {
+			t.Run(method+" "+path, func(t *testing.T) {
+				request := httptest.NewRequest(method, path, bytes.NewReader(make([]byte, 2*1024)))
+				request.Header.Set("Content-Type", "application/json")
+				request.Header.Set("x-user-data", "not-json")
+				request.Header.Set("x-application-data", "not-json")
+				recorder := httptest.NewRecorder()
+				s.App.ServeHTTP(recorder, request)
+				if method == http.MethodGet && !strings.HasSuffix(path, "/") && recorder.Code != http.StatusOK {
+					t.Fatalf("status = %d, want 200; body = %s", recorder.Code, recorder.Body.String())
+				}
+				if recorder.Code == http.StatusBadRequest || recorder.Code == http.StatusUnauthorized {
+					t.Fatalf("probe parser status = %d; body = %s", recorder.Code, recorder.Body.String())
+				}
+			})
+		}
+	}
+	if requestMiddlewareCalls != 0 {
+		t.Fatalf("request middleware called %d times for health routes, want 0", requestMiddlewareCalls)
+	}
+	for _, key := range []string{"GET /_healthz", "GET /_readyz"} {
+		if responseMiddlewareRequests[key] != 1 {
+			t.Fatalf("response middleware calls for %s = %d, want 1 (total health calls %d)", key, responseMiddlewareRequests[key], responseMiddlewareCalls)
+		}
+	}
+
+	for _, path := range []string{"/_healthz", "/_healthz/"} {
+		for _, method := range []string{http.MethodPost, http.MethodDelete} {
+			request := httptest.NewRequest(method, path, strings.NewReader(`{"broken":`))
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			s.App.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("%s malformed %s request = %d, want 400", method, path, recorder.Code)
+			}
+		}
+	}
+	if requestMiddlewareCalls != 4 {
+		t.Fatalf("request middleware called %d times, want 4 unsupported health requests", requestMiddlewareCalls)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	recorder := httptest.NewRecorder()
+	s.App.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent || requestMiddlewareCalls != 5 {
+		t.Fatalf("application request = status %d, middleware calls %d; want 204/5", recorder.Code, requestMiddlewareCalls)
+	}
+}
+
 func TestServer_Start_NoPort(t *testing.T) {
 	os.Unsetenv("PORT")
 	s := New(Config{})

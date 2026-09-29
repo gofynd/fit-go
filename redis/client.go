@@ -504,7 +504,15 @@ func Init(opts ConnectionOptions) (*Client, error) {
 				connString = "redis://" + connString
 			}
 
-			tlsCfg := loadTLSConfig("REDIS", j.serviceNameUpper)
+			tlsCfg, err := loadTLSConfig("REDIS", j.serviceNameUpper)
+			if err != nil {
+				results <- connResult{
+					serviceName: j.serviceName,
+					connType:    j.connType,
+					err:         fmt.Errorf("redis: TLS configuration for %s_%s: %w", j.serviceName, j.connType, err),
+				}
+				return
+			}
 			envOpts := getRedisEnvOptions(j.serviceNameUpper, j.connType)
 
 			conn, err := dialFromURI(ctx, connString, j, opts, clientName, tlsCfg, envOpts)
@@ -763,6 +771,10 @@ func dialFromURI(
 	if err != nil {
 		return nil, fmt.Errorf("redis: parse URI for %s_%s: %w", job.serviceName, job.connType, err)
 	}
+	tlsCfg, err = applyRedisURITLS(parsed, tlsCfg)
+	if err != nil {
+		return nil, fmt.Errorf("redis: TLS options for %s_%s: %w", job.serviceName, job.connType, err)
+	}
 
 	connectTimeout := opts.DefaultConnectTimeout
 	if envOpts.ConnectTimeout > 0 {
@@ -961,6 +973,34 @@ func dialFromURI(
 	return opts.Dial(ctx, dialOpts)
 }
 
+// applyRedisURITLS ensures a connection string that explicitly requests TLS
+// can never fall through to a plaintext dial. Certificate environment
+// variables still take precedence; when they are absent, rediss:// and
+// tls=true/ssl=true use the system root pool with hostname verification.
+func applyRedisURITLS(parsed *parsedURI, configured *tls.Config) (*tls.Config, error) {
+	if parsed == nil {
+		return configured, nil
+	}
+
+	requested := parsed.Scheme == "rediss"
+	for _, key := range []string{"tls", "ssl"} {
+		value, present := parsed.Options[key]
+		if !present {
+			continue
+		}
+		enabled, err := strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s query value %q: %w", key, value, err)
+		}
+		requested = requested || enabled
+	}
+
+	if !requested || configured != nil {
+		return configured, nil
+	}
+	return &tls.Config{MinVersion: tls.VersionTLS12}, nil
+}
+
 func ioredisCompatibilityProfile(opts ConnectionOptions, serviceName string) (IORedisCompatibilityProfile, bool) {
 	for configuredService, profile := range opts.IORedisCompatibility {
 		if strings.EqualFold(strings.TrimSpace(configuredService), serviceName) {
@@ -1057,7 +1097,7 @@ func getRedisEnvOptions(serviceNameUpper, connType string) envPoolOpts {
 }
 
 // loadTLSConfig builds a *tls.Config from SSL environment variables.
-func loadTLSConfig(dbType, serviceNameUpper string) *tls.Config {
+func loadTLSConfig(dbType, serviceNameUpper string) (*tls.Config, error) {
 	caPath := envWithFallback(
 		fmt.Sprintf("%s_%s_SSL_CA", dbType, serviceNameUpper),
 		fmt.Sprintf("%s_SSL_CA", dbType),
@@ -1071,30 +1111,42 @@ func loadTLSConfig(dbType, serviceNameUpper string) *tls.Config {
 		fmt.Sprintf("%s_SSL_KEY", dbType),
 	)
 
-	if caPath == "" || certPath == "" || keyPath == "" {
-		return nil
+	configuredValues := 0
+	for _, value := range []string{caPath, certPath, keyPath} {
+		if value != "" {
+			configuredValues++
+		}
+	}
+	if configuredValues == 0 {
+		return nil, nil
+	}
+	if configuredValues != 3 {
+		return nil, fmt.Errorf("CA, certificate, and key must all be configured")
 	}
 
 	caCert, err := os.ReadFile(caPath)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("read CA certificate: %w", err)
 	}
 
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("load client certificate: %w", err)
 	}
 
 	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(caCert)
+	if ok := caCertPool.AppendCertsFromPEM(caCert); !ok {
+		return nil, fmt.Errorf("CA certificate contains no valid PEM certificates")
+	}
 
 	return &tls.Config{
 		RootCAs:      caCertPool,
 		Certificates: []tls.Certificate{cert},
-		// Match: rejectUnauthorized: false
-		InsecureSkipVerify: true,
+		// Keep certificate-chain and hostname verification enabled. Dialers fill
+		// ServerName from the selected Redis address when it is not configured.
+		InsecureSkipVerify: false,
 		MinVersion:         tls.VersionTLS12,
-	}
+	}, nil
 }
 
 // resolveConnectionString resolves a value as either a direct connection string

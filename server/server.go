@@ -284,7 +284,7 @@ func (s *Server) Init(
 
 	// Request middlewares provided by user (pre-parse)
 	for _, mw := range requestMiddlewares {
-		root.Use(mw)
+		root.Use(bypassHealthRoutes(mw))
 	}
 
 	// Built-in request parsing middlewares (unless disabled)

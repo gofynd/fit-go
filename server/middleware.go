@@ -39,6 +39,20 @@ import (
 // With gin, this is gin.HandlerFunc.
 type Middleware = gin.HandlerFunc
 
+// bypassHealthRoutes preserves fit.js ordering: the root liveness/readiness
+// router is mounted after fit's own logging/security middleware but before all
+// caller-supplied and built-in request middleware. Unsupported methods must
+// continue through the normal chain, matching Express router fallthrough.
+func bypassHealthRoutes(middleware Middleware) Middleware {
+	return func(c *gin.Context) {
+		if isHealthProbeRequest(c.Request.Method, c.Request.URL.Path) {
+			c.Next()
+			return
+		}
+		middleware(c)
+	}
+}
+
 // WrapHTTPMiddleware converts a standard http middleware into a gin.HandlerFunc.
 func WrapHTTPMiddleware(mw func(http.Handler) http.Handler) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -413,6 +427,10 @@ func requestParams(ps gin.Params) map[string]string {
 // header (JSON) and stores the result in the gin context.
 // Retrieve it with ApplicationDataFromContext.
 func GinParseApplicationData(c *gin.Context) {
+	if isHealthProbeRequest(c.Request.Method, c.Request.URL.Path) {
+		c.Next()
+		return
+	}
 	header := c.GetHeader("x-application-data")
 	if header != "" {
 		data, err := parseHeaderJSON(header)
@@ -442,6 +460,10 @@ func GinParseApplicationData(c *gin.Context) {
 // GinParseUserData is a gin middleware that parses the x-user-data header (JSON)
 // and stores the result in the gin context. Retrieve it with UserDataFromContext.
 func GinParseUserData(c *gin.Context) {
+	if isHealthProbeRequest(c.Request.Method, c.Request.URL.Path) {
+		c.Next()
+		return
+	}
 	header := c.GetHeader("x-user-data")
 	if header != "" {
 		data, err := parseHeaderJSON(header)
@@ -1034,6 +1056,10 @@ func cryptoRandReader() io.Reader {
 func MaxPayloadSize(size string) gin.HandlerFunc {
 	limit := parseSize(size)
 	return func(c *gin.Context) {
+		if isHealthProbeRequest(c.Request.Method, c.Request.URL.Path) {
+			c.Next()
+			return
+		}
 		if c.Request.Body != nil {
 			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
 		}
