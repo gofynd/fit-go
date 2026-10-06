@@ -354,6 +354,73 @@ func TestRoundTrip_ReplacesStalePropagationHeadersCaseInsensitively(t *testing.T
 	}
 }
 
+func TestRoundTrip_CallerPropagationFallbackPreservesUnemittedFields(t *testing.T) {
+	tracingtest.EnabledGlobal(t)
+	f := &fakeRT{}
+	req := httptest.NewRequest(http.MethodGet, "http://svc/x", nil)
+	req.Header = http.Header{
+		"Traceparent": {"00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"},
+		"TRACESTATE":  {"vendor=caller"},
+		"bAgGaGe":     {"tenant=caller"},
+	}
+
+	do(t, WrapTransport(f, WithCallerPropagationHeaders()), req)
+
+	traceparents := headerValuesEqualFold(f.got.Header, "traceparent")
+	if len(traceparents) != 1 || strings.Contains(traceparents[0], "aaaaaaaa") {
+		t.Fatalf("traceparent values = %v, want one freshly injected value", traceparents)
+	}
+	if values := headerValuesEqualFold(f.got.Header, "tracestate"); len(values) != 1 || values[0] != "vendor=caller" {
+		t.Fatalf("caller tracestate = %v, want preserved", values)
+	}
+	if values := headerValuesEqualFold(f.got.Header, "baggage"); len(values) != 1 || values[0] != "tenant=caller" {
+		t.Fatalf("caller baggage = %v, want preserved", values)
+	}
+	if values := headerValuesEqualFold(req.Header, "traceparent"); len(values) != 1 || !strings.Contains(values[0], "aaaaaaaa") {
+		t.Fatalf("original caller request was mutated: %v", values)
+	}
+}
+
+func TestRoundTrip_CallerPropagationFallbackReplacesFieldsEmittedByContext(t *testing.T) {
+	tracingtest.EnabledGlobal(t)
+	state, err := trace.ParseTraceState("vendor=context")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    trace.TraceID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		SpanID:     trace.SpanID{1, 2, 3, 4, 5, 6, 7, 8},
+		TraceFlags: trace.FlagsSampled,
+		TraceState: state,
+		Remote:     true,
+	})
+	member, err := baggage.NewMember("tenant", "context")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bag, err := baggage.New(member)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := trace.ContextWithRemoteSpanContext(context.Background(), parent)
+	ctx = baggage.ContextWithBaggage(ctx, bag)
+
+	f := &fakeRT{}
+	req := httptest.NewRequest(http.MethodGet, "http://svc/x", nil).WithContext(ctx)
+	req.Header = http.Header{
+		"TraceState": {"vendor=caller"},
+		"Baggage":    {"tenant=caller"},
+	}
+	do(t, WrapTransport(f, WithCallerPropagationHeaders()), req)
+
+	if values := headerValuesEqualFold(f.got.Header, "tracestate"); len(values) != 1 || values[0] != "vendor=context" {
+		t.Fatalf("tracestate = %v, want context value", values)
+	}
+	if values := headerValuesEqualFold(f.got.Header, "baggage"); len(values) != 1 || values[0] != "tenant=context" {
+		t.Fatalf("baggage = %v, want context value", values)
+	}
+}
+
 func TestRoundTrip_UsesConfiguredGlobalPropagator(t *testing.T) {
 	tracingtest.EnabledGlobal(t)
 	previous := otel.GetTextMapPropagator()

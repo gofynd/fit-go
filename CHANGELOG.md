@@ -46,6 +46,15 @@ this fork follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Modern privacy-safe HTTP client attributes**: outbound spans use
   `http.request.method`, `http.response.status_code`, `server.address`, and a
   query/userinfo-free `url.full` while retaining trace propagation.
+- **Opt-in caller propagation fallback**: `httpclient.WithCallerPropagationHeaders`
+  always removes the caller's `traceparent`, lets an active trace-aware propagator
+  supply its replacement, replaces other fields emitted by the active context,
+  and otherwise retains trusted caller propagation fields. The default strict
+  clear-before-inject policy is unchanged.
+- **Opt-in Kafka producer lifecycle bounds**: `BrokerCheckTimeout` can make
+  `Connect` validate broker metadata, `CloseTimeout` overrides the existing
+  15-second close budget, and context cancellation now releases keyless metadata
+  callers promptly while the timeout-only driver operation drains safely.
 - **Legacy callback context continuity**: instrumented outbound HTTP, Mongo,
   Redis, MySQL, PostgreSQL, gRPC, and explicit Kafka producer operations now
   fill a missing parent from fit-go's same-goroutine active boundary context.

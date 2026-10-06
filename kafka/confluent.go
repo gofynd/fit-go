@@ -117,6 +117,12 @@ func (cc *ConfluentClient) Producer(config ProducerConfig) (KafkaProducer, error
 	if config.MetadataTimeout < 0 {
 		return nil, fmt.Errorf("kafka/confluent: producer metadata timeout must not be negative")
 	}
+	if config.BrokerCheckTimeout < 0 {
+		return nil, fmt.Errorf("kafka/confluent: producer broker check timeout must not be negative")
+	}
+	if config.CloseTimeout < 0 {
+		return nil, fmt.Errorf("kafka/confluent: producer close timeout must not be negative")
+	}
 	if config.MetadataMaxAge < 0 {
 		return nil, fmt.Errorf("kafka/confluent: producer metadata max age must not be negative")
 	}
@@ -186,20 +192,22 @@ func (cc *ConfluentClient) Producer(config ProducerConfig) (KafkaProducer, error
 	}
 
 	return &ConfluentProducer{
-		configMap:         pCfg,
-		logger:            cc.logger,
-		brokers:           cc.brokers,
-		configuredAcks:    configuredAcks,
-		idempotent:        config.IdempotentProducer,
-		traceHeaders:      config.TraceHeaderPolicy,
-		closePolicy:       config.ClosePolicy,
-		partitioner:       config.Partitioner,
-		producers:         make(map[int]confluentProducerDriver),
-		partitionCounters: make(map[string]uint32),
-		metadataTimeout:   config.MetadataTimeout,
-		metadataMaxAge:    config.MetadataMaxAge,
-		metadataCache:     make(map[string]kafkaJSMetadataCacheEntry),
-		metadataRefreshes: make(map[string]*kafkaJSMetadataRefresh),
+		configMap:          pCfg,
+		logger:             cc.logger,
+		brokers:            cc.brokers,
+		configuredAcks:     configuredAcks,
+		idempotent:         config.IdempotentProducer,
+		traceHeaders:       config.TraceHeaderPolicy,
+		closePolicy:        config.ClosePolicy,
+		closeTimeout:       config.CloseTimeout,
+		partitioner:        config.Partitioner,
+		producers:          make(map[int]confluentProducerDriver),
+		partitionCounters:  make(map[string]uint32),
+		metadataTimeout:    config.MetadataTimeout,
+		metadataMaxAge:     config.MetadataMaxAge,
+		brokerCheckTimeout: config.BrokerCheckTimeout,
+		metadataCache:      make(map[string]kafkaJSMetadataCacheEntry),
+		metadataRefreshes:  make(map[string]*kafkaJSMetadataRefresh),
 	}, nil
 }
 
@@ -354,12 +362,13 @@ type ConfluentProducer struct {
 	partitionCounters map[string]uint32
 	partitionSeed     func() (uint32, error)
 
-	metadataMu        sync.Mutex
-	metadataTimeout   time.Duration
-	metadataMaxAge    time.Duration
-	metadataNow       func() time.Time
-	metadataCache     map[string]kafkaJSMetadataCacheEntry
-	metadataRefreshes map[string]*kafkaJSMetadataRefresh
+	metadataMu         sync.Mutex
+	metadataTimeout    time.Duration
+	metadataMaxAge     time.Duration
+	brokerCheckTimeout time.Duration
+	metadataNow        func() time.Time
+	metadataCache      map[string]kafkaJSMetadataCacheEntry
+	metadataRefreshes  map[string]*kafkaJSMetadataRefresh
 }
 
 type kafkaJSMetadataCacheEntry struct {
@@ -402,6 +411,10 @@ func (cp *ConfluentProducer) Connect() error {
 	if err != nil {
 		return fmt.Errorf("kafka/confluent: producer connect failed: %w", err)
 	}
+	if err := cp.checkBroker(producer); err != nil {
+		producer.Close()
+		return err
+	}
 
 	cp.producer = producer
 	if cp.producers == nil {
@@ -411,6 +424,24 @@ func (cp *ConfluentProducer) Connect() error {
 	cp.logger.Info("kafka/confluent: producer connected",
 		"brokers", strings.Join(cp.brokers, ","),
 	)
+	return nil
+}
+
+func (cp *ConfluentProducer) checkBroker(producer confluentProducerDriver) error {
+	if cp.brokerCheckTimeout <= 0 {
+		return nil
+	}
+	metadataDriver, ok := producer.(confluentProducerMetadataDriver)
+	if !ok {
+		return fmt.Errorf("kafka/confluent: producer connect broker check is not supported by the driver")
+	}
+	metadata, err := metadataDriver.GetMetadata(nil, false, durationMilliseconds(cp.brokerCheckTimeout))
+	if err != nil {
+		return fmt.Errorf("kafka/confluent: producer connect broker check failed: %w", err)
+	}
+	if metadata == nil {
+		return fmt.Errorf("kafka/confluent: producer connect broker check returned nil metadata")
+	}
 	return nil
 }
 
@@ -1825,6 +1856,23 @@ func (cp *ConfluentProducer) kafkaJSPartitionMetadata(
 	cp.metadataRefreshes[topic] = refresh
 	cp.metadataMu.Unlock()
 
+	// GetMetadata is a timeout-only librdkafka API with no context parameter.
+	// Run the shared refresh independently so the initiating caller, like later
+	// waiters, can stop waiting as soon as its context is canceled. Keep the
+	// producer in flight until the driver call exits so Close never invalidates
+	// resources still used by the refresh.
+	cp.inFlight.Add(1)
+	go cp.refreshKafkaJSPartitionMetadata(driver, topic, refresh, now)
+	return waitForKafkaJSMetadata(ctx, refresh)
+}
+
+func (cp *ConfluentProducer) refreshKafkaJSPartitionMetadata(
+	driver confluentProducerMetadataDriver,
+	topic string,
+	refresh *kafkaJSMetadataRefresh,
+	now func() time.Time,
+) {
+	defer cp.inFlight.Done()
 	partitions, err := cp.fetchKafkaJSPartitionMetadata(driver, topic)
 
 	cp.metadataMu.Lock()
@@ -1846,11 +1894,21 @@ func (cp *ConfluentProducer) kafkaJSPartitionMetadata(
 	delete(cp.metadataRefreshes, topic)
 	close(refresh.done)
 	cp.metadataMu.Unlock()
+}
 
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return nil, ctxErr
+func waitForKafkaJSMetadata(ctx context.Context, refresh *kafkaJSMetadataRefresh) ([]ckafka.PartitionMetadata, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	return partitions, err
+	select {
+	case <-refresh.done:
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return clonePartitionMetadata(refresh.partitions), refresh.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (cp *ConfluentProducer) fetchKafkaJSPartitionMetadata(
@@ -1861,7 +1919,7 @@ func (cp *ConfluentProducer) fetchKafkaJSPartitionMetadata(
 	if timeout <= 0 {
 		timeout = defaultProducerMetadataTimeout
 	}
-	metadata, err := driver.GetMetadata(&topic, false, int(timeout.Milliseconds()))
+	metadata, err := driver.GetMetadata(&topic, false, durationMilliseconds(timeout))
 	if err != nil {
 		return nil, fmt.Errorf("kafka/confluent: metadata for topic %s: %w", topic, err)
 	}
@@ -1879,6 +1937,14 @@ func (cp *ConfluentProducer) fetchKafkaJSPartitionMetadata(
 		return nil, fmt.Errorf("kafka/confluent: topic %s has no partitions", topic)
 	}
 	return clonePartitionMetadata(topicMetadata.Partitions), nil
+}
+
+func durationMilliseconds(timeout time.Duration) int {
+	timeoutMs := int(timeout.Milliseconds())
+	if timeoutMs < 1 {
+		return 1
+	}
+	return timeoutMs
 }
 
 func clonePartitionMetadata(partitions []ckafka.PartitionMetadata) []ckafka.PartitionMetadata {

@@ -137,6 +137,168 @@ func metadataForTopic(topic string, partitions ...ckafka.PartitionMetadata) *cka
 	}}
 }
 
+func TestConfluentProducerConnectBrokerCheckIsOptInAndBounded(t *testing.T) {
+	t.Run("zero value keeps lazy connect", func(t *testing.T) {
+		driver := &fakeConfluentProducerDriver{}
+		producer := &ConfluentProducer{
+			configMap:      &ckafka.ConfigMap{},
+			logger:         mustLogger(),
+			configuredAcks: -1,
+			producers:      make(map[int]confluentProducerDriver),
+			newProducer: func(*ckafka.ConfigMap) (confluentProducerDriver, error) {
+				return driver, nil
+			},
+		}
+		if err := producer.Connect(); err != nil {
+			t.Fatalf("Connect() error = %v", err)
+		}
+		if producer.producer != driver {
+			t.Fatal("Connect() did not retain the constructed producer")
+		}
+	})
+
+	t.Run("configured check uses caller timeout", func(t *testing.T) {
+		base := &fakeConfluentProducerDriver{}
+		driver := &fakeMetadataConfluentProducerDriver{
+			fakeConfluentProducerDriver: base,
+			metadataFn: func(topic *string, allTopics bool, timeoutMs int) (*ckafka.Metadata, error) {
+				if topic != nil {
+					t.Fatalf("broker check topic = %v, want nil", *topic)
+				}
+				if allTopics {
+					t.Fatal("broker check requested all topic metadata")
+				}
+				if timeoutMs != 5000 {
+					t.Fatalf("broker check timeout = %dms, want 5000ms", timeoutMs)
+				}
+				return &ckafka.Metadata{}, nil
+			},
+		}
+		producer := &ConfluentProducer{
+			configMap:          &ckafka.ConfigMap{},
+			logger:             mustLogger(),
+			configuredAcks:     -1,
+			brokerCheckTimeout: 5 * time.Second,
+			producers:          make(map[int]confluentProducerDriver),
+			newProducer: func(*ckafka.ConfigMap) (confluentProducerDriver, error) {
+				return driver, nil
+			},
+		}
+		if err := producer.Connect(); err != nil {
+			t.Fatalf("Connect() error = %v", err)
+		}
+	})
+
+	t.Run("failed check closes and rejects the driver", func(t *testing.T) {
+		checkErr := errors.New("broker unavailable")
+		base := &fakeConfluentProducerDriver{}
+		driver := &fakeMetadataConfluentProducerDriver{
+			fakeConfluentProducerDriver: base,
+			metadataFn: func(*string, bool, int) (*ckafka.Metadata, error) {
+				return nil, checkErr
+			},
+		}
+		producer := &ConfluentProducer{
+			configMap:          &ckafka.ConfigMap{},
+			logger:             mustLogger(),
+			configuredAcks:     -1,
+			brokerCheckTimeout: time.Second,
+			producers:          make(map[int]confluentProducerDriver),
+			newProducer: func(*ckafka.ConfigMap) (confluentProducerDriver, error) {
+				return driver, nil
+			},
+		}
+		err := producer.Connect()
+		if !errors.Is(err, checkErr) {
+			t.Fatalf("Connect() error = %v, want broker failure", err)
+		}
+		if producer.producer != nil || len(producer.producers) != 0 {
+			t.Fatal("failed broker check retained an unusable producer")
+		}
+		_, closeCalls := base.calls()
+		if closeCalls != 1 {
+			t.Fatalf("driver close calls = %d, want 1", closeCalls)
+		}
+	})
+
+	t.Run("configured check requires metadata support", func(t *testing.T) {
+		driver := &fakeConfluentProducerDriver{}
+		producer := &ConfluentProducer{
+			configMap:          &ckafka.ConfigMap{},
+			logger:             mustLogger(),
+			configuredAcks:     -1,
+			brokerCheckTimeout: time.Second,
+			producers:          make(map[int]confluentProducerDriver),
+			newProducer: func(*ckafka.ConfigMap) (confluentProducerDriver, error) {
+				return driver, nil
+			},
+		}
+		err := producer.Connect()
+		if err == nil || !strings.Contains(err.Error(), "not supported") {
+			t.Fatalf("Connect() error = %v, want unsupported broker check", err)
+		}
+		_, closeCalls := driver.calls()
+		if closeCalls != 1 {
+			t.Fatalf("driver close calls = %d, want 1", closeCalls)
+		}
+	})
+
+	t.Run("nil metadata fails the check", func(t *testing.T) {
+		base := &fakeConfluentProducerDriver{}
+		driver := &fakeMetadataConfluentProducerDriver{
+			fakeConfluentProducerDriver: base,
+			metadataFn: func(_ *string, _ bool, timeoutMs int) (*ckafka.Metadata, error) {
+				if timeoutMs != 1 {
+					t.Fatalf("sub-millisecond broker check timeout = %dms, want 1ms", timeoutMs)
+				}
+				return nil, nil
+			},
+		}
+		producer := &ConfluentProducer{
+			configMap:          &ckafka.ConfigMap{},
+			logger:             mustLogger(),
+			configuredAcks:     -1,
+			brokerCheckTimeout: time.Nanosecond,
+			producers:          make(map[int]confluentProducerDriver),
+			newProducer: func(*ckafka.ConfigMap) (confluentProducerDriver, error) {
+				return driver, nil
+			},
+		}
+		err := producer.Connect()
+		if err == nil || !strings.Contains(err.Error(), "nil metadata") {
+			t.Fatalf("Connect() error = %v, want nil metadata failure", err)
+		}
+		_, closeCalls := base.calls()
+		if closeCalls != 1 {
+			t.Fatalf("driver close calls = %d, want 1", closeCalls)
+		}
+	})
+}
+
+func TestConfluentProducerBrokerCheckRejectsUnavailableLocalBroker(t *testing.T) {
+	client, err := NewConfluentClient(&Config{
+		Brokers:  []string{"127.0.0.1:1"},
+		ClientID: "broker-check-test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	producer, err := client.Producer(ProducerConfig{BrokerCheckTimeout: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	err = producer.Connect()
+	if err == nil || !strings.Contains(err.Error(), "producer connect broker check failed") {
+		t.Fatalf("Connect() error = %v, want bounded broker-check failure", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("unavailable broker check took %s, want <=2s", elapsed)
+	}
+}
+
 func TestConfluentProducerKafkaJSLegacyKeylessRoundRobin(t *testing.T) {
 	base := &fakeConfluentProducerDriver{}
 	var producedPartitions []int32
@@ -368,6 +530,59 @@ func TestConfluentProducerKafkaJSLegacyMetadataWaitHonorsContext(t *testing.T) {
 	close(releaseMetadata)
 	if err := <-ownerDone; err != nil {
 		t.Fatalf("owner metadata lookup error = %v", err)
+	}
+}
+
+func TestConfluentProducerKafkaJSMetadataOwnerCancellationAndCloseAreBounded(t *testing.T) {
+	base := &fakeConfluentProducerDriver{closeCalled: make(chan struct{})}
+	metadataStarted := make(chan struct{})
+	releaseMetadata := make(chan struct{})
+	driver := &fakeMetadataConfluentProducerDriver{
+		fakeConfluentProducerDriver: base,
+		metadataFn: func(topic *string, _ bool, _ int) (*ckafka.Metadata, error) {
+			close(metadataStarted)
+			<-releaseMetadata
+			return metadataForTopic(*topic, ckafka.PartitionMetadata{ID: 0, Leader: 10}), nil
+		},
+	}
+	producer := newTestConfluentProducer(driver)
+	producer.partitioner = ProducerPartitionerKafkaJSCompatible
+	producer.closePolicy = ProducerCloseKafkaJSDisconnect
+
+	ctx, cancel := context.WithCancel(context.Background())
+	produceResult := make(chan error, 1)
+	go func() {
+		produceResult <- producer.ProduceCtx(ctx, "events", []Message{NewMessage([]byte("value"))}, -1)
+	}()
+	<-metadataStarted
+	cancel()
+	select {
+	case err := <-produceResult:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("ProduceCtx() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("metadata owner did not honor caller cancellation promptly")
+	}
+
+	started := time.Now()
+	if err := producer.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 250*time.Millisecond {
+		t.Fatalf("Close() took %s while metadata was pending", elapsed)
+	}
+	select {
+	case <-base.closeCalled:
+		t.Fatal("driver closed while metadata refresh was still using it")
+	default:
+	}
+
+	close(releaseMetadata)
+	select {
+	case <-base.closeCalled:
+	case <-time.After(time.Second):
+		t.Fatal("driver did not close after the metadata refresh exited")
 	}
 }
 

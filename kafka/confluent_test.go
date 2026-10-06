@@ -972,6 +972,8 @@ func TestProducerConfigOverrides(t *testing.T) {
 		producer, err := client.Producer(ProducerConfig{
 			Timeout:             15 * time.Second,
 			DeliveryTimeout:     8 * time.Second,
+			BrokerCheckTimeout:  5 * time.Second,
+			CloseTimeout:        3 * time.Second,
 			MetadataTimeout:     2 * time.Second,
 			MetadataMaxAge:      time.Minute,
 			MaxRetries:          5,
@@ -992,6 +994,12 @@ func TestProducerConfigOverrides(t *testing.T) {
 		deliveryTimeout, _ := cp.configMap.Get("message.timeout.ms", 0)
 		if deliveryTimeout != 8000 {
 			t.Errorf("message.timeout.ms = %v, want 8000", deliveryTimeout)
+		}
+		if cp.brokerCheckTimeout != 5*time.Second {
+			t.Errorf("broker check timeout = %v, want 5s", cp.brokerCheckTimeout)
+		}
+		if cp.closeTimeout != 3*time.Second {
+			t.Errorf("close timeout = %v, want 3s", cp.closeTimeout)
 		}
 		if cp.metadataTimeout != 2*time.Second {
 			t.Errorf("metadata timeout = %v, want 2s", cp.metadataTimeout)
@@ -1056,6 +1064,12 @@ func TestProducerConfigOverrides(t *testing.T) {
 	})
 
 	t.Run("producer rejects negative metadata durations", func(t *testing.T) {
+		if _, err := client.Producer(ProducerConfig{BrokerCheckTimeout: -time.Second}); err == nil {
+			t.Fatal("Producer() accepted a negative broker check timeout")
+		}
+		if _, err := client.Producer(ProducerConfig{CloseTimeout: -time.Second}); err == nil {
+			t.Fatal("Producer() accepted a negative close timeout")
+		}
 		if _, err := client.Producer(ProducerConfig{MetadataTimeout: -time.Second}); err == nil {
 			t.Fatal("Producer() accepted a negative metadata timeout")
 		}

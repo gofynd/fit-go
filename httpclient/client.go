@@ -25,6 +25,7 @@
 package httpclient
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
@@ -69,6 +70,20 @@ func WithMetrics(rec MetricsRecorder) Option {
 		t.metrics = rec
 		t.metricsConfigured = true
 	}
+}
+
+// WithCallerPropagationHeaders retains caller-supplied propagation fields when
+// the configured propagator does not emit a replacement value. The caller's
+// traceparent is always removed; an active trace-aware propagator supplies its
+// replacement. Fields emitted from the active context replace the corresponding
+// caller values.
+//
+// The default remains strict replacement because forwarding propagation fields
+// from an untrusted caller can attach unrelated trace state or baggage to a new
+// client span. Use this option only for a source-proven trusted forwarding
+// boundary whose instrumentation used set-without-clear semantics.
+func WithCallerPropagationHeaders() Option {
+	return func(t *transport) { t.preserveCallerPropagation = true }
 }
 
 // WrapTransport wraps base with trace propagation, request-id forwarding and
@@ -116,11 +131,12 @@ func NewHTTPClientWithTimeout(timeout time.Duration, opts ...Option) *http.Clien
 }
 
 type transport struct {
-	base              http.RoundTripper
-	logger            *slog.Logger
-	metrics           MetricsRecorder
-	metricsConfigured bool
-	traceRequests     bool
+	base                      http.RoundTripper
+	logger                    *slog.Logger
+	metrics                   MetricsRecorder
+	metricsConfigured         bool
+	traceRequests             bool
+	preserveCallerPropagation bool
 }
 
 // RoundTrip clones the request (per the RoundTripper contract — must not mutate
@@ -161,8 +177,12 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		// ourselves. This carries traceparent, tracestate, baggage, and any future
 		// propagator configured by the process.
 		propagator := otel.GetTextMapPropagator()
-		removePropagationHeaders(req.Header, propagator)
-		propagator.Inject(req.Context(), propagation.HeaderCarrier(req.Header))
+		if t.preserveCallerPropagation {
+			injectPropagationHeadersWithCallerFallback(req.Context(), req.Header, propagator)
+		} else {
+			removePropagationHeaders(req.Header, propagator)
+			propagator.Inject(req.Context(), propagation.HeaderCarrier(req.Header))
+		}
 		span.SetAttributes(map[string]any{
 			"http.request.method": req.Method,
 			// url.full is deliberately query/userinfo-free. The standard key is
@@ -250,6 +270,33 @@ func removePropagationHeaders(header http.Header, propagator propagation.TextMap
 		if tracing.IsPropagationField(key, propagator) {
 			// Delete the map entry directly. http.Header.Del canonicalizes its
 			// argument and would miss non-canonical keys inserted by callers.
+			delete(header, key)
+		}
+	}
+}
+
+// injectPropagationHeadersWithCallerFallback models propagators that set the
+// fields available in the active context without clearing the carrier first.
+// Inject into a fresh carrier so we know exactly which caller values must be
+// replaced, while deleting traceparent unconditionally to prevent multiple or
+// stale parents on the wire.
+func injectPropagationHeadersWithCallerFallback(
+	ctx context.Context,
+	header http.Header,
+	propagator propagation.TextMapPropagator,
+) {
+	injected := make(http.Header)
+	propagator.Inject(ctx, propagation.HeaderCarrier(injected))
+	deleteHeaderEqualFold(header, traceparentHeader)
+	for key, values := range injected {
+		deleteHeaderEqualFold(header, key)
+		header[key] = append([]string(nil), values...)
+	}
+}
+
+func deleteHeaderEqualFold(header http.Header, name string) {
+	for key := range header {
+		if strings.EqualFold(key, name) {
 			delete(header, key)
 		}
 	}

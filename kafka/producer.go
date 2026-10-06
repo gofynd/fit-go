@@ -173,6 +173,12 @@ type ProducerConfig struct {
 	// accepted message for its much longer driver default.
 	DeliveryTimeout time.Duration
 
+	// BrokerCheckTimeout enables an eager broker metadata check during Connect
+	// and bounds how long that check may take. Zero preserves the historical lazy
+	// connection behavior, where Connect only constructs the driver and the first
+	// broker operation establishes connectivity.
+	BrokerCheckTimeout time.Duration
+
 	// MetadataTimeout bounds a broker metadata lookup performed by compatibility
 	// partitioners. Zero uses the KafkaJS-compatible default of 30 seconds. It is
 	// deliberately separate from Timeout so changing request delivery behavior
@@ -230,4 +236,10 @@ type ProducerConfig struct {
 	// ClosePolicy is opt-in. Its zero value retains the existing fit-go close
 	// contract for every caller that does not request KafkaJS compatibility.
 	ClosePolicy ProducerClosePolicy
+
+	// CloseTimeout bounds synchronous Close work. Zero preserves fit-go's
+	// existing 15-second default. It is useful when a caller also configures
+	// shorter metadata and delivery budgets and needs shutdown to obey the same
+	// operational bound.
+	CloseTimeout time.Duration
 }
