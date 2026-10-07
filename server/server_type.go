@@ -21,7 +21,7 @@ import (
 )
 
 // ServerType represents the type of server that determines which routes are loaded.
-// In Fynd Commerce, services are split by server type to isolate concerns.
+// Applications may split routes by server type to isolate concerns.
 type ServerType int
 
 const (
@@ -49,6 +49,8 @@ const (
 	ServerTypeDev
 	// ServerTypeCommon serves routes shared across all types.
 	ServerTypeCommon
+	// ServerTypeCentral serves legacy central/admin routes.
+	ServerTypeCentral
 )
 
 // serverTypeNames maps ServerType to its string representation.
@@ -64,6 +66,7 @@ var serverTypeNames = map[ServerType]string{
 	ServerTypePanel:         "panel",
 	ServerTypeDev:           "dev",
 	ServerTypeCommon:        "common",
+	ServerTypeCentral:       "central",
 }
 
 // serverTypeFromString is the reverse lookup table.
@@ -127,6 +130,7 @@ func AllServerTypes() []ServerType {
 		ServerTypePanel,
 		ServerTypeDev,
 		ServerTypeCommon,
+		ServerTypeCentral,
 	}
 }
 

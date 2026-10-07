@@ -17,11 +17,23 @@ package redis
 import (
 	"context"
 	"crypto/tls"
+	"net"
 	"testing"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
 )
+
+// fastDialCtx returns a short-deadline context for the dial-option tests so they
+// do not pay the full CLIENT-handshake probe timeout against unreachable fake
+// servers. The probe correctly respects the caller's context deadline; its
+// rejection logic is unit-tested separately (TestClientHandshakeRejected).
+func fastDialCtx(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	t.Cleanup(cancel)
+	return ctx
+}
 
 // ---------------------------------------------------------------------------
 // Interface compliance checks
@@ -54,6 +66,30 @@ func TestDefaultDialFunc_ReturnsDialFunc(t *testing.T) {
 	}
 }
 
+func TestDefaultDialFuncIsLazy(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	conn, err := DefaultDialFunc()(context.Background(), &DialOptions{Addr: listener.Addr().String(), ClientName: "legacy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if tcp, ok := listener.(*net.TCPListener); ok {
+		_ = tcp.SetDeadline(time.Now().Add(50 * time.Millisecond))
+	}
+	accepted, err := listener.Accept()
+	if err == nil {
+		accepted.Close()
+		t.Fatal("DefaultDialFunc performed a startup network handshake")
+	}
+	if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+		t.Fatalf("Accept error = %v, want timeout", err)
+	}
+}
+
 func TestDefaultDialFunc_CreatesStandaloneConnection(t *testing.T) {
 	dial := DefaultDialFunc()
 
@@ -64,7 +100,7 @@ func TestDefaultDialFunc_CreatesStandaloneConnection(t *testing.T) {
 		DB:       2,
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultDialFunc() error = %v", err)
 	}
@@ -103,30 +139,37 @@ func TestDefaultDialFunc_CreatesStandaloneConnection(t *testing.T) {
 }
 
 func TestDefaultDialFunc_AppliesAllOptions(t *testing.T) {
-	dial := DefaultDialFunc()
+	dial := DefaultAdvancedDialFunc()
 
 	tlsCfg := &tls.Config{
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS12,
 	}
 
-	opts := &DialOptions{
-		Addr:           "myhost:6380",
-		Password:       "pass",
-		Username:       "admin",
-		DB:             3,
-		ClientName:     "test-client",
-		TLSConfig:      tlsCfg,
-		ConnectTimeout: 5 * time.Second,
-		SocketTimeout:  10 * time.Second,
-		KeepAlive:      30 * time.Second,
-		MaxRetries:     3,
-		PoolSize:       50,
-		MinIdleConns:   10,
-		ReadOnly:       false,
+	opts := &AdvancedDialOptions{
+		DialOptions: DialOptions{
+			Addr:           "myhost:6380",
+			Password:       "pass",
+			Username:       "admin",
+			DB:             3,
+			ClientName:     "test-client",
+			TLSConfig:      tlsCfg,
+			ConnectTimeout: 5 * time.Second,
+			SocketTimeout:  10 * time.Second,
+			KeepAlive:      30 * time.Second,
+			MaxRetries:     20,
+			PoolSize:       50,
+			MinIdleConns:   10,
+			ReadOnly:       false,
+		},
+		MinRetryBackoff:    50 * time.Millisecond,
+		MaxRetryBackoff:    2 * time.Second,
+		DialerRetries:      1,
+		DialerRetryTimeout: 75 * time.Millisecond,
+		Protocol:           RedisProtocolRESP2,
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultDialFunc() error = %v", err)
 	}
@@ -152,14 +195,29 @@ func TestDefaultDialFunc_AppliesAllOptions(t *testing.T) {
 	if redisOpts.WriteTimeout != 10*time.Second {
 		t.Errorf("WriteTimeout = %v, want 10s", redisOpts.WriteTimeout)
 	}
-	if redisOpts.MaxRetries != 3 {
-		t.Errorf("MaxRetries = %d, want 3", redisOpts.MaxRetries)
+	if redisOpts.MaxRetries != 20 {
+		t.Errorf("MaxRetries = %d, want 20", redisOpts.MaxRetries)
+	}
+	if redisOpts.MinRetryBackoff != 50*time.Millisecond {
+		t.Errorf("MinRetryBackoff = %v, want 50ms", redisOpts.MinRetryBackoff)
+	}
+	if redisOpts.MaxRetryBackoff != 2*time.Second {
+		t.Errorf("MaxRetryBackoff = %v, want 2s", redisOpts.MaxRetryBackoff)
+	}
+	if redisOpts.DialerRetries != 1 {
+		t.Errorf("DialerRetries = %d, want 1", redisOpts.DialerRetries)
+	}
+	if redisOpts.DialerRetryTimeout != 75*time.Millisecond {
+		t.Errorf("DialerRetryTimeout = %v, want 75ms", redisOpts.DialerRetryTimeout)
 	}
 	if redisOpts.PoolSize != 50 {
 		t.Errorf("PoolSize = %d, want 50", redisOpts.PoolSize)
 	}
 	if redisOpts.MinIdleConns != 10 {
 		t.Errorf("MinIdleConns = %d, want 10", redisOpts.MinIdleConns)
+	}
+	if redisOpts.Protocol != 2 {
+		t.Errorf("Protocol = %d, want RESP2", redisOpts.Protocol)
 	}
 	if redisOpts.ConnMaxIdleTime != 30*time.Second {
 		t.Errorf("ConnMaxIdleTime = %v, want 30s", redisOpts.ConnMaxIdleTime)
@@ -176,7 +234,7 @@ func TestDefaultDialFunc_ZeroValues(t *testing.T) {
 		Addr: "localhost:6379",
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultDialFunc() error = %v", err)
 	}
@@ -193,8 +251,24 @@ func TestDefaultDialFunc_ZeroValues(t *testing.T) {
 	if redisOpts.DB != 0 {
 		t.Errorf("DB should be 0, got %d", redisOpts.DB)
 	}
+	if redisOpts.Protocol != 3 {
+		t.Errorf("Protocol = %d, want go-redis's current default RESP3", redisOpts.Protocol)
+	}
 
 	_ = conn.Close()
+}
+
+func TestDefaultDialFunctionsRejectUnsupportedProtocol(t *testing.T) {
+	ctx := context.Background()
+	if _, err := DefaultAdvancedDialFunc()(ctx, &AdvancedDialOptions{Protocol: 4}); err == nil {
+		t.Fatal("standalone dial accepted unsupported protocol")
+	}
+	if _, err := DefaultAdvancedClusterDialFunc()(ctx, &AdvancedClusterDialOptions{Protocol: 4}); err == nil {
+		t.Fatal("cluster dial accepted unsupported protocol")
+	}
+	if _, err := DefaultAdvancedSentinelDialFunc()(ctx, &AdvancedSentinelDialOptions{Protocol: 4}); err == nil {
+		t.Fatal("sentinel dial accepted unsupported protocol")
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +291,7 @@ func TestDefaultClusterDialFunc_CreatesClusterConnection(t *testing.T) {
 		Username: "cluster-user",
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultClusterDialFunc() error = %v", err)
 	}
@@ -241,25 +315,33 @@ func TestDefaultClusterDialFunc_CreatesClusterConnection(t *testing.T) {
 }
 
 func TestDefaultClusterDialFunc_AppliesOptions(t *testing.T) {
-	dial := DefaultClusterDialFunc()
+	dial := DefaultAdvancedClusterDialFunc()
 
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
 
-	opts := &ClusterDialOptions{
-		Addrs:          []string{"h1:6379", "h2:6379"},
-		Password:       "pass",
-		Username:       "admin",
-		ClientName:     "cluster-client",
-		TLSConfig:      tlsCfg,
-		ConnectTimeout: 3 * time.Second,
-		SocketTimeout:  5 * time.Second,
-		KeepAlive:      15 * time.Second,
-		ReadOnly:       true,
-		PoolSize:       100,
-		MinIdleConns:   20,
+	opts := &AdvancedClusterDialOptions{
+		ClusterDialOptions: ClusterDialOptions{
+			Addrs:          []string{"h1:6379", "h2:6379"},
+			Password:       "pass",
+			Username:       "admin",
+			ClientName:     "cluster-client",
+			TLSConfig:      tlsCfg,
+			ConnectTimeout: 3 * time.Second,
+			SocketTimeout:  5 * time.Second,
+			KeepAlive:      15 * time.Second,
+			ReadOnly:       true,
+			PoolSize:       100,
+			MinIdleConns:   20,
+		},
+		Protocol:           RedisProtocolRESP2,
+		MaxRetries:         20,
+		MinRetryBackoff:    50 * time.Millisecond,
+		MaxRetryBackoff:    2 * time.Second,
+		DialerRetries:      1,
+		DialerRetryTimeout: 75 * time.Millisecond,
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultClusterDialFunc() error = %v", err)
 	}
@@ -267,6 +349,17 @@ func TestDefaultClusterDialFunc_AppliesOptions(t *testing.T) {
 	// We can verify it's a cluster connection.
 	if !conn.IsCluster() {
 		t.Error("Expected cluster connection")
+	}
+	clusterClient := conn.Raw().(*goredis.ClusterClient)
+	clusterRedisOpts := clusterClient.Options()
+	if clusterRedisOpts.MaxRetries != 20 || clusterRedisOpts.MinRetryBackoff != 50*time.Millisecond || clusterRedisOpts.MaxRetryBackoff != 2*time.Second {
+		t.Errorf("cluster command retry options = %+v, want 20/50ms/2s", clusterRedisOpts)
+	}
+	if clusterRedisOpts.DialerRetries != 1 || clusterRedisOpts.DialerRetryTimeout != 75*time.Millisecond {
+		t.Errorf("cluster dial retry options = %+v, want 1/75ms", clusterRedisOpts)
+	}
+	if clusterRedisOpts.Protocol != int(RedisProtocolRESP2) {
+		t.Errorf("cluster protocol = %d, want RESP2", clusterRedisOpts.Protocol)
 	}
 
 	// Verify it implements ClusterConnection.
@@ -299,7 +392,7 @@ func TestDefaultSentinelDialFunc_CreatesSentinelConnection(t *testing.T) {
 		Password:      "master-pass",
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultSentinelDialFunc() error = %v", err)
 	}
@@ -323,29 +416,37 @@ func TestDefaultSentinelDialFunc_CreatesSentinelConnection(t *testing.T) {
 }
 
 func TestDefaultSentinelDialFunc_AppliesAllOptions(t *testing.T) {
-	dial := DefaultSentinelDialFunc()
+	dial := DefaultAdvancedSentinelDialFunc()
 
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
 
-	opts := &SentinelDialOptions{
-		MasterName:           "mymaster",
-		SentinelAddrs:        []string{"s1:26379", "s2:26379", "s3:26379"},
-		Password:             "master-pass",
-		Username:             "master-user",
-		SentinelPassword:     "sentinel-pass",
-		SentinelUsername:     "sentinel-user",
-		DB:                   1,
-		ClientName:           "sentinel-client",
-		TLSConfig:            tlsCfg,
-		EnableTLSForSentinel: true,
-		ConnectTimeout:       3 * time.Second,
-		SocketTimeout:        5 * time.Second,
-		KeepAlive:            10 * time.Second,
-		PoolSize:             25,
-		MinIdleConns:         5,
+	opts := &AdvancedSentinelDialOptions{
+		SentinelDialOptions: SentinelDialOptions{
+			MasterName:           "mymaster",
+			SentinelAddrs:        []string{"s1:26379", "s2:26379", "s3:26379"},
+			Password:             "master-pass",
+			Username:             "master-user",
+			SentinelPassword:     "sentinel-pass",
+			SentinelUsername:     "sentinel-user",
+			DB:                   1,
+			ClientName:           "sentinel-client",
+			TLSConfig:            tlsCfg,
+			EnableTLSForSentinel: true,
+			ConnectTimeout:       3 * time.Second,
+			SocketTimeout:        5 * time.Second,
+			KeepAlive:            10 * time.Second,
+			PoolSize:             25,
+			MinIdleConns:         5,
+		},
+		Protocol:           RedisProtocolRESP2,
+		MaxRetries:         20,
+		MinRetryBackoff:    50 * time.Millisecond,
+		MaxRetryBackoff:    2 * time.Second,
+		DialerRetries:      1,
+		DialerRetryTimeout: 75 * time.Millisecond,
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultSentinelDialFunc() error = %v", err)
 	}
@@ -356,9 +457,19 @@ func TestDefaultSentinelDialFunc_AppliesAllOptions(t *testing.T) {
 
 	// Verify it wraps a go-redis Client (failover client).
 	raw := conn.Raw()
-	_, ok := raw.(*goredis.Client)
+	client, ok := raw.(*goredis.Client)
 	if !ok {
 		t.Fatalf("Raw() returned %T, want *goredis.Client", raw)
+	}
+	redisOpts := client.Options()
+	if redisOpts.MaxRetries != 20 || redisOpts.MinRetryBackoff != 50*time.Millisecond || redisOpts.MaxRetryBackoff != 2*time.Second {
+		t.Errorf("sentinel command retry options = %+v, want 20/50ms/2s", redisOpts)
+	}
+	if redisOpts.DialerRetries != 1 || redisOpts.DialerRetryTimeout != 75*time.Millisecond {
+		t.Errorf("sentinel dial retry options = %+v, want 1/75ms", redisOpts)
+	}
+	if redisOpts.Protocol != int(RedisProtocolRESP2) {
+		t.Errorf("sentinel protocol = %d, want RESP2", redisOpts.Protocol)
 	}
 
 	_ = conn.Close()
@@ -373,7 +484,7 @@ func TestDefaultSentinelDialFunc_ReadOnly(t *testing.T) {
 		ReadOnly:      true,
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultSentinelDialFunc() error = %v", err)
 	}
@@ -410,7 +521,7 @@ func TestDefaultDialFunc_DB0NotSkipped(t *testing.T) {
 		DB:   0,
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultDialFunc() error = %v", err)
 	}
@@ -431,7 +542,7 @@ func TestDefaultClusterDialFunc_ReadOnlyRouting(t *testing.T) {
 		ReadOnly: true,
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultClusterDialFunc() error = %v", err)
 	}
@@ -454,7 +565,7 @@ func TestDefaultDialFunc_TLSOnly(t *testing.T) {
 		},
 	}
 
-	conn, err := dial(context.Background(), opts)
+	conn, err := dial(fastDialCtx(t), opts)
 	if err != nil {
 		t.Fatalf("DefaultDialFunc() error = %v", err)
 	}

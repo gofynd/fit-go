@@ -113,9 +113,17 @@ type ConnectionOptions struct {
 	Context context.Context
 
 	// TLSRegistrar registers a TLS config with the driver. For go-sql-driver/mysql,
-	// this wraps mysql.RegisterTLSConfig(). If nil, TLS is configured via the DSN
-	// tls= parameter.
+	// this wraps mysql.RegisterTLSConfig(). It is required when certificate-based
+	// TLS environment variables are configured; InitDefault supplies it.
 	TLSRegistrar func(name string, config *tls.Config) error
+}
+
+// ConnectionAdvancedOptions enables post-main opt-in behavior while retaining
+// the original connection contract.
+// Deprecated: use InstrumentedConnectionOptions.
+type ConnectionAdvancedOptions struct {
+	ConnectionOptions
+	EnableTracing bool
 }
 
 // ServicePoolOverrides allows programmatic pool configuration per service.
@@ -224,6 +232,16 @@ func InitDefaultWithContext(ctx context.Context) (*Client, error) {
 // Init discovers MySQL connection environment variables, resolves connection
 // strings, and establishes connections.
 func Init(opts ConnectionOptions) (*Client, error) {
+	return initWithOptions(opts, false)
+}
+
+// InitAdvanced initializes MySQL with explicit post-main instrumentation.
+// Deprecated: use InitInstrumented.
+func InitAdvanced(opts ConnectionAdvancedOptions) (*Client, error) {
+	return initWithOptions(opts.ConnectionOptions, opts.EnableTracing)
+}
+
+func initWithOptions(opts ConnectionOptions, enableTracing bool) (*Client, error) {
 	if opts.DriverName == "" {
 		opts.DriverName = "mysql"
 	}
@@ -292,7 +310,11 @@ func Init(opts ConnectionOptions) (*Client, error) {
 		serviceNameUpper := upperNames[serviceName]
 
 		// Load TLS config if present.
-		tlsCfg, serverName := loadMySQLTLSConfig(serviceNameUpper)
+		tlsCfg, serverName, err := loadMySQLTLSConfig(serviceNameUpper)
+		if err != nil {
+			_ = c.Close()
+			return nil, fmt.Errorf("mysql: TLS configuration for %s: %w", serviceName, err)
+		}
 
 		sc := &ServiceConnection{}
 
@@ -309,14 +331,14 @@ func Init(opts ConnectionOptions) (*Client, error) {
 			}
 
 			// Create write connection.
-			writeDB, err := openDB(ctx, opts, writeConnStr, serviceName, serviceNameUpper, "write", appName, tlsCfg, serverName)
+			writeDB, err := openDBAdvanced(ctx, opts, writeConnStr, serviceName, serviceNameUpper, "write", appName, tlsCfg, serverName, enableTracing)
 			if err != nil {
 				return nil, err
 			}
 			applyPoolSettings(writeDB, serviceNameUpper, "WRITE", opts.PerService, serviceName, "write")
 
 			// Create read connection.
-			readDB, err := openDB(ctx, opts, readConnStr, serviceName, serviceNameUpper, "read", appName, tlsCfg, serverName)
+			readDB, err := openDBAdvanced(ctx, opts, readConnStr, serviceName, serviceNameUpper, "read", appName, tlsCfg, serverName, enableTracing)
 			if err != nil {
 				_ = writeDB.Close()
 				return nil, err
@@ -341,7 +363,7 @@ func Init(opts ConnectionOptions) (*Client, error) {
 				return nil, fmt.Errorf("mysql: resolve connection for %s_%s: %w", serviceName, connType, err)
 			}
 
-			db, err := openDB(ctx, opts, connStr, serviceName, serviceNameUpper, connType, appName, tlsCfg, serverName)
+			db, err := openDBAdvanced(ctx, opts, connStr, serviceName, serviceNameUpper, connType, appName, tlsCfg, serverName, enableTracing)
 			if err != nil {
 				return nil, err
 			}
@@ -466,13 +488,29 @@ func openDB(
 	tlsCfg *tls.Config,
 	serverName string,
 ) (*sql.DB, error) {
+	return openDBAdvanced(ctx, opts, connStr, serviceName, serviceNameUpper, connType, appName, tlsCfg, serverName, false)
+}
+
+func openDBAdvanced(
+	ctx context.Context,
+	opts ConnectionOptions,
+	connStr, serviceName, serviceNameUpper, connType, appName string,
+	tlsCfg *tls.Config,
+	serverName string,
+	enableTracing bool,
+) (*sql.DB, error) {
 	parsed, err := parseURI(connStr)
 	if err != nil {
 		return nil, fmt.Errorf("mysql: parse URI for %s_%s: %w", serviceName, connType, err)
 	}
 
-	// Register TLS config with driver if available.
-	if tlsCfg != nil && opts.TLSRegistrar != nil {
+	// A loaded certificate config cannot be represented by a bare DSN. Refuse to
+	// continue rather than silently opening a plaintext connection when a custom
+	// Init caller omitted the driver-specific registrar.
+	if tlsCfg != nil {
+		if opts.TLSRegistrar == nil {
+			return nil, fmt.Errorf("mysql: TLS configured for %s_%s but TLSRegistrar is nil", serviceName, connType)
+		}
 		tlsConfigName := fmt.Sprintf("mysql_%s_%s", serviceName, connType)
 		if err := opts.TLSRegistrar(tlsConfigName, tlsCfg); err != nil {
 			return nil, fmt.Errorf("mysql: register TLS for %s_%s: %w", serviceName, connType, err)
@@ -487,9 +525,15 @@ func openDB(
 
 	dsn := opts.DSNTransform(parsed)
 
-	db, err := sql.Open(opts.DriverName, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("mysql: open %s_%s: %w", serviceName, connType, err)
+	var db *sql.DB
+	var openErr error
+	if enableTracing {
+		db, openErr = openSQLDB(opts.DriverName, dsn)
+	} else {
+		db, openErr = sql.Open(opts.DriverName, dsn)
+	}
+	if openErr != nil {
+		return nil, fmt.Errorf("mysql: open %s_%s: %w", serviceName, connType, openErr)
 	}
 
 	return db, nil
@@ -584,8 +628,9 @@ func parseURI(rawURI string) (*ParsedURI, error) {
 }
 
 // loadMySQLTLSConfig builds a *tls.Config from SSL environment variables.
-// Returns the config and the server name.
-func loadMySQLTLSConfig(serviceNameUpper string) (*tls.Config, string) {
+// Returns the config and the server name. An entirely absent configuration
+// disables TLS; a partial or invalid configuration is rejected.
+func loadMySQLTLSConfig(serviceNameUpper string) (*tls.Config, string, error) {
 	serverName := os.Getenv(fmt.Sprintf("MYSQL_%s_SSL_SERVER_NAME", serviceNameUpper))
 	caPath := envWithFallback(
 		fmt.Sprintf("MYSQL_%s_SSL_CA", serviceNameUpper),
@@ -600,30 +645,40 @@ func loadMySQLTLSConfig(serviceNameUpper string) (*tls.Config, string) {
 		"MYSQL_SSL_KEY",
 	)
 
-	// SSL requires all four: CA, cert, key, and server name (.
-	if caPath == "" || certPath == "" || keyPath == "" || serverName == "" {
-		return nil, ""
+	configuredValues := 0
+	for _, value := range []string{caPath, certPath, keyPath, serverName} {
+		if value != "" {
+			configuredValues++
+		}
+	}
+	if configuredValues == 0 {
+		return nil, "", nil
+	}
+	if configuredValues != 4 {
+		return nil, "", fmt.Errorf("CA, certificate, key, and server name must all be configured")
 	}
 
 	caCert, err := os.ReadFile(caPath)
 	if err != nil {
-		return nil, ""
+		return nil, "", fmt.Errorf("read CA certificate: %w", err)
 	}
 
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		return nil, ""
+		return nil, "", fmt.Errorf("load client certificate: %w", err)
 	}
 
 	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(caCert)
+	if ok := caCertPool.AppendCertsFromPEM(caCert); !ok {
+		return nil, "", fmt.Errorf("CA certificate contains no valid PEM certificates")
+	}
 
 	return &tls.Config{
 		ServerName:   serverName,
 		RootCAs:      caCertPool,
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
-	}, serverName
+	}, serverName, nil
 }
 
 // resolveConnectionString resolves a value as either a direct connection string

@@ -41,17 +41,44 @@ const (
 //	encrypted, err := mgr.Encrypt("sensitive data")
 //	decrypted, err := mgr.Decrypt(encrypted)
 type Manager struct {
-	mu              sync.RWMutex
-	initialized     bool
-	dek             []byte
-	iv              []byte
-	encryptionCache *lruCache
-	decryptionCache *lruCache
+	mu                sync.RWMutex
+	initialized       bool
+	dek               []byte
+	iv                []byte
+	encryptionCache   *lruCache
+	decryptionCache   *lruCache
+	allowedNonceSizes map[int]struct{}
+	invalidNonceSizes bool
 }
 
 // NewManager creates a new uninitialized Manager.
 func NewManager() *Manager {
-	return &Manager{}
+	return NewManagerAdvanced(ManagerAdvancedOptions{AllowedNonceSizes: []int{12}})
+}
+
+// ManagerAdvancedOptions enables explicit cross-language nonce compatibility.
+// The original constructor intentionally remains fixed to the 12-byte GCM nonce.
+// Deprecated: use ManagerOptions.
+type ManagerAdvancedOptions struct{ AllowedNonceSizes []int }
+
+// NewManagerAdvanced creates a manager accepting only the explicitly listed
+// nonce sizes. Empty input uses the secure 12-byte default.
+// Deprecated: use NewManagerWithOptions.
+func NewManagerAdvanced(opts ManagerAdvancedOptions) *Manager {
+	explicit := len(opts.AllowedNonceSizes) > 0
+	if len(opts.AllowedNonceSizes) == 0 {
+		opts.AllowedNonceSizes = []int{12}
+	}
+	allowed := make(map[int]struct{}, len(opts.AllowedNonceSizes))
+	for _, size := range opts.AllowedNonceSizes {
+		if size > 0 {
+			allowed[size] = struct{}{}
+		}
+	}
+	return &Manager{
+		allowedNonceSizes: allowed,
+		invalidNonceSizes: explicit && len(allowed) == 0,
+	}
 }
 
 // Init initializes the encryption manager. It reads the provider from
@@ -64,6 +91,9 @@ func (m *Manager) Init() error {
 
 	if m.initialized {
 		return nil
+	}
+	if m.invalidNonceSizes {
+		return fmt.Errorf("encryption: AllowedNonceSizes must contain at least one positive nonce size")
 	}
 
 	// Try inline DEK/IV from environment first.
@@ -99,8 +129,24 @@ func (m *Manager) Init() error {
 	if len(m.dek) != 32 {
 		return fmt.Errorf("encryption: DEK must be 32 bytes (AES-256), got %d", len(m.dek))
 	}
-	if len(m.iv) != 12 {
-		return fmt.Errorf("encryption: IV must be 12 bytes (GCM nonce), got %d", len(m.iv))
+	// The original fit-go contract requires a 12-byte GCM nonce. Cross-language
+	// deployments with another fixed nonce size (commonly 9 bytes in Node/pyfit)
+	// must opt in explicitly through NewManagerAdvanced.
+	_, allowed := m.allowedNonceSizes[len(m.iv)]
+	if len(m.allowedNonceSizes) == 0 {
+		// Preserve the usable zero-value Manager contract.
+		allowed = len(m.iv) == 12
+	}
+	if !allowed {
+		if len(m.allowedNonceSizes) == 0 {
+			return fmt.Errorf("encryption: IV must be 12 bytes (GCM nonce), got %d", len(m.iv))
+		}
+		if len(m.allowedNonceSizes) == 1 {
+			if _, legacy := m.allowedNonceSizes[12]; legacy {
+				return fmt.Errorf("encryption: IV must be 12 bytes (GCM nonce), got %d", len(m.iv))
+			}
+		}
+		return fmt.Errorf("encryption: IV (GCM nonce) size %d is not allowed", len(m.iv))
 	}
 
 	// Initialize LRU caches.
@@ -157,7 +203,9 @@ func (m *Manager) Encrypt(message string) (string, error) {
 		return "", fmt.Errorf("encryption: cipher init failed: %w", err)
 	}
 
-	gcm, err := cipher.NewGCM(block)
+	// NewGCMWithNonceSize (not NewGCM, which forces 12 bytes and would panic on
+	// Seal with a shorter IV); see Init() for the variable-nonce interop rationale.
+	gcm, err := cipher.NewGCMWithNonceSize(block, len(iv))
 	if err != nil {
 		return "", fmt.Errorf("encryption: GCM init failed: %w", err)
 	}
@@ -222,7 +270,8 @@ func (m *Manager) Decrypt(encrypted string) (string, error) {
 		return "", fmt.Errorf("encryption: cipher init failed: %w", err)
 	}
 
-	gcm, err := cipher.NewGCM(block)
+	// Variable nonce size (see Init()) so fit-go can Open ciphertext Node/pyfit produced.
+	gcm, err := cipher.NewGCMWithNonceSize(block, len(iv))
 	if err != nil {
 		return "", fmt.Errorf("encryption: GCM init failed: %w", err)
 	}

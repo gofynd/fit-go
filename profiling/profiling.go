@@ -30,6 +30,7 @@
 // - PROFILING_CPU_WALL_ENABLED: Enable wall profiling (default: true)
 // - PROFILING_TAGS_JSON: Additional tags as JSON object
 // - PROFILING_FLUSH_INTERVAL_MS: Flush interval (default: 10000)
+// - PROFILING_SAMPLE_RATE: Legacy requested CPU sample rate (default: 10)
 // - PROFILING_HEAP_SAMPLING_INTERVAL_BYTES: Heap sample rate (default: 524288)
 // - PROFILING_HEAP_STACK_DEPTH: Heap stack depth (default: 64)
 // - PROFILING_WALL_SAMPLING_DURATION_MS: Wall profile duration (default: 60000)
@@ -39,16 +40,18 @@
 // - PROJECT_NAME: Project name for app identification
 // - DEPLOYMENT_NAME: Deployment name override
 // - DEPLOYMENT_TYPE: Deployment type (server, worker, etc.)
-// - PLATFORM_VERSION: Fynd platform version tag
+// - PLATFORM_VERSION: Platform version tag
 package profiling
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"runtime"
 	"runtime/pprof"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -57,6 +60,8 @@ import (
 
 	pyroscope "github.com/grafana/pyroscope-go"
 )
+
+const pyroscopeEffectiveSampleRate = 100
 
 // Config holds the profiler configuration.
 type Config struct {
@@ -76,6 +81,16 @@ type Config struct {
 	ApplicationName            string            `json:"applicationName,omitempty"`
 }
 
+// AdvancedConfig contains post-main profiler status fields without changing
+// the positional layout of Config.
+// Deprecated: use RuntimeConfig.
+type AdvancedConfig struct {
+	Config
+	SampleRate             int  `json:"sampleRate"`
+	EffectiveSampleRate    int  `json:"effectiveSampleRate"`
+	SampleRateConfigurable bool `json:"sampleRateConfigurable"`
+}
+
 // DetailedStatus represents the detailed profiling status.
 type DetailedStatus struct {
 	Overall bool        `json:"overall"`
@@ -93,7 +108,7 @@ type ProfileType struct {
 // Profiler manages continuous profiling.
 type Profiler struct {
 	mu             sync.Mutex
-	config         Config
+	config         AdvancedConfig
 	cpuRunning     atomic.Bool
 	heapRunning    atomic.Bool
 	wallRunning    atomic.Bool
@@ -107,6 +122,7 @@ type Profiler struct {
 
 	// Pyroscope profiler instance (nil when using pprof fallback).
 	pyroscope *pyroscope.Profiler
+	advanced  bool
 }
 
 // profileBuffer holds pprof output in memory.
@@ -137,11 +153,42 @@ func DefaultConfig() Config {
 	}
 }
 
+// DefaultAdvancedConfig returns the environment configuration including
+// post-main profiler status fields.
+// Deprecated: use DefaultRuntimeConfig.
+func DefaultAdvancedConfig() AdvancedConfig {
+	return AdvancedConfig{
+		Config:                 DefaultConfig(),
+		SampleRate:             envInt("PROFILING_SAMPLE_RATE", 10),
+		EffectiveSampleRate:    pyroscopeEffectiveSampleRate,
+		SampleRateConfigurable: false,
+	}
+}
+
 // New creates a new Profiler with the given configuration.
 func New(cfg Config) *Profiler {
-	return &Profiler{
-		config: cfg,
+	return &Profiler{config: AdvancedConfig{
+		Config: cfg, SampleRate: 10, EffectiveSampleRate: pyroscopeEffectiveSampleRate,
+	}}
+}
+
+// NewAdvanced creates a profiler with post-main opt-in controls.
+// Deprecated: use NewRuntime.
+func NewAdvanced(cfg AdvancedConfig) *Profiler {
+	if cfg.SampleRate <= 0 {
+		cfg.SampleRate = 10
 	}
+	// pyroscope-go exposes a deprecated SampleRate field but fixes collection
+	// at 100 Hz internally. Report the requested legacy value and the actual Go
+	// value separately rather than pretending the request changes collection.
+	cfg.EffectiveSampleRate = pyroscopeEffectiveSampleRate
+	cfg.SampleRateConfigurable = false
+	profiler := &Profiler{
+		config:   cfg,
+		advanced: true,
+	}
+	profiler.enabled.Store(cfg.Enabled)
+	return profiler
 }
 
 // NewFromEnv creates a new Profiler using environment variable configuration.
@@ -149,13 +196,15 @@ func NewFromEnv() *Profiler {
 	return New(DefaultConfig())
 }
 
-// buildAppName constructs the application name from environment variables,
-// .
+// buildAppName constructs the application name from environment variables.
 func (p *Profiler) buildAppName() string {
 	podName := envString("K8S_POD_NAME", "unknown-pod")
 	projectName := envString("PROJECT_NAME", "DefaultProject")
 	deploymentName := envString("DEPLOYMENT_NAME", "")
-	deploymentType := strings.ToLower(envString("DEPLOYMENT_TYPE", "server"))
+	deploymentType := strings.ToLower(strings.TrimSpace(envString("DEPLOYMENT_TYPE", "server")))
+	if deploymentType == "" {
+		deploymentType = "server"
+	}
 
 	// Derive deployment name from pod name if not provided.
 	if deploymentName == "" {
@@ -167,7 +216,6 @@ func (p *Profiler) buildAppName() string {
 		}
 	}
 
-	// Capitalize deployment type.
 	deploymentTypeCapitalized := strings.ToUpper(deploymentType[:1]) + deploymentType[1:]
 	return fmt.Sprintf("%s-%s-%s", projectName, deploymentName, deploymentTypeCapitalized)
 }
@@ -476,7 +524,7 @@ func (p *Profiler) GetDetailedStatus() DetailedStatus {
 // Status returns the profiler status as a generic map, suitable for JSON
 // serialization in HTTP handlers.
 func (p *Profiler) Status() map[string]interface{} {
-	return map[string]interface{}{
+	status := map[string]interface{}{
 		"enabled":         p.enabled.Load(),
 		"running":         p.overallRunning.Load(),
 		"applicationName": p.config.ApplicationName,
@@ -493,12 +541,23 @@ func (p *Profiler) Status() map[string]interface{} {
 			"running": p.wallRunning.Load(),
 		},
 	}
+	if p.advanced {
+		status["sampleRate"] = map[string]interface{}{
+			"requested": p.config.SampleRate, "effective": p.config.EffectiveSampleRate,
+			"configurable": p.config.SampleRateConfigurable,
+		}
+	}
+	return status
 }
 
 // GetConfig returns the current profiler configuration.
 func (p *Profiler) GetConfig() Config {
-	return p.config
+	return p.config.Config
 }
+
+// GetAdvancedConfig returns the complete profiler configuration.
+// Deprecated: use GetRuntimeConfig.
+func (p *Profiler) GetAdvancedConfig() AdvancedConfig { return p.config }
 
 // GetApplicationName returns the derived application name.
 func (p *Profiler) GetApplicationName() string {
@@ -601,6 +660,10 @@ func (p *Profiler) Routes() http.Handler {
 	})
 
 	mux.HandleFunc("/_profiling/config", func(w http.ResponseWriter, r *http.Request) {
+		if p.advanced {
+			writeJSON(w, http.StatusOK, p.GetAdvancedConfig())
+			return
+		}
 		writeJSON(w, http.StatusOK, p.GetConfig())
 	})
 
@@ -648,29 +711,107 @@ func envInt(key string, defaultVal int) int {
 // Package-level singleton for simple usage
 // ---------------------------------------------------------------------------
 
-var defaultProfiler = NewFromEnv()
+type defaultProfilerOwner struct {
+	profiler *Profiler
+	previous *defaultProfilerOwner
+	baseline *Profiler
+	active   bool
+}
+
+var processDefault = struct {
+	sync.RWMutex
+	profiler *Profiler
+	owner    *defaultProfilerOwner
+}{profiler: NewFromEnv()}
+
+// TagWrapper runs fn with scoped Pyroscope/pprof labels. Labels are attached to
+// samples taken while fn executes and are also carried in the callback context,
+// matching pyfit's per-function tag-wrapper capability without global mutation.
+func TagWrapper(ctx context.Context, tags map[string]string, fn func(context.Context)) {
+	if fn == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	keys := make([]string, 0, len(tags))
+	for key := range tags {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	labels := make([]string, 0, len(tags)*2)
+	for _, key := range keys {
+		labels = append(labels, key, tags[key])
+	}
+	pyroscope.TagWrapper(ctx, pyroscope.Labels(labels...), fn)
+}
 
 // Start starts the default profiler.
 func Start() {
-	defaultProfiler.Start()
+	Default().Start()
 }
 
 // Stop stops the default profiler.
 func Stop() {
-	defaultProfiler.Stop()
+	Default().Stop()
 }
 
 // Default returns the default profiler instance.
 func Default() *Profiler {
-	return defaultProfiler
+	processDefault.RLock()
+	defer processDefault.RUnlock()
+	return processDefault.profiler
+}
+
+// SetDefault installs profiler as the process default and returns an
+// idempotent restore function. Out-of-order restores do not revive an inactive
+// owner, matching the lifecycle guarantees of fit-go's tracing and metrics
+// defaults.
+func SetDefault(profiler *Profiler) func() {
+	if profiler == nil {
+		profiler = New(Config{})
+	}
+	processDefault.Lock()
+	owner := &defaultProfilerOwner{
+		profiler: profiler,
+		previous: processDefault.owner,
+		baseline: processDefault.profiler,
+		active:   true,
+	}
+	processDefault.profiler = profiler
+	processDefault.owner = owner
+	processDefault.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			processDefault.Lock()
+			owner.active = false
+			if processDefault.owner == owner {
+				fallback := owner.baseline
+				previous := owner.previous
+				for previous != nil && !previous.active {
+					fallback = previous.baseline
+					previous = previous.previous
+				}
+				processDefault.owner = previous
+				if previous != nil {
+					processDefault.profiler = previous.profiler
+				} else {
+					processDefault.profiler = fallback
+				}
+			}
+			processDefault.Unlock()
+		})
+	}
 }
 
 // Routes returns the HTTP routes for the default profiler.
 func Routes() http.Handler {
-	return defaultProfiler.Routes()
+	return Default().Routes()
 }
 
 // Status returns the status of the default profiler.
 func StatusMap() map[string]interface{} {
-	return defaultProfiler.Status()
+	return Default().Status()
 }

@@ -17,6 +17,7 @@ package encryption
 import (
 	"encoding/base64"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -109,18 +110,41 @@ func TestManager_Init_WrongDEKSize(t *testing.T) {
 	}
 }
 
-func TestManager_Init_WrongIVSize(t *testing.T) {
+func TestManagerAdvanced_Init_AcceptsExplicitNonStandardIV(t *testing.T) {
+	// A non-12-byte (but non-empty) IV is now accepted: the platform's canonical
+	// fit encryption (Node `fit/encryption`, `pyfit`) uses a fixed Vault IV of
+	// non-standard length (9 bytes in prod), and fit-go must Init with it via
+	// cipher.NewGCMWithNonceSize. Previously this hard-failed ("IV must be 12 bytes").
 	os.Setenv("PII_DEK_BASE64", base64.StdEncoding.EncodeToString(make([]byte, 32)))
-	os.Setenv("PII_IV_BASE64", base64.StdEncoding.EncodeToString(make([]byte, 16))) // wrong size
+	os.Setenv("PII_IV_BASE64", base64.StdEncoding.EncodeToString(make([]byte, 16)))
 	defer func() {
 		os.Unsetenv("PII_DEK_BASE64")
 		os.Unsetenv("PII_IV_BASE64")
 	}()
 
-	mgr := NewManager()
-	err := mgr.Init()
-	if err == nil {
-		t.Error("Init() should fail with wrong IV size")
+	mgr := NewManagerAdvanced(ManagerAdvancedOptions{AllowedNonceSizes: []int{16}})
+	if err := mgr.Init(); err != nil {
+		t.Errorf("Init() should accept a non-standard (16-byte) IV, got: %v", err)
+	}
+}
+
+func TestManager_Init_RejectsNonStandardIV(t *testing.T) {
+	os.Setenv("PII_DEK_BASE64", base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	os.Setenv("PII_IV_BASE64", base64.StdEncoding.EncodeToString(make([]byte, 9)))
+	defer os.Unsetenv("PII_DEK_BASE64")
+	defer os.Unsetenv("PII_IV_BASE64")
+	if err := NewManager().Init(); err == nil || !strings.Contains(err.Error(), "must be 12 bytes") {
+		t.Fatalf("NewManager().Init() error = %v, want legacy 12-byte rejection", err)
+	}
+}
+
+func TestManagerZeroValueRetainsTwelveByteNonceContract(t *testing.T) {
+	os.Setenv("PII_DEK_BASE64", base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	os.Setenv("PII_IV_BASE64", base64.StdEncoding.EncodeToString(make([]byte, 12)))
+	defer os.Unsetenv("PII_DEK_BASE64")
+	defer os.Unsetenv("PII_IV_BASE64")
+	if err := new(Manager).Init(); err != nil {
+		t.Fatalf("zero-value Manager.Init() error = %v", err)
 	}
 }
 

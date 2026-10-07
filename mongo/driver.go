@@ -68,12 +68,21 @@ func (c *mongoConnection) Raw() interface{} {
 // The returned DialFunc applies all DialOptions (pool settings, TLS, app name,
 // timeouts) to the mongo-driver client options before connecting.
 func DefaultDialFunc() DialFunc {
-	return func(ctx context.Context, uri string, opts *DialOptions) (Connection, error) {
-		clientOpts := options.Client().ApplyURI(uri)
+	return defaultDialFunc(false)
+}
 
-		if opts != nil {
-			applyDriverOptions(clientOpts, opts)
-		}
+// DefaultAdvancedDialFunc enables post-main automatic tracing and leaves the
+// selected MongoDB driver's retry policy unchanged. fit-go itself pins the
+// official-main v2.5 baseline; a downstream application may explicitly select
+// a newer driver when that behavior is part of its own migration contract.
+// Deprecated: use DefaultInstrumentedDialFunc.
+func DefaultAdvancedDialFunc() DialFunc {
+	return defaultDialFunc(true)
+}
+
+func defaultDialFunc(advanced bool) DialFunc {
+	return func(ctx context.Context, uri string, opts *DialOptions) (Connection, error) {
+		clientOpts := clientOptionsForMode(uri, opts, advanced)
 
 		client, err := mongo.Connect(clientOpts)
 		if err != nil {
@@ -82,6 +91,37 @@ func DefaultDialFunc() DialFunc {
 
 		return &mongoConnection{client: client}, nil
 	}
+}
+
+func clientOptionsForMode(uri string, opts *DialOptions, advanced bool) *options.ClientOptions {
+	clientOpts := options.Client().ApplyURI(uri)
+	if opts != nil {
+		applyDriverOptions(clientOpts, opts)
+	}
+	if advanced {
+		if monitor := newCommandMonitor(); monitor != nil {
+			clientOpts.SetMonitor(monitor)
+		}
+	} else {
+		// mongo-driver v2.6 introduced adaptive overload retries. Keep the
+		// original dialer's behavior even when a downstream module explicitly
+		// upgrades the selected driver. The optional interface compiles against
+		// official main's v2.5 while activating automatically under v2.6+.
+		disableAdaptiveRetriesIfSupported(clientOpts)
+	}
+	return clientOpts
+}
+
+type adaptiveRetriesSetter interface {
+	SetMaxAdaptiveRetries(uint) *options.ClientOptions
+}
+
+func disableAdaptiveRetriesIfSupported(value any) bool {
+	setter, supported := value.(adaptiveRetriesSetter)
+	if supported {
+		setter.SetMaxAdaptiveRetries(0)
+	}
+	return supported
 }
 
 // applyDriverOptions maps DialOptions to mongo-driver client options.

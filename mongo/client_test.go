@@ -18,7 +18,7 @@ import (
 	"context"
 	"os"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -28,24 +28,19 @@ import (
 // ---------------------------------------------------------------------------
 
 type mockConnection struct {
-	mu          sync.Mutex
-	pingCalled  bool
-	closeCalled bool
+	pingCalled  atomic.Bool
+	closeCalled atomic.Bool
 	pingErr     error
 	closeErr    error
 }
 
 func (m *mockConnection) Ping(ctx context.Context) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.pingCalled = true
+	m.pingCalled.Store(true)
 	return m.pingErr
 }
 
 func (m *mockConnection) Close(ctx context.Context) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.closeCalled = true
+	m.closeCalled.Store(true)
 	return m.closeErr
 }
 
@@ -323,7 +318,10 @@ func TestBuildDialOptions(t *testing.T) {
 			ConnectTimeout: 5 * time.Second,
 		}
 
-		dialOpts := buildDialOptions("USERS", "write", "users", opts, true, false)
+		dialOpts, err := buildDialOptions("USERS", "write", "users", opts, true, false)
+		if err != nil {
+			t.Fatalf("buildDialOptions() error = %v", err)
+		}
 
 		if dialOpts.MaxPoolSize != 100 {
 			t.Errorf("MaxPoolSize = %d, want 100", dialOpts.MaxPoolSize)
@@ -357,7 +355,10 @@ func TestBuildDialOptions(t *testing.T) {
 			},
 		}
 
-		dialOpts := buildDialOptions("ORDERS", "read", "orders", opts, false, true)
+		dialOpts, err := buildDialOptions("ORDERS", "read", "orders", opts, false, true)
+		if err != nil {
+			t.Fatalf("buildDialOptions() error = %v", err)
+		}
 
 		if dialOpts.MaxPoolSize != 200 {
 			t.Errorf("MaxPoolSize = %d, want 200 (override)", dialOpts.MaxPoolSize)
@@ -372,7 +373,10 @@ func TestBuildDialOptions(t *testing.T) {
 			ConnectTimeout: 30 * time.Second,
 		}
 
-		dialOpts := buildDialOptions("SVC", "write", "svc", opts, false, false)
+		dialOpts, err := buildDialOptions("SVC", "write", "svc", opts, false, false)
+		if err != nil {
+			t.Fatalf("buildDialOptions() error = %v", err)
+		}
 
 		if dialOpts.ConnectTimeoutMS != 30000 {
 			t.Errorf("ConnectTimeoutMS = %d, want 30000", dialOpts.ConnectTimeoutMS)
@@ -528,10 +532,10 @@ func TestClient_Close(t *testing.T) {
 		t.Errorf("Close() error = %v, want nil", err)
 	}
 
-	if !read.closeCalled {
+	if !read.closeCalled.Load() {
 		t.Error("Read connection Close() should be called")
 	}
-	if !write.closeCalled {
+	if !write.closeCalled.Load() {
 		t.Error("Write connection Close() should be called")
 	}
 
@@ -655,6 +659,25 @@ func TestInit(t *testing.T) {
 		}
 		if orders.Read != nil {
 			t.Error("Did not expect read connection for 'orders'")
+		}
+	})
+
+	t.Run("propagates TLS configuration errors before dialing", func(t *testing.T) {
+		os.Setenv("MONGO_TLSFAIL_READ_WRITE", "mongodb://localhost:27017/test")
+		os.Setenv("MONGO_TLSFAIL_SSL_CA", "/does/not/exist")
+		defer os.Unsetenv("MONGO_TLSFAIL_READ_WRITE")
+		defer os.Unsetenv("MONGO_TLSFAIL_SSL_CA")
+
+		dialCalled := atomic.Bool{}
+		_, err := Init(ConnectionOptions{Dial: func(context.Context, string, *DialOptions) (Connection, error) {
+			dialCalled.Store(true)
+			return &mockConnection{}, nil
+		}})
+		if err == nil || !strings.Contains(err.Error(), "TLS configuration") {
+			t.Fatalf("Init() error = %v, want TLS configuration error", err)
+		}
+		if dialCalled.Load() {
+			t.Fatal("Dial was called with an invalid TLS configuration")
 		}
 	})
 
@@ -844,32 +867,77 @@ func TestResolveConnectionString(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestLoadTLSConfig_NoCerts(t *testing.T) {
-	// Clear any SSL env vars
-	for _, k := range []string{
-		"MONGO_TEST_SSL_CA",
-		"MONGO_TEST_SSL_CERT",
-		"MONGO_TEST_SSL_KEY",
-		"MONGO_SSL_CA",
-		"MONGO_SSL_CERT",
-		"MONGO_SSL_KEY",
-	} {
-		os.Unsetenv(k)
-	}
+	clearMongoTLSEnv(t)
 
-	cfg := loadTLSConfig("MONGO", "TEST")
+	cfg, err := loadTLSConfig("MONGO", "TEST")
+	if err != nil {
+		t.Fatalf("loadTLSConfig() error = %v", err)
+	}
 	if cfg != nil {
 		t.Error("loadTLSConfig should return nil when no certs are configured")
 	}
 }
 
 func TestLoadTLSConfig_PartialCerts(t *testing.T) {
+	clearMongoTLSEnv(t)
 	// Only CA is set
-	os.Setenv("MONGO_TEST_SSL_CA", "/path/to/ca.pem")
-	defer os.Unsetenv("MONGO_TEST_SSL_CA")
+	t.Setenv("MONGO_TEST_SSL_CA", "/path/to/ca.pem")
 
-	cfg := loadTLSConfig("MONGO", "TEST")
+	cfg, err := loadTLSConfig("MONGO", "TEST")
+	if err == nil || !strings.Contains(err.Error(), "must all be configured") {
+		t.Fatalf("loadTLSConfig() error = %v, want incomplete configuration error", err)
+	}
 	if cfg != nil {
-		t.Error("loadTLSConfig should return nil when certs are incomplete")
+		t.Error("loadTLSConfig should return nil on error")
+	}
+}
+
+func TestLoadTLSConfig_UnreadableAndInvalidMaterial(t *testing.T) {
+	t.Run("unreadable CA", func(t *testing.T) {
+		clearMongoTLSEnv(t)
+		t.Setenv("MONGO_TEST_SSL_CA", "/does/not/exist")
+		t.Setenv("MONGO_TEST_SSL_CERT", "/does/not/exist")
+		t.Setenv("MONGO_TEST_SSL_KEY", "/does/not/exist")
+
+		_, err := loadTLSConfig("MONGO", "TEST")
+		if err == nil || !strings.Contains(err.Error(), "read CA certificate") {
+			t.Fatalf("loadTLSConfig() error = %v, want CA read error", err)
+		}
+	})
+
+	t.Run("invalid CA PEM", func(t *testing.T) {
+		clearMongoTLSEnv(t)
+		tempDir := t.TempDir()
+		caPath := tempDir + "/ca.pem"
+		certPath := tempDir + "/cert.pem"
+		keyPath := tempDir + "/key.pem"
+		for path, contents := range map[string]string{
+			caPath:   "not a certificate",
+			certPath: "not a certificate",
+			keyPath:  "not a key",
+		} {
+			if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Setenv("MONGO_TEST_SSL_CA", caPath)
+		t.Setenv("MONGO_TEST_SSL_CERT", certPath)
+		t.Setenv("MONGO_TEST_SSL_KEY", keyPath)
+
+		_, err := loadTLSConfig("MONGO", "TEST")
+		if err == nil {
+			t.Fatal("loadTLSConfig() error = nil, want invalid material error")
+		}
+	})
+}
+
+func clearMongoTLSEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{
+		"MONGO_TEST_SSL_CA", "MONGO_TEST_SSL_CERT", "MONGO_TEST_SSL_KEY",
+		"MONGO_SSL_CA", "MONGO_SSL_CERT", "MONGO_SSL_KEY",
+	} {
+		t.Setenv(key, "")
 	}
 }
 

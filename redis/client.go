@@ -39,6 +39,16 @@
 //	REDIS_{SERVICE}_{TYPE}_CONNECTION_TIMEOUT - connect timeout in ms
 //	REDIS_{SERVICE}_{TYPE}_SOCKET_TIMEOUT - socket timeout in ms
 //	REDIS_{SERVICE}_{TYPE}_KEEP_ALIVE - keep-alive interval in ms
+//	REDIS_{SERVICE}_{TYPE}_COMMAND_MAX_RETRIES - go-redis command retry count
+//	REDIS_{SERVICE}_{TYPE}_COMMAND_MIN_RETRY_BACKOFF - minimum command retry backoff in ms
+//	REDIS_{SERVICE}_{TYPE}_COMMAND_MAX_RETRY_BACKOFF - maximum command retry backoff in ms
+//	REDIS_{SERVICE}_{TYPE}_DIALER_RETRIES - connect attempts within one command attempt
+//	REDIS_{SERVICE}_{TYPE}_DIALER_RETRY_TIMEOUT - fixed connect-attempt delay in ms
+//
+// Command retries are go-redis per-command retries with jittered exponential
+// backoff. They are not an ioredis-compatible offline queue: commands are not
+// accepted into a shared FIFO while disconnected, retry schedules are owned by
+// individual callers, and Close does not drain queued commands.
 //
 // # SSL/TLS configuration
 //
@@ -103,11 +113,23 @@ type ClusterConnection interface {
 // DialFunc creates a standalone Redis connection.
 type DialFunc func(ctx context.Context, opts *DialOptions) (Connection, error)
 
+// AdvancedDialFunc is retained for fork source compatibility.
+// Deprecated: use ConfiguredDialFunc.
+type AdvancedDialFunc func(ctx context.Context, opts *AdvancedDialOptions) (Connection, error)
+
 // ClusterDialFunc creates a Redis Cluster connection.
 type ClusterDialFunc func(ctx context.Context, opts *ClusterDialOptions) (Connection, error)
 
+// AdvancedClusterDialFunc is retained for fork source compatibility.
+// Deprecated: use ConfiguredClusterDialFunc.
+type AdvancedClusterDialFunc func(ctx context.Context, opts *AdvancedClusterDialOptions) (Connection, error)
+
 // SentinelDialFunc creates a Redis Sentinel connection.
 type SentinelDialFunc func(ctx context.Context, opts *SentinelDialOptions) (Connection, error)
+
+// AdvancedSentinelDialFunc is retained for fork source compatibility.
+// Deprecated: use ConfiguredSentinelDialFunc.
+type AdvancedSentinelDialFunc func(ctx context.Context, opts *AdvancedSentinelDialOptions) (Connection, error)
 
 // DialOptions carries parameters for standalone Redis connections.
 type DialOptions struct {
@@ -151,6 +173,17 @@ type DialOptions struct {
 	ReadOnly bool
 }
 
+// AdvancedDialOptions is retained for fork source compatibility.
+// Deprecated: use DialSettings.
+type AdvancedDialOptions struct {
+	DialOptions
+	Protocol           RedisProtocol
+	MinRetryBackoff    time.Duration
+	MaxRetryBackoff    time.Duration
+	DialerRetries      int
+	DialerRetryTimeout time.Duration
+}
+
 // ClusterDialOptions carries parameters for Redis Cluster connections.
 type ClusterDialOptions struct {
 	// Addrs are the seed "host:port" addresses.
@@ -189,6 +222,18 @@ type ClusterDialOptions struct {
 
 	// MinIdleConns is the minimum idle connections per node.
 	MinIdleConns int
+}
+
+// AdvancedClusterDialOptions is retained for fork source compatibility.
+// Deprecated: use ClusterDialSettings.
+type AdvancedClusterDialOptions struct {
+	ClusterDialOptions
+	Protocol           RedisProtocol
+	MaxRetries         int
+	MinRetryBackoff    time.Duration
+	MaxRetryBackoff    time.Duration
+	DialerRetries      int
+	DialerRetryTimeout time.Duration
 }
 
 // SentinelDialOptions carries parameters for Redis Sentinel connections.
@@ -242,6 +287,18 @@ type SentinelDialOptions struct {
 	MinIdleConns int
 }
 
+// AdvancedSentinelDialOptions is retained for fork source compatibility.
+// Deprecated: use SentinelDialSettings.
+type AdvancedSentinelDialOptions struct {
+	SentinelDialOptions
+	Protocol           RedisProtocol
+	MaxRetries         int
+	MinRetryBackoff    time.Duration
+	MaxRetryBackoff    time.Duration
+	DialerRetries      int
+	DialerRetryTimeout time.Duration
+}
+
 // ---------------------------------------------------------------------------
 // Service connections
 // ---------------------------------------------------------------------------
@@ -277,6 +334,74 @@ type ConnectionOptions struct {
 	Context context.Context
 }
 
+// AdvancedConnectionOptions contains post-main Redis protocol and ioredis
+// compatibility controls without changing ConnectionOptions' positional layout.
+// Deprecated: use CompatibilityOptions.
+type AdvancedConnectionOptions struct {
+	Dial                  DialFunc
+	ClusterDial           ClusterDialFunc
+	SentinelDial          SentinelDialFunc
+	DefaultConnectTimeout time.Duration
+	Context               context.Context
+	AdvancedDial          AdvancedDialFunc
+	AdvancedClusterDial   AdvancedClusterDialFunc
+	AdvancedSentinelDial  AdvancedSentinelDialFunc
+
+	// ProtocolByService explicitly selects RESP2 or RESP3 for named Redis
+	// services. Keys are matched case-insensitively against names discovered
+	// from REDIS_{SERVICE}_READ_{WRITE|ONLY}. Services not present retain the
+	// existing driver default, making this option safe for incremental rollout.
+	ProtocolByService map[string]RedisProtocol
+
+	// IORedisCompatibility selects the exact standalone ioredis connection
+	// lifecycle for named services. Keys are case-insensitive service names as
+	// discovered from REDIS_{SERVICE}_READ_{WRITE|ONLY}. Services not present in
+	// this map continue to use the existing go-redis dialers unchanged.
+	//
+	// The compatibility transport owns its standalone, Sentinel, or Cluster
+	// topology instead of falling back to go-redis. This keeps the accepted
+	// command FIFO and reconnect budget connection-scoped like ioredis 4.x.
+	IORedisCompatibility map[string]IORedisCompatibilityProfile
+}
+
+// IORedisCompatibilityProfile identifies a source-derived ioredis wire and
+// reconnect profile. It is a string so unsupported values fail with a useful
+// configuration error instead of silently falling back to go-redis.
+type IORedisCompatibilityProfile string
+
+// RedisProtocol selects the Redis serialization protocol used by the default
+// go-redis transport. The zero value deliberately means "driver default" so
+// adding this field cannot change existing callers.
+type RedisProtocol int
+
+const (
+	RedisProtocolDefault RedisProtocol = 0
+	RedisProtocolRESP2   RedisProtocol = 2
+	RedisProtocolRESP3   RedisProtocol = 3
+)
+
+const (
+	// IORedisCompatibilityV4 reproduces the shared standalone behavior of
+	// ioredis 4.x used by legacy FIT.js: eager first-ready initialization,
+	// connection-owned offline FIFO, min(attempt*50ms, 2s) reconnect delay and
+	// maxRetriesPerRequest=20. ioredis 4 does not issue CLIENT SETINFO.
+	IORedisCompatibilityV4 IORedisCompatibilityProfile = "ioredis-v4"
+
+	// IORedisCompatibilityV5 reproduces the common ioredis 5.x RESP2
+	// connection lifecycle: eager first-ready initialization, a
+	// connection-owned offline FIFO, min(attempt*50ms, 2s) reconnect delay,
+	// maxRetriesPerRequest=20, and best-effort CLIENT SETINFO metadata. The
+	// metadata version follows the current compatibility oracle (5.11.1), while
+	// application behavior remains defined by this profile rather than a package
+	// patch number.
+	IORedisCompatibilityV5 IORedisCompatibilityProfile = "ioredis-v5-resp2"
+
+	// IORedisCompatibilityV582 pins ioredis 5.8.2 startup metadata while
+	// retaining the ioredis 5 connection lifecycle. Use this only when the
+	// deployed legacy lockfile makes the patch-level wire identity observable.
+	IORedisCompatibilityV582 IORedisCompatibilityProfile = "ioredis-v5.8.2"
+)
+
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
@@ -295,7 +420,27 @@ var envPattern = regexp.MustCompile(`^REDIS_(.+)_READ_(WRITE|ONLY)$`)
 // strings, and establishes connections. It mirrors initRedis() in
 // /src/redis/index.ts.
 func Init(opts ConnectionOptions) (*Client, error) {
-	if opts.Dial == nil {
+	return initConnections(advancedConnectionOptions(opts), true)
+}
+
+func advancedConnectionOptions(opts ConnectionOptions) AdvancedConnectionOptions {
+	return AdvancedConnectionOptions{
+		Dial:                  opts.Dial,
+		ClusterDial:           opts.ClusterDial,
+		SentinelDial:          opts.SentinelDial,
+		DefaultConnectTimeout: opts.DefaultConnectTimeout,
+		Context:               opts.Context,
+	}
+}
+
+// InitAdvanced initializes Redis with post-main protocol and ioredis controls.
+// Deprecated: use InitWithCompatibility.
+func InitAdvanced(opts AdvancedConnectionOptions) (*Client, error) {
+	return initConnections(opts, false)
+}
+
+func initConnections(opts AdvancedConnectionOptions, legacy bool) (*Client, error) {
+	if opts.Dial == nil && opts.AdvancedDial == nil {
 		return nil, fmt.Errorf("redis: DialFunc must be provided")
 	}
 
@@ -383,10 +528,24 @@ func Init(opts ConnectionOptions) (*Client, error) {
 				connString = "redis://" + connString
 			}
 
-			tlsCfg := loadTLSConfig("REDIS", j.serviceNameUpper)
+			tlsCfg, err := loadTLSConfig("REDIS", j.serviceNameUpper)
+			if err != nil {
+				results <- connResult{
+					serviceName: j.serviceName,
+					connType:    j.connType,
+					err:         fmt.Errorf("redis: TLS configuration for %s_%s: %w", j.serviceName, j.connType, err),
+				}
+				return
+			}
 			envOpts := getRedisEnvOptions(j.serviceNameUpper, j.connType)
+			if legacy {
+				// The original Init/InitDefault contract predates protocol,
+				// ioredis-compatibility, and retry controls. New environment
+				// variables must not alter or invalidate those entry points.
+				envOpts = legacyRedisEnvOptions(envOpts)
+			}
 
-			conn, err := dialFromURI(ctx, connString, j, opts, clientName, tlsCfg, envOpts)
+			conn, err := dialFromURIAdvanced(ctx, connString, j, opts, clientName, tlsCfg, envOpts)
 			if err != nil {
 				results <- connResult{
 					serviceName: j.serviceName,
@@ -617,9 +776,14 @@ type connJobEntry struct {
 
 // envPoolOpts holds pool settings read from environment variables.
 type envPoolOpts struct {
-	ConnectTimeout time.Duration
-	SocketTimeout  time.Duration
-	KeepAlive      time.Duration
+	ConnectTimeout     time.Duration
+	SocketTimeout      time.Duration
+	KeepAlive          time.Duration
+	MaxRetries         int
+	MinRetryBackoff    time.Duration
+	MaxRetryBackoff    time.Duration
+	DialerRetries      int
+	DialerRetryTimeout time.Duration
 }
 
 // dialFromURI parses the connection string and routes to the appropriate dial
@@ -633,9 +797,25 @@ func dialFromURI(
 	tlsCfg *tls.Config,
 	envOpts envPoolOpts,
 ) (Connection, error) {
+	return dialFromURIAdvanced(ctx, connString, job, advancedConnectionOptions(opts), clientName, tlsCfg, envOpts)
+}
+
+func dialFromURIAdvanced(
+	ctx context.Context,
+	connString string,
+	job connJobEntry,
+	opts AdvancedConnectionOptions,
+	clientName string,
+	tlsCfg *tls.Config,
+	envOpts envPoolOpts,
+) (Connection, error) {
 	parsed, err := parseRedisURI(connString)
 	if err != nil {
 		return nil, fmt.Errorf("redis: parse URI for %s_%s: %w", job.serviceName, job.connType, err)
+	}
+	tlsCfg, err = applyRedisURITLS(parsed, tlsCfg)
+	if err != nil {
+		return nil, fmt.Errorf("redis: TLS options for %s_%s: %w", job.serviceName, job.connType, err)
 	}
 
 	connectTimeout := opts.DefaultConnectTimeout
@@ -644,10 +824,53 @@ func dialFromURI(
 	}
 
 	isReadOnly := job.connType == "read"
+	compatibilityProfile, compatibilityEnabled := ioredisCompatibilityProfile(opts, job.serviceName)
+	protocol, err := redisProtocolForService(opts, job.serviceName)
+	if err != nil {
+		return nil, fmt.Errorf("redis: protocol for %s_%s: %w", job.serviceName, job.connType, err)
+	}
+	if compatibilityEnabled && protocol == RedisProtocolRESP3 {
+		return nil, fmt.Errorf("redis: %s compatibility for %s_%s requires RESP2", compatibilityProfile, job.serviceName, job.connType)
+	}
 
 	// Route: Sentinel
 	if parsed.Scheme == "redis-sentinel" {
-		if opts.SentinelDial == nil {
+		if compatibilityEnabled {
+			masterName := parsed.Options["master"]
+			if masterName == "" {
+				return nil, fmt.Errorf("redis: master name missing for sentinel connection %s_%s", job.serviceName, job.connType)
+			}
+			if isReadOnly {
+				return nil, fmt.Errorf("redis: %s compatibility for %s_%s does not support Sentinel read replicas", compatibilityProfile, job.serviceName, job.connType)
+			}
+			sentinelAddrs := make([]string, 0, len(parsed.Hosts))
+			for _, host := range parsed.Hosts {
+				sentinelAddrs = append(sentinelAddrs, host.Addr())
+			}
+			sentinelUsername := parsed.Username
+			if value, ok := parsed.Options["sentinelusername"]; ok {
+				sentinelUsername = value
+			}
+			sentinelPassword := parsed.Password
+			if value, ok := parsed.Options["sentinelpassword"]; ok {
+				sentinelPassword = value
+			}
+			return dialIORedisCompatibleSentinel(ctx, compatibilityProfile, ioredisSentinelOptions{
+				SentinelAddrs:    sentinelAddrs,
+				MasterName:       masterName,
+				Username:         parsed.Username,
+				Password:         parsed.Password,
+				SentinelUsername: sentinelUsername,
+				SentinelPassword: sentinelPassword,
+				DB:               parsed.DB,
+				ConnectionName:   clientName,
+				TLSConfig:        tlsCfg,
+				ConnectTimeout:   connectTimeout,
+				SocketTimeout:    envOpts.SocketTimeout,
+				KeepAlive:        envOpts.KeepAlive,
+			})
+		}
+		if opts.SentinelDial == nil && opts.AdvancedSentinelDial == nil {
 			return nil, fmt.Errorf("redis: sentinel connection required for %s_%s but SentinelDial not provided", job.serviceName, job.connType)
 		}
 		masterName := parsed.Options["master"]
@@ -655,18 +878,26 @@ func dialFromURI(
 			return nil, fmt.Errorf("redis: master name missing for sentinel connection %s_%s", job.serviceName, job.connType)
 		}
 
-		sentOpts := &SentinelDialOptions{
-			MasterName:     masterName,
-			SentinelAddrs:  make([]string, 0, len(parsed.Hosts)),
-			Password:       parsed.Password,
-			Username:       parsed.Username,
-			ClientName:     clientName,
-			TLSConfig:      tlsCfg,
-			ConnectTimeout: connectTimeout,
-			SocketTimeout:  envOpts.SocketTimeout,
-			KeepAlive:      envOpts.KeepAlive,
-			DB:             parsed.DB,
-			ReadOnly:       isReadOnly,
+		sentOpts := &AdvancedSentinelDialOptions{
+			SentinelDialOptions: SentinelDialOptions{
+				MasterName:     masterName,
+				SentinelAddrs:  make([]string, 0, len(parsed.Hosts)),
+				Password:       parsed.Password,
+				Username:       parsed.Username,
+				ClientName:     clientName,
+				TLSConfig:      tlsCfg,
+				ConnectTimeout: connectTimeout,
+				SocketTimeout:  envOpts.SocketTimeout,
+				KeepAlive:      envOpts.KeepAlive,
+				DB:             parsed.DB,
+				ReadOnly:       isReadOnly,
+			},
+			MaxRetries:         envOpts.MaxRetries,
+			MinRetryBackoff:    envOpts.MinRetryBackoff,
+			MaxRetryBackoff:    envOpts.MaxRetryBackoff,
+			DialerRetries:      envOpts.DialerRetries,
+			DialerRetryTimeout: envOpts.DialerRetryTimeout,
+			Protocol:           protocol,
 		}
 
 		for _, h := range parsed.Hosts {
@@ -689,34 +920,74 @@ func dialFromURI(
 			sentOpts.EnableTLSForSentinel = true
 		}
 
-		return opts.SentinelDial(ctx, sentOpts)
+		if opts.AdvancedSentinelDial != nil {
+			return opts.AdvancedSentinelDial(ctx, sentOpts)
+		}
+		if advancedSentinelDialControlsSet(sentOpts) {
+			return nil, fmt.Errorf("redis: advanced sentinel controls require AdvancedSentinelDial")
+		}
+		return opts.SentinelDial(ctx, &sentOpts.SentinelDialOptions)
 	}
 
 	// Route: Cluster (multiple hosts or sharded_db=true).
 	isCluster := len(parsed.Hosts) > 1 || parsed.Options["sharded_db"] == "true"
 	if isCluster {
-		if opts.ClusterDial == nil {
+		if compatibilityEnabled {
+			if isReadOnly {
+				return nil, fmt.Errorf("redis: %s compatibility for %s_%s does not support Cluster replica reads", compatibilityProfile, job.serviceName, job.connType)
+			}
+			clusterAddrs := make([]string, 0, len(parsed.Hosts))
+			for _, host := range parsed.Hosts {
+				clusterAddrs = append(clusterAddrs, host.Addr())
+			}
+			return dialIORedisCompatibleCluster(ctx, compatibilityProfile, ioredisClusterOptions{
+				SeedAddrs:      clusterAddrs,
+				Username:       parsed.Username,
+				Password:       parsed.Password,
+				DB:             parsed.DB,
+				ConnectionName: clientName,
+				TLSConfig:      tlsCfg,
+				ConnectTimeout: connectTimeout,
+				SocketTimeout:  envOpts.SocketTimeout,
+				KeepAlive:      envOpts.KeepAlive,
+			})
+		}
+		if opts.ClusterDial == nil && opts.AdvancedClusterDial == nil {
 			return nil, fmt.Errorf("redis: cluster connection required for %s_%s but ClusterDial not provided", job.serviceName, job.connType)
 		}
 
-		clusterOpts := &ClusterDialOptions{
-			Addrs:                make([]string, 0, len(parsed.Hosts)),
-			Password:             parsed.Password,
-			Username:             parsed.Username,
-			ClientName:           clientName,
-			TLSConfig:            tlsCfg,
-			ConnectTimeout:       connectTimeout,
-			SocketTimeout:        envOpts.SocketTimeout,
-			KeepAlive:            envOpts.KeepAlive,
-			SlotsRefreshInterval: 5 * time.Second,
-			ReadOnly:             isReadOnly,
+		clusterOpts := &AdvancedClusterDialOptions{
+			ClusterDialOptions: ClusterDialOptions{
+				Addrs:                make([]string, 0, len(parsed.Hosts)),
+				Password:             parsed.Password,
+				Username:             parsed.Username,
+				ClientName:           clientName,
+				TLSConfig:            tlsCfg,
+				ConnectTimeout:       connectTimeout,
+				SocketTimeout:        envOpts.SocketTimeout,
+				KeepAlive:            envOpts.KeepAlive,
+				SlotsRefreshInterval: 5 * time.Second,
+				ReadOnly:             isReadOnly,
+			},
+			Protocol:           protocol,
+			MaxRetries:         envOpts.MaxRetries,
+			MinRetryBackoff:    envOpts.MinRetryBackoff,
+			MaxRetryBackoff:    envOpts.MaxRetryBackoff,
+			DialerRetries:      envOpts.DialerRetries,
+			DialerRetryTimeout: envOpts.DialerRetryTimeout,
 		}
 
 		for _, h := range parsed.Hosts {
 			clusterOpts.Addrs = append(clusterOpts.Addrs, h.Addr())
 		}
 
-		return opts.ClusterDial(ctx, clusterOpts)
+		if opts.AdvancedClusterDial != nil {
+			return opts.AdvancedClusterDial(ctx, clusterOpts)
+		}
+		if advancedClusterDialControlsSet(clusterOpts) {
+			return nil, fmt.Errorf("redis: advanced cluster controls require AdvancedClusterDial")
+		}
+		return opts.ClusterDial(ctx, &clusterOpts.ClusterDialOptions)
 	}
 
 	// Route: Standalone.
@@ -724,21 +995,130 @@ func dialFromURI(
 	if len(parsed.Hosts) > 0 {
 		addr = parsed.Hosts[0].Addr()
 	}
-
-	dialOpts := &DialOptions{
-		Addr:           addr,
-		Password:       parsed.Password,
-		Username:       parsed.Username,
-		DB:             parsed.DB,
-		ClientName:     clientName,
-		TLSConfig:      tlsCfg,
-		ConnectTimeout: connectTimeout,
-		SocketTimeout:  envOpts.SocketTimeout,
-		KeepAlive:      envOpts.KeepAlive,
-		ReadOnly:       isReadOnly,
+	if compatibilityEnabled {
+		return dialIORedisCompatibleStandalone(ctx, compatibilityProfile, IORedisRESPOptions{
+			Addr:           addr,
+			Username:       parsed.Username,
+			Password:       parsed.Password,
+			DB:             parsed.DB,
+			ConnectionName: clientName,
+			TLSConfig:      tlsCfg,
+			ConnectTimeout: connectTimeout,
+			SocketTimeout:  envOpts.SocketTimeout,
+			KeepAlive:      envOpts.KeepAlive,
+		})
 	}
 
-	return opts.Dial(ctx, dialOpts)
+	dialOpts := &AdvancedDialOptions{
+		DialOptions: DialOptions{
+			Addr:           addr,
+			Password:       parsed.Password,
+			Username:       parsed.Username,
+			DB:             parsed.DB,
+			ClientName:     clientName,
+			TLSConfig:      tlsCfg,
+			ConnectTimeout: connectTimeout,
+			SocketTimeout:  envOpts.SocketTimeout,
+			KeepAlive:      envOpts.KeepAlive,
+			MaxRetries:     envOpts.MaxRetries,
+			ReadOnly:       isReadOnly,
+		},
+		Protocol:           protocol,
+		MinRetryBackoff:    envOpts.MinRetryBackoff,
+		MaxRetryBackoff:    envOpts.MaxRetryBackoff,
+		DialerRetries:      envOpts.DialerRetries,
+		DialerRetryTimeout: envOpts.DialerRetryTimeout,
+	}
+
+	if opts.AdvancedDial != nil {
+		return opts.AdvancedDial(ctx, dialOpts)
+	}
+	if advancedDialControlsSet(dialOpts) {
+		return nil, fmt.Errorf("redis: advanced standalone controls require AdvancedDial")
+	}
+	return opts.Dial(ctx, &dialOpts.DialOptions)
+}
+
+// applyRedisURITLS ensures a connection string that explicitly requests TLS
+// can never fall through to a plaintext dial. Certificate environment
+// variables still take precedence; when they are absent, rediss:// and
+// tls=true/ssl=true use the system root pool with hostname verification.
+func applyRedisURITLS(parsed *parsedURI, configured *tls.Config) (*tls.Config, error) {
+	if parsed == nil {
+		return configured, nil
+	}
+
+	requested := parsed.Scheme == "rediss"
+	for _, key := range []string{"tls", "ssl"} {
+		value, present := parsed.Options[key]
+		if !present {
+			continue
+		}
+		enabled, err := strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s query value %q: %w", key, value, err)
+		}
+		requested = requested || enabled
+	}
+
+	if !requested || configured != nil {
+		return configured, nil
+	}
+	return &tls.Config{MinVersion: tls.VersionTLS12}, nil
+}
+
+func ioredisCompatibilityProfile(opts AdvancedConnectionOptions, serviceName string) (IORedisCompatibilityProfile, bool) {
+	for configuredService, profile := range opts.IORedisCompatibility {
+		if strings.EqualFold(strings.TrimSpace(configuredService), serviceName) {
+			return profile, true
+		}
+	}
+	return "", false
+}
+
+func redisProtocolForService(opts AdvancedConnectionOptions, serviceName string) (RedisProtocol, error) {
+	var selected RedisProtocol
+	matched := false
+	for configuredService, protocol := range opts.ProtocolByService {
+		if !strings.EqualFold(strings.TrimSpace(configuredService), serviceName) {
+			continue
+		}
+		if err := validateRedisProtocol(protocol); err != nil {
+			return RedisProtocolDefault, err
+		}
+		if matched && selected != protocol {
+			return RedisProtocolDefault, fmt.Errorf("conflicting Redis protocols %d and %d", selected, protocol)
+		}
+		selected = protocol
+		matched = true
+	}
+	return selected, nil
+}
+
+func advancedDialControlsSet(opts *AdvancedDialOptions) bool {
+	return opts.Protocol != RedisProtocolDefault || opts.MinRetryBackoff != 0 ||
+		opts.MaxRetryBackoff != 0 || opts.DialerRetries != 0 || opts.DialerRetryTimeout != 0
+}
+
+func advancedClusterDialControlsSet(opts *AdvancedClusterDialOptions) bool {
+	return opts.Protocol != RedisProtocolDefault || opts.MaxRetries != 0 ||
+		opts.MinRetryBackoff != 0 || opts.MaxRetryBackoff != 0 ||
+		opts.DialerRetries != 0 || opts.DialerRetryTimeout != 0
+}
+
+func advancedSentinelDialControlsSet(opts *AdvancedSentinelDialOptions) bool {
+	return opts.Protocol != RedisProtocolDefault || opts.MaxRetries != 0 ||
+		opts.MinRetryBackoff != 0 || opts.MaxRetryBackoff != 0 ||
+		opts.DialerRetries != 0 || opts.DialerRetryTimeout != 0
+}
+
+func validateRedisProtocol(protocol RedisProtocol) error {
+	switch protocol {
+	case RedisProtocolDefault, RedisProtocolRESP2, RedisProtocolRESP3:
+		return nil
+	default:
+		return fmt.Errorf("unsupported Redis protocol %d", protocol)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -770,12 +1150,45 @@ func getRedisEnvOptions(serviceNameUpper, connType string) envPoolOpts {
 			opts.KeepAlive = time.Duration(ms) * time.Millisecond
 		}
 	}
+	if v := os.Getenv(prefix + "COMMAND_MAX_RETRIES"); v != "" {
+		if retries, err := strconv.Atoi(v); err == nil && retries > 0 {
+			opts.MaxRetries = retries
+		}
+	}
+	if v := os.Getenv(prefix + "COMMAND_MIN_RETRY_BACKOFF"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			opts.MinRetryBackoff = time.Duration(ms) * time.Millisecond
+		}
+	}
+	if v := os.Getenv(prefix + "COMMAND_MAX_RETRY_BACKOFF"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			opts.MaxRetryBackoff = time.Duration(ms) * time.Millisecond
+		}
+	}
+	if v := os.Getenv(prefix + "DIALER_RETRIES"); v != "" {
+		if retries, err := strconv.Atoi(v); err == nil && retries > 0 {
+			opts.DialerRetries = retries
+		}
+	}
+	if v := os.Getenv(prefix + "DIALER_RETRY_TIMEOUT"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			opts.DialerRetryTimeout = time.Duration(ms) * time.Millisecond
+		}
+	}
 
 	return opts
 }
 
+func legacyRedisEnvOptions(opts envPoolOpts) envPoolOpts {
+	return envPoolOpts{
+		ConnectTimeout: opts.ConnectTimeout,
+		SocketTimeout:  opts.SocketTimeout,
+		KeepAlive:      opts.KeepAlive,
+	}
+}
+
 // loadTLSConfig builds a *tls.Config from SSL environment variables.
-func loadTLSConfig(dbType, serviceNameUpper string) *tls.Config {
+func loadTLSConfig(dbType, serviceNameUpper string) (*tls.Config, error) {
 	caPath := envWithFallback(
 		fmt.Sprintf("%s_%s_SSL_CA", dbType, serviceNameUpper),
 		fmt.Sprintf("%s_SSL_CA", dbType),
@@ -789,30 +1202,42 @@ func loadTLSConfig(dbType, serviceNameUpper string) *tls.Config {
 		fmt.Sprintf("%s_SSL_KEY", dbType),
 	)
 
-	if caPath == "" || certPath == "" || keyPath == "" {
-		return nil
+	configuredValues := 0
+	for _, value := range []string{caPath, certPath, keyPath} {
+		if value != "" {
+			configuredValues++
+		}
+	}
+	if configuredValues == 0 {
+		return nil, nil
+	}
+	if configuredValues != 3 {
+		return nil, fmt.Errorf("CA, certificate, and key must all be configured")
 	}
 
 	caCert, err := os.ReadFile(caPath)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("read CA certificate: %w", err)
 	}
 
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("load client certificate: %w", err)
 	}
 
 	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(caCert)
+	if ok := caCertPool.AppendCertsFromPEM(caCert); !ok {
+		return nil, fmt.Errorf("CA certificate contains no valid PEM certificates")
+	}
 
 	return &tls.Config{
 		RootCAs:      caCertPool,
 		Certificates: []tls.Certificate{cert},
-		// Match: rejectUnauthorized: false
-		InsecureSkipVerify: true,
+		// Keep certificate-chain and hostname verification enabled. Dialers fill
+		// ServerName from the selected Redis address when it is not configured.
+		InsecureSkipVerify: false,
 		MinVersion:         tls.VersionTLS12,
-	}
+	}, nil
 }
 
 // resolveConnectionString resolves a value as either a direct connection string

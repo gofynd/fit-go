@@ -22,8 +22,8 @@ package encryption
 // secrets from external systems (e.g. HashiCorp Vault, GCP KMS).
 type Provider interface {
 	// Init fetches and returns the plaintext DEK and IV. The DEK must be
-	// exactly 32 bytes (AES-256) and the IV must be 12 bytes (GCM standard
-	// nonce size). Implementations should validate these sizes before
-	// returning.
+	// exactly 32 bytes (AES-256). The IV must be non-empty; 12 bytes is the
+	// standard GCM nonce size, but legacy fit.js/pyfit deployments use Vault IVs
+	// with other lengths, so providers must not reject a non-empty non-12-byte IV.
 	Init() (dek []byte, iv []byte, err error)
 }

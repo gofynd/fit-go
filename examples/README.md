@@ -20,7 +20,7 @@ setup.
 | [03-logging](03-logging) | `logging` | Structured JSON logging, derived loggers, trace context |
 | [04-http-server](04-http-server) | `server` | Gin-based HTTP server, routing by ServerType, health routes |
 | [05-databases](05-databases) | `mongo`, `postgres`, `redis`, `health` | Connect with read/write split and aggregate health checks |
-| [06-kafka](06-kafka) | `kafka` | Produce and consume messages with the confluent driver |
+| [06-kafka](06-kafka) | `kafka` | Context-aware produce and consume with the confluent driver |
 | [07-caching](07-caching) | `groupcache` | Read-through distributed cache with a single-flight loader |
 | [08-encryption](08-encryption) | `encryption` | AES-256-GCM encrypt/decrypt with pluggable key providers |
 | [09-errors](09-errors) | `errors` | Structured error codes with localized messages |

@@ -23,6 +23,7 @@ import (
 
 	"github.com/gofynd/fit-go/health"
 	"github.com/gofynd/fit-go/logging"
+	"github.com/gofynd/fit-go/redact"
 )
 
 const (
@@ -71,7 +72,7 @@ func performHealthCheck(checker *health.Checker, logger *logging.Logger) {
 	errs := checker.Check()
 	if len(errs) > 0 {
 		for _, msg := range errs {
-			logger.Error(fmt.Sprintf("kafka healthz failed (file write skipped): %s", msg))
+			logger.Error("kafka healthz failed (file write skipped)", "error", safeKafkaHealthMessage(msg))
 		}
 		os.Remove(healthFilePath)
 		return
@@ -79,8 +80,43 @@ func performHealthCheck(checker *health.Checker, logger *logging.Logger) {
 
 	f, err := os.OpenFile(healthFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
-		logger.Error("kafka healthz: failed to write health file", "path", healthFilePath, "error", err)
+		logger.Error("kafka healthz: failed to write health file", "error", "health file write failed")
 		return
 	}
 	f.Close()
+}
+
+func safeKafkaHealthMessage(message string) string {
+	return redact.Text(message)
+}
+
+// kafkaHealthError keeps the original cause available to errors.Is/errors.As
+// while ensuring an Error() string is safe for health endpoints and logs.
+type kafkaHealthError struct {
+	operation string
+	cause     error
+}
+
+func newKafkaHealthError(operation string, cause error) error {
+	if cause == nil {
+		return nil
+	}
+	return &kafkaHealthError{operation: operation, cause: cause}
+}
+
+func (e *kafkaHealthError) Error() string {
+	if e == nil || e.cause == nil {
+		return "kafka health check failed"
+	}
+	if e.operation == "" {
+		return redact.ErrorMessage(e.cause)
+	}
+	return fmt.Sprintf("%s: %s", e.operation, redact.ErrorMessage(e.cause))
+}
+
+func (e *kafkaHealthError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
 }

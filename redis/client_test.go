@@ -16,9 +16,14 @@ package redis
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -28,25 +33,20 @@ import (
 // ---------------------------------------------------------------------------
 
 type mockConnection struct {
-	mu          sync.Mutex
-	pingCalled  bool
-	closeCalled bool
+	pingCalled  atomic.Bool
+	closeCalled atomic.Bool
 	pingErr     error
 	closeErr    error
 	isCluster   bool
 }
 
 func (m *mockConnection) Ping(ctx context.Context) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.pingCalled = true
+	m.pingCalled.Store(true)
 	return m.pingErr
 }
 
 func (m *mockConnection) Close() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.closeCalled = true
+	m.closeCalled.Store(true)
 	return m.closeErr
 }
 
@@ -254,6 +254,11 @@ func TestGetRedisEnvOptions(t *testing.T) {
 		"REDIS_CACHE_READ_WRITE_CONNECTION_TIMEOUT",
 		"REDIS_CACHE_READ_WRITE_SOCKET_TIMEOUT",
 		"REDIS_CACHE_READ_WRITE_KEEP_ALIVE",
+		"REDIS_CACHE_READ_WRITE_COMMAND_MAX_RETRIES",
+		"REDIS_CACHE_READ_WRITE_COMMAND_MIN_RETRY_BACKOFF",
+		"REDIS_CACHE_READ_WRITE_COMMAND_MAX_RETRY_BACKOFF",
+		"REDIS_CACHE_READ_WRITE_DIALER_RETRIES",
+		"REDIS_CACHE_READ_WRITE_DIALER_RETRY_TIMEOUT",
 	}
 	origVals := make(map[string]string)
 	for _, k := range envs {
@@ -273,6 +278,11 @@ func TestGetRedisEnvOptions(t *testing.T) {
 		os.Setenv("REDIS_CACHE_READ_WRITE_CONNECTION_TIMEOUT", "5000")
 		os.Setenv("REDIS_CACHE_READ_WRITE_SOCKET_TIMEOUT", "10000")
 		os.Setenv("REDIS_CACHE_READ_WRITE_KEEP_ALIVE", "30000")
+		os.Setenv("REDIS_CACHE_READ_WRITE_COMMAND_MAX_RETRIES", "20")
+		os.Setenv("REDIS_CACHE_READ_WRITE_COMMAND_MIN_RETRY_BACKOFF", "50")
+		os.Setenv("REDIS_CACHE_READ_WRITE_COMMAND_MAX_RETRY_BACKOFF", "2000")
+		os.Setenv("REDIS_CACHE_READ_WRITE_DIALER_RETRIES", "1")
+		os.Setenv("REDIS_CACHE_READ_WRITE_DIALER_RETRY_TIMEOUT", "75")
 
 		opts := getRedisEnvOptions("CACHE", "write")
 
@@ -284,6 +294,21 @@ func TestGetRedisEnvOptions(t *testing.T) {
 		}
 		if opts.KeepAlive != 30*time.Second {
 			t.Errorf("KeepAlive = %v, want 30s", opts.KeepAlive)
+		}
+		if opts.MaxRetries != 20 {
+			t.Errorf("MaxRetries = %d, want 20", opts.MaxRetries)
+		}
+		if opts.MinRetryBackoff != 50*time.Millisecond {
+			t.Errorf("MinRetryBackoff = %v, want 50ms", opts.MinRetryBackoff)
+		}
+		if opts.MaxRetryBackoff != 2*time.Second {
+			t.Errorf("MaxRetryBackoff = %v, want 2s", opts.MaxRetryBackoff)
+		}
+		if opts.DialerRetries != 1 {
+			t.Errorf("DialerRetries = %d, want 1", opts.DialerRetries)
+		}
+		if opts.DialerRetryTimeout != 75*time.Millisecond {
+			t.Errorf("DialerRetryTimeout = %v, want 75ms", opts.DialerRetryTimeout)
 		}
 	})
 
@@ -307,6 +332,25 @@ func TestGetRedisEnvOptions(t *testing.T) {
 
 		if opts.ConnectTimeout != 0 {
 			t.Errorf("ConnectTimeout = %v, want 0 (unset)", opts.ConnectTimeout)
+		}
+		if opts.MaxRetries != 0 || opts.MinRetryBackoff != 0 || opts.MaxRetryBackoff != 0 || opts.DialerRetries != 0 || opts.DialerRetryTimeout != 0 {
+			t.Errorf("retry options = %+v, want zero values when unset", opts)
+		}
+	})
+
+	t.Run("invalid and non-positive retry values retain defaults", func(t *testing.T) {
+		for _, k := range envs {
+			os.Unsetenv(k)
+		}
+		os.Setenv("REDIS_CACHE_READ_WRITE_COMMAND_MAX_RETRIES", "0")
+		os.Setenv("REDIS_CACHE_READ_WRITE_COMMAND_MIN_RETRY_BACKOFF", "-1")
+		os.Setenv("REDIS_CACHE_READ_WRITE_COMMAND_MAX_RETRY_BACKOFF", "invalid")
+		os.Setenv("REDIS_CACHE_READ_WRITE_DIALER_RETRIES", "-2")
+		os.Setenv("REDIS_CACHE_READ_WRITE_DIALER_RETRY_TIMEOUT", "0")
+
+		opts := getRedisEnvOptions("CACHE", "write")
+		if opts.MaxRetries != 0 || opts.MinRetryBackoff != 0 || opts.MaxRetryBackoff != 0 || opts.DialerRetries != 0 || opts.DialerRetryTimeout != 0 {
+			t.Errorf("retry options = %+v, want zero values for invalid/non-positive input", opts)
 		}
 	})
 }
@@ -496,10 +540,10 @@ func TestClient_Close(t *testing.T) {
 		t.Errorf("Close() error = %v, want nil", err)
 	}
 
-	if !read.closeCalled {
+	if !read.closeCalled.Load() {
 		t.Error("Read connection Close() should be called")
 	}
-	if !write.closeCalled {
+	if !write.closeCalled.Load() {
 		t.Error("Write connection Close() should be called")
 	}
 
@@ -606,22 +650,103 @@ func TestInit(t *testing.T) {
 		}
 	})
 
+	t.Run("propagates TLS configuration errors before dialing", func(t *testing.T) {
+		os.Setenv("REDIS_TLSFAIL_READ_WRITE", "redis://localhost:6379/0")
+		os.Setenv("REDIS_TLSFAIL_SSL_CA", "/does/not/exist")
+		defer os.Unsetenv("REDIS_TLSFAIL_READ_WRITE")
+		defer os.Unsetenv("REDIS_TLSFAIL_SSL_CA")
+
+		dialCalled := atomic.Bool{}
+		_, err := Init(ConnectionOptions{Dial: func(context.Context, *DialOptions) (Connection, error) {
+			dialCalled.Store(true)
+			return &mockConnection{}, nil
+		}})
+		if err == nil || !strings.Contains(err.Error(), "TLS configuration") {
+			t.Fatalf("Init() error = %v, want TLS configuration error", err)
+		}
+		if dialCalled.Load() {
+			t.Fatal("Dial was called with an invalid TLS configuration")
+		}
+	})
+
+	t.Run("applies service-scoped protocol without changing other services", func(t *testing.T) {
+		os.Setenv("REDIS_LEGACY_READ_WRITE", "redis://legacy.example:6379/0")
+		os.Setenv("REDIS_NATIVE_READ_WRITE", "redis://native.example:6379/0")
+		defer func() {
+			os.Unsetenv("REDIS_LEGACY_READ_WRITE")
+			os.Unsetenv("REDIS_NATIVE_READ_WRITE")
+		}()
+
+		captured := make(map[string]RedisProtocol)
+		var capturedMu sync.Mutex
+		_, err := InitAdvanced(AdvancedConnectionOptions{
+			AdvancedDial: func(_ context.Context, opts *AdvancedDialOptions) (Connection, error) {
+				capturedMu.Lock()
+				captured[opts.Addr] = opts.Protocol
+				capturedMu.Unlock()
+				return &mockConnection{}, nil
+			},
+			ProtocolByService: map[string]RedisProtocol{"LeGaCy": RedisProtocolRESP2},
+		})
+		if err != nil {
+			t.Fatalf("Init() error = %v", err)
+		}
+		capturedMu.Lock()
+		legacy := captured["legacy.example:6379"]
+		native := captured["native.example:6379"]
+		capturedMu.Unlock()
+		if legacy != RedisProtocolRESP2 || native != RedisProtocolDefault {
+			t.Fatalf("captured protocols = %#v, want legacy=RESP2 and native=default", captured)
+		}
+	})
+
+	t.Run("rejects unsupported service protocol", func(t *testing.T) {
+		os.Setenv("REDIS_CACHE_READ_WRITE", "redis://localhost:6379/0")
+		defer os.Unsetenv("REDIS_CACHE_READ_WRITE")
+		_, err := InitAdvanced(AdvancedConnectionOptions{
+			Dial:              mockDial,
+			ProtocolByService: map[string]RedisProtocol{"cache": 4},
+		})
+		if err == nil || !strings.Contains(err.Error(), "unsupported Redis protocol 4") {
+			t.Fatalf("Init error = %v, want unsupported protocol", err)
+		}
+	})
+
+	t.Run("rejects conflicting case-insensitive service protocols", func(t *testing.T) {
+		os.Setenv("REDIS_CACHE_READ_WRITE", "redis://localhost:6379/0")
+		defer os.Unsetenv("REDIS_CACHE_READ_WRITE")
+		_, err := InitAdvanced(AdvancedConnectionOptions{
+			Dial: mockDial,
+			ProtocolByService: map[string]RedisProtocol{
+				"cache": RedisProtocolRESP2,
+				"CACHE": RedisProtocolRESP3,
+			},
+		})
+		if err == nil || !strings.Contains(err.Error(), "conflicting Redis protocols") {
+			t.Fatalf("Init error = %v, want conflicting protocols", err)
+		}
+	})
+
 	t.Run("routes to cluster dial", func(t *testing.T) {
 		os.Setenv("REDIS_CLUSTER_READ_WRITE", "redis://host1:6379,host2:6379,host3:6379")
 		defer os.Unsetenv("REDIS_CLUSTER_READ_WRITE")
 
 		var clusterDialCalled bool
-		clusterDial := func(ctx context.Context, opts *ClusterDialOptions) (Connection, error) {
+		clusterDial := func(ctx context.Context, opts *AdvancedClusterDialOptions) (Connection, error) {
 			clusterDialCalled = true
 			if len(opts.Addrs) != 3 {
 				t.Errorf("Cluster addrs = %d, want 3", len(opts.Addrs))
 			}
+			if opts.Protocol != RedisProtocolRESP2 {
+				t.Errorf("Cluster protocol = %d, want RESP2", opts.Protocol)
+			}
 			return &mockConnection{isCluster: true}, nil
 		}
 
-		_, err := Init(ConnectionOptions{
-			Dial:        mockDial,
-			ClusterDial: clusterDial,
+		_, err := InitAdvanced(AdvancedConnectionOptions{
+			Dial:                mockDial,
+			AdvancedClusterDial: clusterDial,
+			ProtocolByService:   map[string]RedisProtocol{"cluster": RedisProtocolRESP2},
 		})
 		if err != nil {
 			t.Fatalf("Init() error = %v", err)
@@ -637,17 +762,21 @@ func TestInit(t *testing.T) {
 		defer os.Unsetenv("REDIS_SENTINEL_READ_WRITE")
 
 		var sentinelDialCalled bool
-		sentinelDial := func(ctx context.Context, opts *SentinelDialOptions) (Connection, error) {
+		sentinelDial := func(ctx context.Context, opts *AdvancedSentinelDialOptions) (Connection, error) {
 			sentinelDialCalled = true
 			if opts.MasterName != "mymaster" {
 				t.Errorf("MasterName = %q, want 'mymaster'", opts.MasterName)
 			}
+			if opts.Protocol != RedisProtocolRESP2 {
+				t.Errorf("Sentinel protocol = %d, want RESP2", opts.Protocol)
+			}
 			return &mockConnection{}, nil
 		}
 
-		_, err := Init(ConnectionOptions{
-			Dial:         mockDial,
-			SentinelDial: sentinelDial,
+		_, err := InitAdvanced(AdvancedConnectionOptions{
+			Dial:                 mockDial,
+			AdvancedSentinelDial: sentinelDial,
+			ProtocolByService:    map[string]RedisProtocol{"sentinel": RedisProtocolRESP2},
 		})
 		if err != nil {
 			t.Fatalf("Init() error = %v", err)
@@ -709,6 +838,102 @@ func TestInit(t *testing.T) {
 			t.Errorf("ConnectTimeout = %v, want 10s", capturedOpts.ConnectTimeout)
 		}
 	})
+}
+
+func TestLegacyInitIgnoresAdvancedEnvironmentControlsAcrossTopologies(t *testing.T) {
+	tests := []struct {
+		name       string
+		connection string
+		run        func(*testing.T, ConnectionOptions)
+	}{
+		{
+			name:       "standalone",
+			connection: "redis://standalone.example:6379/0",
+			run: func(t *testing.T, opts ConnectionOptions) {
+				var captured *DialOptions
+				opts.Dial = func(_ context.Context, dialOpts *DialOptions) (Connection, error) {
+					copy := *dialOpts
+					captured = &copy
+					return &mockConnection{}, nil
+				}
+				if _, err := Init(opts); err != nil {
+					t.Fatalf("Init() error = %v", err)
+				}
+				if captured == nil {
+					t.Fatal("standalone dial was not called")
+				}
+				if captured.MaxRetries != 0 {
+					t.Fatalf("legacy MaxRetries = %d, want zero", captured.MaxRetries)
+				}
+				assertLegacyRedisTimeoutOptions(t, captured.ConnectTimeout, captured.SocketTimeout, captured.KeepAlive)
+			},
+		},
+		{
+			name:       "cluster",
+			connection: "redis://cluster-a.example:6379,cluster-b.example:6379/0",
+			run: func(t *testing.T, opts ConnectionOptions) {
+				var captured *ClusterDialOptions
+				opts.ClusterDial = func(_ context.Context, dialOpts *ClusterDialOptions) (Connection, error) {
+					copy := *dialOpts
+					captured = &copy
+					return &mockConnection{isCluster: true}, nil
+				}
+				if _, err := Init(opts); err != nil {
+					t.Fatalf("Init() error = %v", err)
+				}
+				if captured == nil {
+					t.Fatal("cluster dial was not called")
+				}
+				assertLegacyRedisTimeoutOptions(t, captured.ConnectTimeout, captured.SocketTimeout, captured.KeepAlive)
+			},
+		},
+		{
+			name:       "sentinel",
+			connection: "redis-sentinel://sentinel.example:26379/0?master=primary",
+			run: func(t *testing.T, opts ConnectionOptions) {
+				var captured *SentinelDialOptions
+				opts.SentinelDial = func(_ context.Context, dialOpts *SentinelDialOptions) (Connection, error) {
+					copy := *dialOpts
+					captured = &copy
+					return &mockConnection{}, nil
+				}
+				if _, err := Init(opts); err != nil {
+					t.Fatalf("Init() error = %v", err)
+				}
+				if captured == nil {
+					t.Fatal("sentinel dial was not called")
+				}
+				assertLegacyRedisTimeoutOptions(t, captured.ConnectTimeout, captured.SocketTimeout, captured.KeepAlive)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			restore := isolateRedisEnvironment(t)
+			defer restore()
+			_ = os.Setenv("REDIS_LEGACY_READ_WRITE", test.connection)
+			_ = os.Setenv("REDIS_LEGACY_READ_WRITE_CONNECTION_TIMEOUT", "1234")
+			_ = os.Setenv("REDIS_LEGACY_READ_WRITE_SOCKET_TIMEOUT", "2345")
+			_ = os.Setenv("REDIS_LEGACY_READ_WRITE_KEEP_ALIVE", "3456")
+			_ = os.Setenv("REDIS_LEGACY_READ_WRITE_COMMAND_MAX_RETRIES", "20")
+			_ = os.Setenv("REDIS_LEGACY_READ_WRITE_COMMAND_MIN_RETRY_BACKOFF", "50")
+			_ = os.Setenv("REDIS_LEGACY_READ_WRITE_COMMAND_MAX_RETRY_BACKOFF", "2000")
+			_ = os.Setenv("REDIS_LEGACY_READ_WRITE_DIALER_RETRIES", "1")
+			_ = os.Setenv("REDIS_LEGACY_READ_WRITE_DIALER_RETRY_TIMEOUT", "75")
+			_ = os.Setenv("REDIS_LEGACY_READ_WRITE_PROTOCOL", "3")
+			_ = os.Setenv("REDIS_LEGACY_READ_WRITE_IOREDIS_COMPATIBILITY", "ioredis-v5-resp2")
+
+			test.run(t, ConnectionOptions{Dial: mockDial})
+		})
+	}
+}
+
+func assertLegacyRedisTimeoutOptions(t *testing.T, connect, socket, keepAlive time.Duration) {
+	t.Helper()
+	if connect != 1234*time.Millisecond || socket != 2345*time.Millisecond || keepAlive != 3456*time.Millisecond {
+		t.Fatalf("legacy timeout options = %s/%s/%s, want 1234ms/2345ms/3456ms", connect, socket, keepAlive)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -791,20 +1016,111 @@ func TestResolveConnectionString(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestLoadTLSConfig_NoCerts(t *testing.T) {
-	for _, k := range []string{
-		"REDIS_TEST_SSL_CA",
-		"REDIS_TEST_SSL_CERT",
-		"REDIS_TEST_SSL_KEY",
-		"REDIS_SSL_CA",
-		"REDIS_SSL_CERT",
-		"REDIS_SSL_KEY",
-	} {
-		os.Unsetenv(k)
-	}
+	clearRedisTLSEnv(t)
 
-	cfg := loadTLSConfig("REDIS", "TEST")
+	cfg, err := loadTLSConfig("REDIS", "TEST")
+	if err != nil {
+		t.Fatalf("loadTLSConfig() error = %v", err)
+	}
 	if cfg != nil {
 		t.Error("loadTLSConfig should return nil when no certs")
+	}
+}
+
+func TestLoadTLSConfig_FailsClosed(t *testing.T) {
+	t.Run("valid material verifies the server", func(t *testing.T) {
+		clearRedisTLSEnv(t)
+		tempDir := t.TempDir()
+		caPath := filepath.Join(tempDir, "ca.pem")
+		certPath := filepath.Join(tempDir, "cert.pem")
+		keyPath := filepath.Join(tempDir, "key.pem")
+		certificate := newIORedisTestCertificate(t)
+		keyDER, err := x509.MarshalPKCS8PrivateKey(certificate.PrivateKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for path, contents := range map[string][]byte{
+			caPath:   pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate[0]}),
+			certPath: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate[0]}),
+			keyPath:  pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}),
+		} {
+			if err := os.WriteFile(path, contents, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Setenv("REDIS_TEST_SSL_CA", caPath)
+		t.Setenv("REDIS_TEST_SSL_CERT", certPath)
+		t.Setenv("REDIS_TEST_SSL_KEY", keyPath)
+
+		cfg, err := loadTLSConfig("REDIS", "TEST")
+		if err != nil {
+			t.Fatalf("loadTLSConfig() error = %v", err)
+		}
+		if cfg == nil {
+			t.Fatal("loadTLSConfig() config = nil")
+		}
+		if cfg.InsecureSkipVerify {
+			t.Fatal("loadTLSConfig() disabled certificate or hostname verification")
+		}
+	})
+
+	t.Run("partial configuration", func(t *testing.T) {
+		clearRedisTLSEnv(t)
+		t.Setenv("REDIS_TEST_SSL_CA", "/does/not/exist")
+
+		cfg, err := loadTLSConfig("REDIS", "TEST")
+		if err == nil || !strings.Contains(err.Error(), "must all be configured") {
+			t.Fatalf("loadTLSConfig() error = %v, want incomplete configuration error", err)
+		}
+		if cfg != nil {
+			t.Fatal("loadTLSConfig() config is non-nil on error")
+		}
+	})
+
+	t.Run("unreadable material", func(t *testing.T) {
+		clearRedisTLSEnv(t)
+		t.Setenv("REDIS_TEST_SSL_CA", "/does/not/exist")
+		t.Setenv("REDIS_TEST_SSL_CERT", "/does/not/exist")
+		t.Setenv("REDIS_TEST_SSL_KEY", "/does/not/exist")
+
+		_, err := loadTLSConfig("REDIS", "TEST")
+		if err == nil || !strings.Contains(err.Error(), "read CA certificate") {
+			t.Fatalf("loadTLSConfig() error = %v, want CA read error", err)
+		}
+	})
+
+	t.Run("invalid PEM material", func(t *testing.T) {
+		clearRedisTLSEnv(t)
+		tempDir := t.TempDir()
+		caPath := tempDir + "/ca.pem"
+		certPath := tempDir + "/cert.pem"
+		keyPath := tempDir + "/key.pem"
+		for path, contents := range map[string]string{
+			caPath:   "not a certificate",
+			certPath: "not a certificate",
+			keyPath:  "not a key",
+		} {
+			if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Setenv("REDIS_TEST_SSL_CA", caPath)
+		t.Setenv("REDIS_TEST_SSL_CERT", certPath)
+		t.Setenv("REDIS_TEST_SSL_KEY", keyPath)
+
+		if _, err := loadTLSConfig("REDIS", "TEST"); err == nil {
+			t.Fatal("loadTLSConfig() error = nil, want invalid material error")
+		}
+	})
+}
+
+func clearRedisTLSEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{
+		"REDIS_TEST_SSL_CA", "REDIS_TEST_SSL_CERT", "REDIS_TEST_SSL_KEY",
+		"REDIS_SSL_CA", "REDIS_SSL_CERT", "REDIS_SSL_KEY",
+	} {
+		t.Setenv(key, "")
 	}
 }
 
@@ -875,6 +1191,46 @@ func TestDialFromURI_Routing(t *testing.T) {
 		}
 	})
 
+	t.Run("rediss cannot fall through to plaintext", func(t *testing.T) {
+		var capturedOpts *DialOptions
+		captureDial := func(_ context.Context, opts *DialOptions) (Connection, error) {
+			capturedOpts = opts
+			return &mockConnection{}, nil
+		}
+		_, err := dialFromURI(ctx, "rediss://cache.internal:6380/0", job, ConnectionOptions{Dial: captureDial}, "client", nil, envPoolOpts{})
+		if err != nil {
+			t.Fatalf("dialFromURI() error = %v", err)
+		}
+		if capturedOpts == nil || capturedOpts.TLSConfig == nil {
+			t.Fatal("rediss:// connection reached the dialer without TLS")
+		}
+		if capturedOpts.TLSConfig.InsecureSkipVerify || capturedOpts.TLSConfig.MinVersion < tls.VersionTLS12 {
+			t.Fatalf("rediss:// TLS config = %+v, want verified TLS 1.2+", capturedOpts.TLSConfig)
+		}
+	})
+
+	t.Run("TLS query cannot fall through to plaintext", func(t *testing.T) {
+		var capturedOpts *DialOptions
+		captureDial := func(_ context.Context, opts *DialOptions) (Connection, error) {
+			capturedOpts = opts
+			return &mockConnection{}, nil
+		}
+		_, err := dialFromURI(ctx, "redis://cache.internal:6380/0?ssl=true&tls=true", job, ConnectionOptions{Dial: captureDial}, "client", nil, envPoolOpts{})
+		if err != nil {
+			t.Fatalf("dialFromURI() error = %v", err)
+		}
+		if capturedOpts == nil || capturedOpts.TLSConfig == nil {
+			t.Fatal("TLS query connection reached the dialer without TLS")
+		}
+	})
+
+	t.Run("invalid TLS query fails closed", func(t *testing.T) {
+		_, err := dialFromURI(ctx, "redis://cache.internal:6380/0?tls=maybe", job, opts, "client", nil, envPoolOpts{})
+		if err == nil || !strings.Contains(err.Error(), "invalid tls query value") {
+			t.Fatalf("dialFromURI() error = %v, want invalid TLS option error", err)
+		}
+	})
+
 	t.Run("cluster by multiple hosts", func(t *testing.T) {
 		conn, err := dialFromURI(ctx, "redis://h1:6379,h2:6379", job, opts, "client", nil, envPoolOpts{})
 		if err != nil {
@@ -932,6 +1288,36 @@ func TestDialFromURI_Routing(t *testing.T) {
 
 		if !capturedOpts.ReadOnly {
 			t.Error("Read connection should set ReadOnly=true")
+		}
+	})
+
+	t.Run("standalone keeps command and dial retry controls distinct", func(t *testing.T) {
+		var capturedOpts *AdvancedDialOptions
+		captureDial := func(ctx context.Context, opts *AdvancedDialOptions) (Connection, error) {
+			copy := *opts
+			capturedOpts = &copy
+			return &mockConnection{}, nil
+		}
+		retryOpts := envPoolOpts{
+			MaxRetries:         20,
+			MinRetryBackoff:    50 * time.Millisecond,
+			MaxRetryBackoff:    2 * time.Second,
+			DialerRetries:      1,
+			DialerRetryTimeout: 75 * time.Millisecond,
+		}
+
+		_, err := dialFromURIAdvanced(ctx, "redis://localhost:6379", job, AdvancedConnectionOptions{AdvancedDial: captureDial}, "client", nil, retryOpts)
+		if err != nil {
+			t.Fatalf("dialFromURI() error = %v", err)
+		}
+		if capturedOpts == nil {
+			t.Fatal("standalone dial options were not captured")
+		}
+		if capturedOpts.MaxRetries != 20 || capturedOpts.MinRetryBackoff != 50*time.Millisecond || capturedOpts.MaxRetryBackoff != 2*time.Second {
+			t.Errorf("command retry options = %+v, want 20/50ms/2s", capturedOpts)
+		}
+		if capturedOpts.DialerRetries != 1 || capturedOpts.DialerRetryTimeout != 75*time.Millisecond {
+			t.Errorf("dial retry options = %+v, want 1/75ms", capturedOpts)
 		}
 	})
 }
