@@ -757,7 +757,11 @@ func (s *Server) executeChainWithErrorHandler(chain []HandlerFunc, call *CallInf
 				errorHandler(err, call, callback)
 				return
 			}
-			s.logger.Error("gRPC middleware failed", "method", call.FullMethod, "error", redact.Text(err.Error()))
+			// The released Init server emitted no log line for next(err); only the
+			// opt-in advanced server adds this redacted diagnostic.
+			if s.advanced {
+				s.logger.Error("gRPC middleware failed", "method", call.FullMethod, "error", redact.Text(err.Error()))
+			}
 			callback(&RPCError{Code: Internal, Message: s.internalErrorMessage(err.Error())}, nil)
 			return
 		}
@@ -778,13 +782,24 @@ func (s *Server) executeChainWithErrorHandler(chain []HandlerFunc, call *CallInf
 					)
 					callback(&RPCError{
 						Code:    Internal,
-						Message: s.internalErrorMessage(fmt.Sprintf("%v", r)),
+						Message: s.internalPanicMessage(fmt.Sprintf("%v", r)),
 					}, nil)
 				}
 			}()
 			handler(call, callback, next)
 		}()
 	}
+}
+
+func (s *Server) internalPanicMessage(message string) string {
+	// The released legacy server returned fmt.Sprintf("%v", recovered), including
+	// the empty string from panic(""). Keep that byte-for-byte contract. Advanced
+	// servers retain the hardened generic response. The panic log line stays
+	// redacted on both paths (deliberate hardening; it is not a wire contract).
+	if s != nil && !s.advanced {
+		return message
+	}
+	return "Internal Server Error, Please try again!"
 }
 
 func (s *Server) internalErrorMessage(message string) string {
@@ -831,7 +846,9 @@ func (s *Server) wrapWithResponseEncoding(methodName string, chain []HandlerFunc
 						"method", methodName,
 						"error", validationErr,
 					)
-					callback(&RPCError{Code: Internal, Message: "Internal Server Error, Please try again!"}, nil)
+					// Legacy servers returned the validation text as before; advanced
+					// servers keep the generic message.
+					callback(&RPCError{Code: Internal, Message: s.internalErrorMessage(validationErr.Error())}, nil)
 					return
 				}
 			}

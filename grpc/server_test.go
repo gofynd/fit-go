@@ -15,6 +15,7 @@
 package grpc
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -1055,9 +1056,10 @@ func TestMiddlewareDefaultErrorsPreserveOnlyLegacyContract(t *testing.T) {
 		{name: "advanced", advanced: true, want: "Internal Server Error, Please try again!"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			var logs bytes.Buffer
 			server := &Server{
 				advanced: test.advanced,
-				logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+				logger:   slog.New(slog.NewTextHandler(&logs, nil)),
 			}
 			var got error
 			server.executeChain([]HandlerFunc{
@@ -1066,6 +1068,100 @@ func TestMiddlewareDefaultErrorsPreserveOnlyLegacyContract(t *testing.T) {
 			rpcErr, ok := got.(*RPCError)
 			if !ok || rpcErr.Message != test.want {
 				t.Fatalf("middleware error = %#v, want message %q", got, test.want)
+			}
+			// The released Init server emitted no log line for next(err).
+			logged := strings.Contains(logs.String(), "gRPC middleware failed")
+			if logged != test.advanced {
+				t.Fatalf("middleware log present = %v, want %v; log=%q", logged, test.advanced, logs.String())
+			}
+		})
+	}
+}
+
+func TestMiddlewareEmptyPanicPreservesOnlyLegacyContract(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		advanced bool
+		want     string
+	}{
+		{name: "legacy empty panic", want: ""},
+		{name: "advanced empty panic", advanced: true, want: "Internal Server Error, Please try again!"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			server := &Server{
+				advanced: test.advanced,
+				logger:   slog.New(slog.NewTextHandler(&logs, nil)),
+			}
+			var got error
+			server.executeChain([]HandlerFunc{
+				func(_ *CallInfo, _ Callback, _ NextFunc) { panic("") },
+			}, &CallInfo{FullMethod: "/test"}, func(err error, _ map[string]interface{}) { got = err })
+			rpcErr, ok := got.(*RPCError)
+			if !ok || rpcErr.Code != Internal || rpcErr.Message != test.want {
+				t.Fatalf("panic error = %#v, want message %q", got, test.want)
+			}
+			if !strings.Contains(logs.String(), "panic in gRPC handler") {
+				t.Fatalf("panic was not logged: %q", logs.String())
+			}
+		})
+	}
+}
+
+func TestMiddlewarePanicMessageLegacyVsAdvanced(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		advanced bool
+		want     string
+	}{
+		{name: "legacy", want: "boom detail"},
+		{name: "advanced", advanced: true, want: "Internal Server Error, Please try again!"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := &Server{advanced: test.advanced, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			var got error
+			server.executeChain([]HandlerFunc{
+				func(_ *CallInfo, _ Callback, _ NextFunc) { panic("boom detail") },
+			}, &CallInfo{FullMethod: "/test"}, func(err error, _ map[string]interface{}) { got = err })
+			if rpcErr, ok := got.(*RPCError); !ok || rpcErr.Message != test.want {
+				t.Fatalf("panic error = %#v, want message %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestResponseValidationErrorTextLegacyVsAdvanced(t *testing.T) {
+	schema := &ProtoTypeSchema{Schema: map[string]MethodSchema{
+		"getthing": {ResponseSchema: map[string]string{"count": "int32"}},
+	}}
+	wantLegacy := validateResponse(map[string]interface{}{"count": "not-a-number"}, schema.Schema["getthing"].ResponseSchema, "", false)
+	if wantLegacy == nil {
+		t.Fatal("test schema did not produce a validation error")
+	}
+	for _, test := range []struct {
+		name     string
+		advanced bool
+		want     string
+	}{
+		{name: "legacy", want: wantLegacy.Error()},
+		{name: "advanced", advanced: true, want: "Internal Server Error, Please try again!"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := &Server{
+				advanced:       test.advanced,
+				responseSchema: schema,
+				logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+			}
+			chain := server.wrapWithResponseEncoding("GetThing", []HandlerFunc{
+				func(_ *CallInfo, callback Callback, _ NextFunc) {
+					callback(nil, map[string]interface{}{"count": "not-a-number"})
+				},
+			})
+			var got error
+			server.executeChain(chain, &CallInfo{FullMethod: "/svc/GetThing"}, func(err error, _ map[string]interface{}) { got = err })
+			rpcErr, ok := got.(*RPCError)
+			if !ok || rpcErr.Code != Internal || rpcErr.Message != test.want {
+				t.Fatalf("validation error = %#v, want message %q", got, test.want)
 			}
 		})
 	}
