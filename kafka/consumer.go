@@ -106,6 +106,58 @@ type consumerRecordPosition struct {
 	leaderEpoch int32
 }
 
+// awaitConsumerRebalanceHook preserves the original synchronous callback
+// contract while allowing a legacy hook to call Consumer.Close. Close signals
+// closeRequested before it waits for the active run; the driver callback can
+// then return and let that run unwind instead of deadlocking on itself.
+//
+// The hook runs in a goroutine solely to break that wait cycle. Without a close
+// request this function always waits for normal hook completion. If shutdown
+// wins, false tells the caller not to start a later lifecycle hook.
+func awaitConsumerRebalanceHook(closeRequested <-chan struct{}, hook func()) bool {
+	if hook == nil {
+		return true
+	}
+	alreadyClosing := false
+	if closeRequested != nil {
+		select {
+		case <-closeRequested:
+			alreadyClosing = true
+		default:
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		hook()
+	}()
+	// A driver can emit its final revoke callback from inside an external Close,
+	// after closeRequested was signalled. The historical hook must still run, but
+	// the driver callback cannot wait for it: that hook may itself call Close and
+	// would otherwise wait on the Close currently invoking this callback.
+	if alreadyClosing {
+		return false
+	}
+
+	if closeRequested == nil {
+		<-done
+		return true
+	}
+	select {
+	case <-done:
+		// If completion raced shutdown, shutdown wins: do not invoke a later
+		// lifecycle hook after the consumer has started closing.
+		select {
+		case <-closeRequested:
+			return false
+		default:
+			return true
+		}
+	case <-closeRequested:
+		return false
+	}
+}
+
 func (e *consumerHandlerError) Error() string {
 	if e.message == "" {
 		return e.cause.Error()
@@ -135,6 +187,20 @@ func newConsumerHandlerError(message string, cause error) error {
 		return nil
 	}
 	return &consumerHandlerError{message: message, cause: cause}
+}
+
+// newConsumerCommittedHandlerError reports a handler failure for a record whose
+// offset was committed before the handler ran (CommitBeforeHandler). The
+// failed record itself must not be redelivered, but later records fetched in
+// the same partition group were never started; next, when non-nil, is the first
+// of those records and becomes the authoritative rewind position. A nil next
+// yields an authoritative empty plan.
+func newConsumerCommittedHandlerError(message string, cause error, next *consumerRecordPosition) error {
+	err := newConsumerHandlerError(message, cause)
+	if err == nil || next == nil {
+		return err
+	}
+	return &consumerRewindError{cause: err, failed: *next}
 }
 
 func newConsumerHandlerErrorAt(message string, cause error, position consumerRecordPosition) error {
@@ -394,8 +460,10 @@ type ConsumerAdvancedConfig struct {
 
 	// OnPartitionsAssigned, if set, is invoked after partitions are assigned to
 	// this consumer during a group rebalance (visibility / app hook). Optional.
-	// Do not call the consumer's Close method synchronously from this legacy hook;
-	// use OnPartitionsAssignedWithLifecycle when the hook may request shutdown.
+	// Calling the consumer's Close method from this legacy hook is supported: an
+	// in-flight legacy hook no longer blocks Close. A hook that never returns
+	// keeps its goroutine alive after Close. New code should prefer the explicit
+	// lifecycle form below.
 	OnPartitionsAssigned func([]PartitionAssignment)
 	// OnPartitionsAssignedWithLifecycle is the shutdown-safe form of
 	// OnPartitionsAssigned. lifecycle.Close requests shutdown without waiting for
@@ -405,8 +473,10 @@ type ConsumerAdvancedConfig struct {
 	// OnPartitionsRevoked, if set, is invoked before partitions are revoked from
 	// this consumer during a group rebalance. Optional. When automatic commits
 	// are configured, fit-go performs the franz-go final marked-offset commit
-	// before invoking this hook. Do not call the consumer's Close method
-	// synchronously from this legacy hook; use the lifecycle form below.
+	// before invoking this hook. Calling the consumer's Close method from this
+	// legacy hook is supported, and the hook still runs when an external Close
+	// triggers the final revoke (without Close waiting for it). New code should
+	// prefer the lifecycle form below.
 	OnPartitionsRevoked func([]PartitionAssignment)
 	// OnPartitionsRevokedWithLifecycle is the shutdown-safe form of
 	// OnPartitionsRevoked.
@@ -414,7 +484,9 @@ type ConsumerAdvancedConfig struct {
 
 	// OnPartitionsLost is franz-go specific and reports assignments that were
 	// lost without a safe final-commit boundary. It never triggers fit-go's final
-	// revoke commit. Use the lifecycle form when the hook may request shutdown.
+	// revoke commit. Calling the consumer's Close method from the legacy hook is
+	// supported; new code should prefer the lifecycle form. The Confluent backend
+	// rejects both lost hooks at construction time.
 	OnPartitionsLost              func([]PartitionAssignment)
 	OnPartitionsLostWithLifecycle func([]PartitionAssignment, RebalanceLifecycle)
 

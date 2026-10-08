@@ -263,6 +263,11 @@ func (cc *ConfluentClient) consumer(config ConsumerAdvancedConfig, legacy bool) 
 	if config.Backend != ConsumerBackendConfluent {
 		return nil, fmt.Errorf("kafka: unsupported consumer backend %d", config.Backend)
 	}
+	if !legacy && (config.OnPartitionsLost != nil || config.OnPartitionsLostWithLifecycle != nil) {
+		// librdkafka has no distinct lost-partitions callback in the rebalance
+		// API used here; silently ignoring the hook would hide a contract gap.
+		return nil, fmt.Errorf("kafka/confluent: OnPartitionsLost hooks require the franz KafkaJS-compatible backend")
+	}
 
 	// Clone the base config for consumer-specific overrides.
 	cCfg := cloneConfigMap(cc.baseCfg)
@@ -1144,6 +1149,25 @@ type ConfluentConsumer struct {
 	closed    bool
 	closeDone chan struct{}
 	closeErr  error
+
+	// pendingRewinds is populated only when librdkafka cannot seek an exact
+	// first-unprocessed offset after a handler wave fails. No subsequent record
+	// may be read until every pending seek succeeds; rebuilding the consumer
+	// from auto.offset.reset=latest could otherwise skip an uncommitted record.
+	pendingRewinds []consumerRecordPosition
+	// revokedRewinds closes the race where librdkafka reports revocation before
+	// a failed SeekPartitions call is recorded. A position marked revoked is not
+	// retained as a pending seek; the group's next owner resumes from the
+	// committed offset.
+	revokedRewinds map[confluentPartitionKey]struct{}
+	// closeRequested is closed as soon as Close (or a lifecycle close request)
+	// starts, so legacy rebalance hooks stop blocking the driver callback.
+	closeRequested chan struct{}
+}
+
+type confluentPartitionKey struct {
+	topic     string
+	partition int32
 }
 
 // confluentConsumerDriver is the message-loop subset of *ckafka.Consumer.
@@ -1292,12 +1316,17 @@ func (cc *ConfluentConsumer) rebalanceCb(consumer *ckafka.Consumer, event ckafka
 			cc.logger.Error("kafka/confluent: partition assign failed", "groupId", cc.groupID, "error", redact.ErrorMessage(err))
 			return err
 		}
+		cc.markRewindPartitionsAssigned(e.Partitions)
 		cc.logger.Info("kafka/confluent: partitions assigned",
 			"groupId", cc.groupID, "partitions", formatPartitions(e.Partitions))
 		cc.invokePartitionsAssigned(toPartitionAssignments(e.Partitions))
 	case ckafka.RevokedPartitions:
 		cc.logger.Info("kafka/confluent: partitions revoked",
 			"groupId", cc.groupID, "partitions", formatPartitions(e.Partitions))
+		// Exact rewinds are meaningful only while this member owns the target
+		// partition. Drop revoked entries so a later Consume call cannot remain
+		// blocked trying to seek an assignment it no longer owns.
+		cc.clearPendingRewindsForPartitions(e.Partitions)
 		cc.invokePartitionsRevoked(toPartitionAssignments(e.Partitions))
 		var err error
 		if cooperative {
@@ -1315,7 +1344,9 @@ func (cc *ConfluentConsumer) rebalanceCb(consumer *ckafka.Consumer, event ckafka
 
 func (cc *ConfluentConsumer) invokePartitionsAssigned(parts []PartitionAssignment) {
 	if cc.config.OnPartitionsAssigned != nil {
-		cc.config.OnPartitionsAssigned(parts)
+		if !awaitConsumerRebalanceHook(cc.closeRequestSignal(), func() { cc.config.OnPartitionsAssigned(parts) }) {
+			return
+		}
 	}
 	if cc.config.OnPartitionsAssignedWithLifecycle != nil {
 		cc.config.OnPartitionsAssignedWithLifecycle(parts, rebalanceLifecycle{close: cc.requestCloseFromRebalance})
@@ -1324,7 +1355,9 @@ func (cc *ConfluentConsumer) invokePartitionsAssigned(parts []PartitionAssignmen
 
 func (cc *ConfluentConsumer) invokePartitionsRevoked(parts []PartitionAssignment) {
 	if cc.config.OnPartitionsRevoked != nil {
-		cc.config.OnPartitionsRevoked(parts)
+		if !awaitConsumerRebalanceHook(cc.closeRequestSignal(), func() { cc.config.OnPartitionsRevoked(parts) }) {
+			return
+		}
 	}
 	if cc.config.OnPartitionsRevokedWithLifecycle != nil {
 		cc.config.OnPartitionsRevokedWithLifecycle(parts, rebalanceLifecycle{close: cc.requestCloseFromRebalance})
@@ -1444,6 +1477,11 @@ func (cc *ConfluentConsumer) consumeMessages(handler confluentMessageHandler, op
 		return err
 	}
 	defer finish()
+	if !cc.legacy {
+		if err := cc.applyPendingRewinds(consumer); err != nil {
+			return err
+		}
+	}
 
 	waveSize := opts.MaxRecords
 	if waveSize <= 0 {
@@ -1596,7 +1634,15 @@ func (cc *ConfluentConsumer) processMessageGroup(
 				continue
 			}
 			if !isAutoCommit && opts.CommitBeforeHandler {
-				return newConsumerHandlerError("kafka/confluent: message handler failed", handlerErr)
+				// The failed record was committed before its handler ran and is
+				// intentionally not redelivered (at-most-once). Later records of
+				// this partition group were never started: rewind to the first.
+				var next *consumerRecordPosition
+				if i+1 < len(group.messages) {
+					position := confluentRecordPosition(group.messages[i+1])
+					next = &position
+				}
+				return newConsumerCommittedHandlerError("kafka/confluent: message handler failed", handlerErr, next)
 			}
 			return newConsumerHandlerErrorAt("kafka/confluent: message handler failed", handlerErr, confluentRecordPosition(message))
 		}
@@ -1697,6 +1743,11 @@ func (cc *ConfluentConsumer) consumeBatches(handler confluentBatchHandler, opts 
 		return err
 	}
 	defer finish()
+	if !cc.legacy {
+		if err := cc.applyPendingRewinds(consumer); err != nil {
+			return err
+		}
+	}
 
 	batchSize := opts.MaxRecords
 	if batchSize <= 0 {
@@ -1786,58 +1837,251 @@ func (cc *ConfluentConsumer) processBatchGroup(
 	return nil
 }
 
+// prepareHandlerRunRetry rewinds every partition of a failed wave to its first
+// unprocessed record on the existing group member. Only partitions this member
+// still owns are sought. If an exact seek fails, the consumer fails closed: the
+// positions are retained as pending rewinds and the next Consume call must seek
+// them successfully before it reads another record (it returns an error
+// otherwise). The consumer is never rebuilt here, because a rebuilt member with
+// no committed offset would resume from auto.offset.reset=latest and skip the
+// failed record and its backlog. Callers that retry Consume after an error
+// should back off between attempts.
 func (cc *ConfluentConsumer) prepareHandlerRunRetry(runConsumer confluentConsumerDriver, err error) error {
-	positions, rewindDecided := consumerRewindPositions(err)
-	if !rewindDecided || runConsumer == nil {
+	if runConsumer == nil {
 		return err
 	}
+	positions, rewindDecided := consumerRewindPositions(err)
+	if !rewindDecided || len(positions) == 0 {
+		// An authoritative empty plan (CommitBeforeHandler on the last fetched
+		// record) preserves the at-most-once choice.
+		return err
+	}
+	positions = cc.rewindPositionsStillOwned(runConsumer, positions)
 	if len(positions) == 0 {
 		return err
 	}
-	wanted := make([]ckafka.TopicPartition, 0, len(positions))
-	for _, failed := range positions {
-		topic := failed.topic
-		wanted = append(wanted, ckafka.TopicPartition{
-			Topic: &topic, Partition: failed.partition, Offset: ckafka.Offset(failed.offset),
-		})
+	seekErr := seekConfluentPositions(runConsumer, positions)
+	if seekErr == nil {
+		return err
 	}
-	partitions, seekErr := runConsumer.SeekPartitions(wanted)
-	if seekErr == nil && len(partitions) == len(wanted) {
-		allRewound := true
-		for _, partition := range partitions {
-			if partition.Error != nil {
-				allRewound = false
+
+	var pendingPositions []consumerRecordPosition
+	cc.mu.Lock()
+	if !cc.closed && cc.consumer == runConsumer {
+		pending := make([]consumerRecordPosition, 0, len(positions))
+		for _, position := range positions {
+			if _, revoked := cc.revokedRewinds[confluentPartitionKey{
+				topic: position.topic, partition: position.partition,
+			}]; !revoked {
+				pending = append(pending, position)
+			}
+		}
+		cc.pendingRewinds = mergeConsumerRewindPositions(cc.pendingRewinds, pending)
+		pendingPositions = append([]consumerRecordPosition(nil), cc.pendingRewinds...)
+	}
+	cc.mu.Unlock()
+	if len(pendingPositions) == 0 {
+		return err
+	}
+	cc.logger.Warn(
+		"kafka/confluent: exact handler offset rewind failed; consumer paused at pending exact rewinds",
+		"groupId", cc.groupID,
+		"partitions", formatConsumerPositions(pendingPositions),
+		"error", redact.ErrorMessage(seekErr),
+	)
+	return err
+}
+
+// mergeConsumerRewindPositions keeps the earliest offset per partition.
+func mergeConsumerRewindPositions(current, added []consumerRecordPosition) []consumerRecordPosition {
+	merged := append([]consumerRecordPosition(nil), current...)
+	for _, position := range added {
+		found := false
+		for i := range merged {
+			if merged[i].topic == position.topic && merged[i].partition == position.partition {
+				if position.offset < merged[i].offset {
+					merged[i] = position
+				}
+				found = true
 				break
 			}
 		}
-		if allRewound {
-			return err
+		if !found {
+			merged = append(merged, position)
 		}
 	}
-	if seekErr == nil {
-		seekErr = fmt.Errorf("partition seek did not rewind every failed partition")
+	return merged
+}
+
+func (cc *ConfluentConsumer) clearPendingRewindsForPartitions(revoked []ckafka.TopicPartition) {
+	if len(revoked) == 0 {
+		return
 	}
-	cc.logger.Warn(
-		"kafka/confluent: exact processing offset rewind failed; rebuilding from committed offset",
-		"groupId", cc.groupID,
-		"error", redact.ErrorMessage(seekErr),
-	)
+	revokedSet := make(map[confluentPartitionKey]struct{}, len(revoked))
+	for _, partition := range revoked {
+		revokedSet[confluentPartitionKey{topic: confluentTopicName(partition.Topic), partition: partition.Partition}] = struct{}{}
+	}
+
 	cc.mu.Lock()
-	if cc.closed || cc.consumer != runConsumer {
-		cc.mu.Unlock()
-		return err
+	defer cc.mu.Unlock()
+	if cc.revokedRewinds == nil {
+		cc.revokedRewinds = make(map[confluentPartitionKey]struct{}, len(revokedSet))
 	}
-	cc.consumer = nil
+	for key := range revokedSet {
+		cc.revokedRewinds[key] = struct{}{}
+	}
+	kept := cc.pendingRewinds[:0]
+	for _, position := range cc.pendingRewinds {
+		if _, wasRevoked := revokedSet[confluentPartitionKey{topic: position.topic, partition: position.partition}]; !wasRevoked {
+			kept = append(kept, position)
+		}
+	}
+	cc.pendingRewinds = kept
+}
+
+func (cc *ConfluentConsumer) markRewindPartitionsAssigned(assigned []ckafka.TopicPartition) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	for _, partition := range assigned {
+		delete(cc.revokedRewinds, confluentPartitionKey{
+			topic: confluentTopicName(partition.Topic), partition: partition.Partition,
+		})
+	}
+}
+
+// confluentAssignmentReader is implemented by *ckafka.Consumer. Test doubles
+// that do not implement it are treated as owning every requested partition.
+type confluentAssignmentReader interface {
+	Assignment() ([]ckafka.TopicPartition, error)
+}
+
+// rewindPositionsStillOwned filters positions to partitions this member still
+// owns: partitions revoked since their last assignment are dropped, and when
+// the driver exposes its current assignment, partitions outside it are dropped
+// too. Seeking an unowned partition can never succeed and would otherwise pin
+// the consumer in its fail-closed state.
+func (cc *ConfluentConsumer) rewindPositionsStillOwned(
+	runConsumer confluentConsumerDriver,
+	positions []consumerRecordPosition,
+) []consumerRecordPosition {
+	var assigned map[confluentPartitionKey]struct{}
+	if reader, ok := runConsumer.(confluentAssignmentReader); ok {
+		if current, err := reader.Assignment(); err == nil {
+			assigned = make(map[confluentPartitionKey]struct{}, len(current))
+			for _, partition := range current {
+				assigned[confluentPartitionKey{topic: confluentTopicName(partition.Topic), partition: partition.Partition}] = struct{}{}
+			}
+		}
+	}
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	owned := make([]consumerRecordPosition, 0, len(positions))
+	for _, position := range positions {
+		key := confluentPartitionKey{topic: position.topic, partition: position.partition}
+		if _, revoked := cc.revokedRewinds[key]; revoked {
+			continue
+		}
+		if assigned != nil {
+			if _, ok := assigned[key]; !ok {
+				continue
+			}
+		}
+		owned = append(owned, position)
+	}
+	return owned
+}
+
+// applyPendingRewinds retries exact seeks retained after a failed handler-wave
+// rewind. It runs before any read in a new Consume call and returns an error
+// (without reading) while any owned partition still cannot be sought.
+func (cc *ConfluentConsumer) applyPendingRewinds(runConsumer confluentConsumerDriver) error {
+	cc.mu.Lock()
+	if cc.closed || cc.consumer != runConsumer || len(cc.pendingRewinds) == 0 {
+		cc.mu.Unlock()
+		return nil
+	}
+	positions := append([]consumerRecordPosition(nil), cc.pendingRewinds...)
 	cc.mu.Unlock()
 
-	if closeErr := runConsumer.Close(); closeErr != nil {
-		cc.logger.Warn(
-			"kafka/confluent: failed consumer reset after handler error",
-			"groupId", cc.groupID,
-			"error", redact.ErrorMessage(closeErr),
-		)
+	owned := cc.rewindPositionsStillOwned(runConsumer, positions)
+	if err := seekConfluentPositions(runConsumer, owned); err != nil {
+		return fmt.Errorf("kafka/confluent: pending exact handler offset rewind failed: %w", err)
 	}
-	return err
+
+	cc.mu.Lock()
+	if cc.consumer == runConsumer {
+		// Remove only the positions handled above; a concurrent revoke may
+		// already have pruned the slice.
+		kept := cc.pendingRewinds[:0]
+		for _, pending := range cc.pendingRewinds {
+			handled := false
+			for _, position := range positions {
+				if pending == position {
+					handled = true
+					break
+				}
+			}
+			if !handled {
+				kept = append(kept, pending)
+			}
+		}
+		cc.pendingRewinds = kept
+	}
+	cc.mu.Unlock()
+	return nil
+}
+
+func seekConfluentPositions(runConsumer confluentConsumerDriver, positions []consumerRecordPosition) error {
+	if runConsumer == nil || len(positions) == 0 {
+		return nil
+	}
+	requested := make([]ckafka.TopicPartition, len(positions))
+	for i, position := range positions {
+		topic := position.topic
+		requested[i] = ckafka.TopicPartition{
+			Topic: &topic, Partition: position.partition, Offset: ckafka.Offset(position.offset),
+		}
+	}
+	result, err := runConsumer.SeekPartitions(requested)
+	if err != nil {
+		return err
+	}
+	if len(result) != len(requested) {
+		return fmt.Errorf("partition seek returned %d result(s) for %d request(s)", len(result), len(requested))
+	}
+	expected := make(map[confluentPartitionKey]struct{}, len(requested))
+	for _, partition := range requested {
+		expected[confluentPartitionKey{topic: confluentTopicName(partition.Topic), partition: partition.Partition}] = struct{}{}
+	}
+	for _, partition := range result {
+		if partition.Error != nil {
+			return fmt.Errorf("partition seek failed for %s[%d]: %w", confluentTopicName(partition.Topic), partition.Partition, partition.Error)
+		}
+		key := confluentPartitionKey{topic: confluentTopicName(partition.Topic), partition: partition.Partition}
+		if _, ok := expected[key]; !ok {
+			return fmt.Errorf("partition seek returned unexpected result for %s[%d]", key.topic, key.partition)
+		}
+		delete(expected, key)
+	}
+	if len(expected) != 0 {
+		return fmt.Errorf("partition seek omitted %d requested partition(s)", len(expected))
+	}
+	return nil
+}
+
+func formatConsumerPositions(positions []consumerRecordPosition) []string {
+	formatted := make([]string, len(positions))
+	for i, position := range positions {
+		formatted[i] = fmt.Sprintf("%s[%d]@%d", position.topic, position.partition, position.offset)
+	}
+	return formatted
+}
+
+func confluentTopicName(topic *string) string {
+	if topic == nil {
+		return ""
+	}
+	return *topic
 }
 
 func confluentRecordPosition(message *ckafka.Message) consumerRecordPosition {
@@ -2072,6 +2316,7 @@ func (cc *ConfluentConsumer) Close() error {
 		return err
 	}
 	cc.closed = true
+	cc.signalCloseRequestedLocked()
 	cc.closeDone = make(chan struct{})
 	done := cc.closeDone
 	cancel := cc.cancelFn
@@ -2088,6 +2333,7 @@ func (cc *ConfluentConsumer) requestCloseFromRebalance() error {
 		return nil
 	}
 	cc.closed = true
+	cc.signalCloseRequestedLocked()
 	cc.closeDone = make(chan struct{})
 	done := cc.closeDone
 	cancel := cc.cancelFn
@@ -2137,6 +2383,29 @@ func (cc *ConfluentConsumer) finishClose(
 		"groupId", cc.groupID,
 	)
 	return nil
+}
+
+func (cc *ConfluentConsumer) closeRequestSignal() <-chan struct{} {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	if cc.closeRequested == nil {
+		cc.closeRequested = make(chan struct{})
+		if cc.closed {
+			close(cc.closeRequested)
+		}
+	}
+	return cc.closeRequested
+}
+
+func (cc *ConfluentConsumer) signalCloseRequestedLocked() {
+	if cc.closeRequested == nil {
+		cc.closeRequested = make(chan struct{})
+	}
+	select {
+	case <-cc.closeRequested:
+	default:
+		close(cc.closeRequested)
+	}
 }
 
 func (cc *ConfluentConsumer) closeLegacy() error {

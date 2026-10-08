@@ -68,6 +68,10 @@ type franzKafkaJS2CompatConsumer struct {
 	closed    bool
 	closeErr  error
 	closeDone chan struct{}
+
+	// closeRequested is closed as soon as Close (or a lifecycle close request)
+	// starts, so legacy rebalance hooks stop blocking the franz-go callback.
+	closeRequested chan struct{}
 }
 
 func newFranzKafkaJS2CompatConsumer(
@@ -264,7 +268,9 @@ func (c *franzKafkaJS2CompatConsumer) handlePartitionsLost(lost map[string][]int
 	c.logger.Warn("kafka/kafkajs: partitions lost", "groupId", c.config.GroupID, "partitions", formatAssignments(parts))
 	hasLostHook := c.config.OnPartitionsLost != nil || c.config.OnPartitionsLostWithLifecycle != nil
 	if c.config.OnPartitionsLost != nil {
-		c.config.OnPartitionsLost(parts)
+		if !awaitConsumerRebalanceHook(c.closeRequestSignal(), func() { c.config.OnPartitionsLost(parts) }) {
+			return
+		}
 	}
 	if c.config.OnPartitionsLostWithLifecycle != nil {
 		c.config.OnPartitionsLostWithLifecycle(parts, rebalanceLifecycle{close: c.requestCloseFromRebalance})
@@ -279,7 +285,9 @@ func (c *franzKafkaJS2CompatConsumer) handlePartitionsLost(lost map[string][]int
 
 func (c *franzKafkaJS2CompatConsumer) invokePartitionsAssigned(parts []PartitionAssignment) {
 	if c.config.OnPartitionsAssigned != nil {
-		c.config.OnPartitionsAssigned(parts)
+		if !awaitConsumerRebalanceHook(c.closeRequestSignal(), func() { c.config.OnPartitionsAssigned(parts) }) {
+			return
+		}
 	}
 	if c.config.OnPartitionsAssignedWithLifecycle != nil {
 		c.config.OnPartitionsAssignedWithLifecycle(parts, rebalanceLifecycle{close: c.requestCloseFromRebalance})
@@ -288,7 +296,9 @@ func (c *franzKafkaJS2CompatConsumer) invokePartitionsAssigned(parts []Partition
 
 func (c *franzKafkaJS2CompatConsumer) invokePartitionsRevoked(parts []PartitionAssignment) {
 	if c.config.OnPartitionsRevoked != nil {
-		c.config.OnPartitionsRevoked(parts)
+		if !awaitConsumerRebalanceHook(c.closeRequestSignal(), func() { c.config.OnPartitionsRevoked(parts) }) {
+			return
+		}
 	}
 	if c.config.OnPartitionsRevokedWithLifecycle != nil {
 		c.config.OnPartitionsRevokedWithLifecycle(parts, rebalanceLifecycle{close: c.requestCloseFromRebalance})
@@ -408,9 +418,19 @@ func (c *franzKafkaJS2CompatConsumer) consumeMessages(handler kafkaJSMessageHand
 		}
 		groups := groupKafkaJSRecords(fetches.Records())
 		if err = runKafkaJSRecordGroups(runCtx, groups, concurrency, func(group []*kgo.Record) error {
-			for _, record := range group {
+			for index, record := range group {
 				if err := c.processRecord(runCtx, client, record, handler, isAutoCommit, opts); err != nil {
 					if errors.Is(err, errKafkaJSUnresolvedRecordRewound) {
+						return err
+					}
+					if !isAutoCommit && opts.CommitBeforeHandler && isConsumerHandlerError(err) {
+						// The failed record was committed before its handler ran and is
+						// intentionally not redelivered (at-most-once). Later fetched
+						// records of this partition were never started: rewind to the
+						// first of them so they are not skipped.
+						if index+1 < len(group) {
+							return &consumerRewindError{cause: err, failed: kafkaJSRecordPosition(group[index+1])}
+						}
 						return err
 					}
 					return withConsumerRewindPosition(err, kafkaJSRecordPosition(record))
@@ -993,6 +1013,7 @@ func (c *franzKafkaJS2CompatConsumer) Close() error {
 		return nil
 	}
 	c.closed = true
+	c.signalCloseRequestedLocked()
 	closeDone := make(chan struct{})
 	c.closeDone = closeDone
 	client, cancel, stopPoll, runDone := c.client, c.cancelRun, c.stopPoll, c.runDone
@@ -1008,6 +1029,7 @@ func (c *franzKafkaJS2CompatConsumer) requestCloseFromRebalance() error {
 		return nil
 	}
 	c.closed = true
+	c.signalCloseRequestedLocked()
 	closeDone := make(chan struct{})
 	c.closeDone = closeDone
 	client, cancel, stopPoll, runDone := c.client, c.cancelRun, c.stopPoll, c.runDone
@@ -1058,4 +1080,27 @@ func (c *franzKafkaJS2CompatConsumer) finishClose(
 	close(closeDone)
 	c.mu.Unlock()
 	return err
+}
+
+func (c *franzKafkaJS2CompatConsumer) closeRequestSignal() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closeRequested == nil {
+		c.closeRequested = make(chan struct{})
+		if c.closed {
+			close(c.closeRequested)
+		}
+	}
+	return c.closeRequested
+}
+
+func (c *franzKafkaJS2CompatConsumer) signalCloseRequestedLocked() {
+	if c.closeRequested == nil {
+		c.closeRequested = make(chan struct{})
+	}
+	select {
+	case <-c.closeRequested:
+	default:
+		close(c.closeRequested)
+	}
 }

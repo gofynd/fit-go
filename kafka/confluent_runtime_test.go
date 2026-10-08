@@ -2015,11 +2015,16 @@ func TestConfluentAdvancedConsumerSeeksExactOffsetAfterHandlerFailure(t *testing
 	}
 }
 
-func TestConfluentHandlerRecoveryRebuildsWhenExactSeekFails(t *testing.T) {
+func TestConfluentHandlerRecoveryFailsClosedAndRetriesExactSeek(t *testing.T) {
 	topic := "orders"
 	seekErr := errors.New("assignment changed")
-	driver := &fakeConfluentConsumerDriver{seekFn: func([]ckafka.TopicPartition) ([]ckafka.TopicPartition, error) {
-		return nil, seekErr
+	seekAttempts := 0
+	driver := &fakeConfluentConsumerDriver{seekFn: func(partitions []ckafka.TopicPartition) ([]ckafka.TopicPartition, error) {
+		seekAttempts++
+		if seekAttempts == 1 {
+			return nil, seekErr
+		}
+		return partitions, nil
 	}}
 	consumer := newTestConfluentConsumer(false, driver)
 	err := newConsumerHandlerErrorAt("handler failed", errors.New("boom"), consumerRecordPosition{
@@ -2028,12 +2033,24 @@ func TestConfluentHandlerRecoveryRebuildsWhenExactSeekFails(t *testing.T) {
 	if got := consumer.prepareHandlerRunRetry(driver, err); got != err {
 		t.Fatalf("prepare error = %v, want original handler error", got)
 	}
-	if consumer.consumer != nil {
-		t.Fatal("failed exact seek retained the old Confluent driver")
+	if consumer.consumer != driver {
+		t.Fatal("failed exact seek discarded the healthy Confluent driver")
 	}
 	_, _, closes := driver.operationCalls()
-	if closes != 1 {
-		t.Fatalf("driver closes = %d, want 1 after failed exact seek", closes)
+	if closes != 0 {
+		t.Fatalf("driver closes = %d, want 0 after failed exact seek", closes)
+	}
+	if len(consumer.pendingRewinds) != 1 || consumer.pendingRewinds[0].offset != 17 {
+		t.Fatalf("pending rewinds = %#v, want orders[2]@17", consumer.pendingRewinds)
+	}
+	if err := consumer.applyPendingRewinds(driver); err != nil {
+		t.Fatalf("applyPendingRewinds error = %v", err)
+	}
+	if seekAttempts != 2 {
+		t.Fatalf("seek attempts = %d, want 2", seekAttempts)
+	}
+	if len(consumer.pendingRewinds) != 0 {
+		t.Fatalf("pending rewinds after successful retry = %#v, want none", consumer.pendingRewinds)
 	}
 }
 
