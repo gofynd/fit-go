@@ -236,7 +236,6 @@ func TestTextKeepsOperationalDottedNumbers(t *testing.T) {
 		"durations=1000-2000-3000",
 		"origin=0.000000 0.000000",
 		"retry pass: 3",
-		"PWD=/app",
 	}, " ")
 	if got := Text(input); got != input {
 		t.Fatalf("Text redacted operational dotted values:\n got: %s\nwant: %s", got, input)
@@ -324,5 +323,85 @@ func TestTextRedactsJWTAfterDottedPrefixAndCompactJWE(t *testing.T) {
 	}
 	if !strings.Contains(got, "topic=fulfillment.shipments."+Mask) {
 		t.Fatalf("Text did not preserve safe dotted prefix: %s", got)
+	}
+}
+
+func mustParseURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed
+}
+
+func TestTextDistinguishesRetryPassCounterFromPasswordAliases(t *testing.T) {
+	input := `retry pass: 3 pass: 123456 PWD=/app PWD=/hunter2 PWD=secret pass: hunter2 pwd=/also-secret`
+	got := Text(input)
+	for _, safe := range []string{"retry pass: 3"} {
+		if !strings.Contains(got, safe) {
+			t.Fatalf("Text masked operational value %q: %s", safe, got)
+		}
+	}
+	for _, secret := range []string{"pass: 123456", "PWD=/app", "PWD=/hunter2", "PWD=secret", "pass: hunter2", "pwd=/also-secret"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("Text leaked secret %q: %s", secret, got)
+		}
+	}
+}
+
+func TestPaymentCardScannerIsLinearForLongAlphanumericWord(t *testing.T) {
+	input := strings.Repeat("a1", 128<<10) // 256 KiB: every digit used to scan back to byte zero.
+	if got := redactPaymentCards(input); got != input {
+		t.Fatal("payment-card scanner redacted an alternating alphanumeric identifier")
+	}
+	if allocations := testing.AllocsPerRun(3, func() { _ = redactPaymentCards(input) }); allocations > 1 {
+		t.Fatalf("adversarial card scan allocations = %.0f, want at most one", allocations)
+	}
+}
+
+func BenchmarkPaymentCardScannerAlternatingWord256KiB(b *testing.B) {
+	input := strings.Repeat("a1", 128<<10)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(input)))
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		_ = redactPaymentCards(input)
+	}
+}
+
+func TestProtectedPhoneSpanScanPreservesSortedOperationalSpans(t *testing.T) {
+	for _, size := range []int{64 << 10, 256 << 10} {
+		input := strings.Repeat("1791364800000,", size/14)
+		if got := redactPhoneCandidates(input); got != input {
+			t.Fatalf("protected timestamps were redacted for %d-byte input", size)
+		}
+	}
+}
+
+func BenchmarkPhoneScannerProtectedSpans256KiB(b *testing.B) {
+	input := strings.Repeat("1791364800000,", (256<<10)/14)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(input)))
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		_ = redactPhoneCandidates(input)
+	}
+}
+
+func TestPhoneLabelLookupIsBoundedForAdversarialInput(t *testing.T) {
+	input := strings.Repeat("123456789-x", 1<<15)
+	if got := redactPhoneCandidates(input); got != input {
+		t.Fatal("adversarial operational sequence was redacted as a phone")
+	}
+}
+
+func BenchmarkPhoneScannerAdversarial256KiB(b *testing.B) {
+	input := strings.Repeat("123456789-x", (256<<10)/11)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(input)))
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		_ = redactPhoneCandidates(input)
 	}
 }

@@ -61,9 +61,13 @@ var (
 			`[0-9][ -][0-9]{3}[ -][0-9]{3}[ -][0-9]{4}|\+[0-9]{1,3}[ -][0-9]{3}[ -][0-9]{3}[ -][0-9]{4}|` +
 			`\+?[0-9]{1,3}[ -]?\([0-9]{3}\)[ -]?[0-9]{3}[ -][0-9]{4})$`,
 	)
-	textDatePrefixPattern   = regexp.MustCompile(`^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[ T]\d{1,2})?$`)
-	textEpochMillisPattern  = regexp.MustCompile(`\b[0-9]{13}\b`)
-	textEpochSecondsPattern = regexp.MustCompile(
+	// textParenAreaPhonePattern matches a NANP number whose area code opens
+	// with "(" — the phone candidate regex starts at the first digit, so the
+	// opening parenthesis is re-attached before this check.
+	textParenAreaPhonePattern = regexp.MustCompile(`^\([0-9]{3}\)[ -]?[0-9]{3}[ .-]?[0-9]{4}$`)
+	textDatePrefixPattern     = regexp.MustCompile(`^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[ T]\d{1,2})?$`)
+	textEpochMillisPattern    = regexp.MustCompile(`\b[0-9]{13}\b`)
+	textEpochSecondsPattern   = regexp.MustCompile(
 		`(?i)\b(?:epoch(?:_seconds)?|timestamp|created_at|updated_at)\s*[:=]\s*[0-9]{10}\b`,
 	)
 	textUUIDPattern   = regexp.MustCompile(`(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b`)
@@ -349,7 +353,7 @@ func Text(value string) string {
 	value = textBearerPattern.ReplaceAllString(value, "Bearer "+Mask)
 	value = textBasicPattern.ReplaceAllString(value, "Basic "+Mask)
 	value = textSecretJSONPattern.ReplaceAllString(value, "$1\""+Mask+"\"")
-	value = textSecretPattern.ReplaceAllStringFunc(value, redactTextSecret)
+	value = redactTextSecrets(value)
 	value = textLooseNumericSecretPattern.ReplaceAllString(value, "$1 "+Mask)
 	value = redactJWTs(value)
 	value = textEmailPattern.ReplaceAllString(value, "[REDACTED_EMAIL]")
@@ -358,20 +362,67 @@ func Text(value string) string {
 	return value
 }
 
-func redactTextSecret(raw string) string {
-	parts := textSecretPattern.FindStringSubmatch(raw)
-	if len(parts) != 4 {
-		return Mask
+// redactTextSecrets masks key/value secrets. PWD is deliberately treated as a
+// password alias: a logger cannot reliably tell a working directory such as
+// /app from a credential such as /hunter2, and leaking the latter is worse than
+// losing working-directory detail. The only "pass" value kept is an explicit
+// numeric retry counter ("retry pass: 3").
+func redactTextSecrets(value string) string {
+	matches := textSecretPattern.FindAllStringSubmatchIndex(value, -1)
+	if len(matches) == 0 {
+		return value
 	}
-	key, delimiter := parts[1], parts[2]
-	// PWD is the conventional process working-directory variable, not a
-	// password. The lower-case pwd= alias remains sensitive. A prose
-	// "pass: <count>" is also operational; secret aliases use '=' while the
-	// unambiguous password/passphrase names continue to support either form.
-	if key == "PWD" || (delimiter == ":" && strings.EqualFold(key, "pass")) {
-		return raw
+	var output strings.Builder
+	output.Grow(len(value))
+	last := 0
+	for _, match := range matches {
+		if len(match) != 8 || match[2] < 0 || match[4] < 0 || match[6] < 0 {
+			continue
+		}
+		output.WriteString(value[last:match[0]])
+		key := value[match[2]:match[3]]
+		delimiter := value[match[4]:match[5]]
+		secret := value[match[6]:match[7]]
+		if delimiter == ":" && strings.EqualFold(key, "pass") && isUnsignedDecimal(secret) &&
+			hasImmediateWordBefore(value, match[0], "retry") {
+			output.WriteString(value[match[0]:match[1]])
+		} else {
+			output.WriteString(key)
+			output.WriteString(delimiter)
+			output.WriteString(Mask)
+		}
+		last = match[1]
 	}
-	return key + delimiter + Mask
+	output.WriteString(value[last:])
+	return output.String()
+}
+
+// hasImmediateWordBefore reports whether word (ASCII case-insensitive) is the
+// whole word immediately before start, separated only by whitespace. The
+// whitespace look-back is bounded so adversarial runs stay linear.
+func hasImmediateWordBefore(value string, start int, word string) bool {
+	end := start
+	for end > 0 && start-end < 64 && isASCIISpace(value[end-1]) {
+		end--
+	}
+	wordStart := end - len(word)
+	if wordStart < 0 || !strings.EqualFold(value[wordStart:end], word) {
+		return false
+	}
+	return wordStart == 0 || !isASCIIWord(value[wordStart-1])
+}
+
+func isUnsignedDecimal(value string) bool {
+	value = strings.Trim(value, `"'`)
+	if value == "" {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		if !isASCIIDigit(value[index]) {
+			return false
+		}
+	}
+	return true
 }
 
 func containsValidJWT(value string) bool {
@@ -504,10 +555,13 @@ func redactPaymentCards(value string) string {
 	var output strings.Builder
 	last := 0
 	for start := 0; start < len(value); start++ {
-		if !isASCIIDigit(value[start]) || !validPaymentCardLeftBoundary(value, start) {
+		if !isASCIIDigit(value[start]) || start > 0 && isASCIIDigit(value[start-1]) {
 			continue
 		}
 		labelled := hasPaymentCardLabelBefore(value, start)
+		if !validPaymentCardLeftBoundary(value, start, labelled) {
+			continue
+		}
 		end, ok := paymentCardEnd(value, start, labelled)
 		if !ok {
 			continue
@@ -527,18 +581,22 @@ func redactPaymentCards(value string) string {
 	return output.String()
 }
 
-func validPaymentCardLeftBoundary(value string, start int) bool {
+func validPaymentCardLeftBoundary(value string, start int, labelled bool) bool {
 	if start == 0 {
 		return true
 	}
 	previous := value[start-1]
-	if isASCIIDigit(previous) || previous == '.' || previous == '-' {
+	if isASCIIDigit(previous) {
 		return false
 	}
-	if !isASCIIWord(previous) {
+	if !isASCIIWord(previous) && previous != '.' && previous != '-' {
 		return true
 	}
-	return hasPaymentCardLabelBefore(value, start)
+	// A word character, '.', or '-' immediately before the digits is a valid
+	// boundary only when it completes a payment-card label (my_card4111...,
+	// card.4111..., pan-4111...). This keeps ref-4111..., versions, and dotted
+	// numeric fragments out of the card scanner.
+	return labelled
 }
 
 func paymentCardEnd(value string, start int, labelled bool) (int, bool) {
@@ -578,20 +636,77 @@ func paymentCardEnd(value string, start int, labelled bool) (int, bool) {
 			return end, true
 		}
 	}
-	return labelledPaymentCardEnd(value, start)
+	if end, ok := flexibleGroupedPaymentCardEnd(value, start); ok {
+		return end, true
+	}
+	// Arbitrary groupings are only reinterpreted as a PAN behind an explicit
+	// card label; unlabelled separator-joined numeric lists are operational.
+	if labelled {
+		return labelledPaymentCardEnd(value, start)
+	}
+	return 0, false
+}
+
+// flexibleGroupedPaymentCardEnd matches established PAN layouts whose groups
+// are joined by one or two separator characters, mixed separators allowed
+// (4111  1111 1111-1111, 41111111 11111111, 3056 930902 5904). It is bounded by
+// the 19-digit maximum and therefore constant-time per start position.
+func flexibleGroupedPaymentCardEnd(value string, start int) (int, bool) {
+	for _, groups := range [...][5]uint8{
+		{4, 4, 4, 4, 3}, // 19 digit
+		{4, 4, 4, 4},    // 16 digit
+		{8, 8},          // 16 digit, 8-8
+		{4, 6, 5},       // 15 digit (Amex)
+		{4, 6, 4},       // 14 digit (Diners)
+	} {
+		var digits [19]byte
+		digitCount := 0
+		position := start
+		ok := true
+		for groupIndex, groupSize := range groups {
+			if groupSize == 0 {
+				break
+			}
+			if groupIndex > 0 {
+				separators := 0
+				for position < len(value) && separators < 2 && isCardSeparator(value[position]) {
+					position++
+					separators++
+				}
+				if separators == 0 {
+					ok = false
+					break
+				}
+			}
+			for count := uint8(0); count < groupSize; count++ {
+				if position >= len(value) || !isASCIIDigit(value[position]) {
+					ok = false
+					break
+				}
+				digits[digitCount] = value[position]
+				digitCount++
+				position++
+			}
+			if !ok {
+				break
+			}
+		}
+		if ok && validPaymentCardRightBoundary(value, position) &&
+			!allSameDigit(digits[:digitCount]) && validLuhn(digits[:digitCount]) {
+			return position, true
+		}
+	}
+	return 0, false
 }
 
 func labelledPaymentCardEnd(value string, start int) (int, bool) {
 	// Do not reinterpret an address merely because it follows a card-like
 	// label. This also prevents a following numeric field from extending an IP
 	// into a Luhn-valid window.
-	tokenEnd := start
-	for tokenEnd < len(value) && (isASCIIDigit(value[tokenEnd]) || value[tokenEnd] == '.' ||
-		value[tokenEnd] == '(' || value[tokenEnd] == ')' || value[tokenEnd] == '[' || value[tokenEnd] == ']') {
-		tokenEnd++
-	}
-	addressToken := value[start:tokenEnd]
-	if strings.ContainsAny(addressToken, ".:") && net.ParseIP(strings.Trim(addressToken, "()[]{}")) != nil {
+	// The scan is bounded: an IPv4/IPv6 literal (with brackets) never exceeds
+	// maxAddressTokenLength bytes, so longer runs cannot be an address and are
+	// not re-scanned per start position.
+	if looksLikeIPAddressAt(value, start) {
 		return 0, false
 	}
 
@@ -640,6 +755,31 @@ func labelledPaymentCardEnd(value string, start int) (int, bool) {
 	return lastDigitEnd, true
 }
 
+const maxAddressTokenLength = 64
+
+func isIPAddressTokenByte(value byte) bool {
+	return isASCIIDigit(value) || value >= 'a' && value <= 'f' || value >= 'A' && value <= 'F' ||
+		value == '.' || value == ':' || value == '(' || value == ')' || value == '[' || value == ']'
+}
+
+func looksLikeIPAddressAt(value string, start int) bool {
+	tokenEnd := start
+	hasAddressSeparator := false
+	for tokenEnd < len(value) && isIPAddressTokenByte(value[tokenEnd]) {
+		if tokenEnd-start >= maxAddressTokenLength {
+			return false
+		}
+		if value[tokenEnd] == '.' || value[tokenEnd] == ':' {
+			hasAddressSeparator = true
+		}
+		tokenEnd++
+	}
+	if !hasAddressSeparator {
+		return false
+	}
+	return net.ParseIP(strings.Trim(value[start:tokenEnd], "()[]{}")) != nil
+}
+
 func groupedPaymentCard(value string, start int, groups [5]uint8, digits *[19]byte) (int, int, bool) {
 	digitCount := 0
 	position := start
@@ -675,7 +815,77 @@ func validPaymentCardRightBoundary(value string, end int) bool {
 	return end == len(value) || !isASCIIDigit(value[end]) && value[end] != '.' && value[end] != '-'
 }
 
+// paymentCardLabelTails are the normalized endings every payment-card label
+// must have: each exact label below ends with one of them, and the delimited or
+// camel-case suffix rule only accepts labels ending in card or pan.
+var paymentCardLabelTails = [...]string{
+	"card", "cards", "cardno", "cardnumber", "cardpan", "cardholder", "pan", "panno", "pannumber",
+}
+
+// maxCardLabelTail is the longest entry in paymentCardLabelTails.
+const maxCardLabelTail = len("cardnumber")
+
+// mayHavePaymentCardLabelBefore is a constant-time pre-filter for
+// hasPaymentCardLabelBefore. It skips the same value/label delimiters as
+// labelBeforeNumericValue, normalizes at most maxCardLabelTail label bytes, and
+// rejects unless they end with a payment-card label tail. Without it every digit
+// in a long alphanumeric word paid for a 64-byte look-back plus 14 comparisons.
+func mayHavePaymentCardLabelBefore(value string, start int) bool {
+	position := start
+	for position > 0 && start-position < 64 && isASCIISpace(value[position-1]) {
+		position--
+	}
+	for position > 0 && start-position < 64 && (value[position-1] == '"' || value[position-1] == '\'') {
+		position--
+	}
+	if position > 0 && (value[position-1] == ':' || value[position-1] == '=') {
+		position--
+		for position > 0 && start-position < 64 &&
+			(isASCIISpace(value[position-1]) || value[position-1] == '"' || value[position-1] == '\'') {
+			position--
+		}
+	}
+	var tail [maxCardLabelTail]byte // reversed, lower-case alphanumerics
+	count := 0
+	for scanned := 0; position > 0 && count < len(tail) && scanned < 3*maxCardLabelTail; scanned++ {
+		ch := value[position-1]
+		if ch >= 'A' && ch <= 'Z' {
+			ch += 'a' - 'A'
+		}
+		if ch >= 'a' && ch <= 'z' || isASCIIDigit(ch) {
+			// Every tail ends in d, s, o, n, or r: reject ordinary words at once.
+			if count == 0 && ch != 'd' && ch != 's' && ch != 'o' && ch != 'n' && ch != 'r' {
+				return false
+			}
+			tail[count] = ch
+			count++
+		} else if ch != '_' && ch != '-' && ch != '.' && ch != ' ' {
+			break
+		}
+		position--
+	}
+	for _, want := range paymentCardLabelTails {
+		if len(want) > count {
+			continue
+		}
+		matched := true
+		for index := 0; index < len(want); index++ {
+			if tail[index] != want[len(want)-1-index] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
+}
+
 func hasPaymentCardLabelBefore(value string, start int) bool {
+	if !mayHavePaymentCardLabelBefore(value, start) {
+		return false
+	}
 	label := labelBeforeNumericValue(value, start)
 	for _, candidate := range [...]string{
 		"card", "cards", "cardno", "cardnumber", "cardpan", "creditcard", "debitcard",
@@ -699,7 +909,8 @@ func hasTimestampLabelBefore(value string, start int) bool {
 			return true
 		}
 	}
-	return false
+	// Token-suffix forms such as request_ts, start_timestamp, and requestTs.
+	return hasDelimitedOrCamelLabelSuffix(label, "ts") || hasDelimitedOrCamelLabelSuffix(label, "timestamp")
 }
 
 func hasTimestampPathBefore(value string, start int) bool {
@@ -713,7 +924,8 @@ func hasTimestampPathBefore(value string, start int) bool {
 	}
 	segmentEnd := prefixStart - 1
 	segmentStart := segmentEnd
-	for segmentStart > 0 && value[segmentStart-1] != '/' && !isASCIISpace(value[segmentStart-1]) {
+	for segmentStart > 0 && segmentEnd-segmentStart < 64 && value[segmentStart-1] != '/' &&
+		!isASCIISpace(value[segmentStart-1]) {
 		segmentStart--
 	}
 	return isTimestampPathValue(normalizePathKey(value[segmentStart:segmentEnd]), value[start:min(start+13, len(value))])
@@ -865,24 +1077,41 @@ func redactPhoneCandidates(value string) string {
 	}
 	protected := append(textUUIDPattern.FindAllStringIndex(value, -1), textEpochMillisPattern.FindAllStringIndex(value, -1)...)
 	protected = append(protected, textEpochSecondsPattern.FindAllStringIndex(value, -1)...)
-	sort.Slice(protected, func(i, j int) bool { return protected[i][0] < protected[j][0] })
+	sort.Slice(protected, func(i, j int) bool {
+		if protected[i][0] != protected[j][0] {
+			return protected[i][0] < protected[j][0]
+		}
+		return protected[i][1] < protected[j][1]
+	})
 	var output strings.Builder
 	output.Grow(len(value))
 	last := 0
 	protectedIndex := 0
 	for _, match := range matches {
-		output.WriteString(value[last:match[0]])
 		candidate := value[match[0]:match[1]]
 		for protectedIndex < len(protected) && protected[protectedIndex][1] <= match[0] {
 			protectedIndex++
 		}
 		if protectedIndex < len(protected) && match[0] < protected[protectedIndex][1] && protected[protectedIndex][0] < match[1] {
+			output.WriteString(value[last:match[0]])
 			output.WriteString(candidate)
+		} else if match[0] > last && value[match[0]-1] == '(' && match[1]-match[0] <= 16 &&
+			textParenAreaPhonePattern.MatchString(value[match[0]-1:match[1]]) {
+			// "(415) 555-1234": redact the opening parenthesis with the number.
+			output.WriteString(value[last : match[0]-1])
+			output.WriteString("[REDACTED_PHONE]")
 		} else {
+			output.WriteString(value[last:match[0]])
 			phoneLabel := hasPhoneLabelBefore(value, match[0])
 			operationalLabel := hasOperationalNumericLabelBefore(value, match[0])
-			if match[0] > 1 && value[match[0]-1] == '(' && isASCIIWord(value[match[0]-2]) && !phoneLabel {
-				output.WriteString(candidate)
+			if argumentEnd, ok := operationalCallArgumentEnd(value, match[0], match[1], phoneLabel); ok {
+				// Preserve a function-like operational argument such as
+				// f(1234567890), then continue scanning anything the regex
+				// joined after its closing parenthesis.
+				output.WriteString(value[match[0]:argumentEnd])
+				if argumentEnd < match[1] {
+					output.WriteString(redactPhoneCandidate(value[argumentEnd:match[1]], false, false))
+				}
 			} else {
 				output.WriteString(redactPhoneCandidate(candidate, phoneLabel, operationalLabel))
 			}
@@ -893,12 +1122,47 @@ func redactPhoneCandidates(value string) string {
 	return output.String()
 }
 
+// maxCallArgumentLength bounds the function-call argument inspection. Every
+// supported phone layout is shorter, so longer arguments are never phone-shaped.
+const maxCallArgumentLength = 32
+
+// operationalCallArgumentEnd reports whether the phone-regex match at
+// [start,end) is the argument of a word-prefixed call such as f(1234567890)
+// whose argument is NOT phone-shaped. It returns the end of the preserved
+// argument (including its closing parenthesis when that lies inside the match).
+func operationalCallArgumentEnd(value string, start, end int, phoneLabel bool) (int, bool) {
+	if phoneLabel || start < 2 || value[start-1] != '(' || !isASCIIWord(value[start-2]) {
+		return 0, false
+	}
+	argumentEnd := end
+	limit := min(len(value), start+maxCallArgumentLength+1)
+	if closing := strings.IndexByte(value[start:limit], ')'); closing >= 0 && start+closing < end {
+		argumentEnd = start + closing
+	}
+	argument := value[start:argumentEnd]
+	if isPhoneShapedArgument(argument) {
+		return 0, false
+	}
+	if argumentEnd < end {
+		argumentEnd++ // keep the closing parenthesis with the argument
+	}
+	return argumentEnd, true
+}
+
+// isPhoneShapedArgument reports whether a parenthesised argument has a phone
+// layout: an Indian mobile (compact or 5-5), a +CC form, a formatted/dotted
+// NANP form, or a UK local grouping.
+func isPhoneShapedArgument(argument string) bool {
+	argument = strings.TrimSpace(argument)
+	if argument == "" || len(argument) > maxCallArgumentLength {
+		return false
+	}
+	return redactPhoneCandidate(argument, false, false) != argument
+}
+
 func redactPhoneCandidate(value string, phoneLabel, operationalLabel bool) string {
 	candidate := strings.TrimSpace(value)
 	if net.ParseIP(candidate) != nil || textDatePrefixPattern.MatchString(candidate) {
-		return value
-	}
-	if strings.Contains(candidate, ".") && !textDottedPhonePattern.MatchString(candidate) {
 		return value
 	}
 	digits := 0
@@ -907,7 +1171,15 @@ func redactPhoneCandidate(value string, phoneLabel, operationalLabel bool) strin
 			digits++
 		}
 	}
-	if digits < 8 || digits > 15 {
+	if digits > maxPhoneDigits {
+		// The candidate regex joins whitespace-separated numbers, so one
+		// candidate can hold an ID followed by a phone. Evaluate its parts.
+		return redactMergedPhoneCandidate(value, phoneLabel, operationalLabel)
+	}
+	if strings.Contains(candidate, ".") && !textDottedPhonePattern.MatchString(candidate) {
+		return value
+	}
+	if digits < 8 {
 		return value
 	}
 	compact := phoneDigits(candidate)
@@ -918,11 +1190,91 @@ func redactPhoneCandidate(value string, phoneLabel, operationalLabel bool) strin
 	if phoneLabel && validPhonePunctuation(candidate) ||
 		explicitCountryCode && plausibleInternationalPhone(candidate, compact) ||
 		textDottedPhonePattern.MatchString(candidate) || textFormattedPhonePattern.MatchString(candidate) ||
-		plausibleIndianGroupedPhone(candidate, compact) || plausibleUKLocalPhone(candidate, compact) ||
+		textParenAreaPhonePattern.MatchString(candidate) || plausibleIndianGroupedPhone(candidate, compact) || plausibleUKLocalPhone(candidate, compact) ||
 		len(candidate) == 10 && len(compact) == 10 && compact[0] >= '6' && compact[0] <= '9' {
 		return preservePhoneWhitespace(value)
 	}
 	return value
+}
+
+const (
+	maxPhoneDigits = 15
+	// A phone layout spans at most five whitespace-separated groups
+	// (+CC area exchange subscriber and similar); see plausibleInternationalPhone.
+	maxPhoneSpanTokens = 5
+	maxPhoneSpanBytes  = 40
+)
+
+// redactMergedPhoneCandidate splits an over-long phone candidate on whitespace
+// and redacts each maximal run of up to maxPhoneSpanTokens tokens that is
+// phone-shaped on its own. The first run inherits the candidate's label
+// context, so an ID label before the first token still keeps a non-+CC value;
+// later runs are judged on shape alone. Each token starts at most
+// maxPhoneSpanTokens bounded checks, so the pass is linear in the candidate.
+func redactMergedPhoneCandidate(value string, phoneLabel, operationalLabel bool) string {
+	type token struct{ start, end, digits int }
+	tokens := make([]token, 0, 8)
+	for index := 0; index < len(value); {
+		if isASCIISpace(value[index]) {
+			index++
+			continue
+		}
+		start, digits := index, 0
+		for index < len(value) && !isASCIISpace(value[index]) {
+			if isASCIIDigit(value[index]) {
+				digits++
+			}
+			index++
+		}
+		tokens = append(tokens, token{start: start, end: index, digits: digits})
+	}
+	if len(tokens) < 2 {
+		return value // one oversized token cannot be a phone
+	}
+	var output strings.Builder
+	output.Grow(len(value))
+	last := 0
+	for first := 0; first < len(tokens); {
+		labelled := first == 0 && phoneLabel
+		operational := first == 0 && operationalLabel
+		// Prefer the longest run with a real phone layout; a phone label's
+		// looser punctuation rule is only a fallback so that
+		// "phone: 98765 43210 98765 43211" yields two phones, not one
+		// over-long run that leaves a fragment behind.
+		matchedEnd, lenientEnd := -1, -1
+		digits := 0
+		for next := first; next < len(tokens) && next-first < maxPhoneSpanTokens; next++ {
+			digits += tokens[next].digits
+			if digits > maxPhoneDigits || tokens[next].end-tokens[first].start > maxPhoneSpanBytes {
+				break
+			}
+			if digits < 8 {
+				continue
+			}
+			span := value[tokens[first].start:tokens[next].end]
+			if redactPhoneCandidate(span, false, operational && !labelled) != span {
+				matchedEnd = next
+			} else if labelled && redactPhoneCandidate(span, true, false) != span {
+				lenientEnd = next
+			}
+		}
+		if matchedEnd < 0 {
+			matchedEnd = lenientEnd
+		}
+		if matchedEnd < 0 {
+			first++
+			continue
+		}
+		output.WriteString(value[last:tokens[first].start])
+		output.WriteString("[REDACTED_PHONE]")
+		last = tokens[matchedEnd].end
+		first = matchedEnd + 1
+	}
+	if last == 0 {
+		return value
+	}
+	output.WriteString(value[last:])
+	return output.String()
 }
 
 func redactBareIndianMobiles(value string) string {
@@ -943,10 +1295,9 @@ func redactBareIndianMobiles(value string) string {
 		if !allDigits || start > 0 && isASCIIWord(value[start-1]) || end < len(value) && isASCIIWord(value[end]) {
 			continue
 		}
+		// A 6-9-leading 10-digit value is phone-shaped, so the function-call
+		// exception (f(...)) never applies here: Ravi(9876543210) is redacted.
 		phoneLabel := hasPhoneLabelBefore(value, start)
-		if start > 1 && value[start-1] == '(' && isASCIIWord(value[start-2]) && !phoneLabel {
-			continue
-		}
 		if hasOperationalNumericLabelBefore(value, start) && !phoneLabel {
 			continue
 		}
@@ -1053,15 +1404,23 @@ func hasPhoneLabelBefore(value string, start int) bool {
 		"tel", "telephone", "telephonenumber", "whatsapp", "whatsappnumber":
 		return true
 	default:
-		return hasDelimitedOrCamelLabelSuffix(label, "phone") || hasDelimitedOrCamelLabelSuffix(label, "mobile")
+		// Suffix matching uses the delimiter/camel-boundary rule, so all-caps
+		// words such as HOTEL are not tel labels.
+		for _, suffix := range [...]string{"phone", "mobile", "tel", "whatsapp", "msisdn"} {
+			if hasDelimitedOrCamelLabelSuffix(label, suffix) {
+				return true
+			}
+		}
+		return false
 	}
 }
 
 func hasOperationalNumericLabelBefore(value string, start int) bool {
 	label := labelBeforeNumericValue(value, start)
 	switch normalizeNumericLabel(label) {
-	case "amount", "bytes", "count", "duration", "durationms", "id", "index", "invoiceid", "latency",
-		"latencyms", "offset", "orderid", "partition", "quantity", "qty", "sequence", "version":
+	case "amount", "build", "bytes", "count", "duration", "durationms", "id", "identifier", "index",
+		"invoiceid", "latency", "latencyms", "offset", "orderid", "partition", "quantity", "qty", "seq",
+		"sequence", "size", "version":
 		return true
 	default:
 		return hasDelimitedOrCamelLabelSuffix(label, "id")
