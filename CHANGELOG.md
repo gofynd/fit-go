@@ -6,6 +6,17 @@ the module follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- Default-path log and Sentry output is redacted for existing main users with
+  no API or wire change: `logging` error values, the mandatory Sentry
+  `BeforeSend`/`BeforeSendTransaction` sanitizer on `InitSentry`/
+  `InitSentryWithConfig`, `server.New` access-log query (always) and opted-in
+  headers, `DecryptionMiddleware` failures, `utils.HTTPClient` `[EXT]` logs,
+  the legacy `grpc.Init` panic log, Kafka health and Confluent diagnostic logs,
+  `fit.Init` startup warnings, and span status messages when tracing is
+  enabled. See `docs/UPSTREAM_INTEGRATION_MIGRATION.md` ("Log and Sentry output
+  changes for existing main users"); pinned by upstream-default guard tests.
+
 ### Fixed
 - Preserve official-main runtime behavior for original APIs: GSM results stay
   base64-encoded, legacy datastore initializers retain best-effort TLS behavior,
@@ -34,10 +45,14 @@ the module follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   snapshots, preserve legacy boolean coercion/cancellation, and remove API
   keys/user context from returned errors. Unbuilt or failed request contexts no
   longer fall back to values evaluated for the parent client. Streaming retries
-  now use bounded exponential backoff, honor bounded `Retry-After` guidance,
-  reset only after feature-state events, floor/cap `edge.stale` delays, expire
-  retained stale snapshots after 30 seconds, coalesce rapid context refreshes,
-  and cannot arm a stale-expiry timer after `Stop`.
+  now use bounded exponential backoff with equal jitter (a configured interval
+  above 30 seconds is honoured), honor bounded `Retry-After` guidance, reset
+  only after feature-state events, floor/cap `edge.stale` delays and ignore
+  non-finite values, expire a retained stale snapshot at most 30 seconds after
+  the first stale notice of a window, allow at most one context-change
+  interrupt per stale window while applying the latest context when it ends,
+  and cannot arm a stale-expiry timer after `Stop`. Legacy evaluation-context
+  snapshots are bounded by `FEATURE_FLAG_INIT_TIMEOUT`.
 - Retire the global tracer after shutdown until an explicit reinitialization,
   prefer an explicitly bound logger context, preserve slog groups and caller
   PCs, deduplicate routed metric instruments, and respect an explicit resource
@@ -59,11 +74,19 @@ the module follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Rewind advanced Franz and Confluent consumers to the exact failed record after
   a handler error without changing a fresh group's configured latest/earliest
   fallback; collect every failed partition in a poll wave, rewind finalizer and
-  post-handler commit failures, and do not replay records whose
-  `CommitBeforeHandler` boundary already succeeded. Preserve the revoke-hook
+  post-handler commit failures, and do not replay a record whose
+  `CommitBeforeHandler` commit already succeeded while rewinding later fetched
+  records of its group. Confluent seeks only still-owned partitions, drops
+  rewinds for revoked partitions, and keeps a failed exact seek pending: later
+  `Consume` calls return an error without reading until it succeeds (no
+  rebuild from `auto.offset.reset=latest`; callers should back off between
+  retries). Confluent again rejects `OnPartitionsLost*` hooks. Preserve the revoke-hook
   notification fallback for lost partitions without committing them, and
   reject unsupported options on additive context-aware legacy-consumer entry
   points instead of dropping them.
+- Reject cluster-wide `SCAN`/`KEYS`/`FLUSHDB`/`FLUSHALL`/`RANDOMKEY` in the
+  ioredis Cluster path instead of routing them to one node, and keep the
+  Cluster transport after an authoritative same-node pipeline redirect.
 - Preserve completed same-node pipeline replies when Redis Cluster reports a
   redirect, close nodes whose connection races with cluster shutdown, process
   queued retry failures linearly, and allocate large RESP payloads incrementally
@@ -72,12 +95,18 @@ the module follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   arguments while retaining stable causes such as `io.EOF` for `errors.Is`.
 - Preserve retired global-tracer state across temporary `SetGlobal` ownership,
   bound pre-initialization health cleanup by the initialization context, and
-  retain original gRPC handler-error text only on the legacy `Init` path while
-  managed servers stay sanitized. Redact compound password keys, compact
+  restore the legacy gRPC `Init` contract (no `next(err)` log line, raw panic
+  value including `panic("")`, raw response-validation text; only the panic
+  log line is redacted) while managed servers stay sanitized. Redact compound password keys, compact
   JWE/JWT tokens, grouped cards, loose numeric codes, and supported
   international phone forms while retaining known operational numeric lists,
   durations, decimals, labelled timestamps, coordinates, versions and labelled
-  IDs. Ambiguous unlabelled Luhn-valid 13-digit values remain fail-closed.
+  IDs. Unlabelled Luhn-valid 13-digit values are redacted unless
+  timestamp-labelled or in an event path, and bare 10-digit values starting
+  6–9 are redacted unless ID-labelled. Function-call arguments, `card-`/`card.`
+  labels, `PWD=`/`pass:` aliases (only `retry pass: <n>` is kept), merged
+  phone/ID runs, and `(415) 555-1234` are now handled; look-backs are bounded
+  and the card scanner is allocation-free (about 1.4 ms per 256 KiB).
 - Update gRPC to 1.83.2 for GO-2026-6443 and the OpenTelemetry core/exporter
   and matching contrib families to 1.45.0/0.70.0 for GO-2026-6505 (exporter
   configuration log leakage).
@@ -93,9 +122,10 @@ the module follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   legacy health-route variants without giving unrelated routes an auth bypass.
 - Kafka advanced consumer settings expose callback-scoped
   `RebalanceLifecycle` hooks for deadlock-free shutdown without weakening the
-  synchronous external `Close` contract. Legacy callbacks must return; calling
-  ordinary `Close` from inside one can deadlock, while an external close cannot
-  reclaim a callback goroutine that never returns.
+  synchronous external `Close` contract. Original-signature hooks may also call
+  `Close` without deadlocking, an external `Close` does not block behind a slow
+  hook, and the revoke hook still runs on external `Close`; a hook that never
+  returns still retains its goroutine.
 - `health.Checker.ResetContext` and `StopPeriodicCheckContext` let managed
   shutdown honor its deadline while the original blocking methods remain
   source- and behavior-compatible wrappers.

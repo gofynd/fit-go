@@ -56,33 +56,34 @@ an original upstream implementation where semantics can be preserved. They
 return an explicit error when advanced controls are requested from a driver
 that cannot implement them; controls are never silently discarded.
 
-Advanced Kafka rebalance callbacks that may request shutdown must use the
-`OnPartitions*WithLifecycle` form and call the supplied
-`RebalanceLifecycle.Close`. The original callback signatures remain source
-compatible, but synchronously calling the consumer's ordinary `Close` from
-inside those callbacks is not safe; external and signal-handler calls to
-`Close` remain synchronous and wait for the active run. A legacy callback that
-never returns necessarily retains its callback goroutine and can keep an
-external close waiting; use the lifecycle callback plus a bounded callback.
+Advanced Kafka rebalance hooks with the original callback signatures
+(`OnPartitionsAssigned/Revoked/Lost`) may call the consumer's `Close` without
+deadlocking, and an external `Close` does not block behind a slow hook; the
+revoke hook still runs on external `Close`. `OnPartitions*WithLifecycle` and
+`RebalanceLifecycle.Close` remain available for callback-scoped shutdown. A
+hook that never returns still retains its goroutine. Confluent consumers reject
+`OnPartitionsLost*` (Franz-only).
 
 ## Intentional security hardening
 
-Two privacy/security behaviors are deliberately not restored. Sentry now
+Privacy/security output hardening is deliberately not reverted. Sentry now
 applies mandatory export sanitization even through the original
 `InitSentryWithConfig` path: user PII, request query/body/cookies, sensitive
 extras/tags, attachments, logs, and metrics are removed or masked. Callers
 should correlate with an opaque allowlisted tag rather than email, username, or
-raw user data. Access logs also keep credential/header/query redaction in the
-original structural log schema; raw secrets are not a compatibility target.
+raw user data. Access logs keep credential/header/query redaction in the
+original structural log schema. HTTP-client logging redacts credentials, query
+values, sensitive path segments, and raw transport errors, and root startup
+warnings do not serialize raw tracing or metrics initialization errors. See
+[Log and Sentry output changes](#log-and-sentry-output-changes-for-existing-main-users)
+for every affected default path.
 
 FIT-style gRPC handler errors and recovered panics are converted to a generic
 Internal response on the explicit advanced/managed server. The original `Init`
-entry point retains upstream-main's raw message behavior because changing that
-wire contract would break existing consumers; services needing the hardened
-boundary must migrate to `InitWithOptions`. HTTP-client logging likewise
-continues to redact credentials, query values, sensitive path segments, and raw
-transport errors, and root startup warnings do not serialize raw tracing or
-metrics initialization errors.
+entry point retains upstream-main's wire behavior: no log line for
+`next(err)`, the raw panic value (including `panic("")`), and raw
+response-validation text. Only its panic log line is redacted. Services needing
+the hardened boundary must migrate to `InitWithOptions`.
 
 Fail-closed datastore TLS handling is available only through the explicit
 strict/runtime entry points in the table above. The original MongoDB,
@@ -96,6 +97,38 @@ complete TLS material before rollout.
 matching upstream main and callers that already decode it. Consumers that need
 the usable secret value, including datastore resolver wiring, must explicitly
 use `config.GetDecodedSecretFromGSM`.
+
+## Log and Sentry output changes for existing main users
+
+The original entry points keep their APIs, field names, and wire contracts,
+but the following default-path diagnostics now pass through `redact`. This is
+a deliberate, pinned change (guard tests:
+`logging/upstream_redaction_guard_test.go`,
+`server/upstream_redaction_guard_test.go`,
+`errors/upstream_redaction_guard_test.go`,
+`kafka/legacy_consume_upstream_guard_test.go`).
+
+| Caller (file) | Main behavior | Now |
+|---|---|---|
+| `logging.New` logger, `formatValue` (`logging/logger.go`) | `error` values logged as `err.Error()` | `error` values rendered with `redact.ErrorMessage`; non-error values unchanged |
+| `errors.InitSentry` / `InitSentryWithConfig` (`errors/sentry.go`) | No sanitizer | Mandatory `BeforeSend`/`BeforeSendTransaction` sanitizer: message, exceptions, breadcrumbs, tags, extras, contexts, spans and request URL/headers redacted; request query/body/cookies masked; user cleared; attachments/logs/metrics dropped; `EnableTracing` only when `TracesSampleRate > 0`, `EnableLogs: false`, `DisableMetrics: true`; init-failure and not-initialized debug logs omit or redact error text |
+| `LogRequestResponse` via `server.New` (`server/middleware.go`) | `request_url` = raw request URI; opted-in headers raw | Query always redacted (values kept only for `redact.DefaultQueryAllowlist` keys such as `limit`, `sort`); URL path unchanged; headers from `INCLUDE_HEADERS_IN_LOG` pass `redact.HeaderValue` (credential headers masked) |
+| `DecryptionMiddleware` failure log (`server/middleware.go`) | raw error | `redact.ErrorMessage` |
+| `utils.HTTPClient.Do` `[EXT]` logs (`utils/http.go`) | full URL incl. query; raw error | `redact.SafeURL` (no query/fragment/userinfo, credential path segments masked); `redact.ErrorMessage` |
+| Legacy `grpc.Init` panic log (`grpc/server.go`) | raw panic value | `redact.Text`; wire response unchanged |
+| Kafka health failure log (`kafka/health.go`) | raw check message in the log message; file-write error with path | check message in a redacted `error` field; file-write failure logs a fixed message |
+| Legacy Confluent consumer handler-failure and post-handler logs, plus producer close, topic auto-create, and partition assign/unassign warnings (`kafka/confluent.go`) | raw error | `redact.ErrorMessage` |
+| Root `fit.Init` tracing/metrics init warnings (`fit.go`) | raw error | `redact.ErrorMessage` |
+| Span status when tracing is enabled (`tracing.Span.SetStatus`, `Trace`/`TraceWithResult`, `kafka/tracing.go`) | raw message | `redact.Text` / `redact.ErrorMessage` |
+
+Masked: password/secret values, emails, phones, payment cards, Bearer/JWT
+tokens and other recognised credentials. Kept: IP addresses and ports,
+ID-labelled numbers (`order_id=9876543210`), labelled timestamps
+(`ts=1791364800006`), UUIDs. Accepted trade-offs: bare 10-digit values starting
+6–9 are redacted unless ID-labelled; unlabelled Luhn-valid 13-digit values are
+redacted unless timestamp-labelled or in an event path; `PWD=` is redacted even
+when path-like; only `retry pass: <n>` survives as a `pass` counter. The logger scans
+`error` values only; plain string fields are logged as supplied.
 
 ## Compatibility and safety corrections after rc.1 review
 
@@ -118,27 +151,43 @@ permanent HTTP failures stop the shared reconnect loop after readiness instead
 of creating an unbounded authorization-error loop; terminal waiters are woken
 with the sanitized HTTP status instead of hanging after a previously healthy
 stream. Transient failures use bounded exponential backoff and bounded
-`Retry-After`; only feature-state events reset that backoff. Positive stale
-delays are floored by the reconnect interval and capped at 30 seconds. A cached
-ready snapshot expires after 30 seconds of stale-only responses, rapid context
-changes are rate-limited while stale, and stopping a client cancels its one
-owned expiry timer before another can be armed.
+`Retry-After`; only feature-state events reset that backoff. Outage retries use
+equal jitter, and a configured reconnect interval above 30 seconds is honoured.
+Positive stale delays are floored by the reconnect interval, capped at 30
+seconds, and not jittered; non-finite `edge.stale` values are ignored. The
+stale-retention deadline is fixed by the first stale notice, so a cached ready
+snapshot expires at most 30 seconds later even if stale replies continue. Each
+stale window allows at most one context-change interrupt; later changes are
+coalesced and the latest context is sent when the window ends. Stopping a
+client cancels its one owned expiry timer before another can be armed. Legacy
+`feature.Init` evaluation-context snapshot fetches are bounded by
+`FEATURE_FLAG_INIT_TIMEOUT`; `feature.Init` itself remains a polling client and
+never opens an SSE stream.
 
 KafkaJS-compatible processing recovery rewinds the active Franz or Confluent
 group member to the earliest unprocessed record in every partition that failed
 in the same poll wave. This covers handler, finalizer, and post-handler commit
-failures without letting one partition hide a sibling failure. A successful
-`CommitBeforeHandler` boundary is not rewound when the subsequent handler
-fails. Recovery does not replace `FromBeginning=false` with an
-earliest-retention fallback and therefore cannot replay a fresh group's
-historical retention merely because its first handled record failed. Transport
-recovery continues from broker-committed offsets. Lost partitions fall back to
-the revoke notification only when no distinct lost hook is configured, and
-never use the safe-revoke final commit boundary.
+failures without letting one partition hide a sibling failure. With
+`CommitBeforeHandler`, a record whose pre-handler commit succeeded is not
+replayed when its handler fails, but later fetched records of that partition
+group are rewound rather than skipped. Recovery does not replace
+`FromBeginning=false` with an earliest-retention fallback. Confluent seeks only
+partitions the member still owns and drops rewinds for revoked partitions; if
+an exact seek fails, the rewind stays pending and every later `Consume` call
+returns an error without reading until the seek succeeds. The consumer is never
+rebuilt from `auto.offset.reset=latest`, so callers that retry `Consume` should
+back off between attempts. Lost partitions fall back to the revoke notification
+only when no distinct lost hook is configured, and never use the safe-revoke
+final commit boundary. The legacy `client.Consumer`/`Consume` path keeps main's
+log-and-skip semantics.
 
 The owned RESP2 compatibility transport deliberately rejects connection-state
 operations that cannot be made reconnect-safe (`MULTI`/`EXEC`, arbitrary
-`SELECT`, subscriptions, monitor mode, and indefinite blocking commands).
+`SELECT`, subscriptions, monitor mode, and indefinite blocking commands). In
+Cluster mode it also rejects cluster-wide `SCAN`, `KEYS`, `FLUSHDB`,
+`FLUSHALL`, and `RANDOMKEY` rather than running them on one node; an
+authoritative same-node pipeline redirect returns per-command replies without
+retiring the Cluster transport.
 Finite-timeout blocking commands and exact `HELLO 2` are supported. Consumers
 needing transactions or database selection should use the established
 go-redis client APIs, where those states are owned by the driver, rather than
@@ -177,10 +226,10 @@ BSON/error-classification rollout gate.
 5. Deploy dependents after the library release. Do not deploy a consumer whose
    `go.mod` still contains a local filesystem replacement.
 
-Metroplex's current local source uses `GetDecodedSecretFromGSM` and
-`UseHealthRouteMiddleware`, so it requires this integration tree (or a future
-official tag containing those APIs). Its checked-in module replacement still
-points at `github.com/swapnilfynd/fit-go v0.2.0-rc.1`, which does not provide the
-complete integration surface. Pre-release validation therefore uses an
-explicit local workspace/replacement; the fork pin must be replaced with the
-new official immutable tag before deployment.
+Metroplex's local `internal/app.go` uses `GetDecodedSecretFromGSM` and
+`UseHealthRouteMiddleware`, which are not in `v0.2.0-rc.1`. Its pin test
+`cmd/promotions_dependency_pin_test.go` requires the replacement
+`github.com/swapnilfynd/fit-go v0.2.0-rc.1` with its recorded checksum, or an
+absolute local replacement together with `FIT_GO_LOCAL_INTEGRATION=1`.
+Pre-release validation uses the local replacement. At release, repin to the new
+official immutable tag and update the pin test.

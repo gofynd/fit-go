@@ -79,7 +79,11 @@ can be `FullyWritten` because its bytes reached a Redis node while
 that node did not execute it. The same false side-effect outcome applies when
 the 16-redirect limit is reached after authoritative redirects. Callers can use
 `errors.As(err, *IORedisRedirectError)` to inspect both fields without matching
-message text.
+message text. When a same-node Cluster pipeline receives an authoritative
+redirect, every per-command reply is returned and the Cluster transport is
+kept; only ambiguous outcomes (`MayHaveExecuted` without an aligned reply
+stream) retire it. Redirected pipeline commands are not replayed
+automatically.
 
 Deterministic tests use real loopback TCP, `net.Pipe`, and a generated test TLS
 certificate for startup command order, AUTH/SELECT/INFO boundaries, INFO loading,
@@ -132,7 +136,10 @@ The following remain adoption gates:
   XREAD/XREADGROUP with a missing/non-numeric/non-positive BLOCK value,
   subscription commands, MONITOR, WAIT/WAITAOF, RESET/SYNC/PSYNC, SHUTDOWN,
   READONLY/READWRITE, HELLO without exactly the argument `2`, cluster
-  multi-key/count forms whose keys span slots, and cross-node pipelines.
+  multi-key/count forms whose keys span slots, cluster-wide SCAN, KEYS,
+  FLUSHDB, FLUSHALL and RANDOMKEY in Cluster mode (rejected rather than run on
+  the node owning their first argument's slot; the error names only the verb),
+  and cross-node pipelines.
   Finite-timeout blocking operations use an exclusive,
   no-ambiguous-replay boundary. Multi-key commands such as MGET/DEL are routed
   by their first key rather than fanned out;
