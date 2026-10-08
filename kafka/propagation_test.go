@@ -34,11 +34,11 @@ func headerValue(msg *Message, key string) string {
 	return ""
 }
 
-// TestInjectTraceHeaders_CarriesBaggage: fit-go previously registered only the
+// TestInjectPropagationHeaders_CarriesBaggage: fit-go previously registered only the
 // TraceContext propagator, so W3C `baggage` set by an upstream Node/Python service (or
 // by us) was silently dropped at every Go Kafka boundary. The composite propagator
 // now carries it.
-func TestInjectTraceHeaders_CarriesBaggage(t *testing.T) {
+func TestInjectPropagationHeaders_CarriesBaggage(t *testing.T) {
 	tracer := tracingtest.EnabledGlobal(t)
 
 	member, err := baggage.NewMember("tenant", "acme")
@@ -54,7 +54,7 @@ func TestInjectTraceHeaders_CarriesBaggage(t *testing.T) {
 	defer span.End()
 
 	msg := &Message{Value: []byte("x")}
-	InjectTraceHeaders(ctx, msg)
+	injectPropagationHeaders(ctx, msg)
 
 	if headerValue(msg, "traceparent") == "" {
 		t.Fatal("no traceparent injected")

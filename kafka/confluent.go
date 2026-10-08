@@ -1522,7 +1522,9 @@ func (cc *ConfluentConsumer) consumeMessages(handler confluentMessageHandler, op
 			}
 			messages = append(messages, message)
 		}
-		if ctx.Err() != nil {
+		// Upstream main handled a record it had already read even if Close
+		// raced the read; only the advanced path drops it.
+		if !cc.legacy && ctx.Err() != nil {
 			return nil
 		}
 		groups := groupConfluentBatchMessages(messages)
@@ -1552,7 +1554,7 @@ func (cc *ConfluentConsumer) processMessageGroup(
 	opts ConsumerAdvancedOptions,
 ) error {
 	for i, message := range group.messages {
-		if ctx.Err() != nil {
+		if !cc.legacy && ctx.Err() != nil {
 			return nil
 		}
 		payload := group.payload.Messages[i]
@@ -1626,13 +1628,16 @@ func (cc *ConfluentConsumer) processMessageGroup(
 		handlerErr := handler(ctx, payload)
 
 		if handlerErr != nil {
+			if cc.legacy {
+				// Upstream main logged and skipped the record; the handler
+				// error is never returned from the legacy Consume loop.
+				cc.logMessageFailure("kafka/confluent: message handler error", message, handlerErr)
+				continue
+			}
 			if ctx.Err() != nil {
 				return nil
 			}
 			cc.logMessageFailure("kafka/confluent: message handler error", message, handlerErr)
-			if cc.legacy {
-				continue
-			}
 			if !isAutoCommit && opts.CommitBeforeHandler {
 				// The failed record was committed before its handler ran and is
 				// intentionally not redelivered (at-most-once). Later records of
@@ -1760,7 +1765,9 @@ func (cc *ConfluentConsumer) consumeBatches(handler confluentBatchHandler, opts 
 
 		messages := make([]*ckafka.Message, 0, batchSize)
 		deadline := time.Now().Add(batchTimeout)
-		for len(messages) < batchSize && time.Now().Before(deadline) && ctx.Err() == nil {
+		// Upstream main's legacy batch collector did not observe Close while
+		// filling a batch; it only stopped on a read error / timeout.
+		for len(messages) < batchSize && time.Now().Before(deadline) && (cc.legacy || ctx.Err() == nil) {
 			remaining := time.Until(deadline)
 			if remaining <= 0 {
 				break
@@ -1778,7 +1785,9 @@ func (cc *ConfluentConsumer) consumeBatches(handler confluentBatchHandler, opts 
 			messages = append(messages, message)
 		}
 
-		if ctx.Err() != nil {
+		// Upstream main delivered an already collected batch even when Close
+		// raced the collection; only the advanced path drops it.
+		if !cc.legacy && ctx.Err() != nil {
 			return nil
 		}
 		if len(messages) == 0 {
@@ -1818,6 +1827,13 @@ func (cc *ConfluentConsumer) processBatchGroup(
 		}
 	}
 	if err := handler(ctx, group.payload); err != nil {
+		if cc.legacy {
+			// Upstream main returned the handler's own error value unchanged
+			// (identity preserved) and did so even when Close cancelled the run
+			// concurrently. Consumers created with Consumer keep that contract.
+			cc.logBatchFailure("kafka/confluent: batch handler error", group.payload, err)
+			return err
+		}
 		if ctx.Err() != nil {
 			return nil
 		}

@@ -81,10 +81,10 @@ func TestProduceConsume_TraceLinkage(t *testing.T) {
 	require.Equal(t, wantTrace, gotTrace, "consumer span must continue the producer's trace")
 }
 
-// InjectTraceHeaders must REPLACE a stale traceparent on a forwarded/re-produced
+// The producer injection path (injectPropagationHeaders) must REPLACE a stale traceparent on a forwarded/re-produced
 // message (not append a second one), since the consumer reads the first header
 // it finds. Otherwise the re-publishing span would be silently dropped.
-func TestInjectTraceHeaders_ReplacesExisting(t *testing.T) {
+func TestInjectPropagationHeaders_ReplacesExisting(t *testing.T) {
 	tracer := tracingtest.EnabledGlobal(t)
 
 	ctx, span := tracer.StartSpan(context.Background(), "producer.republish", tracing.SpanKindProducer)
@@ -97,7 +97,7 @@ func TestInjectTraceHeaders_ReplacesExisting(t *testing.T) {
 		Value:   []byte("payload"),
 		Headers: []Header{{Key: traceparentHeaderKey, Value: []byte(stale)}},
 	}
-	InjectTraceHeaders(ctx, msg)
+	injectPropagationHeaders(ctx, msg)
 
 	var tps []string
 	for _, h := range msg.Headers {

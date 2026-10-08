@@ -17,8 +17,8 @@
 // TracedMessageHandler wraps a MessageHandler with an OpenTelemetry consumer
 // span per message, extracting the configured propagation fields from headers.
 //
-// InjectTraceHeaders refreshes the configured propagation fields on outbound
-// Kafka messages so downstream consumers can continue the trace.
+// InjectTraceHeaders adds a traceparent header to outbound Kafka messages so
+// downstream consumers can continue the trace.
 package kafka
 
 import (
@@ -157,12 +157,61 @@ func runTracedMessageLifecycle(
 	return complete(ctx, handlerErr)
 }
 
-// InjectTraceHeaders injects every field owned by the configured global
+// InjectTraceHeaders appends a traceparent header to the message's headers
+// using the current span from ctx. If tracing is disabled or ctx has no
+// active span, the message is returned unmodified.
+//
+// This exported helper keeps the original (upstream main) contract exactly:
+// only a fit-go span stored by tracing.StartSpan in ctx is used (native OTel
+// spans and goroutine-local contexts are not adopted), the header is
+// "traceparent" with the sampled flag forced to 01, it is appended in place
+// with append semantics, and existing headers (including an app-supplied
+// traceparent, tracestate, baggage, B3 or Jaeger headers) are left untouched.
+// The producer's automatic injection (ProducerTraceHeadersInject) uses the
+// richer global-propagator path instead.
+func InjectTraceHeaders(ctx context.Context, msg *Message) {
+	tracer := tracing.Global()
+	if tracer == nil || !tracer.IsEnabled() {
+		return
+	}
+	if ctx == nil || msg == nil {
+		return
+	}
+
+	span := upstreamContextSpan(ctx)
+	if span == nil {
+		return
+	}
+
+	traceID := span.TraceID()
+	spanID := span.SpanID()
+	if traceID == "" || spanID == "" {
+		return
+	}
+
+	tp := tracing.FormatTraceparent(traceID, spanID, true)
+	msg.Headers = append(msg.Headers, Header{
+		Key:   traceparentHeaderKey,
+		Value: []byte(tp),
+	})
+}
+
+// upstreamContextSpan returns only the fit-go span stored in ctx by
+// tracing.StartSpan, matching upstream main's tracing.SpanFromContext lookup.
+// tracing.ContextWithTrace marks a derived lookup context as a compatibility
+// context, for which SpanFromContext returns the private span without adopting
+// native OTel spans. The derived context is used only for this lookup.
+func upstreamContextSpan(ctx context.Context) *tracing.Span {
+	return tracing.SpanFromContext(tracing.ContextWithTrace(ctx, "", ""))
+}
+
+// injectPropagationHeaders injects every field owned by the configured global
 // propagator from the current span in ctx. Before injection it removes all stale
 // propagation fields case-insensitively, including duplicates and fields absent
 // from the new context. Non-propagation headers are left in their original order.
 // If tracing is disabled or ctx has no active span, the message is left unmodified.
-func InjectTraceHeaders(ctx context.Context, msg *Message) {
+// It backs the producer's automatic ProducerTraceHeadersInject policy.
+func injectPropagationHeaders(ctx context.Context, msg *Message) {
 	tracer := tracing.Global()
 	if tracer == nil || !tracer.IsEnabled() {
 		return
@@ -176,8 +225,7 @@ func InjectTraceHeaders(ctx context.Context, msg *Message) {
 	//
 	// The context must carry a span for the propagator to write anything. Adopt the
 	// native OTel span when present (otelgin/otelgrpc put a span in the native context
-	// only) — tracing.SpanFromContext handles that, and it is why a produce from an
-	// HTTP handler now propagates at all.
+	// only) — tracing.SpanFromContext handles that.
 	ctx = tracing.ContextWithActiveGoroutine(ctx)
 	if tracing.SpanFromContext(ctx) == nil {
 		return
@@ -202,8 +250,9 @@ func cloneHeaders(headers []Header) []Header {
 	return cloned
 }
 
-// InjectTraceHeadersToMessages refreshes propagation headers on all messages in
-// the slice. Convenience wrapper for callers that manage their own producer span.
+// InjectTraceHeadersToMessages adds traceparent headers to all messages in the
+// slice. Convenience wrapper for batch produce calls. It applies the original
+// InjectTraceHeaders contract to each message.
 func InjectTraceHeadersToMessages(ctx context.Context, messages []Message) {
 	for i := range messages {
 		InjectTraceHeaders(ctx, &messages[i])
@@ -295,7 +344,7 @@ func startProducerMessageSpansWithPolicy(
 				continue
 			}
 			if policy == ProducerTraceHeadersInject {
-				InjectTraceHeaders(spanCtx, &topicMessages[i].Messages[j])
+				injectPropagationHeaders(spanCtx, &topicMessages[i].Messages[j])
 			}
 			spans = append(spans, span)
 		}

@@ -25,9 +25,11 @@ import (
 	"github.com/gofynd/fit-go/tracing"
 )
 
-// TestInjectTraceHeaders_FromNativeHTTPSpan protects HTTP-to-Kafka trace
-// continuity when the server span exists only in the native OTel context.
-func TestInjectTraceHeaders_FromNativeHTTPSpan(t *testing.T) {
+// TestInjectPropagationHeaders_FromNativeHTTPSpan protects HTTP-to-Kafka trace
+// continuity (producer ProducerTraceHeadersInject path) when the server span
+// exists only in the native OTel context. The exported InjectTraceHeaders keeps
+// upstream main semantics and does not adopt native spans.
+func TestInjectPropagationHeaders_FromNativeHTTPSpan(t *testing.T) {
 	tracingtest.EnabledGlobal(t)
 
 	// Simulate the otelgin server span: native OTel only, no fit-go private key.
@@ -35,7 +37,7 @@ func TestInjectTraceHeaders_FromNativeHTTPSpan(t *testing.T) {
 	defer serverSpan.End()
 
 	msg := &Message{Value: []byte(`{"payload":{}}`)}
-	InjectTraceHeaders(ctx, msg)
+	injectPropagationHeaders(ctx, msg)
 
 	var tp string
 	for _, h := range msg.Headers {

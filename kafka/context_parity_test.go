@@ -201,7 +201,7 @@ func TestExplicitProducerSpanEntryPointsAdoptActiveGoroutineParent(t *testing.T)
 	producerCtx, producerSpan := StartProducerSpan(base, "orders", 1)
 	messageCtx, messageSpan := startProducerMessageSpan(base, "orders", Message{Value: []byte("payload")})
 	manualMessage := Message{Value: []byte("manual")}
-	InjectTraceHeaders(base, &manualMessage)
+	injectPropagationHeaders(base, &manualMessage)
 	require.NotNil(t, producerSpan)
 	require.NotNil(t, messageSpan)
 
@@ -524,7 +524,7 @@ func TestProducerInjectionDoesNotMutateSharedHeaderBackingStorage(t *testing.T) 
 	first := Message{Headers: shared}
 	second := Message{Headers: shared}
 
-	InjectTraceHeaders(ctx, &first)
+	injectPropagationHeaders(ctx, &first)
 
 	require.Equal(t, "stale", string(second.Headers[0].Value))
 	require.Equal(t, "traceparent", second.Headers[0].Key)
