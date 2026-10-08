@@ -75,7 +75,7 @@ raw user data. Access logs keep credential/header/query redaction in the
 original structural log schema. HTTP-client logging redacts credentials, query
 values, sensitive path segments, and raw transport errors, and root startup
 warnings do not serialize raw tracing or metrics initialization errors. See
-[Log and Sentry output changes](#log-and-sentry-output-changes-for-existing-main-users)
+[Behaviour differences for existing main users](#behaviour-differences-for-existing-main-users)
 for every affected default path.
 
 FIT-style gRPC handler errors and recovered panics are converted to a generic
@@ -98,37 +98,119 @@ matching upstream main and callers that already decode it. Consumers that need
 the usable secret value, including datastore resolver wiring, must explicitly
 use `config.GetDecodedSecretFromGSM`.
 
-## Log and Sentry output changes for existing main users
+## Behaviour differences for existing main users
 
-The original entry points keep their APIs, field names, and wire contracts,
-but the following default-path diagnostics now pass through `redact`. This is
-a deliberate, pinned change (guard tests:
-`logging/upstream_redaction_guard_test.go`,
+This is the authoritative list of what an existing consumer of upstream main
+(`df96a28`) observes after upgrading **without code changes**. Every item was
+checked against the code on this branch; additive entry points (`InitSDK`,
+`NewProducer`, `NewConsumer`, `InitManaged`, `NewRuntime`, `*WithOptions`, …)
+are excluded unless an original entry point now reaches them. The redaction
+items are deliberate and pinned by guard tests
+(`logging/upstream_redaction_guard_test.go`,
 `server/upstream_redaction_guard_test.go`,
 `errors/upstream_redaction_guard_test.go`,
 `kafka/legacy_consume_upstream_guard_test.go`).
 
-| Caller (file) | Main behavior | Now |
-|---|---|---|
-| `logging.New` logger, `formatValue` (`logging/logger.go`) | `error` values logged as `err.Error()` | `error` values rendered with `redact.ErrorMessage`; non-error values unchanged |
-| `errors.InitSentry` / `InitSentryWithConfig` (`errors/sentry.go`) | No sanitizer | Mandatory `BeforeSend`/`BeforeSendTransaction` sanitizer: message, exceptions, breadcrumbs, tags, extras, contexts, spans and request URL/headers redacted; request query/body/cookies masked; user cleared; attachments/logs/metrics dropped; `EnableTracing` only when `TracesSampleRate > 0`, `EnableLogs: false`, `DisableMetrics: true`; init-failure and not-initialized debug logs omit or redact error text |
-| `LogRequestResponse` via `server.New` (`server/middleware.go`) | `request_url` = raw request URI; opted-in headers raw | Query always redacted (values kept only for `redact.DefaultQueryAllowlist` keys such as `limit`, `sort`); URL path unchanged; headers from `INCLUDE_HEADERS_IN_LOG` pass `redact.HeaderValue` (credential headers masked) |
-| `DecryptionMiddleware` failure log (`server/middleware.go`) | raw error | `redact.ErrorMessage` |
-| `utils.HTTPClient.Do` `[EXT]` logs (`utils/http.go`) | full URL incl. query; raw error | `redact.SafeURL` (no query/fragment/userinfo, credential path segments masked); `redact.ErrorMessage` |
-| Legacy `grpc.Init` panic log (`grpc/server.go`) | raw panic value | `redact.Text`; wire response unchanged |
-| Kafka health failure log (`kafka/health.go`) | raw check message in the log message; file-write error with path | check message in a redacted `error` field; file-write failure logs a fixed message |
-| Legacy Confluent consumer handler-failure and post-handler logs, plus producer close, topic auto-create, and partition assign/unassign warnings (`kafka/confluent.go`) | raw error | `redact.ErrorMessage` |
-| Root `fit.Init` tracing/metrics init warnings (`fit.go`) | raw error | `redact.ErrorMessage` |
-| Span status when tracing is enabled (`tracing.Span.SetStatus`, `Trace`/`TraceWithResult`, `kafka/tracing.go`) | raw message | `redact.Text` / `redact.ErrorMessage` |
+### (a) Runtime-semantic differences
 
-Masked: password/secret values, emails, phones, payment cards, Bearer/JWT
-tokens and other recognised credentials. Kept: IP addresses and ports,
-ID-labelled numbers (`order_id=9876543210`), labelled timestamps
-(`ts=1791364800006`), UUIDs. Accepted trade-offs: bare 10-digit values starting
-6–9 are redacted unless ID-labelled; unlabelled Luhn-valid 13-digit values are
-redacted unless timestamp-labelled or in an event path; `PWD=` is redacted even
-when path-like; only `retry pass: <n>` survives as a `pass` counter. The logger scans
-`error` values only; plain string fields are logged as supplied.
+| Area (file) | Main | Now |
+|---|---|---|
+| Sentry `InitSentry` / `InitSentryWithConfig` options (`errors/sentry.go`) | `ClientOptions` without `EnableTracing`, so transactions were dropped even with `SENTRY_TRACES_SAMPLE_RATE > 0`; SDK defaults for logs/metrics; no `BeforeSend` | `EnableTracing = TracesSampleRate > 0` (transactions are sent when a rate is set), `EnableLogs: false`, `DisableMetrics: true`. The first-call-owns-init (`sync.Once`) contract is unchanged |
+| Sentry export sanitizer (`errors/sentry.go`, `sanitizeSentryEvent`) | Events sent as captured | Mandatory `BeforeSend`/`BeforeSendTransaction` sanitizer: `event.User` cleared; request query, body and cookies replaced by the mask, request URL/headers/env redacted; message, exceptions (incl. mechanism), breadcrumbs, tags (sensitive keys masked), extras, contexts, spans, threads and stack frames redacted; `Fingerprint` and `Transaction` passed through `redact.Text`, so issue grouping and transaction names can change; attachments, logs and metrics dropped |
+| Tracer after `Shutdown` (`tracing/tracing.go`, `IsEnabled`) | `IsEnabled()` stayed `true` | `IsEnabled()` is `false` once `Shutdown` starts, so decorators, `kafka.TracedMessageHandler` and other instrumentation stop creating spans during the drain. The global propagator (and, for `Init`/`New` tracers, the shut-down provider) stays installed, so propagation continues |
+| Tracer re-init (`tracing/tracing.go`, `initWithOptions`) | `sync.Once`: `Init` → `Shutdown` → `Init` returned the shut-down tracer; a failed init was never retried | Same (`9b8754c`). Only the additive `InitSDK` creates a fresh tracer after shutdown or retries |
+| Span lookup helpers (`tracing/tracing.go`, `SpanFromContext`, `TraceIDFromContext`, `SpanIDFromContext`) | fit-go context keys only | Also fall back to (and prefer) a valid native OTel span context, e.g. one created by otelgin/otelgrpc. `ContextWithTrace` values keep their precedence |
+| `kafka.TracedMessageHandler` with tracing enabled (`kafka/tracing.go`) | Span `kafka.consume <topic>`; parent from a hand-parsed `traceparent`; four `messaging.*` attributes; raw status message | Span `process <topic>`; parent extracted through the installed global propagator (`traceparent`, `tracestate`, baggage; remote parent); extra `messaging.destination.name`, `messaging.operation.*`, `messaging.destination.partition.id`, `messaging.kafka.offset` attributes; span context published as the goroutine-local active context for the handler; status message redacted |
+| Legacy `ConfluentProducer.Close` (`kafka/confluent.go`, `closeLegacy`) | Synchronous `Flush(15s)` then `Close` under the producer lock | Total wait capped at 15 s; if exceeded it logs a warning and returns `nil` while flush/close continue in the background. Concurrent `Close` callers wait for the same completion |
+| `utils.HTTPClient.Do` (`utils/http.go`) | Always generated a new request ID for its log line; `http.DefaultTransport.(*http.Transport)` assertion panicked if the default transport was replaced | Reuses a caller-supplied `x-request-id` in the log line (the wire header is not added on this path); a replaced `http.DefaultTransport` is used as-is with the `ProxyURL`/proxy-list setting ignored instead of panicking |
+| `SERVER_TYPE` (`server/server_type.go`, `server/server.go`) | `central` rejected as an unknown server type | `central` is a recognised type (`ServerTypeCentral`); `ServerType(12).String()` is `"central"`. Mounting still fails if no router is supplied for it |
+| Health (`health/health.go`) | `HEALTH_CHECK_INTERVAL_SECONDS <= 0` panicked in `time.NewTicker`; `Check` held the read lock while running checks | Non-positive or unparsable values are ignored (argument or 30 s used); `Check` snapshots the checks and runs them outside the lock |
+| Legacy gRPC server (`grpc/server.go`) | Health `Check`/`Watch` updated only service `""`; `Shutdown` held the lock during `GracefulStop` | Standard health status for `cfg.FileName` is also updated; `Shutdown` releases the lock before `GracefulStop`, so `IsRunning` (now `false`), `Stop` and `AddServiceDefinitions` do not block during the drain |
+| Legacy profiler routes (`server/profiler_route.go`) | CPU profile marked running even if `pprof.StartCPUProfile` failed | Marked running only on success (affects `/status`/`/config` and a later stop) |
+| `DecodedTokenFromContext` (`server/middleware.go`) | Fell back to the request context when the gin key held a non-map | Returns `nil` in that case; `AuthorizeJWTToken` always stores a map, so normal use is unaffected |
+| `postgres.InitDefault` / `InitWithContext` (`postgres/client.go`) | Pools already built for earlier services leaked when a later one failed | Those pools are closed before the (unchanged) error is returned |
+| Profiler application name (`profiling/profiling.go`, `buildAppName`) | `DEPLOYMENT_TYPE` used untrimmed | Trimmed; a blank value falls back to `server`. Changes the Pyroscope application name only when the variable has surrounding whitespace |
+| Legacy Confluent consumer config (`kafka/confluent.go`) | Producer-only `acks`/`compression.type` passed to the consumer instance (librdkafka ignored them with a `CONFWARN` log) | Removed from the consumer map; every consumer key librdkafka honours is unchanged |
+| `mongo.DefaultDialFunc` (`mongo/driver.go`) | Driver retry defaults | Disables adaptive retries only when the application selects driver v2.6+ (no effect with the pinned v2.5.0) |
+| Removed panics | Panicked | No panic: nil `req.Header` with default headers in `utils.HTTPClient.Do`; `Logger.WithContext(nil)`; `tracing.SpanFromContext(nil)` (and `kafka.InjectTraceHeaders` with a nil ctx/msg); legacy producer delivery report sent on the closed delivery channel after a partial `Produce` failure; profiler wall interval `<= 0` (`PROFILING_WALL_SAMPLING_INTERVAL_MICROS`) |
+
+### (b) Log and Sentry text only
+
+No API or wire change; only diagnostic text differs.
+
+| Caller (file) | Main | Now |
+|---|---|---|
+| `logging.New` logger, `formatValue` (`logging/logger.go`) | `error` values logged as `err.Error()` | `redact.ErrorMessage` (`redact/redact.go`): an error wrapping `context.Canceled`/`DeadlineExceeded` becomes exactly `operation canceled`/`operation timed out` (the rest of the message is dropped); a `*url.Error` becomes `METHOD <safe URL>: <category>` (`network timeout`, `network error`, `operation failed`, …) with the cause dropped; an empty message becomes `operation failed`; otherwise `redact.Text`. Non-error values (including plain strings) are unchanged |
+| `server.LogRequestResponse` via `server.New` (`server/middleware.go`) | `request_url` = `URL.RequestURI()` (escaped path + raw query); opted-in headers raw | `request_url` = decoded `URL.Path` plus a key-sorted query in which only `redact.DefaultQueryAllowlist` keys (`limit`, `page`, `sort`, `order`, …) keep their values; every other value, including `order_id`, is masked; multi-values joined with `,`; an unparsable query is masked whole. `INCLUDE_HEADERS_IN_LOG` values pass `redact.HeaderValue` |
+| `DecryptionMiddleware` failure log (`server/middleware.go`) | raw error | `redact.ErrorMessage` |
+| `utils.HTTPClient.Do` `[EXT]` logs (`utils/http.go`) | full URL incl. query; raw error | `redact.SafeURL` (no query/fragment/userinfo, credential path segments masked) in the message and `request_url`; `redact.ErrorMessage` for `error` |
+| Legacy `grpc.Init` panic log (`grpc/server.go`) | raw panic value | `redact.Text`; the wire response is unchanged |
+| Legacy Confluent consumer (`kafka/confluent.go`, `logMessageFailure`, `logBatchFailure`) | `offset` logged as a `kafka.Offset` string; per-record commit failure `kafka/confluent: commit failed`; batch commit failure `kafka/confluent: batch commit failed` with only `error`; raw errors | `offset` is numeric; commit failures are logged as `kafka/confluent: post-handler offset resolution failed` / `post-handler batch offset resolution failed` with `topic`, `partition`, (`firstOffset`, `lastOffset`) fields; errors redacted. Producer close, topic auto-create and partition assign/unassign warnings are also redacted |
+| Legacy producer close (`kafka/confluent.go`, `closeLegacy`) | none | New warning `kafka/confluent: legacy producer close timed out; safe cleanup continues in background` with `pendingReports` when the 15 s cap is hit |
+| Kafka health (`kafka/health.go`) | check message embedded in the log message; file-write failure logged `path` and raw error | fixed message `kafka healthz failed (file write skipped)` with the redacted check message in `error`; file-write failure logs a fixed message without path or cause |
+| Root `fit.Init` warnings (`fit.go`) | raw tracing/metrics init error | `redact.ErrorMessage` |
+| Span status (`tracing.Span.SetStatus`, `Trace`/`TraceWithResult`, `kafka/tracing.go`) | raw message | `redact.Text` / `redact.ErrorMessage` (also what `Span.Status()` reports) |
+| Sentry `log` lines (`errors/sentry.go`) | init failure printed the error; debug init line printed a truncated DSN; not-initialized lines printed raw error/message | init failure without error text; `initialized (debug)`; not-initialized lines redacted |
+
+Redaction coverage: password/secret values, emails, phones, payment cards,
+Bearer/JWT tokens and other recognised credentials are masked. Kept: IP
+addresses and ports, ID-labelled numbers (`order_id=9876543210` in free text),
+labelled timestamps (`ts=1791364800006`), UUIDs. Accepted trade-offs: bare
+10-digit values starting 6–9 are redacted unless ID-labelled; unlabelled
+Luhn-valid 13-digit values are redacted unless timestamp-labelled or in an
+event path; `PWD=` is redacted even when path-like; only `retry pass: <n>`
+survives as a `pass` counter. The logger scans `error` values only; plain
+string fields are logged as supplied.
+
+### (c) Dependencies
+
+Selecting this release raises, through minimum version selection, these
+modules in every consumer's build (`go.mod`):
+
+- OpenTelemetry `otel`, `sdk`, `trace`, `metric`, `otlptracehttp` 1.43.0 →
+  1.45.0; gRPC 1.80.0 → 1.83.2; contrib 0.70.0 (`otelgrpc` direct, `otelhttp`
+  indirect); `golang.org/x/net`, `x/crypto`, `x/sys`, `x/text`, `x/sync`;
+  `google.golang.org/genproto/googleapis/{api,rpc}`; gin's transitive
+  dependencies (`bytedance/sonic`, `gin-contrib/sse`, `validator`, `go-json`,
+  `quic-go`, …). Gin itself stays 1.12.0.
+- New module requirements: `gqlgen`/`gqlparser`, `franz-go`/`kmsg`,
+  `protocompile`, `otelsql`, `gopkg.in/yaml.v3` (now direct), `godotenv`,
+  `gofrs/flock`, `prometheus/common` (now direct), b3/jaeger propagators, OTLP
+  metric/trace gRPC+HTTP and stdout exporters, `sdk/metric`, and
+  `gocloud.dev` with its AWS SDK v2 and Google Cloud Storage graph (in
+  `go.mod`/`go.sum`).
+- The root `fit` package now links `pgx`/`otelpgx`, `pyroscope-go`, the OTLP
+  metric and trace exporters (gRPC and HTTP), `sdk/metric`, the stdout
+  exporters, the b3/jaeger propagators, `godotenv` and `yaml.v3`; on main it
+  linked only the OTLP/HTTP trace exporter.
+- The `go` directive is unchanged at `1.25.10`.
+
+### Unchanged (verified)
+
+- `config.Load` (best-effort dotenv, first-file-wins) and
+  `config.GetSecretFromGSM` (base64 transport payload).
+- `server.New` routes and middleware order (`SecureHeaders` → access log →
+  request middlewares → payload/user/application parsers → response
+  middlewares → health → profiling when enabled → `SERVER_TYPE` mounts → 404),
+  `CORS`, `RequestID`.
+- `grpc.Init` wire contract: eager proto validation, health, reflection, no
+  extra interceptors or stats handler, raw `next(err)`/panic/validation text.
+- `AuthorizeJWTToken` accept/reject decisions and context values (`59dac4c`;
+  593-case test against verbatim main).
+- Legacy Kafka consumer configuration and semantics: log-and-skip in
+  `Consume`, handler error returned unchanged from `ConsumeBatch`, mixed
+  batches, commit/auto-commit behaviour, `Close` races (`4d45fdf`).
+- `kafka.InjectTraceHeaders`/`InjectTraceHeadersToMessages`: appends one
+  `traceparent` from the fit-go span (`4d45fdf`).
+- `redis.Init`/`InitDefault`, `mongo.Init`, `mysql.Init`,
+  `postgres.InitDefault`/`InitWithContext` (except the leak fix above),
+  `metrics.New`, `feature.Init` (polling), `encryption.NewManager`, profiling
+  (`New`/`NewFromEnv`/`Start`/`Stop`/`Routes`/`Status` keys and
+  `server.RegisterProfileRoutes` responses; except the application-name trim
+  above), the legacy Kafka producer configuration and empty-key semantics, and
+  the original address parsers (now `server/international_compat.go`).
+- `fit.Init` steps, defaults and `Shutdown` scope (apart from the redacted
+  warnings above).
 
 ## Compatibility and safety corrections after rc.1 review
 
@@ -178,8 +260,10 @@ returns an error without reading until the seek succeeds. The consumer is never
 rebuilt from `auto.offset.reset=latest`, so callers that retry `Consume` should
 back off between attempts. Lost partitions fall back to the revoke notification
 only when no distinct lost hook is configured, and never use the safe-revoke
-final commit boundary. The legacy `client.Consumer`/`Consume` path keeps main's
-log-and-skip semantics.
+final commit boundary. The legacy `client.Consumer` path keeps main's
+semantics: `Consume` logs and skips a failed record, and `ConsumeBatch` returns
+the handler's own error value unchanged (not wrapped), including when `Close`
+races the failure.
 
 The owned RESP2 compatibility transport deliberately rejects connection-state
 operations that cannot be made reconnect-safe (`MULTI`/`EXEC`, arbitrary
@@ -228,7 +312,7 @@ BSON/error-classification rollout gate.
 
 Metroplex's local `internal/app.go` uses `GetDecodedSecretFromGSM` and
 `UseHealthRouteMiddleware`, which are not in `v0.2.0-rc.1`. Its pin test
-`cmd/promotions_dependency_pin_test.go` requires the replacement
+`cmd/promotions_dependency_pin_test.go` still requires the replacement
 `github.com/swapnilfynd/fit-go v0.2.0-rc.1` with its recorded checksum, or an
 absolute local replacement together with `FIT_GO_LOCAL_INTEGRATION=1`.
 Pre-release validation uses the local replacement. At release, repin to the new

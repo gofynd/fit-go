@@ -1653,8 +1653,9 @@ func relinquishGlobalTracer(t *Tracer) {
 		// Preserve the released sync.Once behavior for lazy callers: after the
 		// process-wide tracer has shut down, Global keeps returning that inert
 		// tracer instead of silently starting a second exporter during drain,
-		// including when a temporary SetGlobal tracer currently masks it. An
-		// explicit Init call still starts a fresh lifecycle.
+		// including when a temporary SetGlobal tracer currently masks it. A
+		// legacy Init/InitWithOptions call also returns this tracer; only
+		// InitSDK starts a fresh lifecycle.
 		retiredGlobalTracer = t
 	}
 	globalTracerMu.Unlock()

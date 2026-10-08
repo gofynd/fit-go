@@ -14,10 +14,38 @@ the module follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   headers, `DecryptionMiddleware` failures, `utils.HTTPClient` `[EXT]` logs,
   the legacy `grpc.Init` panic log, Kafka health and Confluent diagnostic logs,
   `fit.Init` startup warnings, and span status messages when tracing is
-  enabled. See `docs/UPSTREAM_INTEGRATION_MIGRATION.md` ("Log and Sentry output
-  changes for existing main users"); pinned by upstream-default guard tests.
+  enabled. See `docs/UPSTREAM_INTEGRATION_MIGRATION.md` ("Behaviour
+  differences for existing main users"), which also lists the remaining
+  runtime-semantic and dependency differences; pinned by upstream-default
+  guard tests.
 
 ### Fixed
+- Restore upstream-main tracing lifecycle for the released constructors
+  (`New`, `Init`, `InitWithOptions`, lazy `Global`): a failed global
+  initialization is cached (`Global()` returns nil without re-running SDK
+  init; later `Init` calls return `(nil, nil)`), a failed `New` stays enabled
+  with no OTel tracer, `Init` after `Shutdown` returns the shut-down tracer,
+  and only main's resource/exporter/sampler/propagator are built (no leaked
+  advanced exporters, no extra `OTEL_*` reads). `Shutdown` keeps the global
+  propagator installed on every path, including `InitSDK` tracers, so
+  propagation continues during graceful drain; released-constructor tracers
+  also leave their provider installed. With no OTel tracer, `StartSpan` no
+  longer stamps in-memory IDs on the logging context and decorators skip the
+  goroutine-local store.
+- `server.AuthorizeJWTToken` again uses upstream main's HS256 verifier byte
+  for byte (numeric-only `exp`/`nbf`, `now == exp` accepted, empty secret used
+  as-is, padding, payload shapes, context values). The golang-jwt verifier is
+  used only by `AuthorizeJWTTokenWithOptions`/`AuthorizeJWTTokenAdvanced`.
+- Legacy Confluent `ConsumeBatch` returns the handler's own error value again
+  (not wrapped), also when `Close` races the failure, and delivers an already
+  collected batch when `Close` races collection; legacy `Consume` keeps main's
+  log-and-skip and `Close`-race handling. Advanced consumers keep wrapped
+  rewind errors.
+- `kafka.InjectTraceHeaders`/`InjectTraceHeadersToMessages` again append only
+  a `traceparent` (sampled flag `01`) from the fit-go span in ctx, in place,
+  leaving existing headers untouched. The strip-and-propagate behaviour via
+  the global propagator is used only by `kafka.NewProducer`'s
+  `ProducerTraceHeadersInject` policy.
 - Preserve official-main runtime behavior for original APIs: GSM results stay
   base64-encoded, legacy datastore initializers retain best-effort TLS behavior,
   Redis retains its historical TLS verification default, and original gRPC
@@ -53,7 +81,8 @@ the module follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   interrupt per stale window while applying the latest context when it ends,
   and cannot arm a stale-expiry timer after `Stop`. Legacy evaluation-context
   snapshots are bounded by `FEATURE_FLAG_INIT_TIMEOUT`.
-- Retire the global tracer after shutdown until an explicit reinitialization,
+- Retire the global tracer after shutdown (`Global()` and the released `Init`
+  return the shut-down tracer; only `InitSDK` starts a fresh lifecycle),
   prefer an explicitly bound logger context, preserve slog groups and caller
   PCs, deduplicate routed metric instruments, and respect an explicit resource
   `service.name`. Legacy tracing constructors retain explicit-context-only log
