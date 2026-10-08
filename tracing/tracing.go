@@ -413,6 +413,10 @@ type Tracer struct {
 	closed             atomic.Bool
 	globalLifecycle    atomic.Bool
 	implicitLogContext bool
+	// upstream marks tracers built through the released constructors (New,
+	// Init, InitWithOptions, lazy Global). Their lifecycle mirrors upstream
+	// main: Shutdown leaves the installed OTel globals in place.
+	upstream bool
 }
 
 var (
@@ -420,8 +424,14 @@ var (
 	globalTracerMu      sync.Mutex
 	globalInitErr       error
 	retiredGlobalTracer *Tracer
-	implicitTraceMu     sync.Mutex
-	globalTracerOwners  = struct {
+	// globalInitFailed caches a failed process-global initialization. Upstream
+	// main guarded initialization with sync.Once, so a failure was never
+	// retried by Init/InitWithOptions/Global. Without this cache every Global()
+	// call on hot paths (decorators, Kafka handlers, header injection) would
+	// rerun full SDK initialization.
+	globalInitFailed   bool
+	implicitTraceMu    sync.Mutex
+	globalTracerOwners = struct {
 		current *globalTracerOwner
 		active  map[*globalTracerOwner]struct{}
 	}{active: make(map[*globalTracerOwner]struct{})}
@@ -485,6 +495,14 @@ func NewAdvanced(ctx context.Context, opts AdvancedOptions) (*Tracer, error) {
 	return newTracer(ctx, opts, false)
 }
 
+// Indirections used by tests to observe SDK initialization and advanced
+// exporter construction. Production code never reassigns them.
+var (
+	newGlobalTracer            = newTracer
+	buildAdvancedSpanExporters = newSpanExporters
+	buildUpstreamSpanExporters = newUpstreamSpanExporters
+)
+
 func newTracer(ctx context.Context, opts AdvancedOptions, upstreamDefaults bool) (*Tracer, error) {
 	enabled := tracingEnabled(opts)
 	if upstreamDefaults {
@@ -499,11 +517,18 @@ func newTracer(ctx context.Context, opts AdvancedOptions, upstreamDefaults bool)
 		enabled:            enabled,
 		options:            opts,
 		implicitLogContext: !upstreamDefaults,
+		upstream:           upstreamDefaults,
 	}
 
 	if t.enabled {
 		if err := t.initOTel(ctx, opts, upstreamDefaults); err != nil {
-			t.enabled = false
+			// Upstream main returned the failed tracer with enabled=true and no
+			// OTel tracer (StartSpan then yields in-memory spans). Preserve that
+			// for the released constructors; the SDK constructors report the
+			// failed tracer as disabled.
+			if !upstreamDefaults {
+				t.enabled = false
+			}
 			return t, fmt.Errorf("fit/tracing: failed to initialize OTel: %w", err)
 		}
 	}
@@ -1174,31 +1199,38 @@ func snapshotPropagator(propagator propagation.TextMapPropagator) propagation.Te
 }
 
 // initOTel sets up the real OTel TracerProvider with the configured exporters.
+//
+// The released constructors (upstreamDefaults) build ONLY upstream main's
+// resource, OTLP/HTTP exporter, sampler, and TraceContext+Baggage propagator.
+// The advanced builders are never invoked on that path, so no extra OTEL_*
+// environment is read, no advanced exporter is constructed and leaked, and no
+// resource-detection warning is emitted.
 func (t *Tracer) initOTel(ctx context.Context, opts AdvancedOptions, upstreamDefaults bool) error {
-	propagator, err := buildPropagator(opts.Propagators)
-	if err != nil {
-		return fmt.Errorf("creating propagator: %w", err)
-	}
-	res := buildResource(ctx, opts)
+	var (
+		propagator propagation.TextMapPropagator
+		res        *resource.Resource
+		exporters  []sdktrace.SpanExporter
+		sampler    sdktrace.Sampler
+		err        error
+	)
 	if upstreamDefaults {
 		propagator = propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})
-		res, err = buildUpstreamResource(ctx, opts)
-		if err != nil {
+		if res, err = buildUpstreamResource(ctx, opts); err != nil {
 			return err
 		}
-	}
-
-	exporters, err := newSpanExporters(ctx, opts)
-	if upstreamDefaults {
-		exporters, err = newUpstreamSpanExporters(ctx, opts)
-	}
-	if err != nil {
-		return err
-	}
-
-	sampler := buildSampler(opts)
-	if upstreamDefaults {
+		if exporters, err = buildUpstreamSpanExporters(ctx, opts); err != nil {
+			return err
+		}
 		sampler = upstreamSampler(opts.SampleRate)
+	} else {
+		if propagator, err = buildPropagator(opts.Propagators); err != nil {
+			return fmt.Errorf("creating propagator: %w", err)
+		}
+		res = buildResource(ctx, opts)
+		if exporters, err = buildAdvancedSpanExporters(ctx, opts); err != nil {
+			return err
+		}
+		sampler = buildSampler(opts)
 	}
 	providerOpts := []sdktrace.TracerProviderOption{
 		sdktrace.WithResource(res),
@@ -1307,6 +1339,21 @@ func effectiveOTelPredecessor(owner *otelGlobalOwner) (*otelGlobalOwner, trace.T
 }
 
 func restoreOTelOwnerLocked(owner *otelGlobalOwner) {
+	restoreOTelOwnerGlobalsLocked(owner, false, false)
+}
+
+// restoreOTelOwnerGlobalsLocked unlinks owner from the ownership chain and,
+// unless preserved, reinstalls the predecessor's OTel globals.
+//
+// preserveProvider leaves the (shut-down) tracer provider installed, matching
+// upstream main's Shutdown for released-constructor tracers.
+//
+// preservePropagator leaves the owner's text-map propagator installed. Shutdown
+// sets it for every tracer: propagation is stateless and independent of the
+// SDK, so outbound requests issued while a service drains keep forwarding the
+// inbound trace context (upstream main never uninstalled its propagator).
+// SetGlobal restore functions still restore both globals.
+func restoreOTelOwnerGlobalsLocked(owner *otelGlobalOwner, preserveProvider, preservePropagator bool) {
 	if otelOwners.current != owner {
 		return
 	}
@@ -1315,14 +1362,14 @@ func restoreOTelOwnerLocked(owner *otelGlobalOwner) {
 
 	// Provider and propagator ownership are independent. An external component
 	// may replace only one of them, and fit-go must preserve that replacement.
-	if otel.GetTracerProvider() == owner.provider {
+	if !preserveProvider && otel.GetTracerProvider() == owner.provider {
 		if previous != nil {
 			otel.SetTracerProvider(previous.provider)
 		} else {
 			otel.SetTracerProvider(fallbackTP)
 		}
 	}
-	if ownedByPropagator(otel.GetTextMapPropagator(), owner.propagator) {
+	if !preservePropagator && ownedByPropagator(otel.GetTextMapPropagator(), owner.propagator) {
 		if previous != nil {
 			otel.SetTextMapPropagator(previous.propagator)
 		} else {
@@ -1377,7 +1424,10 @@ func relinquishOTelGlobals(t *Tracer) {
 		}
 	}
 	if otelOwners.current != nil && !otelOwners.current.active {
-		restoreOTelOwnerLocked(otelOwners.current)
+		// Shutdown keeps the propagator installed so propagation continues
+		// during graceful drain. Released-constructor tracers additionally keep
+		// upstream main's provider semantics (provider left installed).
+		restoreOTelOwnerGlobalsLocked(otelOwners.current, t.upstream, true)
 	}
 	refreshLegacyOTelSnapshotsLocked()
 	otelOwners.Unlock()
@@ -1407,12 +1457,26 @@ func initWithOptions(opts AdvancedOptions, upstreamDefaults bool) (*Tracer, erro
 	if current := globalTracer.Load(); current != nil {
 		return current, globalInitErr
 	}
+	if upstreamDefaults {
+		// Upstream main's sync.Once ran initialization exactly once: a later
+		// Init/InitWithOptions returned the shut-down tracer after Shutdown, or
+		// (nil, nil) after a failed initialization. InitSDK keeps the explicit
+		// fresh-lifecycle/retry behavior.
+		if retiredGlobalTracer != nil {
+			return retiredGlobalTracer, nil
+		}
+		if globalInitFailed {
+			return nil, nil
+		}
+	}
 
-	t, err := newTracer(context.Background(), opts, upstreamDefaults)
+	t, err := newGlobalTracer(context.Background(), opts, upstreamDefaults)
 	if err != nil {
 		globalInitErr = err
+		globalInitFailed = true
 		return nil, err
 	}
+	globalInitFailed = false
 	t.globalLifecycle.Store(true)
 	installGlobalTracerLocked(t, err)
 	refreshImplicitTraceEnabled()
@@ -1442,6 +1506,13 @@ func GlobalWithError() (*Tracer, error) {
 		err := globalInitErr
 		globalTracerMu.Unlock()
 		return retired, err
+	}
+	if globalInitFailed {
+		// A failed initialization is cached (upstream main returned nil from
+		// Global forever after a failed sync.Once). Never rerun SDK init here.
+		err := globalInitErr
+		globalTracerMu.Unlock()
+		return nil, err
 	}
 	globalTracerMu.Unlock()
 	return InitWithOptions(DefaultOptions())
@@ -1721,11 +1792,16 @@ func (t *Tracer) StartSpan(ctx context.Context, name string, kind SpanKind) (con
 	// logger.WithContext(ctx) auto-stamps the complete trace identity on every
 	// log line within this span — the Go equivalent of Node's OTel log-format
 	// enrichment, with no per-call wiring.
-	var traceFlags byte
-	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
-		traceFlags = byte(sc.TraceFlags())
+	//
+	// Only real OTel spans are bridged. Upstream main never stamped the
+	// random in-memory IDs of a disabled tracer onto log lines.
+	if span.otelSpan != nil {
+		var traceFlags byte
+		if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+			traceFlags = byte(sc.TraceFlags())
+		}
+		ctx = logging.ContextWithTraceFlags(ctx, span.traceID, span.spanID, traceFlags)
 	}
-	ctx = logging.ContextWithTraceFlags(ctx, span.traceID, span.spanID, traceFlags)
 
 	return ctx, span
 }
@@ -1988,8 +2064,7 @@ func (d *decorators) Trace(name string, fn func(ctx context.Context) error) func
 
 		ctx, span := tracer.StartSpan(ctx, name, SpanKindInternal)
 		defer span.End()
-		restoreActiveContext := InjectContextIntoGoroutine(ctx)
-		defer restoreActiveContext()
+		defer injectDecoratorContext(tracer, ctx)()
 
 		err := fn(ctx)
 		if err != nil {
@@ -2012,8 +2087,7 @@ func TraceWithResult[T any](name string, fn func(ctx context.Context) (T, error)
 
 		ctx, span := tracer.StartSpan(ctx, name, SpanKindInternal)
 		defer span.End()
-		restoreActiveContext := InjectContextIntoGoroutine(ctx)
-		defer restoreActiveContext()
+		defer injectDecoratorContext(tracer, ctx)()
 
 		result, err := fn(ctx)
 		if err != nil {
@@ -2023,6 +2097,18 @@ func TraceWithResult[T any](name string, fn func(ctx context.Context) (T, error)
 		}
 		return result, err
 	}
+}
+
+// injectDecoratorContext publishes the decorator span as the goroutine-local
+// active context only when the tracer has a real OTel tracer. Upstream main
+// never touched goroutine-local storage, so an in-memory span (for example
+// from a released-constructor tracer whose SDK initialization failed) must not
+// pay the per-call goroutine-id lookup.
+func injectDecoratorContext(tracer *Tracer, ctx context.Context) func() {
+	if tracer == nil || tracer.otelTracer == nil {
+		return func() {}
+	}
+	return InjectContextIntoGoroutine(ctx)
 }
 
 // Utils provides tracing utility functions.

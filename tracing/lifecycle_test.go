@@ -44,7 +44,8 @@ func (e *lifecycleExporter) Shutdown(context.Context) error {
 }
 
 func TestTracerShutdownFlushesOnceAndCachesError(t *testing.T) {
-	previousFields := otel.GetTextMapPropagator().Fields()
+	baselinePropagator := snapshotPropagator(otel.GetTextMapPropagator())
+	t.Cleanup(func() { otel.SetTextMapPropagator(baselinePropagator) })
 	enabled := true
 	wantErr := errors.New("exporter shutdown failed")
 	exporter := &lifecycleExporter{shutdownErr: wantErr}
@@ -76,8 +77,10 @@ func TestTracerShutdownFlushesOnceAndCachesError(t *testing.T) {
 	if otel.GetTracerProvider() != tracer.previousTP {
 		t.Fatal("Shutdown did not restore the captured global tracer provider snapshot")
 	}
-	if got := otel.GetTextMapPropagator().Fields(); !equalStringSets(got, previousFields) {
-		t.Fatalf("Shutdown propagator fields = %v, want restored %v", got, previousFields)
+	// Shutdown keeps the tracer's propagator installed so outbound propagation
+	// continues during graceful drain.
+	if !ownedByPropagator(otel.GetTextMapPropagator(), tracer.otelOwner.propagator) {
+		t.Fatal("Shutdown uninstalled the tracer's propagator")
 	}
 }
 
@@ -369,8 +372,10 @@ func TestShutdownRestoresPreexistingCustomGlobals(t *testing.T) {
 	if got := otel.GetTracerProvider(); got != customProvider {
 		t.Fatalf("restored provider = %T %p, want custom %T %p", got, got, customProvider, customProvider)
 	}
-	if got := otel.GetTextMapPropagator().Fields(); !equalStringSets(got, customPropagator.Fields()) {
-		t.Fatalf("restored propagator fields = %v, want %v", got, customPropagator.Fields())
+	// The propagator is intentionally NOT restored on Shutdown (graceful-drain
+	// propagation); SetGlobal restore still restores it.
+	if !ownedByPropagator(otel.GetTextMapPropagator(), tracer.otelOwner.propagator) {
+		t.Fatalf("Shutdown propagator = %T, want the tracer's propagator kept installed", otel.GetTextMapPropagator())
 	}
 }
 
@@ -425,8 +430,9 @@ func TestTracerShutdownRewiresOutOfOrderGlobalOwnership(t *testing.T) {
 	if otel.GetTracerProvider() != baselineProvider {
 		t.Fatal("last owner restored a shut-down predecessor instead of the baseline")
 	}
-	if got := otel.GetTextMapPropagator().Fields(); !equalStringSets(got, baselinePropagator.Fields()) {
-		t.Fatalf("last owner propagator fields = %v, want baseline %v", got, baselinePropagator.Fields())
+	// The last owner's propagator stays installed after its Shutdown.
+	if !ownedByPropagator(otel.GetTextMapPropagator(), second.otelOwner.propagator) {
+		t.Fatalf("last owner propagator fields = %v, want second owner's kept installed", otel.GetTextMapPropagator().Fields())
 	}
 }
 
@@ -485,8 +491,10 @@ func TestSetGlobalAndNewRestoreOutOfOrder(t *testing.T) {
 	if otel.GetTracerProvider() != baselineProvider {
 		t.Fatal("final shutdown did not restore the baseline provider")
 	}
-	if got := otel.GetTextMapPropagator().Fields(); !equalStringSets(got, baselinePropagator.Fields()) {
-		t.Fatalf("final propagator fields = %v, want %v", got, baselinePropagator.Fields())
+	// second was the current owner when it shut down, so its propagator stays
+	// installed; the later restoreSecond is a no-op for the retired owner.
+	if got := otel.GetTextMapPropagator().Fields(); !equalStringSets(got, []string{"baggage"}) {
+		t.Fatalf("final propagator fields = %v, want second owner's [baggage]", got)
 	}
 }
 
@@ -519,8 +527,8 @@ func TestTracerRestorationPreservesIndependentGlobalReplacement(t *testing.T) {
 		if otel.GetTracerProvider() != external {
 			t.Fatal("shutdown clobbered an independently replaced provider")
 		}
-		if got := otel.GetTextMapPropagator().Fields(); !equalStringSets(got, baselinePropagator.Fields()) {
-			t.Fatalf("owned propagator was not restored: %v", got)
+		if !ownedByPropagator(otel.GetTextMapPropagator(), tracer.otelOwner.propagator) {
+			t.Fatalf("Shutdown uninstalled the owned propagator: %T", otel.GetTextMapPropagator())
 		}
 	})
 
@@ -605,8 +613,12 @@ func TestConcurrentGlobalOwnerTeardownRestoresBaseline(t *testing.T) {
 	if otel.GetTracerProvider() != baselineProvider {
 		t.Fatal("concurrent teardown did not restore baseline provider")
 	}
-	if got := otel.GetTextMapPropagator().Fields(); !equalStringSets(got, baselinePropagator.Fields()) {
-		t.Fatalf("concurrent teardown propagator fields = %v, want %v", got, baselinePropagator.Fields())
+	// Depending on whether restore or Shutdown wins per owner, the final
+	// propagator is the baseline or an owner's kept (TraceContext+Baggage)
+	// propagator.
+	ownerFields := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}).Fields()
+	if got := otel.GetTextMapPropagator().Fields(); !equalStringSets(got, baselinePropagator.Fields()) && !equalStringSets(got, ownerFields) {
+		t.Fatalf("concurrent teardown propagator fields = %v, want baseline %v or owner %v", got, baselinePropagator.Fields(), ownerFields)
 	}
 	for index, tracer := range tracers {
 		if tracer.IsEnabled() {

@@ -35,6 +35,7 @@ func resetGlobalTracer() {
 	defer globalTracerMu.Unlock()
 	globalTracer.Store(nil)
 	globalInitErr = nil
+	globalInitFailed = false
 	retiredGlobalTracer = nil
 	globalTracerOwners.current = nil
 	globalTracerOwners.active = make(map[*globalTracerOwner]struct{})

@@ -28,8 +28,8 @@ import (
 
 // StartSpan must bridge the span's trace/span IDs into the logging package so that
 // logger.WithContext(ctx) auto-stamps trace_id/span_id — the Go equivalent of
-// Node's OTel log enrichment. StartSpan always produces IDs (independent of the
-// enabled/exporter state), so this is deterministic.
+// Node's OTel log enrichment. Only real OTel spans are bridged; a disabled
+// tracer's in-memory IDs are not (see upstream_parity_test.go).
 func TestStartSpan_BridgesTraceIDsToLogger(t *testing.T) {
 	var buf bytes.Buffer
 	logger, err := logging.New(logging.Options{Env: "production", Level: "info", Output: &buf})
@@ -37,7 +37,20 @@ func TestStartSpan_BridgesTraceIDsToLogger(t *testing.T) {
 		t.Fatalf("logging.New: %v", err)
 	}
 
-	ctx, span := Global().StartSpan(context.Background(), "op", SpanKindInternal)
+	enabled := true
+	tracer, err := NewAdvanced(context.Background(), AdvancedOptions{
+		ServiceName:            "logging-bridge",
+		Enabled:                &enabled,
+		Sampler:                "always_on",
+		SpanExporter:           tracetest.NewInMemoryExporter(),
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("NewAdvanced: %v", err)
+	}
+	t.Cleanup(func() { _ = tracer.Shutdown(context.Background()) })
+
+	ctx, span := tracer.StartSpan(context.Background(), "op", SpanKindInternal)
 	if span.TraceID() == "" || span.SpanID() == "" {
 		t.Fatalf("span must have IDs; got trace=%q span=%q", span.TraceID(), span.SpanID())
 	}
