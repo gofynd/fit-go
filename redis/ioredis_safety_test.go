@@ -222,6 +222,29 @@ func TestIORedisClusterRoutingAndPipelineSafety(t *testing.T) {
 	} else if want, routeErr := cluster.routeKey("block"); routeErr != nil || address != want {
 		t.Fatalf("XREAD stream named block route = %q, want %q (error %v)", address, want, routeErr)
 	}
+	for _, command := range [][]string{
+		{"SCAN", "0"},
+		{"KEYS", "*"},
+		{"FLUSHDB"},
+		{"FLUSHALL"},
+		{"RANDOMKEY"},
+		{"scan", "0", "MATCH", "secret-pattern*"},
+	} {
+		_, routeErr := cluster.route(command)
+		if routeErr == nil || !strings.Contains(routeErr.Error(), "cluster-wide and unsupported") {
+			t.Fatalf("cluster-wide command %v route error = %v", command, routeErr)
+		}
+		if strings.Contains(routeErr.Error(), "secret-pattern") || strings.Contains(routeErr.Error(), "*") {
+			t.Fatalf("cluster-wide route error echoes arguments: %v", routeErr)
+		}
+	}
+	firstBeforeWide, secondBeforeWide := first.exchanges.Load(), second.exchanges.Load()
+	if wide := cluster.Exchange(context.Background(), [][]string{{"KEYS", "*"}}); wide.Error == nil || wide.WriteDisposition != IORedisNotWritten {
+		t.Fatalf("cluster-wide exchange = %+v; want unwritten rejection", wide)
+	}
+	if first.exchanges.Load() != firstBeforeWide || second.exchanges.Load() != secondBeforeWide {
+		t.Fatalf("cluster-wide command reached a node")
+	}
 	for _, command := range [][]string{{"DBSIZE"}, {"SCRIPT", "LOAD", "return 1"}} {
 		exchange := cluster.Exchange(context.Background(), [][]string{command})
 		if exchange.Error != nil || len(exchange.Replies) != 1 || exchange.Replies[0].Value != "first" {
@@ -398,6 +421,67 @@ func TestIORedisClusterPipelineRedirectIsNeverReplayed(t *testing.T) {
 	}
 	if got := source.exchanges.Load(); got != 1 {
 		t.Fatalf("pipeline exchanges = %d, want one without replay", got)
+	}
+	var redirectErr *IORedisRedirectError
+	if !errors.As(exchange.Error, &redirectErr) || !redirectErr.MayHaveExecuted || redirectErr.WriteDisposition != IORedisFullyWritten {
+		t.Fatalf("pipeline redirect outcome = %+v", redirectErr)
+	}
+	terminal, ok := asIORedisTerminalError(exchange.Error)
+	if !ok || terminal.closeTransport {
+		t.Fatalf("authoritative same-node pipeline redirect retires transport: (%+v, %v)", terminal, ok)
+	}
+	select {
+	case <-source.Closed():
+		t.Fatal("authoritative same-node pipeline redirect closed the node transport")
+	case <-cluster.Closed():
+		t.Fatal("authoritative same-node pipeline redirect closed the Cluster transport")
+	default:
+	}
+}
+
+// An authoritative same-node redirect must settle with per-command replies
+// and keep serving later commands on the same transport (no reconnect).
+func TestIORedisClusterPipelineRedirectKeepsTransportThroughConnection(t *testing.T) {
+	keyOne, keyTwo := "{pipeline}one", "{pipeline}two"
+	slot := ioredisClusterSlot(keyOne)
+	var redirectOnce atomic.Bool
+	source := newIORedisSafetyTransport(func(commands [][]string) IORedisExchange {
+		if len(commands) == 2 && redirectOnce.CompareAndSwap(false, true) {
+			return IORedisExchange{
+				Replies:          []IORedisReply{{Value: "one"}, {Error: fmt.Errorf("MOVED %d 127.0.0.1:7002", slot)}},
+				WriteDisposition: IORedisFullyWritten,
+				MayHaveExecuted:  true,
+			}
+		}
+		replies := make([]IORedisReply, len(commands))
+		for index := range replies {
+			replies[index] = IORedisReply{Value: "ok"}
+		}
+		return IORedisExchange{Replies: replies, WriteDisposition: IORedisFullyWritten, MayHaveExecuted: true}
+	})
+	cluster := newIORedisRedirectTestCluster(source, nil)
+	var connects atomic.Int32
+	client := newFastIORedisClient(t, IORedisTransportFactoryFunc(func(context.Context) (IORedisTransport, error) {
+		connects.Add(1)
+		return cluster, nil
+	}))
+	defer client.Disconnect()
+
+	result, err := waitIORedisFuture(t, client.SubmitPipeline([]string{"INCR", keyOne}, []string{"INCR", keyTwo}))
+	if err != nil {
+		t.Fatalf("pipeline error = %v; want per-command replies", err)
+	}
+	if len(result.Replies) != 2 || result.Replies[0].Value != "one" || result.Replies[1].Error == nil {
+		t.Fatalf("pipeline replies = %+v", result.Replies)
+	}
+	assertIORedisFutureOK(t, client.Submit("GET", keyOne), "ok", 0, 0)
+	if got := connects.Load(); got != 1 {
+		t.Fatalf("transport connects = %d; authoritative redirect must not retire the transport", got)
+	}
+	select {
+	case <-cluster.Closed():
+		t.Fatal("Cluster transport retired after authoritative redirect")
+	default:
 	}
 }
 

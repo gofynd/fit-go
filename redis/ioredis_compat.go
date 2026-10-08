@@ -105,6 +105,17 @@ func newIORedisRedirectOutcomeError(err error, mayHaveExecuted bool) error {
 	}
 }
 
+// newIORedisAuthoritativeRedirectError reports a redirect whose per-command
+// replies were all received in order. The outcome is authoritative, so the
+// healthy transport is not retired.
+func newIORedisAuthoritativeRedirectError(err error, mayHaveExecuted bool) error {
+	return ioredisTerminalError{
+		cause: &IORedisRedirectError{
+			MayHaveExecuted: mayHaveExecuted, WriteDisposition: IORedisFullyWritten, cause: err,
+		},
+	}
+}
+
 // newIORedisSafeError keeps only stable error identity that callers can act on;
 // it never appends provider text to the returned message. Redis error replies,
 // malformed protocol bytes, addresses, and keys may contain tenant data.

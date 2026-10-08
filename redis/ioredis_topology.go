@@ -418,11 +418,17 @@ func (t *ioredisClusterTransport) Exchange(ctx context.Context, commands [][]str
 				if len(commands) == 1 {
 					return t.followSingleRedirect(ctx, route.command, redirect)
 				}
+				// The node answered every command in the pipeline, so each reply is
+				// authoritative: the redirected command did not execute and the
+				// others report their own outcome. The connection is healthy and the
+				// reply stream is aligned, so the aggregate transport is kept; only
+				// ambiguous outcomes (ioredisRedirectFailure with mayHaveExecuted)
+				// retire it.
 				return IORedisExchange{
 					Replies:          replies,
 					WriteDisposition: IORedisFullyWritten,
 					MayHaveExecuted:  len(routes) > 1,
-					Error: newIORedisRedirectOutcomeError(
+					Error: newIORedisAuthoritativeRedirectError(
 						errors.New("redis: ioredis Cluster pipeline redirect is not replayed automatically"), len(routes) > 1,
 					),
 				}
@@ -437,6 +443,15 @@ func (t *ioredisClusterTransport) route(command []string) (string, error) {
 		return "", errors.New("redis: Cluster command is empty")
 	}
 	verb := strings.ToUpper(command[0])
+	switch verb {
+	case "SCAN", "KEYS", "FLUSHDB", "FLUSHALL", "RANDOMKEY":
+		// Cluster-wide commands would silently cover only one node's keyspace.
+		// The error names only the verb, never caller arguments.
+		return "", fmt.Errorf(
+			"redis: ioredis Cluster command %s is cluster-wide and unsupported; execute it explicitly on each intended node",
+			verb,
+		)
+	}
 	if ioredisClusterNodeCommand(verb) || verb == "SCRIPT" {
 		t.mu.RLock()
 		first := t.first
