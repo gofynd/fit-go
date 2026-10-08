@@ -142,7 +142,12 @@ The following remain adoption gates:
   and cross-node pipelines.
   Finite-timeout blocking operations use an exclusive,
   no-ambiguous-replay boundary. Multi-key commands such as MGET/DEL are routed
-  by their first key rather than fanned out;
+  by their first key rather than fanned out. Commands whose key follows a
+  subcommand use explicit routing rules: `OBJECT ENCODING|FREQ|IDLETIME|REFCOUNT`,
+  `MEMORY USAGE`, the keyed `XGROUP` operations, and keyed `XINFO` operations
+  route by argument 2. Their documented keyless `HELP`/node-local variants run
+  on the selected first node; unknown subcommands are rejected without echoing
+  arguments rather than guessing a key position;
 - TLS fault injection must verify partial TLS-record and lost-reply disposition
   against the deployed proxy/Redis stack; the transport exposes underlying
   ciphertext progress but deterministic tests currently cover successful TLS;

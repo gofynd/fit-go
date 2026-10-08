@@ -79,12 +79,14 @@ type SentryContext struct {
 // SentryReporter is the interface that a real Sentry integration must satisfy.
 type SentryReporter interface {
 	// Init initializes the Sentry SDK. It should read configuration from
-	// environment variables (SENTRY_DSN, SENTRY_ENVIRONMENT) and be safe
-	// to call multiple times. Successful initialization is idempotent; a
-	// missing DSN or failed initialization remains retryable.
+	// environment variables (SENTRY_DSN, SENTRY_ENVIRONMENT). The legacy
+	// initializer is first-call-wins: repeated calls are safe and idempotent,
+	// but an initial missing DSN or initialization failure is not retried.
+	// Retryable startup is available through InitSentryWithHooks.
 	Init() error
 
-	// InitWithConfig initializes Sentry with explicit configuration.
+	// InitWithConfig initializes Sentry with explicit configuration. It retains
+	// the same first-call-wins contract as Init.
 	InitWithConfig(cfg SentryConfig) error
 
 	// IsInitialized returns true if Sentry has been initialized.
@@ -424,13 +426,17 @@ func WithSentryContext(ctx context.Context, values SentryContext) context.Contex
 	return sentrylib.SetHubOnContext(ctx, hub)
 }
 
-// InitSentry initialises the active Sentry reporter. It is safe to call early
-// in program startup; if SENTRY_DSN is not set the call is a no-op.
+// InitSentry initialises the active Sentry reporter. Its first call owns the
+// legacy reporter lifetime; if SENTRY_DSN is not set the call is a permanent
+// no-op for that reporter. Use InitSentryWithHooks when startup must remain
+// retryable until configuration becomes available.
 func InitSentry() error {
 	return Sentry.Init()
 }
 
-// InitSentryWithConfig initializes Sentry with explicit configuration.
+// InitSentryWithConfig initializes Sentry with explicit configuration. Its
+// first call owns the legacy reporter lifetime, including an empty DSN or SDK
+// initialization failure. Use InitSentryWithHooks for retryable startup.
 func InitSentryWithConfig(cfg SentryConfig) error {
 	return Sentry.InitWithConfig(cfg)
 }

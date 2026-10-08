@@ -18,8 +18,37 @@ the module follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   differences for existing main users"), which also lists the remaining
   runtime-semantic and dependency differences; pinned by upstream-default
   guard tests.
+- Document the inherited compatibility boundaries that remain intentionally
+  unchanged: `server.New` logs the decoded URL path as main did, and the
+  fit.js/pyfit-compatible encryption manager uses a fixed provider IV. New
+  encrypted formats must use a versioned random nonce per ciphertext; the
+  legacy wire format is retained only for interoperability.
+- Correct the Sentry initialization contract documentation: legacy
+  `InitSentry`/`InitSentryWithConfig` are first-call-wins, while the additive
+  `InitSentryWithHooks` path supports retryable startup.
 
 ### Fixed
+- Allow `Stop` or a deadline-based `ShutdownContext` to force an in-progress
+  legacy gRPC graceful drain while leaving plain legacy `Shutdown` unbounded.
+- Match main's repeated released-tracer shutdown result (first exporter error,
+  then nil) and retain failed-global-init diagnostics through a no-op package
+  shutdown.
+- Serialize FeatureHub context revisions with full/incremental/delete event
+  application so buffered old-stream events cannot mutate or mark a newer
+  server-evaluated context ready.
+- Let advanced Confluent and Franz message handlers, batch handlers, and offset
+  finalizers call their own consumer's `Close` without self-deadlocking while
+  preserving synchronous external close, including callbacks wrapped with
+  public tracing adapters or an explicitly replaced active tracing context.
+  Guard advanced Confluent dispatch by
+  assignment generation after revoke/reassignment, and reject mixed per-topic
+  `FromBeginning` settings on additive paths while retaining legacy
+  Confluent's first-topic behavior.
+- Sanitize ioredis bootstrap AUTH/SELECT/INFO failures and route keyed
+  `OBJECT`, `MEMORY USAGE`, `XGROUP`, and `XINFO` cluster forms by their actual
+  key argument rather than the subcommand.
+- Render JSON-shaped values in `international.AddressDisplayParser` with
+  JavaScript-like string coercion while preserving exact native Go integers.
 - Restore upstream-main tracing lifecycle for the released constructors
   (`New`, `Init`, `InitWithOptions`, lazy `Global`): a failed global
   initialization is cached (`Global()` returns nil without re-running SDK

@@ -453,13 +453,7 @@ func (t *ioredisClusterTransport) route(command []string) (string, error) {
 		)
 	}
 	if ioredisClusterNodeCommand(verb) || verb == "SCRIPT" {
-		t.mu.RLock()
-		first := t.first
-		t.mu.RUnlock()
-		if first == "" {
-			return "", errors.New("redis: ioredis Cluster has no available node")
-		}
-		return first, nil
+		return t.routeFirstNode()
 	}
 	if verb == "EVAL" || verb == "EVALSHA" {
 		return t.routeEval(command, 2)
@@ -471,6 +465,22 @@ func (t *ioredisClusterTransport) route(command []string) (string, error) {
 		return t.routeXRead(command)
 	}
 	switch verb {
+	case "OBJECT", "XGROUP", "XINFO":
+		return t.routeSubcommandKey(command)
+	case "MEMORY":
+		if len(command) < 2 {
+			return "", errors.New("redis: ioredis Cluster command MEMORY is missing its subcommand")
+		}
+		subcommand := strings.ToUpper(command[1])
+		if subcommand == "USAGE" {
+			return t.routeKeyAt(command, 2)
+		}
+		switch subcommand {
+		case "DOCTOR", "HELP", "MALLOC-STATS", "PURGE", "STATS":
+			return t.routeFirstNode()
+		default:
+			return "", errors.New("redis: ioredis Cluster command MEMORY has no supported subcommand routing rule")
+		}
 	case "BLPOP", "BRPOP", "BZPOPMIN", "BZPOPMAX":
 		if len(command) < 3 {
 			return "", fmt.Errorf("redis: ioredis Cluster command %s is missing keys or timeout", verb)
@@ -488,6 +498,60 @@ func (t *ioredisClusterTransport) route(command []string) (string, error) {
 		return "", fmt.Errorf("redis: ioredis Cluster command %s has no routable key", verb)
 	}
 	return t.routeKey(command[1])
+}
+
+func (t *ioredisClusterTransport) routeFirstNode() (string, error) {
+	t.mu.RLock()
+	first := t.first
+	t.mu.RUnlock()
+	if first == "" {
+		return "", errors.New("redis: ioredis Cluster has no available node")
+	}
+	return first, nil
+}
+
+func (t *ioredisClusterTransport) routeSubcommandKey(command []string) (string, error) {
+	verb := strings.ToUpper(command[0])
+	if len(command) < 2 {
+		return "", fmt.Errorf("redis: ioredis Cluster command %s is missing its subcommand", verb)
+	}
+	subcommand := strings.ToUpper(command[1])
+	if subcommand == "HELP" {
+		return t.routeFirstNode()
+	}
+	if !ioredisClusterKeyedSubcommand(verb, subcommand) {
+		return "", fmt.Errorf("redis: ioredis Cluster command %s has no supported subcommand routing rule", verb)
+	}
+	return t.routeKeyAt(command, 2)
+}
+
+func ioredisClusterKeyedSubcommand(verb, subcommand string) bool {
+	switch verb {
+	case "OBJECT":
+		switch subcommand {
+		case "ENCODING", "FREQ", "IDLETIME", "REFCOUNT":
+			return true
+		}
+	case "XGROUP":
+		switch subcommand {
+		case "CREATE", "CREATECONSUMER", "DELCONSUMER", "DESTROY", "SETID":
+			return true
+		}
+	case "XINFO":
+		switch subcommand {
+		case "CONSUMERS", "GROUPS", "STREAM":
+			return true
+		}
+	}
+	return false
+}
+
+func (t *ioredisClusterTransport) routeKeyAt(command []string, index int) (string, error) {
+	verb := strings.ToUpper(command[0])
+	if len(command) <= index {
+		return "", fmt.Errorf("redis: ioredis Cluster command %s is missing its key", verb)
+	}
+	return t.routeKey(command[index])
 }
 
 func ioredisClusterNodeCommand(verb string) bool {
@@ -513,13 +577,7 @@ func (t *ioredisClusterTransport) routeEval(command []string, keyCountIndex int)
 		return "", fmt.Errorf("redis: ioredis Cluster command %s declares %d keys but provides %d arguments", verb, keyCount, len(command)-firstKeyIndex)
 	}
 	if keyCount == 0 {
-		t.mu.RLock()
-		first := t.first
-		t.mu.RUnlock()
-		if first == "" {
-			return "", errors.New("redis: ioredis Cluster has no available node")
-		}
-		return first, nil
+		return t.routeFirstNode()
 	}
 	firstSlot := ioredisClusterSlot(command[firstKeyIndex])
 	for index := firstKeyIndex + 1; index < firstKeyIndex+keyCount; index++ {

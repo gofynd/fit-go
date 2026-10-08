@@ -53,6 +53,39 @@ func TestIORedisBootstrapAndProtocolErrorsOmitRawData(t *testing.T) {
 	}
 }
 
+func TestIORedisRESPStartupErrorsOmitServerText(t *testing.T) {
+	tests := []struct {
+		name    string
+		options IORedisRESPOptions
+		verb    string
+		want    string
+	}{
+		{name: "auth", options: IORedisRESPOptions{Password: "wrong", DisableClientInfo: true}, verb: "AUTH", want: "redis: ioredis AUTH failed"},
+		{name: "select", options: IORedisRESPOptions{DB: 2, DisableClientInfo: true}, verb: "SELECT", want: "redis: ioredis SELECT failed"},
+		{name: "ready", options: IORedisRESPOptions{DisableClientInfo: true}, verb: "INFO", want: "redis: ioredis INFO readiness check failed"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := startIORedisRESPScenarioServer(t, nil, func(command []string) (string, bool) {
+				if strings.EqualFold(command[0], test.verb) {
+					return "-ERR secret-tenant-value\r\n", false
+				}
+				return "+OK\r\n", false
+			})
+			defer server.stop()
+			test.options.Addr = server.addr
+			factory, err := NewIORedisRESPTransportFactory(test.options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = factory.Connect(context.Background())
+			if err == nil || err.Error() != test.want || strings.Contains(err.Error(), "secret-tenant-value") {
+				t.Fatalf("startup error = %v, want safe %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestIORedisPINGErrorsOmitRawReplies(t *testing.T) {
 	for name, reply := range map[string]IORedisReply{
 		"server error":     {Error: errors.New("ERR secret-value-123")},
@@ -124,6 +157,41 @@ func TestIORedisRoutingErrorsDoNotEchoArguments(t *testing.T) {
 		_, err := cluster.route(command)
 		if err == nil || strings.Contains(err.Error(), "secret-key-count") {
 			t.Fatalf("route(%v) error = %v; argument must be omitted", command[:2], err)
+		}
+	}
+}
+
+func TestIORedisClusterRoutesSubcommandKeys(t *testing.T) {
+	cluster := &ioredisClusterTransport{first: "first"}
+	for slot := range cluster.slots {
+		cluster.slots[slot] = "first"
+	}
+	key := keyInTopologySlotRange(8192, 16383)
+	cluster.slots[ioredisClusterSlot(key)] = "key-node"
+
+	for _, command := range [][]string{
+		{"OBJECT", "ENCODING", key},
+		{"MEMORY", "USAGE", key},
+		{"XGROUP", "CREATE", key, "group", "$"},
+		{"XINFO", "GROUPS", key},
+	} {
+		address, err := cluster.route(command)
+		if err != nil || address != "key-node" {
+			t.Fatalf("route(%v) = (%q, %v), want key-node", command[:2], address, err)
+		}
+	}
+
+	for _, command := range [][]string{{"OBJECT", "HELP"}, {"MEMORY", "STATS"}, {"XGROUP", "HELP"}, {"XINFO", "HELP"}} {
+		address, err := cluster.route(command)
+		if err != nil || address != "first" {
+			t.Fatalf("route(%v) = (%q, %v), want first", command, address, err)
+		}
+	}
+
+	for _, command := range [][]string{{"OBJECT", "secret-subcommand", "secret-key"}, {"XGROUP", "secret-subcommand", "secret-key"}, {"MEMORY", "secret-subcommand", "secret-key"}} {
+		_, err := cluster.route(command)
+		if err == nil || strings.Contains(err.Error(), "secret") {
+			t.Fatalf("route(%s) error = %v; want argument-safe rejection", command[0], err)
 		}
 	}
 }

@@ -43,7 +43,7 @@ removing deprecated names requires a future major release.
 | Fail-closed datastore TLS validation | `mongo.InitWithTLSValidation`, `mysql.InitWithTLSValidation`, `postgres.InitWithPoolOptions`, or `redis.InitWithCompatibility`; original initializers retain upstream-main fallback and Redis verification behavior |
 | Automatic MongoDB command tracing and an explicitly selected newer driver's retry policy | `mongo.DefaultInstrumentedDialFunc`; the original default dialer remains untraced and disables v2.6+ adaptive retries when that optional driver control is available |
 | Automatic MySQL OpenTelemetry instrumentation | `mysql.InstrumentedConnectionOptions` and `mysql.InitInstrumented`; the original initializer keeps `database/sql` behavior |
-| fit.js/pyfit non-standard AES-GCM nonce sizes | `encryption.NewManagerWithOptions(encryption.ManagerOptions{AllowedNonceSizes: []int{9, 12}})`; the original constructor retains the 12-byte requirement |
+| fit.js/pyfit non-standard AES-GCM nonce sizes | `encryption.NewManagerWithOptions(encryption.ManagerOptions{AllowedNonceSizes: []int{9, 12}})`; the original constructor retains the fixed 12-byte requirement. This is wire compatibility, not a safe nonce-generation design |
 | Profiler sample-rate status fields | `profiling.RuntimeConfig`, `profiling.NewRuntime`, and `GetRuntimeConfig`; original `Status`/`Routes` keep their prior JSON shape |
 | Redis protocol/retry/ioredis controls | `redis.CompatibilityOptions`, configured dial option/function types, and `redis.InitWithCompatibility` |
 | Automatic request IDs, OTel server middleware, process-default metrics, health-middleware bypass, or process profiler routes | `server.RuntimeConfig` and `server.NewRuntime`; use `server.RequestIDWithHeaderPropagation` in a manually assembled runtime chain. Original `server.New`/`server.RequestID` retain official-main behavior |
@@ -77,6 +77,14 @@ values, sensitive path segments, and raw transport errors, and root startup
 warnings do not serialize raw tracing or metrics initialization errors. See
 [Behaviour differences for existing main users](#behaviour-differences-for-existing-main-users)
 for every affected default path.
+
+Two inherited compatibility boundaries are deliberately not presented as
+security hardening. `server.New` still records the decoded URL path unchanged;
+applications must not put credentials or PII in path segments. The encryption
+manager still uses the fixed provider IV required by existing fit.js/pyfit
+ciphertext. AES-GCM nonce reuse with one key is unsafe, so new encrypted data
+needs a separately versioned random-nonce format rather than a silent change to
+the legacy ciphertext contract.
 
 FIT-style gRPC handler errors and recovered panics are converted to a generic
 Internal response on the explicit advanced/managed server. The original `Init`
@@ -125,7 +133,7 @@ items are deliberate and pinned by guard tests
 | `utils.HTTPClient.Do` (`utils/http.go`) | Always generated a new request ID for its log line; `http.DefaultTransport.(*http.Transport)` assertion panicked if the default transport was replaced | Reuses a caller-supplied `x-request-id` in the log line (the wire header is not added on this path); a replaced `http.DefaultTransport` is used as-is with the `ProxyURL`/proxy-list setting ignored instead of panicking |
 | `SERVER_TYPE` (`server/server_type.go`, `server/server.go`) | `central` rejected as an unknown server type | `central` is a recognised type (`ServerTypeCentral`); `ServerType(12).String()` is `"central"`. Mounting still fails if no router is supplied for it |
 | Health (`health/health.go`) | `HEALTH_CHECK_INTERVAL_SECONDS <= 0` panicked in `time.NewTicker`; `Check` held the read lock while running checks | Non-positive or unparsable values are ignored (argument or 30 s used); `Check` snapshots the checks and runs them outside the lock |
-| Legacy gRPC server (`grpc/server.go`) | Health `Check`/`Watch` updated only service `""`; `Shutdown` held the lock during `GracefulStop` | Standard health status for `cfg.FileName` is also updated; `Shutdown` releases the lock before `GracefulStop`, so `IsRunning` (now `false`), `Stop` and `AddServiceDefinitions` do not block during the drain |
+| Legacy gRPC server (`grpc/server.go`) | Health `Check`/`Watch` updated only service `""`; `Shutdown` held the lock during `GracefulStop` | Standard health status for `cfg.FileName` is also updated; `Shutdown` releases the lock before its still-unbounded `GracefulStop`. `Stop` can force an active drain and `ShutdownContext` can enforce a deadline started by another caller |
 | Legacy profiler routes (`server/profiler_route.go`) | CPU profile marked running even if `pprof.StartCPUProfile` failed | Marked running only on success (affects `/status`/`/config` and a later stop) |
 | `DecodedTokenFromContext` (`server/middleware.go`) | Fell back to the request context when the gin key held a non-map | Returns `nil` in that case; `AuthorizeJWTToken` always stores a map, so normal use is unaffected |
 | `postgres.InitDefault` / `InitWithContext` (`postgres/client.go`) | Pools already built for earlier services leaked when a later one failed | Those pools are closed before the (unchanged) error is returned |
@@ -223,7 +231,9 @@ FeatureHub retry/context isolation, tracing shutdown retirement, explicit
 logger-context precedence, CORS `Vary` preservation, bounded request IDs, and
 privacy-safe redaction. Legacy tracing constructors do not enable the new
 goroutine-local log lookup. GraphQL resolver spans are explicit opt-in;
-operation spans remain the default when the extension is registered.
+operation spans remain the default when the extension is registered. The
+additive `international.AddressDisplayParser` uses JavaScript-like `String`
+coercion for JSON-shaped non-scalars while keeping exact native Go integers.
 
 Request-scoped FeatureHub contexts fail closed until `Build` succeeds and do
 not read the parent client's server-evaluated or legacy values. A context
@@ -244,7 +254,9 @@ coalesced and the latest context is sent when the window ends. Stopping a
 client cancels its one owned expiry timer before another can be armed. Legacy
 `feature.Init` evaluation-context snapshot fetches are bounded by
 `FEATURE_FLAG_INIT_TIMEOUT`; `feature.Init` itself remains a polling client and
-never opens an SSE stream.
+never opens an SSE stream. Context revision changes and full/incremental/delete
+event application are serialized: a buffered event from an older
+server-evaluated stream cannot mutate the newer context or publish readiness.
 
 KafkaJS-compatible processing recovery rewinds the active Franz or Confluent
 group member to the earliest unprocessed record in every partition that failed
@@ -263,10 +275,16 @@ only when no distinct lost hook is configured, and never use the safe-revoke
 final commit boundary. The legacy `client.Consumer` path keeps main's
 semantics: `Consume` logs and skips a failed record, and `ConsumeBatch` returns
 the handler's own error value unchanged (not wrapped), including when `Close`
-races the failure.
+races the failure. In advanced consumers, a message handler, batch handler, or
+offset finalizer can call its own `Close` without self-deadlocking; only that
+callback-local call completes asynchronously, while external `Close` remains
+synchronous. Advanced Confluent dispatch rejects a group gathered under a
+revoked assignment generation before calling application code. Advanced
+Confluent and Franz also reject mixed per-topic `FromBeginning` values; legacy
+Confluent retains main's first-topic behavior.
 
 The owned RESP2 compatibility transport deliberately rejects connection-state
-operations that cannot be made reconnect-safe (`MULTI`/`EXEC`, arbitrary
+operations that cannot be made reconnect-safe (`MULTI`/`EXEC`, every
 `SELECT`, subscriptions, monitor mode, and indefinite blocking commands). In
 Cluster mode it also rejects cluster-wide `SCAN`, `KEYS`, `FLUSHDB`,
 `FLUSHALL`, and `RANDOMKEY` rather than running them on one node; an
@@ -286,6 +304,9 @@ use the platform redactor before logging them. `WriteDisposition` describes the
 socket write, whereas `MayHaveExecuted` describes possible side effects: a
 fully written command can still be known not to have executed when Redis
 returned an authoritative redirect, including at the redirect limit.
+Keyed `OBJECT`, `MEMORY USAGE`, `XGROUP`, and `XINFO` forms have explicit
+argument-2 routing; unknown subcommands are rejected without echoing arguments
+instead of being misrouted by hashing the subcommand.
 
 MongoDB remains pinned to official main's v2.5 driver because a v2.6 upgrade
 would also change BSON validation and error classification outside fit-go's
@@ -311,9 +332,10 @@ BSON/error-classification rollout gate.
    `go.mod` still contains a local filesystem replacement.
 
 Metroplex's local `internal/app.go` uses `GetDecodedSecretFromGSM` and
-`UseHealthRouteMiddleware`, which are not in `v0.2.0-rc.1`. Its pin test
-`cmd/promotions_dependency_pin_test.go` still requires the replacement
-`github.com/swapnilfynd/fit-go v0.2.0-rc.1` with its recorded checksum, or an
-absolute local replacement together with `FIT_GO_LOCAL_INTEGRATION=1`.
-Pre-release validation uses the local replacement. At release, repin to the new
-official immutable tag and update the pin test.
+`UseHealthRouteMiddleware`. These follow-up fixes target new immutable fork
+tag `v0.2.0-rc.3`, after the `rc.2` baseline at `15f19406`. Publish the
+candidate without moving `rc.2`, then repin Metroplex's local module
+replacement, checksum, and pin test and rerun with `GOWORK=off`. Record the
+published-pin evidence in Metroplex's library document and PR #3. An official
+release after upstream merge is a separate pin migration; the fork replacement
+must remain until that official immutable tag is available and validated.

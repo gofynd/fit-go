@@ -354,6 +354,19 @@ type TopicConfig struct {
 	FromBeginning bool
 }
 
+func validateUniformTopicStart(topics []TopicConfig) error {
+	if len(topics) < 2 {
+		return nil
+	}
+	fromBeginning := topics[0].FromBeginning
+	for _, topic := range topics[1:] {
+		if topic.FromBeginning != fromBeginning {
+			return errors.New("kafka: mixed FromBeginning settings are not supported in one subscription")
+		}
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // Consumer configuration
 // ---------------------------------------------------------------------------

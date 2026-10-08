@@ -157,8 +157,11 @@ func TestGlobalInitFailureIsVisibleAndShutdownAllowsReinit(t *testing.T) {
 	if shutdownErr := Shutdown(context.Background()); shutdownErr != nil {
 		t.Fatalf("Shutdown after failed initialization: %v", shutdownErr)
 	}
-	if globalTracer.Load() != nil || InitError() != nil {
-		t.Fatalf("shutdown did not clear failed initialization: tracer=%v err=%v", globalTracer.Load(), InitError())
+	if globalTracer.Load() != nil || InitError() == nil {
+		t.Fatalf("shutdown lost failed initialization diagnostic: tracer=%v err=%v", globalTracer.Load(), InitError())
+	}
+	if tracer, cachedErr := GlobalWithError(); tracer != nil || cachedErr == nil {
+		t.Fatalf("GlobalWithError after failed-init shutdown = (%v, %v), want nil tracer and cached error", tracer, cachedErr)
 	}
 
 	exporter := &lifecycleExporter{}
@@ -172,6 +175,9 @@ func TestGlobalInitFailureIsVisibleAndShutdownAllowsReinit(t *testing.T) {
 	})
 	if err != nil || valid == nil || !valid.IsEnabled() {
 		t.Fatalf("reinitialize after reset = (%v, %v)", valid, err)
+	}
+	if InitError() != nil {
+		t.Fatalf("successful explicit reinitialization retained stale error: %v", InitError())
 	}
 	if err := Shutdown(context.Background()); err != nil {
 		t.Fatalf("valid Shutdown: %v", err)

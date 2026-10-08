@@ -4,6 +4,8 @@
 package encryption
 
 // ManagerOptions configures accepted cross-language AES-GCM nonce sizes.
+// It does not make the inherited fixed-IV format safe for new encryption.
+// Prefer a versioned format with a fresh random nonce for every ciphertext.
 type ManagerOptions = ManagerAdvancedOptions
 
 // NewManagerWithOptions creates an encryption manager using explicit compatibility options.

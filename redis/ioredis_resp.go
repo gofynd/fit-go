@@ -240,15 +240,15 @@ func (f *IORedisRESPTransportFactory) startup(ctx context.Context, transport *io
 	if len(commands) > 0 {
 		exchange := transport.Exchange(ctx, commands)
 		if exchange.Error != nil {
-			return exchange.Error
+			return newIORedisSafeError("redis: ioredis bootstrap failed", exchange.Error)
 		}
 		if authIndex >= 0 && exchange.Replies[authIndex].Error != nil && !ioredisToleratesAuthError(exchange.Replies[authIndex].Error) {
-			return exchange.Replies[authIndex].Error
+			return newIORedisSafeError("redis: ioredis AUTH failed", exchange.Replies[authIndex].Error)
 		}
 		// FIT.js rejects its initialization promise on a SELECT error before
 		// ready. Failing the transport here preserves that startup boundary.
 		if selectIndex >= 0 && exchange.Replies[selectIndex].Error != nil {
-			return exchange.Replies[selectIndex].Error
+			return newIORedisSafeError("redis: ioredis SELECT failed", exchange.Replies[selectIndex].Error)
 		}
 		// CLIENT SETNAME and SETINFO errors are intentionally ignored by
 		// ioredis 5.11.1.
@@ -260,14 +260,14 @@ func (f *IORedisRESPTransportFactory) startup(ctx context.Context, transport *io
 	for {
 		exchange := transport.Exchange(ctx, [][]string{{"info"}})
 		if exchange.Error != nil {
-			return exchange.Error
+			return newIORedisSafeError("redis: ioredis INFO readiness check failed", exchange.Error)
 		}
 		reply := exchange.Replies[0]
 		if reply.Error != nil {
 			if strings.Contains(reply.Error.Error(), "NOPERM") {
 				return nil
 			}
-			return reply.Error
+			return newIORedisSafeError("redis: ioredis INFO readiness check failed", reply.Error)
 		}
 		info, ok := reply.Value.(string)
 		if !ok {

@@ -564,9 +564,14 @@ work unit without mutating process-global profiling state.
 
 ### Error Reporting
 
-`errors.InitSentryWithConfig` is retryable when the DSN is initially absent or
-SDK initialization fails. Error events and explicitly enabled transaction
-events are sanitized both before and after optional caller hooks: request
+`errors.InitSentry` and `errors.InitSentryWithConfig` preserve the released
+first-call-wins contract: an initial missing DSN is a no-op and an SDK
+initialization failure is returned, but neither path retries on a later legacy
+call. Applications that need retryable startup should use
+`errors.InitSentryWithHooks`; that additive initializer can be called again
+until configuration is available and initialization succeeds. Error events and
+explicitly enabled transaction events are sanitized both before and after
+optional caller hooks: request
 bodies/query strings/cookies and user data are removed, while sensitive keyed
 values and secret or PII text are redacted. Bounded reflection also sanitizes
 typed nested values and cycles without invoking custom string or marshal code.
@@ -581,6 +586,11 @@ grouping and application control flow.
 ## Encryption
 
 AES-256-GCM encryption with pluggable key providers (HashiCorp Vault, GCP KMS):
+
+> Compatibility warning: the provider supplies a fixed IV, matching the legacy
+> fit.js/pyfit ciphertext format. Reusing an AES-GCM nonce with one key is unsafe
+> for new designs. Keep this API for existing ciphertext interoperability and
+> migrate new data to a versioned format with a fresh random nonce per value.
 
 ```go
 mgr := encryption.NewManager()

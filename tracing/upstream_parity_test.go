@@ -72,6 +72,40 @@ func TestUpstreamParity_FailedGlobalInitIsCached(t *testing.T) {
 	if _, err := GlobalWithError(); err == nil {
 		t.Fatal("GlobalWithError should still report the cached failure")
 	}
+	if err := Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown after failed initialization: %v", err)
+	}
+	if tracer, err := GlobalWithError(); tracer != nil || err == nil {
+		t.Fatalf("GlobalWithError after failed-init Shutdown = (%v, %v), want nil tracer and cached error", tracer, err)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("SDK init attempts after Shutdown = %d, want failed sync.Once state retained", got)
+	}
+}
+
+func TestUpstreamParity_RepeatedShutdownReturnsExporterErrorOnce(t *testing.T) {
+	isolateOTelGlobals(t)
+	enabled := true
+	wantErr := errors.New("exporter shutdown failed")
+	exporter := &lifecycleExporter{shutdownErr: wantErr}
+	tracer, err := New(context.Background(), Options{
+		ServiceName:            "legacy-shutdown",
+		Enabled:                &enabled,
+		SpanExporter:           exporter,
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := tracer.Shutdown(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("first Shutdown error = %v, want %v", err, wantErr)
+	}
+	if err := tracer.Shutdown(context.Background()); err != nil {
+		t.Fatalf("second Shutdown error = %v, want upstream-main nil", err)
+	}
+	if got := exporter.shutdowns.Load(); got != 1 {
+		t.Fatalf("exporter shutdown calls = %d, want one", got)
+	}
 }
 
 func TestUpstreamParity_FailedNewKeepsEnabledWithoutOTelTracer(t *testing.T) {

@@ -1150,6 +1150,15 @@ type ConfluentConsumer struct {
 	closeDone chan struct{}
 	closeErr  error
 
+	// assignmentMu gates advanced handler dispatch against rebalance callbacks.
+	// A handler holds a read lease through its offset boundary; revocation takes
+	// the write lease before removing ownership. This prevents records gathered
+	// before a revoke from reaching application code after ownership is lost.
+	assignmentMu         sync.RWMutex
+	assignmentKnown      bool
+	assignmentGeneration uint64
+	assignedPartitions   map[confluentPartitionKey]uint64
+
 	// pendingRewinds is populated only when librdkafka cannot seek an exact
 	// first-unprocessed offset after a handler wave fails. No subsequent record
 	// may be read until every pending seek succeeds; rebuilding the consumer
@@ -1206,6 +1215,11 @@ func (cc *ConfluentConsumer) Connect(topics []TopicConfig) error {
 	}
 	if cc.consumer != nil {
 		return nil
+	}
+	if !cc.legacy {
+		if err := validateUniformTopicStart(topics); err != nil {
+			return fmt.Errorf("kafka/confluent: connect: %w", err)
+		}
 	}
 
 	// Set initial offset based on FromBeginning.
@@ -1316,6 +1330,7 @@ func (cc *ConfluentConsumer) rebalanceCb(consumer *ckafka.Consumer, event ckafka
 			cc.logger.Error("kafka/confluent: partition assign failed", "groupId", cc.groupID, "error", redact.ErrorMessage(err))
 			return err
 		}
+		cc.markPartitionsAssigned(e.Partitions, cooperative)
 		cc.markRewindPartitionsAssigned(e.Partitions)
 		cc.logger.Info("kafka/confluent: partitions assigned",
 			"groupId", cc.groupID, "partitions", formatPartitions(e.Partitions))
@@ -1323,6 +1338,9 @@ func (cc *ConfluentConsumer) rebalanceCb(consumer *ckafka.Consumer, event ckafka
 	case ckafka.RevokedPartitions:
 		cc.logger.Info("kafka/confluent: partitions revoked",
 			"groupId", cc.groupID, "partitions", formatPartitions(e.Partitions))
+		// Wait for any admitted advanced handler/offset boundary to finish, then
+		// make the revocation visible before another gathered group can dispatch.
+		cc.markPartitionsRevoked(e.Partitions, cooperative)
 		// Exact rewinds are meaningful only while this member owns the target
 		// partition. Drop revoked entries so a later Consume call cannot remain
 		// blocked trying to seek an assignment it no longer owns.
@@ -1340,6 +1358,78 @@ func (cc *ConfluentConsumer) rebalanceCb(consumer *ckafka.Consumer, event ckafka
 		}
 	}
 	return nil
+}
+
+func (cc *ConfluentConsumer) markPartitionsAssigned(partitions []ckafka.TopicPartition, cooperative bool) {
+	cc.assignmentMu.Lock()
+	defer cc.assignmentMu.Unlock()
+	cc.assignmentKnown = true
+	cc.assignmentGeneration++
+	if cc.assignedPartitions == nil || !cooperative {
+		cc.assignedPartitions = make(map[confluentPartitionKey]uint64, len(partitions))
+	}
+	for _, partition := range partitions {
+		if partition.Topic == nil {
+			continue
+		}
+		cc.assignedPartitions[confluentPartitionKey{topic: *partition.Topic, partition: partition.Partition}] = cc.assignmentGeneration
+	}
+}
+
+func (cc *ConfluentConsumer) markPartitionsRevoked(partitions []ckafka.TopicPartition, cooperative bool) {
+	cc.assignmentMu.Lock()
+	defer cc.assignmentMu.Unlock()
+	cc.assignmentKnown = true
+	cc.assignmentGeneration++
+	if !cooperative {
+		clear(cc.assignedPartitions)
+		return
+	}
+	for _, partition := range partitions {
+		if partition.Topic == nil {
+			continue
+		}
+		delete(cc.assignedPartitions, confluentPartitionKey{topic: *partition.Topic, partition: partition.Partition})
+	}
+}
+
+// beginPartitionDispatch returns a lease for one advanced partition group. A
+// nil release means a rebalance generation has removed ownership and the group
+// must be discarded without invoking application code. Before the first
+// assignment callback ownership is unknown, so test drivers and pre-existing
+// direct process helpers retain their historical behavior.
+func (cc *ConfluentConsumer) beginPartitionDispatch(group confluentBatchGroup) func() {
+	cc.assignmentMu.RLock()
+	if cc.assignmentKnown && len(group.messages) > 0 {
+		partition := group.messages[0].TopicPartition
+		if partition.Topic == nil {
+			cc.assignmentMu.RUnlock()
+			return nil
+		}
+		key := confluentPartitionKey{topic: *partition.Topic, partition: partition.Partition}
+		partitionGeneration, owned := cc.assignedPartitions[key]
+		if !owned || (group.assignmentKnown && group.assignmentGeneration != partitionGeneration) {
+			cc.assignmentMu.RUnlock()
+			return nil
+		}
+	}
+	return cc.assignmentMu.RUnlock
+}
+
+type confluentAssignmentSnapshot struct {
+	known      bool
+	generation uint64
+}
+
+func (cc *ConfluentConsumer) assignmentSnapshot(message *ckafka.Message) confluentAssignmentSnapshot {
+	cc.assignmentMu.RLock()
+	defer cc.assignmentMu.RUnlock()
+	if !cc.assignmentKnown || message == nil || message.TopicPartition.Topic == nil {
+		return confluentAssignmentSnapshot{}
+	}
+	key := confluentPartitionKey{topic: *message.TopicPartition.Topic, partition: message.TopicPartition.Partition}
+	generation := cc.assignedPartitions[key]
+	return confluentAssignmentSnapshot{known: true, generation: generation}
 }
 
 func (cc *ConfluentConsumer) invokePartitionsAssigned(parts []PartitionAssignment) {
@@ -1510,6 +1600,10 @@ func (cc *ConfluentConsumer) consumeMessages(handler confluentMessageHandler, op
 		}
 
 		messages := []*ckafka.Message{first}
+		var assignments []confluentAssignmentSnapshot
+		if !cc.legacy {
+			assignments = []confluentAssignmentSnapshot{cc.assignmentSnapshot(first)}
+		}
 		var deferredReadErr error
 		for len(messages) < waveSize && ctx.Err() == nil {
 			message, err := consumer.ReadMessage(0)
@@ -1521,6 +1615,9 @@ func (cc *ConfluentConsumer) consumeMessages(handler confluentMessageHandler, op
 				break
 			}
 			messages = append(messages, message)
+			if !cc.legacy {
+				assignments = append(assignments, cc.assignmentSnapshot(message))
+			}
 		}
 		// Upstream main handled a record it had already read even if Close
 		// raced the read; only the advanced path drops it.
@@ -1528,6 +1625,9 @@ func (cc *ConfluentConsumer) consumeMessages(handler confluentMessageHandler, op
 			return nil
 		}
 		groups := groupConfluentBatchMessages(messages)
+		if !cc.legacy {
+			groups = groupConfluentBatchMessagesWithAssignments(messages, assignments)
+		}
 		if cc.legacy {
 			// Official-main called the original handler synchronously from Consume.
 			// Keep panics/recovery and goroutine-local state on the caller's stack.
@@ -1535,7 +1635,7 @@ func (cc *ConfluentConsumer) consumeMessages(handler confluentMessageHandler, op
 				return err
 			}
 		} else if err := runConfluentPartitionGroups(ctx, groups, concurrency, func(groupCtx context.Context, group confluentBatchGroup) error {
-			return cc.processMessageGroup(groupCtx, consumer, group, handler, isAutoCommit, opts)
+			return cc.processAssignedMessageGroup(groupCtx, consumer, group, handler, isAutoCommit, opts)
 		}); err != nil {
 			return cc.prepareHandlerRunRetry(consumer, err)
 		}
@@ -1543,6 +1643,22 @@ func (cc *ConfluentConsumer) consumeMessages(handler confluentMessageHandler, op
 			return fmt.Errorf("kafka/confluent: consume error: %w", deferredReadErr)
 		}
 	}
+}
+
+func (cc *ConfluentConsumer) processAssignedMessageGroup(
+	ctx context.Context,
+	consumer confluentConsumerDriver,
+	group confluentBatchGroup,
+	handler confluentMessageHandler,
+	isAutoCommit bool,
+	opts ConsumerAdvancedOptions,
+) error {
+	release := cc.beginPartitionDispatch(group)
+	if release == nil {
+		return nil
+	}
+	defer release()
+	return cc.processMessageGroup(ctx, consumer, group, handler, isAutoCommit, opts)
 }
 
 func (cc *ConfluentConsumer) processMessageGroup(
@@ -1553,6 +1669,11 @@ func (cc *ConfluentConsumer) processMessageGroup(
 	isAutoCommit bool,
 	opts ConsumerAdvancedOptions,
 ) error {
+	if !cc.legacy {
+		var cleanup func()
+		ctx, cleanup = enterConsumerCallback(ctx, cc)
+		defer cleanup()
+	}
 	for i, message := range group.messages {
 		if !cc.legacy && ctx.Err() != nil {
 			return nil
@@ -1764,6 +1885,10 @@ func (cc *ConfluentConsumer) consumeBatches(handler confluentBatchHandler, opts 
 		}
 
 		messages := make([]*ckafka.Message, 0, batchSize)
+		var assignments []confluentAssignmentSnapshot
+		if !cc.legacy {
+			assignments = make([]confluentAssignmentSnapshot, 0, batchSize)
+		}
 		deadline := time.Now().Add(batchTimeout)
 		// Upstream main's legacy batch collector did not observe Close while
 		// filling a batch; it only stopped on a read error / timeout.
@@ -1783,6 +1908,9 @@ func (cc *ConfluentConsumer) consumeBatches(handler confluentBatchHandler, opts 
 				return fmt.Errorf("kafka/confluent: consume batch error: %w", err)
 			}
 			messages = append(messages, message)
+			if !cc.legacy {
+				assignments = append(assignments, cc.assignmentSnapshot(message))
+			}
 		}
 
 		// Upstream main delivered an already collected batch even when Close
@@ -1794,6 +1922,9 @@ func (cc *ConfluentConsumer) consumeBatches(handler confluentBatchHandler, opts 
 			continue
 		}
 		groups := groupConfluentBatchMessages(messages)
+		if !cc.legacy {
+			groups = groupConfluentBatchMessagesWithAssignments(messages, assignments)
+		}
 		if cc.legacy {
 			groups = []confluentBatchGroup{legacyConfluentBatchGroup(messages)}
 		}
@@ -1802,11 +1933,27 @@ func (cc *ConfluentConsumer) consumeBatches(handler confluentBatchHandler, opts 
 				return err
 			}
 		} else if err := runConfluentPartitionGroups(ctx, groups, concurrency, func(groupCtx context.Context, group confluentBatchGroup) error {
-			return cc.processBatchGroup(groupCtx, consumer, group, handler, isAutoCommit, opts)
+			return cc.processAssignedBatchGroup(groupCtx, consumer, group, handler, isAutoCommit, opts)
 		}); err != nil {
 			return cc.prepareHandlerRunRetry(consumer, err)
 		}
 	}
+}
+
+func (cc *ConfluentConsumer) processAssignedBatchGroup(
+	ctx context.Context,
+	consumer confluentConsumerDriver,
+	group confluentBatchGroup,
+	handler confluentBatchHandler,
+	isAutoCommit bool,
+	opts ConsumerAdvancedOptions,
+) error {
+	release := cc.beginPartitionDispatch(group)
+	if release == nil {
+		return nil
+	}
+	defer release()
+	return cc.processBatchGroup(ctx, consumer, group, handler, isAutoCommit, opts)
 }
 
 func (cc *ConfluentConsumer) processBatchGroup(
@@ -1817,6 +1964,11 @@ func (cc *ConfluentConsumer) processBatchGroup(
 	isAutoCommit bool,
 	opts ConsumerAdvancedOptions,
 ) error {
+	if !cc.legacy {
+		var cleanup func()
+		ctx, cleanup = enterConsumerCallback(ctx, cc)
+		defer cleanup()
+	}
 	if !isAutoCommit && opts.CommitBeforeHandler {
 		if _, err := consumer.CommitMessage(group.lastMessage); err != nil {
 			cc.logBatchFailure("kafka/confluent: pre-handler batch commit failed", group.payload, err)
@@ -2262,29 +2414,49 @@ func (cc *ConfluentConsumer) beginConsumeRun() (
 }
 
 type confluentBatchGroup struct {
-	payload     BatchPayload
-	messages    []*ckafka.Message
-	lastMessage *ckafka.Message
+	payload              BatchPayload
+	messages             []*ckafka.Message
+	lastMessage          *ckafka.Message
+	assignmentKnown      bool
+	assignmentGeneration uint64
 }
 
 func groupConfluentBatchMessages(messages []*ckafka.Message) []confluentBatchGroup {
+	return groupConfluentBatchMessagesWithAssignments(messages, nil)
+}
+
+func groupConfluentBatchMessagesWithAssignments(
+	messages []*ckafka.Message,
+	assignments []confluentAssignmentSnapshot,
+) []confluentBatchGroup {
 	groups := make([]confluentBatchGroup, 0)
 	indexes := make(map[string]int)
-	for _, message := range messages {
+	for messageIndex, message := range messages {
 		if message == nil {
 			continue
 		}
 		payload := mapConfluentToPayload(message)
 		key := fmt.Sprintf("%s\x00%d", payload.Topic, payload.Partition)
+		assignment := confluentAssignmentSnapshot{}
+		if messageIndex < len(assignments) {
+			assignment = assignments[messageIndex]
+			if assignment.known {
+				key = fmt.Sprintf("%s\x00%d\x00%d", payload.Topic, payload.Partition, assignment.generation)
+			}
+		}
 		index, exists := indexes[key]
 		if !exists {
 			index = len(groups)
 			indexes[key] = index
-			groups = append(groups, confluentBatchGroup{payload: BatchPayload{
-				Topic:       payload.Topic,
-				Partition:   payload.Partition,
-				FirstOffset: payload.Offset,
-			}})
+			groups = append(groups, confluentBatchGroup{
+				payload: BatchPayload{
+					Topic:       payload.Topic,
+					Partition:   payload.Partition,
+					FirstOffset: payload.Offset,
+				},
+				assignmentKnown:      assignment.known,
+				assignmentGeneration: assignment.generation,
+			})
 		}
 		group := &groups[index]
 		group.payload.Messages = append(group.payload.Messages, payload)
@@ -2321,10 +2493,14 @@ func (cc *ConfluentConsumer) Close() error {
 	if cc.legacy {
 		return cc.closeLegacy()
 	}
+	callbackClose := isCurrentConsumerCallback(cc)
 	cc.mu.Lock()
 	if cc.closeDone != nil {
 		done := cc.closeDone
 		cc.mu.Unlock()
+		if callbackClose {
+			return nil
+		}
 		<-done
 		cc.mu.Lock()
 		err := cc.closeErr
@@ -2339,6 +2515,10 @@ func (cc *ConfluentConsumer) Close() error {
 	runDone := cc.runDone
 	consumer := cc.consumer
 	cc.mu.Unlock()
+	if callbackClose {
+		go cc.finishClose(cancel, runDone, consumer, done)
+		return nil
+	}
 	return cc.finishClose(cancel, runDone, consumer, done)
 }
 

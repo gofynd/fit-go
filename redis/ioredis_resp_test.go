@@ -299,7 +299,7 @@ func TestIORedisRESPStartupErrorBoundaries(t *testing.T) {
 				}
 				return "+OK\r\n"
 			},
-			wantErr: "WRONGPASS invalid username-password pair",
+			wantErr: "redis: ioredis AUTH failed",
 		},
 		{
 			name:    "auth unnecessary warning tolerated",
@@ -321,7 +321,7 @@ func TestIORedisRESPStartupErrorBoundaries(t *testing.T) {
 				}
 				return "+OK\r\n"
 			},
-			wantErr: "ERR DB index is out of range",
+			wantErr: "redis: ioredis SELECT failed",
 		},
 		{
 			name:    "info noperm is ready",
@@ -337,7 +337,7 @@ func TestIORedisRESPStartupErrorBoundaries(t *testing.T) {
 			reply: func([]string) string {
 				return "-ERR ready check failed\r\n"
 			},
-			wantErr: "ERR ready check failed",
+			wantErr: "redis: ioredis INFO readiness check failed",
 		},
 	}
 	for _, test := range tests {

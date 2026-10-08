@@ -280,7 +280,6 @@ type MethodSchema struct {
 // Server manages a gRPC server instance.
 type Server struct {
 	mu              sync.Mutex
-	shutdownMu      sync.Mutex
 	cfg             Config
 	logger          *slog.Logger
 	shutdownTimeout time.Duration
@@ -313,6 +312,12 @@ type Server struct {
 
 	// running indicates whether the server is actively listening.
 	running bool
+	// stopping remains true while a graceful or forced stop is in progress. It
+	// is separate from running so a deadline supervisor can still force an
+	// already-started graceful drain after IsRunning begins reporting false.
+	stopping bool
+	stopped  bool
+	stopOnce sync.Once
 
 	// done channel is closed when the server stops.
 	done     chan struct{}
@@ -1049,7 +1054,7 @@ func (s *Server) healthCheckHandler() HandlerFunc {
 // Start starts the gRPC server, listening on the configured port.
 func (s *Server) Start() error {
 	s.mu.Lock()
-	if s.running {
+	if s.running || s.stopping {
 		s.mu.Unlock()
 		return fmt.Errorf("grpc: server already running")
 	}
@@ -1072,6 +1077,8 @@ func (s *Server) Start() error {
 	// Mark as not running after Serve returns.
 	s.mu.Lock()
 	s.running = false
+	s.stopping = false
+	s.stopped = true
 	s.mu.Unlock()
 
 	s.signalDone()
@@ -1084,18 +1091,20 @@ func (s *Server) Start() error {
 // original unbounded graceful-stop behavior.
 func (s *Server) Shutdown() error {
 	if !s.advanced {
-		s.mu.Lock()
-		if !s.running {
-			s.mu.Unlock()
+		server, done, start, active := s.beginGracefulShutdown()
+		if !active {
 			return nil
 		}
-		s.running = false
-		server := s.grpcServer
-		s.mu.Unlock()
-
-		server.GracefulStop()
-		s.signalDone()
-		s.logger.Info("gRPC Server Stopped")
+		if start {
+			server.GracefulStop()
+			s.finishShutdown()
+			s.logger.Info("gRPC Server Stopped")
+			return nil
+		}
+		// Preserve legacy Shutdown's unbounded graceful contract when another
+		// caller already started the drain. Stop or ShutdownContext can still
+		// force that shared drain through the state retained above.
+		<-done
 		return nil
 	}
 	if s.shutdownTimeout <= 0 {
@@ -1107,41 +1116,34 @@ func (s *Server) Shutdown() error {
 }
 
 // ShutdownContext gracefully shuts down until ctx expires. On expiry it calls
-// grpc.Server.Stop so shutdown remains bounded and returns the context error.
+// grpc.Server.Stop and returns the context error after stopping. Handlers must
+// honor RPC cancellation: gRPC's internal handler wait can otherwise keep a
+// concurrent GracefulStop/Stop from finishing.
 func (s *Server) ShutdownContext(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	s.shutdownMu.Lock()
-	defer s.shutdownMu.Unlock()
-
-	s.mu.Lock()
-	if !s.running {
-		s.mu.Unlock()
+	server, done, start, active := s.beginGracefulShutdown()
+	if !active {
 		return nil
 	}
-	s.running = false
-	server := s.grpcServer
-	s.mu.Unlock()
-
-	if s.healthServer != nil {
+	if start && s.healthServer != nil {
 		s.healthServer.Shutdown()
 	}
-	stopped := make(chan struct{})
-	go func() {
-		server.GracefulStop()
-		close(stopped)
-	}()
+	if start {
+		go func() {
+			server.GracefulStop()
+			s.finishShutdown()
+		}()
+	}
 
 	select {
-	case <-stopped:
-		s.signalDone()
+	case <-done:
 		s.logger.Info("gRPC Server Stopped")
 		return nil
 	case <-ctx.Done():
-		server.Stop()
-		<-stopped
-		s.signalDone()
+		s.forceStop(server)
+		<-done
 		s.logger.Warn("gRPC Server Force Stopped after graceful shutdown deadline")
 		return fmt.Errorf("grpc: graceful shutdown: %w", ctx.Err())
 	}
@@ -1149,26 +1151,51 @@ func (s *Server) ShutdownContext(ctx context.Context) error {
 
 // Stop forcefully stops the gRPC server without waiting for pending RPCs.
 func (s *Server) Stop() error {
-	s.shutdownMu.Lock()
-	defer s.shutdownMu.Unlock()
-
 	s.mu.Lock()
-	if !s.running {
+	if s.stopped || (!s.running && !s.stopping) {
 		s.mu.Unlock()
 		return nil
 	}
 	s.running = false
+	s.stopping = true
 	server := s.grpcServer
 	s.mu.Unlock()
 
 	if s.advanced && s.healthServer != nil {
 		s.healthServer.Shutdown()
 	}
-	server.Stop()
-	s.signalDone()
+	s.forceStop(server)
 
 	s.logger.Info("gRPC Server Force Stopped")
 	return nil
+}
+
+func (s *Server) beginGracefulShutdown() (server *grpc.Server, done <-chan struct{}, start, active bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped || (!s.running && !s.stopping) {
+		return nil, s.done, false, false
+	}
+	if s.stopping {
+		return s.grpcServer, s.done, false, true
+	}
+	s.running = false
+	s.stopping = true
+	return s.grpcServer, s.done, true, true
+}
+
+func (s *Server) forceStop(server *grpc.Server) {
+	s.stopOnce.Do(server.Stop)
+	s.finishShutdown()
+}
+
+func (s *Server) finishShutdown() {
+	s.mu.Lock()
+	s.running = false
+	s.stopping = false
+	s.stopped = true
+	s.mu.Unlock()
+	s.signalDone()
 }
 
 func (s *Server) signalDone() {

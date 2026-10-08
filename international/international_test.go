@@ -4,6 +4,8 @@
 package international
 
 import (
+	"encoding/json"
+	"math"
 	"reflect"
 	"testing"
 )
@@ -96,5 +98,40 @@ func TestAddressDisplayParser_CoercesValues(t *testing.T) {
 	got := AddressDisplayParser("{zip}", map[string]any{"zip": 560001})
 	if !reflect.DeepEqual(got, []string{"560001"}) {
 		t.Fatalf("got %#v, want [\"560001\"]", got)
+	}
+}
+
+func TestAddressDisplayParserUsesJavaScriptStringCoercion(t *testing.T) {
+	tests := []struct {
+		name  string
+		value any
+		want  string
+	}{
+		{name: "null", value: nil, want: "null"},
+		{name: "array", value: []any{"a", "b"}, want: "a,b"},
+		{name: "nested array", value: []any{1, nil, []any{2, 3}, map[string]any{"x": 1}}, want: "1,,2,3,[object Object]"},
+		{name: "object", value: map[string]any{"a": 1}, want: "[object Object]"},
+		{name: "boolean true", value: true, want: "true"},
+		{name: "boolean false", value: false, want: "false"},
+		{name: "large signed integer remains exact", value: int64(9223372036854775807), want: "9223372036854775807"},
+		{name: "large unsigned integer remains exact", value: uint64(18446744073709551615), want: "18446744073709551615"},
+		{name: "JSON number uses JavaScript precision", value: json.Number("9007199254740993"), want: "9007199254740992"},
+		{name: "negative zero", value: math.Copysign(0, -1), want: "0"},
+		{name: "small exponent", value: 1e-7, want: "1e-7"},
+		{name: "small decimal threshold", value: 1e-6, want: "0.000001"},
+		{name: "large decimal threshold", value: 1e20, want: "100000000000000000000"},
+		{name: "large exponent", value: 1e21, want: "1e+21"},
+		{name: "positive infinity", value: math.Inf(1), want: "Infinity"},
+		{name: "negative infinity", value: math.Inf(-1), want: "-Infinity"},
+		{name: "not a number", value: math.NaN(), want: "NaN"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := AddressDisplayParser("{value}", map[string]any{"value": test.value})
+			if !reflect.DeepEqual(got, []string{test.want}) {
+				t.Fatalf("AddressDisplayParser() = %#v; want %#v", got, []string{test.want})
+			}
+		})
 	}
 }

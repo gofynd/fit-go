@@ -18,7 +18,8 @@ This ledger records the remediation on top of PR head
 | `9b8754c` | Tracing legacy lifecycle parity |
 | `59dac4c` | `AuthorizeJWTToken` restored to main's HS256 verifier |
 | `4d45fdf` | Legacy `ConsumeBatch` error identity and `InjectTraceHeaders` parity |
-| (this change) | Documentation refresh for the three parity fixes |
+| `15f1940` (`v0.2.0-rc.2`) | Documentation refresh for the three parity fixes |
+| `v0.2.0-rc.3` follow-up | Final correctness fixes on top of immutable `v0.2.0-rc.2` |
 
 It separates verified behavior from accepted limitations so a release
 description does not promise more than the code and tests provide.
@@ -30,10 +31,10 @@ The compatibility objective is:
 - in the opt-in compatibility transports (ioredis, Kafka advanced recovery),
   reject or pause operations whose ordering or side-effect guarantees cannot be
   preserved instead of silently degrading them;
-- keep the default log/Sentry paths free of the secret and PII classes the
-  redactor recognises (a deliberate output change, listed with every other
-  remaining difference in
-  [Behaviour differences for existing main users](UPSTREAM_INTEGRATION_MIGRATION.md#behaviour-differences-for-existing-main-users)); and
+- apply the documented redactor to default log/Sentry text and structured
+  values (a deliberate output change), while explicitly retaining and
+  documenting main's raw access-log URL-path field; every difference is listed
+  in [Behaviour differences for existing main users](UPSTREAM_INTEGRATION_MIGRATION.md#behaviour-differences-for-existing-main-users); and
 - keep Metroplex buildable with a small integration-only change after an
   official immutable fit-go tag exists.
 
@@ -61,6 +62,10 @@ Applies to the released constructors (`New`, `Init`, `InitWithOptions`, lazy
 - With no real OTel tracer, `StartSpan` no longer stamps the random in-memory
   IDs onto the logging context, and the decorators skip the goroutine-local
   store.
+- A released-constructor tracer returns its exporter shutdown error on the
+  first `Shutdown` only and nil on later calls, matching main. Advanced tracers
+  retain their cached-result contract. A failed global-init diagnostic remains
+  visible through `GlobalWithError` after a no-op package shutdown.
 
 ### `AuthorizeJWTToken` (`59dac4c`)
 
@@ -117,6 +122,16 @@ past it. Legacy `ConsumeBatch` returns the handler's own error (`4d45fdf`).
   the legacy revoke hook still runs on external `Close`. A hook that never
   returns still retains its goroutine.
 - Confluent rejects `OnPartitionsLost*` hooks (Franz-only feature).
+- An advanced message handler, batch handler, or offset finalizer may call its
+  own consumer's `Close` without waiting on itself. Only that callback-local
+  call completes asynchronously; external `Close` remains synchronous. Callback
+  ownership is stored independently of tracing context, so public tracing
+  wrappers and explicit active-context replacement cannot hide it.
+- Advanced Confluent dispatch holds an assignment lease through the handler and
+  offset boundary. A record gathered before revoke/reassignment is discarded
+  before application code; the new owner remains responsible for it.
+- Advanced Confluent and Franz subscriptions reject mixed per-topic
+  `FromBeginning` values. Legacy Confluent retains main's first-topic behavior.
 
 ### Redis ioredis compatibility path (`534a759`)
 
@@ -128,6 +143,10 @@ past it. Legacy `ConsumeBatch` returns the handler's own error (`4d45fdf`).
 - RESP length/depth/value limits, sanitized bootstrap/PING/topology/redirect
   errors, stable `errors.Is` causes, and the `WriteDisposition` versus
   `MayHaveExecuted` split are unchanged from the baseline.
+- AUTH, SELECT, INFO-readiness, and transport bootstrap failures now return a
+  fixed boundary message and preserve only safe causes. Cluster routing uses
+  explicit argument-2 key rules for keyed `OBJECT`, `MEMORY USAGE`, `XGROUP`,
+  and `XINFO` forms instead of hashing the subcommand.
 - Guard: `redis.Init`/`InitDefault` never construct an ioredis transport.
 
 ### FeatureHub streaming (`ef2cd9d`; `feature.Init` remains polling)
@@ -145,6 +164,10 @@ past it. Legacy `ConsumeBatch` returns the handler's own error (`4d45fdf`).
 - Baseline behavior retained: nil-safe disabled clients, terminal-failure
   wakeups, bounded `Retry-After`, backoff reset only after feature-state
   events, one owned stale-expiry timer that cannot be re-armed after `Stop`.
+- Context mutation, revision advancement, readiness invalidation, feature
+  application, and readiness publication now share one synchronization
+  boundary. Buffered full/incremental/delete events from an older stream cannot
+  mutate the newer server-evaluated context or mark it ready.
 
 ### gRPC legacy parity (`0522954`)
 
@@ -152,6 +175,18 @@ The original `grpc.Init` server emits no log line for `next(err)`, returns the
 raw panic value (including `panic("")`), and returns raw response-validation
 text. Its panic *log* line is redacted (deliberate). Advanced/managed servers
 keep the generic message and redacted diagnostics.
+
+Legacy `Shutdown()` remains an unbounded graceful drain, as on main. A
+concurrent `Stop()` can now force an in-progress drain, and
+`ShutdownContext()` can enforce its deadline even when another caller started
+that drain.
+
+### International rendering
+
+`AddressDisplayParser` now uses JavaScript-like `String` coercion for
+JSON-shaped nulls, arrays, objects, booleans, floating-point values, NaN, and
+infinities. Native Go integer kinds retain exact decimal formatting for
+existing callers.
 
 ### Redaction (`57e2b31`)
 
@@ -208,6 +243,8 @@ unchanged.
 | Area | Deliberate boundary |
 |---|---|
 | Default-path output | Log and Sentry output on the original entry points is redacted. There is no API change; see [Behaviour differences for existing main users](UPSTREAM_INTEGRATION_MIGRATION.md#behaviour-differences-for-existing-main-users) for this and every remaining runtime and dependency difference. |
+| Legacy access-log path | `server.New` keeps main's raw URL-path field for compatibility. Query values and opted-in headers are redacted, but applications must not put credentials or PII in path segments; a stricter default needs a separately reviewed migration. |
+| Legacy AES-GCM wire format | `encryption.NewManager` and its compatibility options keep the provider-supplied fixed IV so existing fit.js/pyfit ciphertext remains decryptable. Reusing a nonce with one AES-GCM key is unsafe; new data needs a separately versioned random-nonce format rather than a silent wire-format change. |
 | FeatureHub protocol | The API key remains in FeatureHub's required URL path, server-evaluated context remains in the query/header, a permanent 4xx ends the stream, and each request-scoped `Build` owns its SSE request. |
 | Ambiguous phones | Bare 10-digit values starting 6–9 are redacted even when they are order IDs, unless an ID-like label (`order_id=`, `id:`) precedes them. A `+CC` prefix or phone label overrides the ID label. |
 | Ambiguous cards | An unlabelled Luhn-valid 13-digit value is redacted unless a timestamp label or `/event(s)/…` path context marks it as epoch milliseconds. |
@@ -221,6 +258,7 @@ unchanged.
 | Kafka pending rewinds | While a Confluent exact seek keeps failing, every `Consume` call returns an error without reading; callers must back off between retries. |
 | Kafka payload copying | Produce paths keep defensive deep copies to prevent caller mutation/races. |
 | gRPC legacy errors | Original `Init` returns raw panic/validation/handler text on the wire; its panic log is redacted. Managed/advanced servers use the generic boundary. |
+| gRPC shutdown | Forced shutdown cancels RPCs, but handlers must honor cancellation. gRPC's internal handler wait can retain an ongoing graceful stop and its concurrent force-stop call if a handler never returns. |
 | Server/logging/tracing | TraceClue remains the default schema, profiler response-key changes remain, and the legacy tracing initializer retains its owned propagator wrapper. |
 | Toolchain | The module directive remains Go 1.25.10. Selecting a patched release toolchain is a release-engineering gate. |
 
@@ -245,12 +283,13 @@ Effect of the parity fixes on Metroplex:
   (`69129e4`).
 
 Metroplex's local `internal/app.go` uses `GetDecodedSecretFromGSM` and
-`UseHealthRouteMiddleware`, which are not in `v0.2.0-rc.1`. Its pin test
-`cmd/promotions_dependency_pin_test.go` still requires the replacement
-`github.com/swapnilfynd/fit-go v0.2.0-rc.1` with its recorded checksum, or an
-absolute local replacement only when `FIT_GO_LOCAL_INTEGRATION=1`. Pre-release
-validation uses the local replacement. At release, repin Metroplex to the new
-official immutable fit-go tag and update the pin test accordingly.
+`UseHealthRouteMiddleware`. The release target for these fixes is the new
+immutable fork tag `github.com/swapnilfynd/fit-go v0.2.0-rc.3`, following the
+`rc.2` baseline at `15f19406`. Publish the candidate without moving `rc.2`,
+then repin Metroplex's local module replacement, checksum, and pin test and
+rerun its full suite with `GOWORK=off`. Workspace validation before publication
+does not prove the published dependency pin. Publication and consuming-module
+validation results are recorded in PR #3 and Metroplex's library document.
 
 ## Validation
 
@@ -259,28 +298,38 @@ On this host loopback listeners are allowed, so the full `go test ./...` and
 librdkafka mock-broker tests. Only 8 live-infrastructure tests skip: the 6
 `*Live` Kafka broker tests and 2 Redis Sentinel/Cluster live subtests.
 
-Final verification on 2026-10-08
+Candidate-tree verification on 2026-10-08
 
 - `gofmt -l`, `git diff --check`, `go build ./...`, and `go vet ./...` are clean.
 - `go test -count=1 ./...` and `go test -race -count=1 ./...` pass with only the
   8 live-infrastructure skips listed above.
+- `GOTOOLCHAIN=go1.25.10 go test -count=1 ./...` and `go vet ./...` pass, so
+  the module's declared toolchain remains supported.
 - `go mod tidy -diff` is clean. The only module changes from the PR head are
   the OpenTelemetry 1.45.0/contrib 0.70.0 and gRPC 1.83.2 security updates.
 - `apidiff -m -incompatible` against official main `df96a28` reports no
   incompatible changes.
-- `govulncheck ./...` reports no reachable third-party advisory; 8 reachable
-  Go 1.26.4 standard-library advisories are fixed by Go 1.26.6.
+- `GOTOOLCHAIN=go1.26.7 govulncheck ./...` reports zero reachable
+  vulnerabilities. The 8 standard-library findings seen with Go 1.26.4 are
+  absent.
 - Metroplex (`go build ./...`, `go vet ./...`, and `go test ./...`) passes
-  against this tree through an uncommitted local workspace file.
+  against this exact local tree through an uncommitted workspace file;
+  targeted race tests for its Kafka/Redis/tracing/shutdown boundaries and the
+  Promotions, Extensions, observability, and scheduler packages also pass.
+  That workspace run preceded the published `rc.3` repin; it used the existing
+  local `rc.2` replacement and checksum without modifying them.
 
 Remaining release gates:
 
-1. Run build, vet, full and race suites on the final tree in CI.
+1. Repeat format/diff, build, vet, full and race suites in CI after commit.
 2. Run live-broker Kafka recovery/rebalance tests, including multi-partition
    failures and all commit modes.
 3. Compile every known reverse dependency of fit-go against the release
    candidate.
-4. Build/test Metroplex against the exact candidate tag, then remove its fork
-   replacement.
+4. Build/test Metroplex against the exact candidate tag with `GOWORK=off`.
+   After upstream merge and an official release, migrate its fork replacement
+   to the official immutable tag and repeat the consuming-module validation.
 5. Build with the release-selected patched Go toolchain and rerun
    `govulncheck`.
+6. Keep PR #3's remote description aligned with the published commit/tag,
+   validation evidence, and deliberate compatibility/security boundaries.

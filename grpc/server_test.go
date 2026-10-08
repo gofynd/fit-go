@@ -96,6 +96,34 @@ service Test {
 	return srv
 }
 
+func newLegacyTestServer(t *testing.T) *Server {
+	t.Helper()
+	tmpDir := t.TempDir()
+	serverType := "legacytestservice"
+	protoDir := filepath.Join(tmpDir, serverType)
+	if err := os.MkdirAll(protoDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(protoDir, "test.proto"), []byte(`
+syntax = "proto3";
+package test;
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	t.Setenv("SERVER_TYPE", serverType)
+	t.Setenv("PORT", "0")
+	srv, err := Init(Config{
+		FileName: "test",
+		ProtoDir: tmpDir,
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	return srv
+}
+
 // startServer starts the server in a background goroutine and waits until
 // it is running. Returns a cleanup function that shuts down the server.
 func startServer(t *testing.T, srv *Server) func() {
@@ -602,6 +630,118 @@ func TestServer_ShutdownDeadlineForcesActiveRPC(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("forced stop did not cancel the active RPC")
 	}
+}
+
+func TestLegacyServer_StopForcesInProgressGracefulShutdown(t *testing.T) {
+	srv, callDone := startLegacyBlockingRPC(t)
+
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- srv.Shutdown() }()
+	waitForGracefulDrain(t, srv)
+
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("legacy Shutdown returned before the active RPC completed: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	if err := srv.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("legacy Shutdown after forced stop: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not release the in-progress legacy graceful shutdown")
+	}
+	select {
+	case <-callDone:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not cancel the active legacy RPC")
+	}
+}
+
+func TestLegacyServer_ShutdownContextBoundsInProgressGracefulShutdown(t *testing.T) {
+	srv, callDone := startLegacyBlockingRPC(t)
+
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- srv.Shutdown() }()
+	waitForGracefulDrain(t, srv)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := srv.ShutdownContext(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ShutdownContext error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("ShutdownContext took %v, want bounded completion", elapsed)
+	}
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("legacy Shutdown after context forced stop: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ShutdownContext did not release the in-progress legacy graceful shutdown")
+	}
+	select {
+	case <-callDone:
+	case <-time.After(time.Second):
+		t.Fatal("ShutdownContext did not cancel the active legacy RPC")
+	}
+}
+
+func startLegacyBlockingRPC(t *testing.T) (*Server, <-chan error) {
+	t.Helper()
+	srv := newLegacyTestServer(t)
+	service := &blockingServiceImpl{entered: make(chan struct{})}
+	srv.GRPCServer().RegisterService(&blockingServiceDescription, service)
+	cleanup := startServer(t, srv)
+	t.Cleanup(cleanup)
+
+	conn, err := grpc.NewClient(
+		srv.Listener().Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	callDone := make(chan error, 1)
+	go func() {
+		callDone <- conn.Invoke(
+			context.Background(),
+			"/fit.test.Blocking/Block",
+			&emptypb.Empty{},
+			&emptypb.Empty{},
+		)
+	}()
+	select {
+	case <-service.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocking legacy RPC did not start")
+	}
+	return srv, callDone
+}
+
+func waitForGracefulDrain(t *testing.T, srv *Server) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		srv.mu.Lock()
+		stopping := srv.stopping
+		srv.mu.Unlock()
+		if stopping {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("server did not enter graceful drain")
 }
 
 // ---------------------------------------------------------------------------

@@ -1680,11 +1680,11 @@ func refreshImplicitTraceEnabled() {
 func Shutdown(ctx context.Context) error {
 	globalTracerMu.Lock()
 	g := globalTracer.Load()
-	if g == nil {
-		globalInitErr = nil
-	}
 	globalTracerMu.Unlock()
 	if g == nil {
+		// There is no resource to shut down after an initialization failure. Keep
+		// its cached diagnostic visible through GlobalWithError/InitError; an
+		// explicit successful advanced initialization replaces it.
 		return nil
 	}
 	return g.Shutdown(ctx)
@@ -1707,7 +1707,9 @@ func (t *Tracer) shutdown(ctx context.Context) error {
 	if t == nil {
 		return nil
 	}
+	shutdownStarted := false
 	t.shutdownOnce.Do(func() {
+		shutdownStarted = true
 		t.closed.Store(true)
 		relinquishGlobalTracer(t)
 		relinquishOTelGlobals(t)
@@ -1715,6 +1717,14 @@ func (t *Tracer) shutdown(ctx context.Context) error {
 			t.shutdownErr = t.provider.Shutdown(ctx)
 		}
 	})
+	if t.upstream && !shutdownStarted {
+		// Upstream main delegated every call to sdktrace.TracerProvider.Shutdown.
+		// The provider returned its exporter error once and nil on later calls.
+		// Keep the single physical shutdown while preserving that released return
+		// contract for New/Init/InitWithOptions tracers. Advanced tracers continue
+		// returning their cached shutdown result.
+		return nil
+	}
 	return t.shutdownErr
 }
 

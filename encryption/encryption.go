@@ -62,7 +62,12 @@ func NewManager() *Manager {
 type ManagerAdvancedOptions struct{ AllowedNonceSizes []int }
 
 // NewManagerAdvanced creates a manager accepting only the explicitly listed
-// nonce sizes. Empty input uses the secure 12-byte default.
+// nonce sizes. Empty input uses the legacy 12-byte wire-format default.
+//
+// Compatibility warning: providers return a fixed IV, so repeated encryption
+// with one DEK reuses an AES-GCM nonce. That inherited fit.js/pyfit contract is
+// retained for ciphertext interoperability, but it is not safe for new
+// cryptographic designs. Migrate new data to a versioned random-nonce format.
 // Deprecated: use NewManagerWithOptions.
 func NewManagerAdvanced(opts ManagerAdvancedOptions) *Manager {
 	explicit := len(opts.AllowedNonceSizes) > 0
@@ -129,7 +134,9 @@ func (m *Manager) Init() error {
 	if len(m.dek) != 32 {
 		return fmt.Errorf("encryption: DEK must be 32 bytes (AES-256), got %d", len(m.dek))
 	}
-	// The original fit-go contract requires a 12-byte GCM nonce. Cross-language
+	// The original fit-go contract requires a fixed 12-byte GCM nonce. This is a
+	// legacy interoperability format, not a security recommendation: nonce reuse
+	// with the same DEK weakens GCM confidentiality and integrity. Cross-language
 	// deployments with another fixed nonce size (commonly 9 bytes in Node/pyfit)
 	// must opt in explicitly through NewManagerAdvanced.
 	_, allowed := m.allowedNonceSizes[len(m.iv)]

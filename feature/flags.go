@@ -91,6 +91,9 @@ type Client struct {
 	stopOnce         sync.Once
 	receivedInitial  atomic.Bool
 	ready            atomic.Bool
+	// contextRevision is mutated while mu is held so context changes are
+	// serialized with feature application. Atomic loads keep WaitReady and the
+	// stream loop lock-free.
 	contextRevision  atomic.Uint64
 	readyRevision    atomic.Uint64
 	lastErrorMu      sync.RWMutex
@@ -604,9 +607,18 @@ func (c *Client) setAttributeValues(key string, values []string) {
 		c.attributes[key] = cleaned
 	}
 	changed := !stringSlicesEqual(previous, cleaned)
+	if changed && !c.clientEvaluated {
+		// Keep the attribute update, revision change, and readiness invalidation
+		// in one critical section with feature-event application. Otherwise a
+		// buffered event from the previous stream can be applied between the
+		// attribute write and revision increment and publish stale values for the
+		// new server-evaluated context.
+		c.contextRevision.Add(1)
+		c.ready.Store(false)
+	}
 	c.mu.Unlock()
 	if changed {
-		c.contextChanged()
+		c.notifyContextChanged()
 	}
 }
 
@@ -681,19 +693,23 @@ func (c *Client) replaceAttributes(attributes map[string][]string) {
 	changed := !attributeMapsEqual(c.attributes, attributes)
 	if changed {
 		c.attributes = cloneAttributes(attributes)
+		if !c.clientEvaluated {
+			c.contextRevision.Add(1)
+			c.ready.Store(false)
+		}
 	}
 	c.mu.Unlock()
 	if changed {
-		c.contextChanged()
+		c.notifyContextChanged()
 	}
 }
 
-func (c *Client) contextChanged() {
+// notifyContextChanged wakes the stream loop after the context state and its
+// revision have been updated atomically under c.mu.
+func (c *Client) notifyContextChanged() {
 	if c == nil || c.clientEvaluated {
 		return
 	}
-	c.contextRevision.Add(1)
-	c.ready.Store(false)
 	select {
 	case c.refresh <- struct{}{}:
 	default:
@@ -1096,26 +1112,19 @@ func (c *Client) handleEvent(name, data string, revision uint64) error {
 		if err := json.Unmarshal([]byte(data), &features); err != nil {
 			return fmt.Errorf("decode FeatureHub features event: %w", err)
 		}
-		c.applyFullFeatureSet(features)
-		c.clearStaleRetention()
-		c.featureEvents.Add(1)
-		c.markReady(revision)
+		c.applyFullFeatureSet(features, revision)
 	case "feature":
 		var feature featureState
 		if err := json.Unmarshal([]byte(data), &feature); err != nil {
 			return fmt.Errorf("decode FeatureHub feature event: %w", err)
 		}
-		c.applyFeature(&feature)
-		c.clearStaleRetention()
-		c.featureEvents.Add(1)
+		c.applyFeature(&feature, revision)
 	case "delete_feature":
 		var feature featureState
 		if err := json.Unmarshal([]byte(data), &feature); err != nil {
 			return fmt.Errorf("decode FeatureHub delete event: %w", err)
 		}
-		c.deleteFeature(&feature)
-		c.clearStaleRetention()
-		c.featureEvents.Add(1)
+		c.deleteFeature(&feature, revision)
 	}
 	return nil
 }
@@ -1326,10 +1335,13 @@ func (c *Client) clearStaleRetention() {
 	c.staleTimerMu.Unlock()
 }
 
-func (c *Client) applyFullFeatureSet(features []*featureState) {
+func (c *Client) applyFullFeatureSet(features []*featureState, revision uint64) bool {
 	incoming := make(map[string]struct{}, len(features))
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	if c.contextRevision.Load() != revision {
+		c.mu.Unlock()
+		return false
+	}
 	for _, feature := range features {
 		if feature == nil || feature.Key == "" {
 			continue
@@ -1344,41 +1356,60 @@ func (c *Client) applyFullFeatureSet(features []*featureState) {
 			delete(c.features, key)
 		}
 	}
-}
-
-func (c *Client) applyFeature(feature *featureState) {
-	if feature == nil || feature.Key == "" {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if current := c.features[feature.Key]; current == nil || featureVersion(feature) >= featureVersion(current) {
-		c.features[feature.Key] = feature
-	}
-}
-
-func (c *Client) deleteFeature(feature *featureState) {
-	if feature == nil || feature.Key == "" {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	current := c.features[feature.Key]
-	if current == nil || feature.Version == nil || *feature.Version == 0 || *feature.Version >= featureVersion(current) {
-		delete(c.features, feature.Key)
-	}
-}
-
-func (c *Client) failTerminal() {
-	c.terminalFailOnce.Do(func() { close(c.terminalFailure) })
-}
-
-func (c *Client) markReady(revision uint64) {
+	// Clear a stale-expiry timer before publishing readiness. Holding c.mu keeps
+	// this operation ordered with a concurrent context revision change; the
+	// timer's generation check prevents a callback already in flight from
+	// invalidating the newly accepted snapshot.
+	c.clearStaleRetention()
+	c.featureEvents.Add(1)
 	c.readyRevision.Store(revision)
 	c.ready.Store(true)
 	c.receivedInitial.Store(true)
 	c.setLastError(nil)
+	c.mu.Unlock()
 	c.signalReadyChange()
+	return true
+}
+
+func (c *Client) applyFeature(feature *featureState, revision uint64) bool {
+	if feature == nil || feature.Key == "" {
+		return false
+	}
+	c.mu.Lock()
+	if c.contextRevision.Load() != revision {
+		c.mu.Unlock()
+		return false
+	}
+	if current := c.features[feature.Key]; current == nil || featureVersion(feature) >= featureVersion(current) {
+		c.features[feature.Key] = feature
+	}
+	c.clearStaleRetention()
+	c.featureEvents.Add(1)
+	c.mu.Unlock()
+	return true
+}
+
+func (c *Client) deleteFeature(feature *featureState, revision uint64) bool {
+	if feature == nil || feature.Key == "" {
+		return false
+	}
+	c.mu.Lock()
+	if c.contextRevision.Load() != revision {
+		c.mu.Unlock()
+		return false
+	}
+	current := c.features[feature.Key]
+	if current == nil || feature.Version == nil || *feature.Version == 0 || *feature.Version >= featureVersion(current) {
+		delete(c.features, feature.Key)
+	}
+	c.clearStaleRetention()
+	c.featureEvents.Add(1)
+	c.mu.Unlock()
+	return true
+}
+
+func (c *Client) failTerminal() {
+	c.terminalFailOnce.Do(func() { close(c.terminalFailure) })
 }
 
 func (c *Client) signalReadyChange() {

@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/gofynd/fit-go/internal/goroutinectx"
 	"github.com/gofynd/fit-go/redact"
 	"github.com/gofynd/fit-go/tracing"
 	"go.opentelemetry.io/otel"
@@ -35,6 +36,31 @@ import (
 )
 
 const traceparentHeaderKey = "traceparent"
+
+var consumerCallbacks goroutinectx.Scope[any]
+
+// enterConsumerCallback marks only the goroutine that is currently executing
+// an application handler or offset finalizer. Advanced consumer Close methods
+// use this marker to break the otherwise unavoidable self-wait on runDone.
+// External callers do not carry the marker and therefore retain synchronous
+// shutdown semantics even while another goroutine is inside a callback.
+// Ownership has a separate scope so nested tracing adapters or a caller's
+// replacement of the active trace context cannot hide it.
+func enterConsumerCallback(ctx context.Context, owner any) (context.Context, func()) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cleanupOwner := consumerCallbacks.Enter(owner)
+	cleanupContext := tracing.InjectContextIntoGoroutine(ctx)
+	return ctx, func() {
+		cleanupContext()
+		cleanupOwner()
+	}
+}
+
+func isCurrentConsumerCallback(owner any) bool {
+	return consumerCallbacks.Contains(owner)
+}
 
 // automaticProducerContext mirrors Node's active-context instrumentation for
 // source-compatible raw producer methods. Cancellation is deliberately detached:

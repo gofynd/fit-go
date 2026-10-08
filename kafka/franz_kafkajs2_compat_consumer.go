@@ -116,6 +116,9 @@ func (c *franzKafkaJS2CompatConsumer) Connect(topics []TopicConfig) error {
 	if len(topics) == 0 {
 		return fmt.Errorf("kafka/kafkajs: at least one topic is required")
 	}
+	if err := validateUniformTopicStart(topics); err != nil {
+		return fmt.Errorf("kafka/kafkajs: connect: %w", err)
+	}
 	names := make([]string, len(topics))
 	for i, topic := range topics {
 		if strings.TrimSpace(topic.Topic) == "" {
@@ -555,6 +558,9 @@ func (c *franzKafkaJS2CompatConsumer) processRecord(
 	if record.Attrs.IsControl() {
 		return resolveKafkaJSRecord(ctx, client, record, isAutoCommit, c.config.AutoCommit, opts.NullOffsetCommitMetadata)
 	}
+	var cleanup func()
+	ctx, cleanup = enterConsumerCallback(ctx, c)
+	defer cleanup()
 	payload := kafkaJSPayload(record)
 	if !isAutoCommit && opts.CommitBeforeHandler {
 		if err := client.CommitRecords(ctx, record); err != nil {
@@ -854,11 +860,16 @@ func (c *franzKafkaJS2CompatConsumer) consumeBatches(handler kafkaJSBatchHandler
 				FirstOffset: visible[0].Offset,
 				LastOffset:  lastVisible.Offset,
 			}
-			if err := handler(runCtx, payload); err != nil {
+			handlerErr := func() error {
+				callbackCtx, cleanup := enterConsumerCallback(runCtx, c)
+				defer cleanup()
+				return handler(callbackCtx, payload)
+			}()
+			if handlerErr != nil {
 				if !isAutoCommit && opts.CommitBeforeHandler {
-					return newConsumerHandlerError("kafka/kafkajs: batch handler failed", err)
+					return newConsumerHandlerError("kafka/kafkajs: batch handler failed", handlerErr)
 				}
-				return newConsumerHandlerErrorAt("kafka/kafkajs: batch handler failed", err, firstPosition)
+				return newConsumerHandlerErrorAt("kafka/kafkajs: batch handler failed", handlerErr, firstPosition)
 			}
 			if !isAutoCommit && opts.CommitBeforeHandler {
 				return nil
@@ -999,10 +1010,14 @@ func (c *franzKafkaJS2CompatConsumer) prepareTransientRunRetry(runClient franzKa
 }
 
 func (c *franzKafkaJS2CompatConsumer) Close() error {
+	callbackClose := isCurrentConsumerCallback(c)
 	c.mu.Lock()
 	if c.closed {
 		done := c.closeDone
 		c.mu.Unlock()
+		if callbackClose {
+			return nil
+		}
 		if done != nil {
 			<-done
 			c.mu.Lock()
@@ -1019,6 +1034,10 @@ func (c *franzKafkaJS2CompatConsumer) Close() error {
 	client, cancel, stopPoll, runDone := c.client, c.cancelRun, c.stopPoll, c.runDone
 	shutdownPolicy := c.config.ShutdownPolicy
 	c.mu.Unlock()
+	if callbackClose {
+		go c.finishClose(client, cancel, stopPoll, runDone, shutdownPolicy, closeDone)
+		return nil
+	}
 	return c.finishClose(client, cancel, stopPoll, runDone, shutdownPolicy, closeDone)
 }
 

@@ -14,15 +14,19 @@
 
 // Package international ports the address form/display parsing helpers from the
 // Node `fit/international` module, so services relying on country-specific address
-// layouts can migrate to Go unchanged. The two functions are the byte-compatible
-// equivalents of `addressFormParser` and `addressDisplayParser`.
+// layouts can migrate to Go unchanged. The two functions mirror
+// `addressFormParser` and `addressDisplayParser` for JSON-shaped inputs; native
+// Go integer values additionally keep their exact decimal precision.
 package international
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -125,8 +129,11 @@ func AddressFormParser(template string, input []AddressField) ([][]AddressField,
 // AddressDisplayParser fills a display template's `{key}` placeholders with the
 // corresponding values from input and splits the result into lines on "_". Only
 // the FIRST occurrence of each `{key}` is replaced (matching Node
-// `international.addressDisplayParser`). Values are coerced to their default
-// string form.
+// `international.addressDisplayParser`). Values use JavaScript String coercion:
+// null becomes "null", arrays join with commas, objects become
+// "[object Object]", and booleans/floating-point/JSON numbers use their
+// JavaScript textual form. Native Go integer kinds retain exact decimal
+// precision for compatibility with existing Go callers.
 func AddressDisplayParser(template string, input map[string]any) []string {
 	result := template
 	keys := make([]string, 0, len(input))
@@ -135,8 +142,108 @@ func AddressDisplayParser(template string, input map[string]any) []string {
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		val := input[key]
-		result = strings.Replace(result, "{"+key+"}", fmt.Sprintf("%v", val), 1)
+		result = strings.Replace(result, "{"+key+"}", javascriptString(input[key]), 1)
 	}
 	return strings.Split(result, "_")
+}
+
+func javascriptString(value any) string {
+	return javascriptReflectString(reflect.ValueOf(value), false)
+}
+
+func javascriptReflectString(value reflect.Value, arrayElement bool) string {
+	if !value.IsValid() {
+		if arrayElement {
+			return ""
+		}
+		return "null"
+	}
+	for value.Kind() == reflect.Interface || value.Kind() == reflect.Pointer {
+		if value.IsNil() {
+			if arrayElement {
+				return ""
+			}
+			return "null"
+		}
+		value = value.Elem()
+	}
+
+	if value.CanInterface() {
+		if number, ok := value.Interface().(json.Number); ok {
+			parsed, err := strconv.ParseFloat(string(number), 64)
+			if err != nil {
+				return "NaN"
+			}
+			return javascriptFloatString(parsed, 64)
+		}
+	}
+
+	switch value.Kind() {
+	case reflect.String:
+		return value.String()
+	case reflect.Bool:
+		return strconv.FormatBool(value.Bool())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		// Go integer callers already had exact decimal formatting. Preserve that
+		// precision instead of routing values above 2^53 through float64.
+		return strconv.FormatInt(value.Int(), 10)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return strconv.FormatUint(value.Uint(), 10)
+	case reflect.Float32, reflect.Float64:
+		return javascriptFloatString(value.Float(), value.Type().Bits())
+	case reflect.Slice:
+		if value.IsNil() {
+			if arrayElement {
+				return ""
+			}
+			return "null"
+		}
+		return javascriptArrayString(value)
+	case reflect.Array:
+		return javascriptArrayString(value)
+	case reflect.Map:
+		if value.IsNil() {
+			if arrayElement {
+				return ""
+			}
+			return "null"
+		}
+		return "[object Object]"
+	case reflect.Struct:
+		return "[object Object]"
+	default:
+		return "[object Object]"
+	}
+}
+
+func javascriptArrayString(value reflect.Value) string {
+	parts := make([]string, value.Len())
+	for index := 0; index < value.Len(); index++ {
+		parts[index] = javascriptReflectString(value.Index(index), true)
+	}
+	return strings.Join(parts, ",")
+}
+
+func javascriptFloatString(value float64, bits int) string {
+	switch {
+	case math.IsNaN(value):
+		return "NaN"
+	case math.IsInf(value, 1):
+		return "Infinity"
+	case math.IsInf(value, -1):
+		return "-Infinity"
+	case value == 0:
+		// JavaScript String(-0) is "0".
+		return "0"
+	}
+
+	// encoding/json uses the same finite-number exponent thresholds as
+	// ECMAScript's number-to-string operation and normalizes exponent padding.
+	var encoded []byte
+	if bits == 32 {
+		encoded, _ = json.Marshal(float32(value))
+	} else {
+		encoded, _ = json.Marshal(value)
+	}
+	return string(encoded)
 }

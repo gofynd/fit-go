@@ -13,8 +13,10 @@
 // limitations under the License.
 
 // Package encryption provides AES-256-GCM encryption and decryption with LRU
-// caching and pluggable key providers (Vault, GCP KMS). Port
-// modules/encryption.
+// caching and pluggable key providers (Vault, GCP KMS). It preserves the
+// original fit.js/pyfit fixed-IV wire format for interoperability. Reusing an
+// IV with one AES-GCM key is unsafe, so new designs should use a versioned
+// format with a random nonce per value. Port modules/encryption.
 package encryption
 
 // Provider is the interface for key providers that supply a Data Encryption Key
