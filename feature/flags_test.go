@@ -6,7 +6,9 @@ package feature
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +17,12 @@ import (
 	"testing"
 	"time"
 )
+
+type featureRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn featureRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
 
 type sseEvent struct {
 	name string
@@ -120,7 +128,7 @@ func TestInitPreservesSynchronousPollingContract(t *testing.T) {
 		if r.Header.Get("X-Api-Key") != "legacy-key" {
 			t.Fatalf("legacy API key header = %q", r.Header.Get("X-Api-Key"))
 		}
-		value := r.Header.Get("X-User-Key") != "disabled-user"
+		value := r.Header.Get("X-User-Key") != "disabled-user" && r.Header.Get("X-Session-Key") != "disabled-session"
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"flag": value})
 	}))
 	defer server.Close()
@@ -140,9 +148,614 @@ func TestInitPreservesSynchronousPollingContract(t *testing.T) {
 	if client.IsEnabled("flag") {
 		t.Fatal("SetUserKey returned before its refreshed state was visible")
 	}
-	if requests.Load() < 2 {
-		t.Fatalf("legacy requests = %d, want at least 2", requests.Load())
+	client.SetUserKey("")
+	client.SetSessionKey("disabled-session")
+	if client.IsEnabled("flag") {
+		t.Fatal("SetSessionKey returned before its refreshed state was visible")
 	}
+	if requests.Load() < 4 {
+		t.Fatalf("legacy requests = %d, want at least 4", requests.Load())
+	}
+}
+
+func TestLegacyStopTerminatesPollLoop(t *testing.T) {
+	t.Setenv("FEATURE_FLAG_POLL_INTERVAL", "60")
+	legacy := &legacyClient{stopCh: make(chan struct{})}
+	done := make(chan struct{})
+	go func() {
+		legacy.poll()
+		close(done)
+	}()
+	legacy.stop()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("legacy poll loop did not stop")
+	}
+}
+
+func TestNewContextIsNilSafeWhenFeatureFlagsAreDisabled(t *testing.T) {
+	var client *Client
+	ctx := client.NewContext().UserKey("user").SessionKey("session").Attribute("segment", "blue")
+	if ctx == nil {
+		t.Fatal("NewContext returned nil")
+	}
+	if err := ctx.Build(context.Background()); err != nil {
+		t.Fatalf("nil-client Build: %v", err)
+	}
+	if ctx.IsEnabled("missing") || ctx.GetValue("missing") != nil {
+		t.Fatal("nil-client context unexpectedly evaluated a feature")
+	}
+}
+
+func TestLegacyPollingClientEvaluationContextUsesLegacyValues(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		enabled := r.Header.Get("X-User-Key") == "context-user" && r.Header.Get("X-Session-Key") == "context-session"
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"flag":  enabled,
+			"name":  "legacy",
+			"count": 42,
+		})
+	}))
+	defer server.Close()
+	t.Setenv("FEATURE_FLAG_ENABLED", "true")
+	t.Setenv("FEATURE_FLAG_URL", server.URL)
+	t.Setenv("FEATURE_FLAG_API_KEY", "legacy-key")
+
+	client, err := Init()
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	defer client.Stop()
+	evaluation := client.NewContext().UserKey("context-user").SessionKey("context-session")
+	if err := evaluation.Build(context.Background()); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !evaluation.IsEnabled("flag") {
+		t.Fatal("legacy evaluation context did not use the refreshed legacy value")
+	}
+	if got, ok := evaluation.GetString("name"); !ok || got != "legacy" {
+		t.Fatalf("GetString = %q, %v", got, ok)
+	}
+	if got, ok := evaluation.GetNumber("count"); !ok || got != 42 {
+		t.Fatalf("GetNumber = %v, %v", got, ok)
+	}
+	client.ResetContext()
+	if client.IsEnabled("flag") {
+		t.Fatal("ResetContext retained legacy user/session headers")
+	}
+}
+
+func TestLegacyPollingRefreshesFeatureValues(t *testing.T) {
+	var enabled atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"flag": enabled.Load()})
+	}))
+	defer server.Close()
+	t.Setenv("FEATURE_FLAG_ENABLED", "true")
+	t.Setenv("FEATURE_FLAG_URL", server.URL)
+	t.Setenv("FEATURE_FLAG_API_KEY", "legacy-key")
+	t.Setenv("FEATURE_FLAG_POLL_INTERVAL", "0.01")
+
+	client, err := Init()
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	defer client.Stop()
+	if client.IsEnabled("flag") {
+		t.Fatal("initial legacy flag unexpectedly enabled")
+	}
+	enabled.Store(true)
+	eventually(t, func() bool { return client.IsEnabled("flag") })
+}
+
+func TestRequiredInitialStateRetriesTooManyRequests(t *testing.T) {
+	var requests atomic.Int32
+	version := int64(1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintf(w, "event: features\ndata: %s\n\n", mustJSON(t, []*featureState{{
+			ID: "id", Key: "flag", Version: &version, Type: featureTypeBoolean, Value: true,
+		}}))
+	}))
+	defer server.Close()
+
+	client, err := InitWithOptions(Options{
+		Enabled: true, URL: server.URL, APIKey: "key*client", RequireInitialState: true,
+		InitTimeout: time.Second, ReconnectInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("InitWithOptions after 429: %v", err)
+	}
+	defer client.Stop()
+	if requests.Load() < 2 || !client.IsEnabled("flag") {
+		t.Fatal("client did not recover from an initial 429")
+	}
+}
+
+func TestStreamingTransportErrorDoesNotExposeAPIKeyOrContext(t *testing.T) {
+	client := &Client{
+		url:             "https://featurehub.example",
+		apiKey:          "environment/secret-api-key",
+		clientEvaluated: false,
+		attributes:      map[string][]string{"userkey": {"private-user"}},
+		httpClient: &http.Client{Transport: featureRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("dial failed")
+		})},
+	}
+	_, err := client.consumeStream(context.Background(), 1)
+	if err == nil {
+		t.Fatal("consumeStream unexpectedly succeeded")
+	}
+	if message := err.Error(); strings.Contains(message, "secret-api-key") || strings.Contains(message, "private-user") {
+		t.Fatalf("transport error exposed FeatureHub credentials/context: %q", message)
+	}
+	if unwrapped := errors.Unwrap(err); unwrapped != nil {
+		t.Fatalf("sanitized transport error unwrap = %T %v; want nil", unwrapped, unwrapped)
+	}
+}
+
+func TestInitialStreamEventsRetryBeforeFeatures(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		event string
+		data  string
+	}{
+		{name: "failure", event: "failure", data: `{}`},
+		{name: "bye", event: "bye", data: `{}`},
+		{name: "malformed features", event: "features", data: `{not-json`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var requests atomic.Int32
+			version := int64(1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				if requests.Add(1) == 1 {
+					_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", test.event, test.data)
+					return
+				}
+				_, _ = fmt.Fprintf(w, "event: features\ndata: %s\n\n", mustJSON(t, []*featureState{{
+					ID: "id", Key: "flag", Version: &version, Type: featureTypeBoolean, Value: true,
+				}}))
+			}))
+			defer server.Close()
+
+			client, err := InitWithOptions(Options{
+				Enabled: true, URL: server.URL, APIKey: "key*client", RequireInitialState: true,
+				InitTimeout: time.Second, ReconnectInterval: time.Millisecond,
+			})
+			if err != nil {
+				t.Fatalf("InitWithOptions: %v", err)
+			}
+			defer client.Stop()
+			if requests.Load() < 2 || !client.IsEnabled("flag") {
+				t.Fatalf("requests = %d enabled = %v; want recovery", requests.Load(), client.IsEnabled("flag"))
+			}
+		})
+	}
+}
+
+func TestZeroEdgeStaleKeepsHealthyStream(t *testing.T) {
+	var requests atomic.Int32
+	version := int64(1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintf(w, "event: features\ndata: %s\n\n", mustJSON(t, []*featureState{{
+			ID: "id", Key: "flag", Version: &version, Type: featureTypeBoolean, Value: true,
+		}}))
+		_, _ = fmt.Fprint(w, "event: config\ndata: {\"edge.stale\":0}\n\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	client, err := InitWithOptions(Options{
+		Enabled: true, URL: server.URL, APIKey: "key*client", RequireInitialState: true,
+		InitTimeout: time.Second, ReconnectInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("InitWithOptions: %v", err)
+	}
+	defer client.Stop()
+	time.Sleep(40 * time.Millisecond)
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("requests after zero-stale = %d; want one healthy stream", got)
+	}
+	if !client.Ready() || !client.IsEnabled("flag") {
+		t.Fatal("zero edge.stale made the healthy stream unready")
+	}
+}
+
+func TestUnbuiltEvaluationContextDoesNotUseParentValues(t *testing.T) {
+	version := int64(1)
+	serverEvaluated := &Client{
+		features: map[string]*featureState{
+			"flag": {ID: "id", Key: "flag", Version: &version, Type: featureTypeBoolean, Value: true},
+		},
+		defaults: make(map[string][]string),
+	}
+	if serverEvaluated.NewContext().UserKey("other").IsEnabled("flag") {
+		t.Fatal("unbuilt server-evaluated context used the parent client's value")
+	}
+
+	legacy := &Client{legacy: &legacyClient{flags: map[string]interface{}{"flag": true}}}
+	if legacy.NewContext().UserKey("other").IsEnabled("flag") {
+		t.Fatal("unbuilt legacy context used the parent client's value")
+	}
+}
+
+func TestLegacyEvaluationContextBuildHonorsCancellationAndBooleanCoercion(t *testing.T) {
+	requestStarted := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	client := &Client{legacy: &legacyClient{
+		url: server.URL, apiKey: "key", client: server.Client(), flags: make(map[string]interface{}),
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	err := client.NewContext().UserKey("user").Build(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Build error = %v; want context deadline exceeded", err)
+	}
+	<-requestStarted
+
+	valuesServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"string_true":"true","number_true":1,"false_value":false}`)
+	}))
+	defer valuesServer.Close()
+	client.legacy.url = valuesServer.URL
+	client.legacy.client = valuesServer.Client()
+	evaluation := client.NewContext().UserKey("user")
+	if err := evaluation.Build(context.Background()); err != nil {
+		t.Fatalf("Build with legacy values: %v", err)
+	}
+	if !evaluation.IsEnabled("string_true") || !evaluation.IsEnabled("number_true") || evaluation.IsEnabled("false_value") {
+		t.Fatal("legacy evaluation context did not preserve Client.IsEnabled coercion")
+	}
+}
+
+func TestEvaluationContextRejectsSnapshotForChangedAttributes(t *testing.T) {
+	requestStarted := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requestStarted <- struct{}{}
+		<-release
+		_, _ = io.WriteString(w, `{"flag":true}`)
+	}))
+	defer server.Close()
+	client := &Client{legacy: &legacyClient{
+		url: server.URL, apiKey: "key", client: server.Client(), flags: make(map[string]interface{}),
+	}}
+	evaluation := client.NewContext().UserKey("first")
+	result := make(chan error, 1)
+	go func() { result <- evaluation.Build(context.Background()) }()
+	<-requestStarted
+	evaluation.UserKey("second")
+	close(release)
+	if err := <-result; err == nil || !strings.Contains(err.Error(), "changed during Build") {
+		t.Fatalf("Build error = %v; want context-changed error", err)
+	}
+	if evaluation.IsEnabled("flag") {
+		t.Fatal("Build published a snapshot fetched for stale attributes")
+	}
+}
+
+func TestPermanentStreamFailureAfterReadinessStopsReconnects(t *testing.T) {
+	var requests atomic.Int32
+	version := int64(1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprintf(w, "event: features\ndata: %s\n\n", mustJSON(t, []*featureState{{
+				ID: "id", Key: "flag", Version: &version, Type: featureTypeBoolean, Value: true,
+			}}))
+			w.(http.Flusher).Flush()
+			time.Sleep(30 * time.Millisecond)
+			return
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	client, err := InitWithOptions(Options{
+		Enabled: true, URL: server.URL, APIKey: "key*client", RequireInitialState: true,
+		InitTimeout: time.Second, ReconnectInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("InitWithOptions: %v", err)
+	}
+	defer client.Stop()
+	select {
+	case <-client.done:
+	case <-time.After(time.Second):
+		t.Fatal("client did not stop after permanent post-readiness failure")
+	}
+	time.Sleep(20 * time.Millisecond)
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("request count = %d; want initial stream plus one permanent failure", got)
+	}
+	waitResult := make(chan error, 1)
+	go func() { waitResult <- client.WaitReady(context.Background()) }()
+	select {
+	case waitErr := <-waitResult:
+		if waitErr == nil || !strings.Contains(waitErr.Error(), "HTTP 401") {
+			t.Fatalf("WaitReady after permanent failure = %v; want terminal HTTP status", waitErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitReady remained blocked after a permanent post-readiness failure")
+	}
+}
+
+func TestEdgeStaleCoercionMatchesSafeFeatureHubSemantics(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		seconds float64
+		stale   bool
+	}{
+		{name: "numeric zero", raw: `0`},
+		{name: "negative", raw: `-1`},
+		{name: "false", raw: `false`},
+		{name: "null", raw: `null`},
+		{name: "empty string", raw: `""`},
+		{name: "positive number", raw: `5`, seconds: 5, stale: true},
+		{name: "positive numeric string", raw: `"5"`, seconds: 5, stale: true},
+		{name: "true coerces to one second", raw: `true`, seconds: 1, stale: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			seconds, stale, err := edgeStaleSeconds(json.RawMessage(test.raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if seconds != test.seconds || stale != test.stale {
+				t.Fatalf("edgeStaleSeconds(%s) = (%v, %v), want (%v, %v)", test.raw, seconds, stale, test.seconds, test.stale)
+			}
+		})
+	}
+}
+
+func TestServerEvaluatedBuildWithBackgroundContextIsBounded(t *testing.T) {
+	requestStarted := make(chan struct{}, 4)
+	requestCanceled := make(chan string, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		kind := "shared"
+		if r.Header.Get("x-featurehub") != "" {
+			kind = "snapshot"
+		}
+		select {
+		case requestStarted <- struct{}{}:
+		default:
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+		requestCanceled <- kind
+	}))
+	defer server.Close()
+
+	client, err := InitWithOptions(Options{
+		Enabled: true, URL: server.URL, APIKey: "server-key", InitTimeout: 40 * time.Millisecond,
+		ReconnectInterval: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("InitWithOptions: %v", err)
+	}
+	defer client.Stop()
+
+	started := time.Now()
+	err = client.NewContext().UserKey("user").Build(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Build error = %v; want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("Build remained blocked for %s", elapsed)
+	}
+	if got := len(requestStarted); got != 2 {
+		t.Fatalf("requests started = %d; want one shared stream plus exactly one isolated snapshot", got)
+	}
+	select {
+	case kind := <-requestCanceled:
+		if kind != "snapshot" {
+			t.Fatalf("first canceled request = %q; long-lived shared stream received snapshot timeout", kind)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("bounded snapshot request was not canceled")
+	}
+	select {
+	case kind := <-requestCanceled:
+		t.Fatalf("unexpected request cancellation before client Stop: %q", kind)
+	default:
+	}
+}
+
+func TestLegacyEvaluationContextsAreRequestIsolated(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user := r.Header.Get("X-User-Key")
+		if user == "slow" {
+			time.Sleep(20 * time.Millisecond)
+		}
+		if user == "" {
+			user = "parent"
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"value": user})
+	}))
+	defer server.Close()
+	t.Setenv("FEATURE_FLAG_ENABLED", "true")
+	t.Setenv("FEATURE_FLAG_URL", server.URL)
+	t.Setenv("FEATURE_FLAG_API_KEY", "legacy-key")
+
+	client, err := Init()
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	defer client.Stop()
+	slow := client.NewContext().UserKey("slow")
+	fast := client.NewContext().UserKey("fast")
+	var wait sync.WaitGroup
+	for _, evaluation := range []*EvaluationContext{slow, fast} {
+		wait.Add(1)
+		go func(evaluation *EvaluationContext) {
+			defer wait.Done()
+			if buildErr := evaluation.Build(context.Background()); buildErr != nil {
+				t.Errorf("Build: %v", buildErr)
+			}
+		}(evaluation)
+	}
+	wait.Wait()
+	if got := slow.GetValue("value"); got != "slow" {
+		t.Fatalf("slow context value = %v", got)
+	}
+	if got := fast.GetValue("value"); got != "fast" {
+		t.Fatalf("fast context value = %v", got)
+	}
+	if got := client.GetValue("value"); got != "parent" {
+		t.Fatalf("parent client value = %v; contexts mutated shared state", got)
+	}
+}
+
+func TestLegacyNilMethodsRemainSafe(t *testing.T) {
+	var client *Client
+	if client.Ready() || client.ClientEvaluated() || client.IsEnabled("flag") || client.GetValue("flag") != nil {
+		t.Fatal("nil client reported a value")
+	}
+	if _, ok := client.GetString("flag"); ok {
+		t.Fatal("nil GetString succeeded")
+	}
+	if _, ok := client.GetNumber("flag"); ok {
+		t.Fatal("nil GetNumber succeeded")
+	}
+	if _, ok := client.GetRawJSON("flag"); ok {
+		t.Fatal("nil GetRawJSON succeeded")
+	}
+	if err := client.WaitReady(context.Background()); err != nil {
+		t.Fatalf("nil WaitReady: %v", err)
+	}
+	client.SetUserKey("user")
+	client.SetSessionKey("session")
+	client.SetCountry("IN")
+	client.SetDevice("mobile")
+	client.SetPlatform("web")
+	client.SetVersion("1")
+	client.SetAttribute("key", "value")
+	client.SetAttributeValues("key", []string{"value"})
+	client.ResetContext()
+	client.Stop()
+
+	var evaluation *EvaluationContext
+	if evaluation.UserKey("user") != nil || evaluation.SessionKey("session") != nil || evaluation.Clear() != nil {
+		t.Fatal("nil evaluation setter returned non-nil")
+	}
+	if err := evaluation.Build(context.Background()); err != nil {
+		t.Fatalf("nil evaluation Build: %v", err)
+	}
+	if evaluation.IsEnabled("flag") || evaluation.GetValue("flag") != nil {
+		t.Fatal("nil evaluation reported a value")
+	}
+}
+
+func TestLegacyInitValidationAndServerError(t *testing.T) {
+	t.Setenv("FEATURE_FLAG_ENABLED", "true")
+	t.Setenv("FEATURE_FLAG_URL", "")
+	t.Setenv("FEATURE_FLAG_API_KEY", "key")
+	if _, err := Init(); err == nil {
+		t.Fatal("Init accepted missing URL")
+	}
+	t.Setenv("FEATURE_FLAG_URL", "http://localhost")
+	t.Setenv("FEATURE_FLAG_API_KEY", "")
+	if _, err := Init(); err == nil {
+		t.Fatal("Init accepted missing API key")
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	t.Setenv("FEATURE_FLAG_URL", server.URL)
+	t.Setenv("FEATURE_FLAG_API_KEY", "key")
+	if _, err := Init(); err == nil {
+		t.Fatal("Init accepted server error")
+	}
+}
+
+func TestLegacyArrayFormatAndURLTrimming(t *testing.T) {
+	var path string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		_ = json.NewEncoder(w).Encode([]map[string]interface{}{{"key": "array-flag", "value": true}})
+	}))
+	defer server.Close()
+	t.Setenv("FEATURE_FLAG_ENABLED", "true")
+	t.Setenv("FEATURE_FLAG_URL", server.URL+"/")
+	t.Setenv("FEATURE_FLAG_API_KEY", "legacy-key")
+	client, err := Init()
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	defer client.Stop()
+	if path != "/features" || !client.IsEnabled("array-flag") {
+		t.Fatalf("path = %q enabled = %v", path, client.IsEnabled("array-flag"))
+	}
+}
+
+func TestLegacyInitEnabledIsCaseInsensitive(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{})
+	}))
+	defer server.Close()
+	for _, enabled := range []string{"TRUE", "True", "tRuE", " true "} {
+		t.Run(enabled, func(t *testing.T) {
+			t.Setenv("FEATURE_FLAG_ENABLED", enabled)
+			t.Setenv("FEATURE_FLAG_URL", server.URL)
+			t.Setenv("FEATURE_FLAG_API_KEY", "legacy-key")
+			client, err := Init()
+			if err != nil || client == nil {
+				t.Fatalf("Init = %#v, %v", client, err)
+			}
+			client.Stop()
+		})
+	}
+}
+
+func TestLegacyConcurrentAccessAndIdempotentStop(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"flag": true, "value": "ok"})
+	}))
+	defer server.Close()
+	t.Setenv("FEATURE_FLAG_ENABLED", "true")
+	t.Setenv("FEATURE_FLAG_URL", server.URL)
+	t.Setenv("FEATURE_FLAG_API_KEY", "legacy-key")
+	client, err := Init()
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	var wait sync.WaitGroup
+	for index := 0; index < 32; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			_ = client.IsEnabled("flag")
+			_ = client.GetValue("value")
+			if index%2 == 0 {
+				client.SetUserKey(fmt.Sprintf("user-%d", index))
+			} else {
+				client.SetSessionKey(fmt.Sprintf("session-%d", index))
+			}
+		}(index)
+	}
+	wait.Wait()
+	client.Stop()
+	client.Stop()
 }
 
 func TestInitWithOptionsDoesNotRequireProcessEnvironment(t *testing.T) {
@@ -465,6 +1078,61 @@ func TestClientEvaluatedContextsAreIndependent(t *testing.T) {
 	}
 	if !blue.IsEnabled("context-flag") || red.IsEnabled("context-flag") || client.IsEnabled("context-flag") {
 		t.Fatal("client-evaluated request contexts leaked attributes")
+	}
+}
+
+func TestServerEvaluatedContextsUseIsolatedSnapshots(t *testing.T) {
+	version := int64(1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		header := r.Header.Get("x-featurehub")
+		value := "base"
+		switch {
+		case strings.Contains(header, "segment=blue"):
+			value = "blue"
+		case strings.Contains(header, "segment=red"):
+			value = "red"
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintf(w, "event: features\ndata: %s\n\n", mustJSON(t, []*featureState{{
+			ID: "id", Key: "color", Version: &version, Type: featureTypeString, Value: value,
+		}}))
+		if value == "base" {
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+		}
+	}))
+	defer server.Close()
+	client, err := InitWithOptions(Options{
+		Enabled: true, URL: server.URL, APIKey: "server-key", RequireInitialState: true, InitTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("InitWithOptions: %v", err)
+	}
+	defer client.Stop()
+
+	blue := client.NewContext().Attribute("segment", "blue")
+	red := client.NewContext().Attribute("segment", "red")
+	buildContext, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var wait sync.WaitGroup
+	for _, evaluation := range []*EvaluationContext{blue, red} {
+		wait.Add(1)
+		go func(evaluation *EvaluationContext) {
+			defer wait.Done()
+			if buildErr := evaluation.Build(buildContext); buildErr != nil {
+				t.Errorf("Build: %v", buildErr)
+			}
+		}(evaluation)
+	}
+	wait.Wait()
+	if got, _ := blue.GetString("color"); got != "blue" {
+		t.Fatalf("blue context = %q", got)
+	}
+	if got, _ := red.GetString("color"); got != "red" {
+		t.Fatalf("red context = %q", got)
+	}
+	if got, _ := client.GetString("color"); got != "base" {
+		t.Fatalf("parent stream context changed to %q", got)
 	}
 }
 

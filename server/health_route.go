@@ -84,25 +84,15 @@ func RegisterHealthRoutes(engine *gin.Engine) {
 }
 
 // RegisterStaticHealthRoutes registers unconditional Express-compatible health
-// responses with the exact body {"ok":"ok"}.
+// responses with the exact body {"ok":"ok"}. It also owns the Express
+// automatic OPTIONS response for those GET/HEAD routes.
 func RegisterStaticHealthRoutes(engine *gin.Engine) {
 	// Express routes are case-insensitive and non-strict and automatically use
 	// GET for HEAD. Gin's exact-path GET registration provides none of those
 	// behaviors, so install the compatibility boundary before registering the
 	// canonical routes. Other methods continue to NoRoute so an application's
 	// catch-all may own them.
-	engine.Use(func(c *gin.Context) {
-		if !isHealthRoutePath(c.Request.URL.Path) {
-			c.Next()
-			return
-		}
-		if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
-			c.Next()
-			return
-		}
-		staticHealthHandler()(c)
-		c.Abort()
-	})
+	engine.Use(staticHealthCompatibilityMiddleware())
 	engine.GET("/_healthz", staticHealthHandler())
 	engine.GET("/_healthz/", staticHealthHandler())
 	engine.GET("/_readyz", staticHealthHandler())
@@ -113,22 +103,37 @@ func RegisterStaticHealthRoutes(engine *gin.Engine) {
 	engine.HEAD("/_readyz/", staticHealthHandler())
 }
 
+func staticHealthCompatibilityMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !isHealthRoutePath(c.Request.URL.Path) {
+			c.Next()
+			return
+		}
+		if c.Request.Method == http.MethodOptions {
+			staticHealthOptionsHandler()(c)
+			c.Abort()
+			return
+		}
+		if c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead {
+			c.Next()
+			return
+		}
+		staticHealthHandler()(c)
+		c.Abort()
+	}
+}
+
 func isHealthRoutePath(path string) bool {
 	path = strings.TrimSuffix(path, "/")
 	return strings.EqualFold(path, "/_healthz") || strings.EqualFold(path, "/_readyz")
 }
 
 func isHealthProbeRequest(method, path string) bool {
-	if !isHealthRoutePath(path) {
-		return false
-	}
+	return method == http.MethodGet && (path == "/_healthz" || path == "/_readyz")
+}
 
-	switch method {
-	case http.MethodGet, http.MethodHead, http.MethodOptions:
-		return true
-	default:
-		return false
-	}
+func isStaticHealthProbeRequest(method, path string) bool {
+	return (method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions) && isHealthRoutePath(path)
 }
 
 // RegisterHealthRoutesWithCheckers registers independent liveness and
@@ -206,6 +211,20 @@ func staticHealthHandler() gin.HandlerFunc {
 			return
 		}
 		c.Data(http.StatusOK, "application/json; charset=utf-8", body)
+	}
+}
+
+func staticHealthOptionsHandler() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		const body = "GET, HEAD"
+		if suppressor, ok := c.Writer.(interface{ SuppressETag() }); ok {
+			suppressor.SuppressETag()
+		}
+		c.Header("X-Powered-By", "Express")
+		c.Header("Allow", body)
+		c.Header("Content-Type", "text/plain")
+		c.Header("Content-Length", strconv.Itoa(len(body)))
+		c.Data(http.StatusOK, "text/plain", []byte(body))
 	}
 }
 

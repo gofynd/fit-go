@@ -83,7 +83,10 @@ type Header struct {
 // Mirrors the Message interface used.
 type Message struct {
 	// Key is the optional partition key. When set, messages with the same
-	// key are routed to the same partition.
+	// key are routed to the same partition. Producers created by the original
+	// Producer constructor retain fit-go's historical behavior where both nil
+	// and []byte{} are keyless. ProducerWithOptions preserves a non-nil empty key
+	// as an explicitly present empty wire key across its entry points.
 	Key []byte
 
 	// Value is the message payload.
@@ -110,8 +113,9 @@ func NewMessage(value []byte) Message {
 }
 
 // NewKeyedMessage creates a keyed message whose partition is selected by the
-// configured producer partitioner. A present empty key remains distinct from a
-// missing key, matching KafkaJS.
+// configured producer partitioner. ProducerWithOptions preserves a present
+// empty key as distinct from a missing key, matching KafkaJS; the original
+// Producer constructor retains fit-go's historical keyless-empty behavior.
 func NewKeyedMessage(key, value []byte) Message {
 	return Message{Key: key, Value: value, Partition: -1}
 }

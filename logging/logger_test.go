@@ -812,6 +812,37 @@ func TestLog_ImplicitTraceFromGoroutineLocal(t *testing.T) {
 	}
 }
 
+func TestLog_ExplicitContextOverridesGoroutineLocalTrace(t *testing.T) {
+	SetImplicitTraceEnabled(true)
+	defer SetImplicitTraceEnabled(false)
+	var buf bytes.Buffer
+	lg, err := New(Options{Level: "info", Env: "production", Output: &buf})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	parentTrace, _ := oteltrace.TraceIDFromHex("11111111111111111111111111111111")
+	parentSpan, _ := oteltrace.SpanIDFromHex("1111111111111111")
+	childTrace, _ := oteltrace.TraceIDFromHex("22222222222222222222222222222222")
+	childSpan, _ := oteltrace.SpanIDFromHex("2222222222222222")
+	parent := oteltrace.ContextWithSpanContext(context.Background(), oteltrace.NewSpanContext(oteltrace.SpanContextConfig{
+		TraceID: parentTrace, SpanID: parentSpan,
+	}))
+	child := oteltrace.ContextWithSpanContext(context.Background(), oteltrace.NewSpanContext(oteltrace.SpanContextConfig{
+		TraceID: childTrace, SpanID: childSpan,
+	}))
+	restore := goroutinectx.Inject(parent)
+	defer restore()
+
+	lg.WithContext(child).Info("explicit child")
+	output := buf.String()
+	if !strings.Contains(output, childTrace.String()) || !strings.Contains(output, childSpan.String()) {
+		t.Fatalf("explicit trace context was not preserved: %s", output)
+	}
+	if strings.Contains(output, parentTrace.String()) || strings.Contains(output, parentSpan.String()) {
+		t.Fatalf("goroutine trace overrode explicit trace context: %s", output)
+	}
+}
+
 // Without any goroutine-local context, logs carry no trace id (no false data).
 func TestLog_NoImplicitTraceWhenNoneInjected(t *testing.T) {
 	var buf bytes.Buffer

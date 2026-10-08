@@ -435,6 +435,11 @@ func (p *Profiler) wallSampler() {
 	defer close(p.wallDone)
 
 	interval := time.Duration(p.config.WallSamplingIntervalMicros) * time.Microsecond
+	if interval <= 0 {
+		// Configuration is intentionally non-fatal for compatibility, but an
+		// invalid ticker duration must never panic in a background goroutine.
+		interval = 10 * time.Millisecond
+	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 

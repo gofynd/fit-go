@@ -131,3 +131,35 @@ func TestCreateFileRejectsUnsafeNames(t *testing.T) {
 		}
 	}
 }
+
+func TestCreateFileGeneratedIdentifiersCannotCollideAcrossVersions(t *testing.T) {
+	first, err := CreateFile(t.TempDir(), "migrations", "v1.2.31", "change")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := CreateFile(t.TempDir(), "migrations", "v1.23.1", "change")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSource, err := os.ReadFile(first.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondSource, err := os.ReadFile(second.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(firstSource), "var V1_2_31_1_Change") {
+		t.Fatalf("first generated identifier is not version-delimited:\n%s", firstSource)
+	}
+	if !strings.Contains(string(secondSource), "var V1_23_1_1_Change") {
+		t.Fatalf("second generated identifier is not version-delimited:\n%s", secondSource)
+	}
+}
+
+func TestCreateFileRejectsOverflowingVersionComponent(t *testing.T) {
+	_, err := CreateFile(t.TempDir(), "migrations", "v18446744073709551616.0.0", "change")
+	if err == nil || !strings.Contains(err.Error(), "major version component") {
+		t.Fatalf("CreateFile() error = %v, want version overflow", err)
+	}
+}

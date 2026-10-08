@@ -28,7 +28,7 @@ func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) 
 	return f(request)
 }
 
-func TestGetSecretFromGSMDecodesRESTPayload(t *testing.T) {
+func TestGetSecretFromGSMPreservesEncodedRESTPayload(t *testing.T) {
 	t.Setenv("GOOGLE_CLOUD_PROJECT", "test-project")
 	oldTransport := http.DefaultTransport
 	http.DefaultTransport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
@@ -53,12 +53,21 @@ func TestGetSecretFromGSMDecodesRESTPayload(t *testing.T) {
 	})
 	t.Cleanup(func() { http.DefaultTransport = oldTransport })
 
+	want := base64.StdEncoding.EncodeToString([]byte("postgres://decoded"))
 	got, err := GetSecretFromGSM("database-url", "7")
 	if err != nil {
 		t.Fatalf("GetSecretFromGSM() error = %v", err)
 	}
-	if got != "postgres://decoded" {
-		t.Fatalf("GetSecretFromGSM() = %q, want decoded payload", got)
+	if got != want {
+		t.Fatalf("GetSecretFromGSM() = %q, want encoded payload %q", got, want)
+	}
+
+	decoded, err := GetDecodedSecretFromGSM("database-url", "7")
+	if err != nil {
+		t.Fatalf("GetDecodedSecretFromGSM() error = %v", err)
+	}
+	if decoded != "postgres://decoded" {
+		t.Fatalf("GetDecodedSecretFromGSM() = %q, want decoded payload", decoded)
 	}
 }
 

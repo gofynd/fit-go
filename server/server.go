@@ -154,6 +154,7 @@ type Server struct {
 	server           *http.Server
 	logger           *slog.Logger
 	fallbackHandler  http.Handler // used for single-type or internal-type root mounting
+	healthRouteMW    []Middleware
 	upstreamDefaults bool
 	profilerOwned    bool
 
@@ -164,6 +165,29 @@ type Server struct {
 	// Router is the gin.Engine, available for direct route registration.
 	//
 	Router *gin.Engine
+}
+
+// UseHealthRouteMiddleware installs application-owned health compatibility
+// middleware after fit-go's security/access-log/CORS boundary and before caller
+// middleware and request parsers. It is intended for applications that
+// explicitly implement Express-style case/slash/HEAD/OPTIONS health variants.
+// Each middleware must call Next for every path or method it does not own.
+// It must be configured before Init.
+func (s *Server) UseHealthRouteMiddleware(middlewares ...Middleware) error {
+	if s == nil {
+		return fmt.Errorf("server: nil server")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.App != nil {
+		return fmt.Errorf("server: health route middleware must be configured before Init")
+	}
+	for _, middleware := range middlewares {
+		if middleware != nil {
+			s.healthRouteMW = append(s.healthRouteMW, middleware)
+		}
+	}
+	return nil
 }
 
 // New creates a new Server with the given configuration.
@@ -244,6 +268,7 @@ func (s *Server) Init(
 	// Create a fresh engine for this init
 	gin.SetMode(gin.ReleaseMode)
 	root := gin.New()
+	staticHealthCompatibility := !s.upstreamDefaults && (s.cfg.StaticHealthResponse || s.cfg.LegacyStaticHealthResponse)
 
 	// 1. Build middleware chain on the engine
 
@@ -254,6 +279,11 @@ func (s *Server) Init(
 	}
 	if secureHeaders {
 		root.Use(SecureHeaders())
+	}
+	if staticHealthCompatibility {
+		// Mark the exact legacy-static requests owned by fit-go before access
+		// logging runs. Unowned health-like variants remain in the normal chain.
+		root.Use(markOwnedStaticHealthProbe())
 	}
 
 	// Request ID: forward an inbound X-Request-ID or mint one, expose it on the
@@ -318,13 +348,23 @@ func (s *Server) Init(
 		}))
 	}
 
-	// CORS (dynamic, callback-based). Installed engine-level AFTER logging but BEFORE
-	// the payload/user-data parse middlewares so a preflight OPTIONS is answered without
-	// parsing a body/user header, and — being engine-level — it runs on gin's no-route
-	// path too, so a preflight to a GET/POST-only path is handled rather than 404/405'd.
-	// nil = disabled (no middleware mounted).
+	// CORS (dynamic, callback-based). Install it before explicit health
+	// compatibility so health preflights receive the same CORS contract as every
+	// other route. Request logging remains outside CORS and static health probes
+	// remain suppressed by their explicit ownership marker.
 	if s.cfg.CORS != nil {
 		root.Use(DynamicCORS(*s.cfg.CORS))
+	}
+
+	// Explicit health compatibility runs after fit-go's security/logging/CORS
+	// layer but before application parsing/auth. Only static compatibility is
+	// marked before logging: a caller-supplied health middleware may fall through,
+	// and those requests must remain visible to access logging and auth.
+	if staticHealthCompatibility {
+		root.Use(staticHealthCompatibilityMiddleware())
+	}
+	for _, middleware := range s.healthRouteMW {
+		root.Use(middleware)
 	}
 
 	// Request middlewares provided by user (pre-parse)
@@ -332,7 +372,7 @@ func (s *Server) Init(
 		if s.upstreamDefaults {
 			root.Use(mw)
 		} else {
-			root.Use(bypassHealthRoutes(mw))
+			root.Use(bypassHealthRoutes(mw, staticHealthCompatibility))
 		}
 	}
 
@@ -344,9 +384,9 @@ func (s *Server) Init(
 			root.Use(GinParseUserData)
 			root.Use(GinParseApplicationData)
 		} else {
-			root.Use(bypassHealthRoutes(GinMaxPayloadSize(payloadSize)))
-			root.Use(bypassHealthRoutes(GinParseUserData))
-			root.Use(bypassHealthRoutes(GinParseApplicationData))
+			root.Use(bypassHealthRoutes(GinMaxPayloadSize(payloadSize), staticHealthCompatibility))
+			root.Use(bypassHealthRoutes(GinParseUserData, staticHealthCompatibility))
+			root.Use(bypassHealthRoutes(GinParseApplicationData, staticHealthCompatibility))
 		}
 	}
 

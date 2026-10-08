@@ -100,7 +100,7 @@ the original broker or handler error.
 ## GraphQL And Process Boundaries
 
 `fitgraphql` is a gqlgen handler extension that creates an internal operation
-span and optional resolver spans under the surrounding HTTP/WebSocket span. It
+span and explicitly opt-in resolver spans under the surrounding HTTP/WebSocket span. It
 exports operation type, explicitly mapped persisted/allowlisted operation
 identity, resolver object/name, and generic error state/count only. Raw
 client-supplied operation names, query text, variables, aliases/paths,

@@ -526,6 +526,17 @@ func TestAuthorizeJWT_StringPayload(t *testing.T) {
 	_, _ = mac.Write([]byte(signingInput))
 	token := signingInput + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 
+	legacyEngine := gin.New()
+	legacyEngine.Use(AuthorizeJWTToken(JWTOptions{Secret: secret}))
+	legacyEngine.GET("/test", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	legacyRequest := httptest.NewRequest(http.MethodGet, "/test", nil)
+	legacyRequest.Header.Set("Authorization", "Bearer "+token)
+	legacyResponse := httptest.NewRecorder()
+	legacyEngine.ServeHTTP(legacyResponse, legacyRequest)
+	if legacyResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("original middleware accepted scalar payload: status=%d", legacyResponse.Code)
+	}
+
 	var decoded interface{}
 	engine := gin.New()
 	engine.Use(AuthorizeJWTTokenAdvanced(JWTAdvancedOptions{
@@ -1228,6 +1239,28 @@ func TestRequestIDAdvancedExposesGeneratedIDToHandlers(t *testing.T) {
 	generated := response.Header().Get("X-Request-ID")
 	if generated == "" || inboundID != generated || request.Header.Get("X-Request-ID") != generated {
 		t.Fatalf("advanced generated ID response/handler/request = %q/%q/%q", generated, inboundID, request.Header.Get("X-Request-ID"))
+	}
+}
+
+func TestRequestIDAdvancedReplacesUnsafeInboundID(t *testing.T) {
+	for _, unsafeID := range []string{
+		strings.Repeat("x", maxPropagatedRequestIDLength+1),
+		"request id with spaces",
+		"request\tid",
+	} {
+		t.Run(fmt.Sprintf("length_%d", len(unsafeID)), func(t *testing.T) {
+			engine := gin.New()
+			engine.Use(RequestIDAdvanced())
+			engine.GET("/", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+			request := httptest.NewRequest(http.MethodGet, "/", nil)
+			request.Header.Set("X-Request-ID", unsafeID)
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			got := response.Header().Get("X-Request-ID")
+			if got == "" || got == unsafeID || request.Header.Get("X-Request-ID") != got {
+				t.Fatalf("unsafe request ID was not replaced consistently: response=%q request=%q", got, request.Header.Get("X-Request-ID"))
+			}
+		})
 	}
 }
 

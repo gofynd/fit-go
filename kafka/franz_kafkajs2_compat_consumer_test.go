@@ -23,13 +23,16 @@ type fakeFranzKafkaJS2CompatClient struct {
 
 	pollFn          func(context.Context, int) kgo.Fetches
 	commitRecordsFn func(context.Context, ...*kgo.Record) error
+	commitMarkedFn  func(context.Context) error
 
 	pollCalls           int
 	allowRebalanceCalls int
 	closeCalls          int
 	markedOffsets       []int64
+	commitMarkedCalls   int
 	exactOffsets        []int64
 	setOffsetsCalls     int
+	setOffsets          []consumerRecordPosition
 }
 
 func TestDeprecatedKafkaJSConsumerBackendAliasMatchesCanonicalValue(t *testing.T) {
@@ -85,10 +88,40 @@ func (f *fakeFranzKafkaJS2CompatClient) MarkCommitRecords(records ...*kgo.Record
 	f.mu.Unlock()
 }
 
-func (f *fakeFranzKafkaJS2CompatClient) SetOffsets(map[string]map[int32]kgo.EpochOffset) {
+func (f *fakeFranzKafkaJS2CompatClient) CommitMarkedOffsets(ctx context.Context) error {
+	f.mu.Lock()
+	f.commitMarkedCalls++
+	commitMarkedFn := f.commitMarkedFn
+	f.mu.Unlock()
+	if commitMarkedFn != nil {
+		return commitMarkedFn(ctx)
+	}
+	return nil
+}
+
+func (f *fakeFranzKafkaJS2CompatClient) markedCommitCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.commitMarkedCalls
+}
+
+func (f *fakeFranzKafkaJS2CompatClient) SetOffsets(offsets map[string]map[int32]kgo.EpochOffset) {
 	f.mu.Lock()
 	f.setOffsetsCalls++
+	for topic, partitions := range offsets {
+		for partition, offset := range partitions {
+			f.setOffsets = append(f.setOffsets, consumerRecordPosition{
+				topic: topic, partition: partition, offset: offset.Offset, leaderEpoch: offset.Epoch,
+			})
+		}
+	}
 	f.mu.Unlock()
+}
+
+func (f *fakeFranzKafkaJS2CompatClient) rewoundOffsets() []consumerRecordPosition {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]consumerRecordPosition(nil), f.setOffsets...)
 }
 
 func (f *fakeFranzKafkaJS2CompatClient) CommitOffsetsSync(
@@ -428,6 +461,265 @@ func TestFranzKafkaJS2CompatManualConsumerDisablesBackgroundAutoCommit(t *testin
 	defer client.Close()
 	if disabled, ok := client.OptValue(kgo.DisableAutoCommit).(bool); !ok || !disabled {
 		t.Fatalf("DisableAutoCommit = %#v; manual mode could background-commit an unhandled record", client.OptValue(kgo.DisableAutoCommit))
+	}
+}
+
+func TestFranzKafkaJS2CompatRuntimeAutoCommitOverrideCommitsSynchronously(t *testing.T) {
+	client := &fakeFranzKafkaJS2CompatClient{}
+	consumer := newFranzKafkaJS2LifecycleTestConsumer(t, client, ConsumerShutdownCancelInFlight)
+	consumer.config.AutoCommit = false
+	record := &kgo.Record{Topic: "orders", Partition: 2, Offset: 11, Value: []byte("payload")}
+
+	if err := consumer.processRecord(
+		context.Background(), client, record,
+		func(context.Context, MessagePayload) error { return nil },
+		true,
+		ConsumerAdvancedOptions{},
+	); err != nil {
+		t.Fatalf("processRecord: %v", err)
+	}
+
+	_, _, marked, exact := client.snapshot()
+	if len(marked) != 0 {
+		t.Fatalf("marked offsets = %v, want none because construction disabled the background commit loop", marked)
+	}
+	if want := []int64{12}; !reflect.DeepEqual(exact, want) {
+		t.Fatalf("synchronous commits = %v, want %v", exact, want)
+	}
+}
+
+func TestKafkaJSPayloadPreservesNullAndPresentEmptyKeys(t *testing.T) {
+	nullPayload := kafkaJSPayload(&kgo.Record{Key: nil})
+	if nullPayload.Key != nil {
+		t.Fatalf("null key became %#v", nullPayload.Key)
+	}
+
+	emptyPayload := kafkaJSPayload(&kgo.Record{Key: []byte{}})
+	if emptyPayload.Key == nil || len(emptyPayload.Key) != 0 {
+		t.Fatalf("present-empty key became %#v", emptyPayload.Key)
+	}
+}
+
+func TestFranzKafkaJS2CompatRevokeCommitsMarkedOffsetsBeforeHook(t *testing.T) {
+	logger, err := logging.New(logging.Options{Level: "error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeFranzKafkaJS2CompatClient{}
+	order := make([]string, 0, 2)
+	client.commitMarkedFn = func(context.Context) error {
+		order = append(order, "commit")
+		return nil
+	}
+	consumer := &franzKafkaJS2CompatConsumer{
+		client: client,
+		config: ConsumerAdvancedConfig{
+			GroupID:    "group",
+			AutoCommit: true,
+			OnPartitionsRevoked: func(parts []PartitionAssignment) {
+				order = append(order, "hook")
+				if want := []PartitionAssignment{{Topic: "orders", Partition: 1}}; !reflect.DeepEqual(parts, want) {
+					t.Errorf("revoked assignments = %#v, want %#v", parts, want)
+				}
+			},
+		},
+		logger: logger,
+	}
+
+	consumer.handlePartitionsRevoked(context.Background(), client, map[string][]int32{"orders": {1}})
+	if want := []string{"commit", "hook"}; !reflect.DeepEqual(order, want) {
+		t.Fatalf("revoke order = %v, want %v", order, want)
+	}
+	if got := client.markedCommitCount(); got != 1 {
+		t.Fatalf("final marked commits = %d, want 1", got)
+	}
+}
+
+func TestFranzKafkaJS2CompatLostPartitionsNeverCommit(t *testing.T) {
+	logger, err := logging.New(logging.Options{Level: "error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeFranzKafkaJS2CompatClient{}
+	var got []PartitionAssignment
+	consumer := &franzKafkaJS2CompatConsumer{
+		client: client,
+		config: ConsumerAdvancedConfig{
+			GroupID:    "group",
+			AutoCommit: true,
+			OnPartitionsLost: func(parts []PartitionAssignment) {
+				got = append([]PartitionAssignment(nil), parts...)
+			},
+		},
+		logger: logger,
+	}
+	consumer.handlePartitionsLost(map[string][]int32{"orders": {2}})
+	if want := []PartitionAssignment{{Topic: "orders", Partition: 2}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("lost assignments = %#v, want %#v", got, want)
+	}
+	if commits := client.markedCommitCount(); commits != 0 {
+		t.Fatalf("lost-partition commits = %d, want 0", commits)
+	}
+}
+
+func TestFranzKafkaJS2CompatLostPartitionsFallBackToRevokeHook(t *testing.T) {
+	logger, err := logging.New(logging.Options{Level: "error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeFranzKafkaJS2CompatClient{}
+	var got []PartitionAssignment
+	consumer := &franzKafkaJS2CompatConsumer{
+		client: client,
+		config: ConsumerAdvancedConfig{
+			GroupID:    "group",
+			AutoCommit: true,
+			OnPartitionsRevoked: func(parts []PartitionAssignment) {
+				got = append([]PartitionAssignment(nil), parts...)
+			},
+		},
+		logger: logger,
+	}
+	consumer.handlePartitionsLost(map[string][]int32{"orders": {2}})
+	if want := []PartitionAssignment{{Topic: "orders", Partition: 2}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("fallback revoke assignments = %#v, want %#v", got, want)
+	}
+	if commits := client.markedCommitCount(); commits != 0 {
+		t.Fatalf("lost-partition commits = %d, want 0", commits)
+	}
+}
+
+func TestFranzKafkaJS2CompatHandlerRecoveryRewindsExactFailedOffset(t *testing.T) {
+	client := &fakeFranzKafkaJS2CompatClient{}
+	consumer := newFranzKafkaJS2LifecycleTestConsumer(t, client, ConsumerShutdownCancelInFlight)
+	handlerErr := newConsumerHandlerErrorAt("handler failed", errors.New("boom"), consumerRecordPosition{
+		topic: "orders", partition: 3, offset: 42, leaderEpoch: 7,
+	})
+	if got := consumer.prepareTransientRunRetry(client, handlerErr); got != handlerErr {
+		t.Fatalf("prepare error = %v, want original handler error", got)
+	}
+	if consumer.client != client {
+		t.Fatal("handler recovery discarded the healthy client")
+	}
+	want := []consumerRecordPosition{{topic: "orders", partition: 3, offset: 42, leaderEpoch: 7}}
+	if got := client.rewoundOffsets(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("rewound offsets = %#v, want %#v", got, want)
+	}
+}
+
+func TestFranzAdvancedConsumerReusesClientAtFailedOffset(t *testing.T) {
+	record := &kgo.Record{Topic: "orders", Partition: 1, Offset: 11, Value: []byte("payload")}
+	handlerErr := errors.New("handler rejected record")
+	stopErr := errors.New("stop after replay")
+	polls := 0
+	first := &fakeFranzKafkaJS2CompatClient{pollFn: func(context.Context, int) kgo.Fetches {
+		polls++
+		if polls <= 2 {
+			return kafkaJSTestFetch(record)
+		}
+		return kgo.NewErrFetch(stopErr)
+	}}
+	consumer := newFranzKafkaJS2LifecycleTestConsumer(t, first, ConsumerShutdownCancelInFlight)
+	consumer.brokers = []string{"127.0.0.1:1"}
+	consumer.fitCfg = &Config{ClientID: "test"}
+	consumer.topics = []TopicConfig{{Topic: "orders", FromBeginning: true}}
+	created := 0
+	consumer.newClient = func(...kgo.Opt) (franzKafkaJS2CompatClient, error) {
+		created++
+		return &fakeFranzKafkaJS2CompatClient{}, nil
+	}
+
+	seen := make([]int64, 0, 2)
+	err := consumer.ConsumeCtx(func(_ context.Context, payload MessagePayload) error {
+		seen = append(seen, payload.Offset)
+		return handlerErr
+	}, ConsumerOptions{PollTimeout: time.Second, MaxRecords: 1})
+	if !errors.Is(err, handlerErr) {
+		t.Fatalf("first Consume error = %v, want handler error", err)
+	}
+	if consumer.client != first {
+		t.Fatal("failed run discarded its healthy franz-go client")
+	}
+	_, firstCloses, _, _ := first.snapshot()
+	if firstCloses != 0 {
+		t.Fatalf("failed client closes = %d, want 0", firstCloses)
+	}
+	if got := first.rewoundOffsets(); len(got) != 1 || got[0].topic != "orders" || got[0].partition != 1 || got[0].offset != 11 {
+		t.Fatalf("handler recovery offsets = %#v, want orders[1]@11", got)
+	}
+
+	err = consumer.ConsumeCtx(func(_ context.Context, payload MessagePayload) error {
+		seen = append(seen, payload.Offset)
+		return nil
+	}, ConsumerOptions{PollTimeout: time.Second, MaxRecords: 1})
+	if !errors.Is(err, stopErr) {
+		t.Fatalf("second Consume error = %v, want stop error", err)
+	}
+	if created != 0 {
+		t.Fatalf("recreated clients = %d, want 0", created)
+	}
+	if want := []int64{11, 11}; !reflect.DeepEqual(seen, want) {
+		t.Fatalf("handled offsets = %v, want replay %v", seen, want)
+	}
+}
+
+func TestFranzKafkaJS2CompatRebalanceLifecycleCloseDoesNotMisclassifyExternalClose(t *testing.T) {
+	logger, err := logging.New(logging.Options{Level: "error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &fakeFranzKafkaJS2CompatClient{}
+	runDone := make(chan struct{})
+	hookCloseReturned := make(chan error, 1)
+	releaseHook := make(chan struct{})
+	consumer := &franzKafkaJS2CompatConsumer{
+		client:  client,
+		runDone: runDone,
+		config: ConsumerAdvancedConfig{
+			GroupID: "group",
+		},
+		logger: logger,
+	}
+	consumer.config.OnPartitionsRevokedWithLifecycle = func(_ []PartitionAssignment, lifecycle RebalanceLifecycle) {
+		hookCloseReturned <- lifecycle.Close()
+		<-releaseHook
+	}
+
+	hookDone := make(chan struct{})
+	go func() {
+		consumer.handlePartitionsRevoked(context.Background(), client, map[string][]int32{"orders": {0}})
+		close(hookDone)
+	}()
+
+	select {
+	case err := <-hookCloseReturned:
+		if err != nil {
+			t.Fatalf("Close from hook: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lifecycle Close deadlocked inside the revoke hook")
+	}
+	externalClose := make(chan error, 1)
+	go func() { externalClose <- consumer.Close() }()
+	select {
+	case err := <-externalClose:
+		t.Fatalf("external Close returned while the revoke hook was active: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(releaseHook)
+	<-hookDone
+	close(runDone)
+	select {
+	case err := <-externalClose:
+		if err != nil {
+			t.Fatalf("external Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("external Close did not finish after the callback and run drained")
+	}
+	_, closes, _, _ := client.snapshot()
+	if closes != 1 {
+		t.Fatalf("client closes = %d, want 1", closes)
 	}
 }
 

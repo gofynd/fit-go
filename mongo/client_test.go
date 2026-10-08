@@ -16,6 +16,7 @@ package mongo
 
 import (
 	"context"
+	"crypto/tls"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -318,7 +319,7 @@ func TestBuildDialOptions(t *testing.T) {
 			ConnectTimeout: 5 * time.Second,
 		}
 
-		dialOpts, err := buildDialOptions("USERS", "write", "users", opts, true, false)
+		dialOpts, err := buildDialOptions("USERS", "write", "users", opts, true, false, false)
 		if err != nil {
 			t.Fatalf("buildDialOptions() error = %v", err)
 		}
@@ -355,7 +356,7 @@ func TestBuildDialOptions(t *testing.T) {
 			},
 		}
 
-		dialOpts, err := buildDialOptions("ORDERS", "read", "orders", opts, false, true)
+		dialOpts, err := buildDialOptions("ORDERS", "read", "orders", opts, false, true, false)
 		if err != nil {
 			t.Fatalf("buildDialOptions() error = %v", err)
 		}
@@ -373,7 +374,7 @@ func TestBuildDialOptions(t *testing.T) {
 			ConnectTimeout: 30 * time.Second,
 		}
 
-		dialOpts, err := buildDialOptions("SVC", "write", "svc", opts, false, false)
+		dialOpts, err := buildDialOptions("SVC", "write", "svc", opts, false, false, false)
 		if err != nil {
 			t.Fatalf("buildDialOptions() error = %v", err)
 		}
@@ -662,22 +663,34 @@ func TestInit(t *testing.T) {
 		}
 	})
 
-	t.Run("propagates TLS configuration errors before dialing", func(t *testing.T) {
+	t.Run("legacy init ignores incomplete TLS while strict init rejects it", func(t *testing.T) {
 		os.Setenv("MONGO_TLSFAIL_READ_WRITE", "mongodb://localhost:27017/test")
 		os.Setenv("MONGO_TLSFAIL_SSL_CA", "/does/not/exist")
 		defer os.Unsetenv("MONGO_TLSFAIL_READ_WRITE")
 		defer os.Unsetenv("MONGO_TLSFAIL_SSL_CA")
 
+		var capturedTLS atomic.Pointer[tls.Config]
+		_, err := Init(ConnectionOptions{Dial: func(_ context.Context, _ string, opts *DialOptions) (Connection, error) {
+			capturedTLS.Store(opts.TLSConfig)
+			return &mockConnection{}, nil
+		}})
+		if err != nil {
+			t.Fatalf("legacy Init() error = %v", err)
+		}
+		if capturedTLS.Load() != nil {
+			t.Fatal("legacy Init passed a partial TLS configuration to Dial")
+		}
+
 		dialCalled := atomic.Bool{}
-		_, err := Init(ConnectionOptions{Dial: func(context.Context, string, *DialOptions) (Connection, error) {
+		_, err = InitWithTLSValidation(ConnectionOptions{Dial: func(context.Context, string, *DialOptions) (Connection, error) {
 			dialCalled.Store(true)
 			return &mockConnection{}, nil
 		}})
 		if err == nil || !strings.Contains(err.Error(), "TLS configuration") {
-			t.Fatalf("Init() error = %v, want TLS configuration error", err)
+			t.Fatalf("InitWithTLSValidation() error = %v, want TLS configuration error", err)
 		}
 		if dialCalled.Load() {
-			t.Fatal("Dial was called with an invalid TLS configuration")
+			t.Fatal("strict Init called Dial with an invalid TLS configuration")
 		}
 	})
 

@@ -82,6 +82,28 @@ func TestSlogHandler_WithAttrsAndGroup(t *testing.T) {
 	}
 }
 
+func TestSlogHandler_FlattensInlineAndNestedGroups(t *testing.T) {
+	sl, buf := newTestSlog(t)
+	sl.Info("grouped",
+		slog.Group("request", slog.String("method", "GET"), slog.Group("client", slog.String("id", "abc"))),
+		slog.Group("", slog.String("inline", "value")),
+	)
+	output := buf.String()
+	for _, key := range []string{`"request.method"`, `"request.client.id"`, `"inline"`} {
+		if !strings.Contains(output, key) {
+			t.Fatalf("grouped slog output missing %s: %s", key, output)
+		}
+	}
+}
+
+func TestSlogHandler_UsesRecordProgramCounterForErrors(t *testing.T) {
+	sl, buf := newTestSlog(t)
+	sl.Error("failed")
+	if output := buf.String(); !strings.Contains(output, "sloghandler_test.go") {
+		t.Fatalf("error caller did not use slog record PC: %s", output)
+	}
+}
+
 func TestSetAsDefaultSlogRestoresBaselineAfterOutOfOrderOwners(t *testing.T) {
 	baseline := slog.Default()
 	first, err := New(Options{Level: "info", Env: "production", Output: &bytes.Buffer{}})

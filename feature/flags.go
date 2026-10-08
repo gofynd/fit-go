@@ -35,6 +35,8 @@ import (
 const (
 	defaultInitTimeout       = 5 * time.Second
 	defaultReconnectInterval = time.Second
+	maxReconnectInterval     = 30 * time.Second
+	maxRetainedSnapshotAge   = 30 * time.Second
 	maxSSEEventSize          = 16 << 20
 )
 
@@ -44,6 +46,15 @@ type edgeStaleError struct {
 
 func (e *edgeStaleError) Error() string {
 	return fmt.Sprintf("FeatureHub edge marked the stream stale for %s", e.delay)
+}
+
+type featureHubHTTPError struct {
+	status     int
+	retryAfter time.Duration
+}
+
+func (e *featureHubHTTPError) Error() string {
+	return fmt.Sprintf("FeatureHub returned HTTP %d", e.status)
 }
 
 // Client maintains a FeatureHub cache populated from the edge server's SSE
@@ -61,6 +72,7 @@ type Client struct {
 	defaults        map[string][]string
 	httpClient      *http.Client
 	reconnectDelay  time.Duration
+	snapshotTimeout time.Duration
 	refresh         chan struct{}
 
 	ctx              context.Context
@@ -69,7 +81,7 @@ type Client struct {
 	readySignalMu    sync.Mutex
 	readySignal      chan struct{}
 	terminalFailure  chan struct{}
-	initialFailOnce  sync.Once
+	terminalFailOnce sync.Once
 	stopOnce         sync.Once
 	receivedInitial  atomic.Bool
 	ready            atomic.Bool
@@ -77,6 +89,11 @@ type Client struct {
 	readyRevision    atomic.Uint64
 	lastErrorMu      sync.RWMutex
 	lastStreamingErr error
+	featureEvents    atomic.Uint64
+	staleTimerMu     sync.Mutex
+	staleTimer       *time.Timer
+	staleGeneration  uint64
+	lastStaleRefresh time.Time
 }
 
 // legacyClient retains the released polling transport and synchronous context
@@ -166,6 +183,10 @@ func InitWithOptions(options Options) (*Client, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defaults := defaultAttributes(options.DefaultAttributes)
+	snapshotTimeout := options.InitTimeout
+	if snapshotTimeout <= 0 {
+		snapshotTimeout = durationFromEnv("FEATURE_FLAG_INIT_TIMEOUT", defaultInitTimeout)
+	}
 	client := &Client{
 		url:             normalizeFeatureHubURL(serverURL),
 		apiKey:          strings.TrimLeft(apiKey, "/"),
@@ -175,6 +196,7 @@ func InitWithOptions(options Options) (*Client, error) {
 		defaults:        defaults,
 		httpClient:      &http.Client{},
 		reconnectDelay:  options.ReconnectInterval,
+		snapshotTimeout: snapshotTimeout,
 		refresh:         make(chan struct{}, 1),
 		ctx:             ctx,
 		cancel:          cancel,
@@ -193,11 +215,7 @@ func InitWithOptions(options Options) (*Client, error) {
 		return client, nil
 	}
 
-	initTimeout := options.InitTimeout
-	if initTimeout <= 0 {
-		initTimeout = durationFromEnv("FEATURE_FLAG_INIT_TIMEOUT", defaultInitTimeout)
-	}
-	waitContext, waitCancel := context.WithTimeout(context.Background(), initTimeout)
+	waitContext, waitCancel := context.WithTimeout(context.Background(), snapshotTimeout)
 	defer waitCancel()
 	if err := client.WaitReady(waitContext); err != nil {
 		client.Stop()
@@ -263,6 +281,9 @@ func (c *Client) WaitReady(ctx context.Context) error {
 			}
 			return errors.New("FeatureHub stream terminated before initial state")
 		case <-ctx.Done():
+			if lastErr := c.lastError(); lastErr != nil {
+				return fmt.Errorf("%w: %v", ctx.Err(), lastErr)
+			}
 			return ctx.Err()
 		case <-c.ctx.Done():
 			return c.ctx.Err()
@@ -273,17 +294,7 @@ func (c *Client) WaitReady(ctx context.Context) error {
 // IsEnabled reports whether a BOOLEAN feature evaluates to true.
 func (c *Client) IsEnabled(key string) bool {
 	if c != nil && c.legacy != nil {
-		value := c.legacy.getValue(key)
-		switch typed := value.(type) {
-		case bool:
-			return typed
-		case string:
-			return strings.EqualFold(strings.TrimSpace(typed), "true")
-		case float64:
-			return typed != 0
-		default:
-			return false
-		}
+		return legacyBoolean(c.legacy.getValue(key))
 	}
 	value, valueType, ok := c.evaluatedValue(key)
 	if !ok || valueType != featureTypeBoolean {
@@ -415,6 +426,7 @@ func (c *Client) Stop() {
 	}
 	c.stopOnce.Do(func() {
 		c.cancel()
+		c.clearStaleRetention()
 		<-c.done
 	})
 }
@@ -447,6 +459,19 @@ func (c *legacyClient) resetContext() {
 	_ = c.refresh()
 }
 
+func (c *legacyClient) snapshotFor(ctx context.Context, attributes map[string][]string) (map[string]interface{}, error) {
+	if c == nil {
+		return map[string]interface{}{}, nil
+	}
+	first := func(key string) string {
+		if values := attributes[key]; len(values) > 0 {
+			return values[0]
+		}
+		return ""
+	}
+	return c.fetchContext(ctx, first("userkey"), first("session"))
+}
+
 func (c *legacyClient) stop() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -477,12 +502,32 @@ func (c *legacyClient) poll() {
 
 func (c *legacyClient) refresh() error {
 	c.mu.RLock()
-	serverURL, apiKey := c.url, c.apiKey
 	userKey, session := c.userKey, c.session
 	c.mu.RUnlock()
-	req, err := http.NewRequest(http.MethodGet, serverURL+"/features", nil)
+	flags, err := c.fetch(userKey, session)
 	if err != nil {
 		return err
+	}
+	c.mu.Lock()
+	c.flags = flags
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *legacyClient) fetch(userKey, session string) (map[string]interface{}, error) {
+	return c.fetchContext(context.Background(), userKey, session)
+}
+
+func (c *legacyClient) fetchContext(ctx context.Context, userKey, session string) (map[string]interface{}, error) {
+	c.mu.RLock()
+	serverURL, apiKey, client := c.url, c.apiKey, c.client
+	c.mu.RUnlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverURL+"/features", nil)
+	if err != nil {
+		return nil, err
 	}
 	req.Header.Set("X-Api-Key", apiKey)
 	req.Header.Set("Content-Type", "application/json")
@@ -492,23 +537,23 @@ func (c *legacyClient) refresh() error {
 	if session != "" {
 		req.Header.Set("X-Session-Key", session)
 	}
-	response, err := c.client.Do(req)
+	response, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("feature flag fetch failed: %w", err)
+		return nil, fmt.Errorf("feature flag fetch failed: %w", err)
 	}
 	defer response.Body.Close()
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
-		return fmt.Errorf("feature flag read body failed: %w", err)
+		return nil, fmt.Errorf("feature flag read body failed: %w", err)
 	}
 	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("feature flag server returned %d: %s", response.StatusCode, string(body))
+		return nil, fmt.Errorf("feature flag server returned %d: %s", response.StatusCode, string(body))
 	}
 	var flags map[string]interface{}
 	if err := json.Unmarshal(body, &flags); err != nil {
 		var features []map[string]interface{}
 		if arrayErr := json.Unmarshal(body, &features); arrayErr != nil {
-			return fmt.Errorf("feature flag parse failed: %w", err)
+			return nil, fmt.Errorf("feature flag parse failed: %w", err)
 		}
 		flags = make(map[string]interface{}, len(features))
 		for _, feature := range features {
@@ -517,10 +562,7 @@ func (c *legacyClient) refresh() error {
 			}
 		}
 	}
-	c.mu.Lock()
-	c.flags = flags
-	c.mu.Unlock()
-	return nil
+	return flags, nil
 }
 
 func (c *Client) setAttributeValues(key string, values []string) {
@@ -553,6 +595,10 @@ func (c *Client) evaluatedValue(key string) (interface{}, string, bool) {
 	if c == nil {
 		return nil, "", false
 	}
+	if c.legacy != nil {
+		value := c.legacy.getValue(key)
+		return value, featureValueType(value), value != nil
+	}
 	c.mu.RLock()
 	feature, ok := c.features[key]
 	attributes := cloneAttributes(c.attributes)
@@ -573,6 +619,10 @@ func (c *Client) evaluatedValueFor(key string, attributes map[string][]string) (
 	if c == nil {
 		return nil, "", false
 	}
+	if c.legacy != nil {
+		value := c.legacy.getValue(key)
+		return value, featureValueType(value), value != nil
+	}
 	c.mu.RLock()
 	feature, ok := c.features[key]
 	c.mu.RUnlock()
@@ -586,6 +636,22 @@ func (c *Client) evaluatedValueFor(key string, attributes map[string][]string) (
 		}
 	}
 	return value, feature.Type, value != nil
+}
+
+func featureValueType(value interface{}) string {
+	switch value.(type) {
+	case bool:
+		return featureTypeBoolean
+	case string:
+		return featureTypeString
+	case float32, float64, int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64, json.Number:
+		return featureTypeNumber
+	case nil:
+		return ""
+	default:
+		return featureTypeJSON
+	}
 }
 
 func (c *Client) replaceAttributes(attributes map[string][]string) {
@@ -620,8 +686,10 @@ func (c *Client) contextChanged() {
 
 func (c *Client) run() {
 	defer close(c.done)
+	retryAttempt := 0
 	for {
 		revision := c.contextRevision.Load()
+		featureEventsBefore := c.featureEvents.Load()
 		streamContext, streamCancel := context.WithCancel(c.ctx)
 		type streamResult struct {
 			permanent bool
@@ -663,11 +731,26 @@ func (c *Client) run() {
 		}
 
 		permanent, err := result.permanent, result.err
+		featureEventReceived := c.featureEvents.Load() != featureEventsBefore
+		if featureEventReceived {
+			retryAttempt = 0
+		}
+		var stale *edgeStaleError
+		isStale := errors.As(err, &stale)
 		if err != nil {
 			c.setLastError(err)
-			c.ready.Store(false)
-			if permanent && !c.receivedInitial.Load() {
-				c.failInitial()
+			if isStale && c.ready.Load() {
+				c.retainReadyDuringStaleWindow(stale.delay)
+			} else {
+				c.ready.Store(false)
+			}
+			if permanent {
+				// A permanent response is terminal regardless of whether the
+				// stream was previously ready. Wake every current and future
+				// waiter with lastStreamingErr instead of leaving a post-ready
+				// failure indistinguishable from a reconnect in progress.
+				c.failTerminal()
+				slog.Error("fit/feature: FeatureHub stream stopped after a permanent response", "error", err.Error())
 				return
 			}
 			if debugFeatureLogs() {
@@ -675,51 +758,50 @@ func (c *Client) run() {
 			}
 		}
 
-		delay := c.reconnectDelay
-		var stale *edgeStaleError
-		if errors.As(err, &stale) {
-			delay = stale.delay
+		if err != nil && !isStale && !featureEventReceived {
+			retryAttempt++
 		}
+		delay := c.retryDelayForAttempt(err, retryAttempt)
 		timer := time.NewTimer(delay)
-		select {
-		case <-c.ctx.Done():
-			timer.Stop()
-			return
-		case <-c.refresh:
-			timer.Stop()
-		case <-timer.C:
+		waiting := true
+		for waiting {
+			select {
+			case <-c.ctx.Done():
+				timer.Stop()
+				return
+			case <-c.refresh:
+				if !isStale {
+					// Context changes during an outage update the next request but
+					// do not bypass the shared failure backoff.
+					continue
+				}
+				if c.allowStaleRefreshInterrupt() {
+					timer.Stop()
+					waiting = false
+				}
+			case <-timer.C:
+				waiting = false
+			}
 		}
 	}
 }
 
 func (c *Client) consumeStream(ctx context.Context, revision uint64) (bool, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url+"/features/"+c.apiKey, nil)
+	req, err := c.newStreamRequest(ctx, nil)
 	if err != nil {
-		return true, err
-	}
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Cache-Control", "no-cache")
-	if !c.clientEvaluated {
-		c.mu.RLock()
-		header := featureHubContextHeader(c.attributes)
-		c.mu.RUnlock()
-		if header != "" {
-			req.Header.Set("x-featurehub", header)
-			query := req.URL.Query()
-			query.Set("xfeaturehub", header)
-			req.URL.RawQuery = query.Encode()
-		}
+		return true, featureHubRequestError{}
 	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return false, err
+		return false, featureHubRequestError{}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
-		return resp.StatusCode >= 400 && resp.StatusCode < 500,
-			fmt.Errorf("FeatureHub returned HTTP %d", resp.StatusCode)
+		return isPermanentFeatureHTTPStatus(resp.StatusCode), &featureHubHTTPError{
+			status: resp.StatusCode, retryAfter: featureRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+		}
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -739,7 +821,7 @@ func (c *Client) consumeStream(ctx context.Context, revision uint64) (bool, erro
 		line := scanner.Text()
 		if line == "" {
 			if err := dispatch(); err != nil {
-				return isPermanentStreamError(err), err
+				return false, err
 			}
 			continue
 		}
@@ -763,14 +845,160 @@ func (c *Client) consumeStream(ctx context.Context, revision uint64) (bool, erro
 		return false, err
 	}
 	if err := dispatch(); err != nil {
-		return isPermanentStreamError(err), err
+		return false, err
 	}
 	return false, io.EOF
 }
 
-func isPermanentStreamError(err error) bool {
-	var stale *edgeStaleError
-	return !errors.As(err, &stale)
+type featureHubRequestError struct{}
+
+func (e featureHubRequestError) Error() string { return "FeatureHub stream request failed" }
+
+func isPermanentFeatureHTTPStatus(status int) bool {
+	if status < http.StatusBadRequest || status >= http.StatusInternalServerError {
+		return false
+	}
+	switch status {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests, 425: // Too Early
+		return false
+	default:
+		return true
+	}
+}
+
+func (c *Client) newStreamRequest(ctx context.Context, attributes map[string][]string) (*http.Request, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url+"/features/"+c.apiKey, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Cache-Control", "no-cache")
+	if !c.clientEvaluated {
+		if attributes == nil {
+			c.mu.RLock()
+			attributes = cloneAttributes(c.attributes)
+			c.mu.RUnlock()
+		}
+		header := featureHubContextHeader(attributes)
+		if header != "" {
+			req.Header.Set("x-featurehub", header)
+			query := req.URL.Query()
+			query.Set("xfeaturehub", header)
+			req.URL.RawQuery = query.Encode()
+		}
+	}
+	return req, nil
+}
+
+func (c *Client) evaluatedFeaturesForContext(ctx context.Context, attributes map[string][]string) (map[string]*featureState, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timeout := c.snapshotTimeout
+	if timeout <= 0 {
+		timeout = defaultInitTimeout
+	}
+	var requestContext context.Context
+	var cancel context.CancelFunc
+	if _, bounded := ctx.Deadline(); bounded {
+		requestContext, cancel = context.WithCancel(ctx)
+	} else {
+		requestContext, cancel = context.WithTimeout(ctx, timeout)
+	}
+	stopClientCancel := func() bool { return false }
+	if c.ctx != nil {
+		stopClientCancel = context.AfterFunc(c.ctx, cancel)
+	}
+	defer func() {
+		stopClientCancel()
+		cancel()
+	}()
+	features, _, err := c.consumeEvaluationSnapshot(requestContext, attributes)
+	if err != nil && requestContext.Err() != nil {
+		return nil, requestContext.Err()
+	}
+	return features, err
+}
+
+func (c *Client) consumeEvaluationSnapshot(ctx context.Context, attributes map[string][]string) (map[string]*featureState, bool, error) {
+	req, err := c.newStreamRequest(ctx, attributes)
+	if err != nil {
+		return nil, true, featureHubRequestError{}
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, false, featureHubRequestError{}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+		return nil, isPermanentFeatureHTTPStatus(resp.StatusCode), &featureHubHTTPError{
+			status: resp.StatusCode, retryAfter: featureRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+		}
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64<<10), maxSSEEventSize)
+	var eventName string
+	var data []string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line != "" {
+			if strings.HasPrefix(line, ":") {
+				continue
+			}
+			field, value, found := strings.Cut(line, ":")
+			if found {
+				value = strings.TrimPrefix(value, " ")
+			}
+			switch field {
+			case "event":
+				eventName = value
+			case "data":
+				data = append(data, value)
+			}
+			continue
+		}
+
+		payload := strings.Join(data, "\n")
+		switch eventName {
+		case "features":
+			var states []*featureState
+			if err := json.Unmarshal([]byte(payload), &states); err != nil {
+				return nil, false, fmt.Errorf("decode FeatureHub features event: %w", err)
+			}
+			features := make(map[string]*featureState, len(states))
+			for _, state := range states {
+				if state != nil && state.Key != "" {
+					features[state.Key] = state
+				}
+			}
+			return features, false, nil
+		case "failure", "error":
+			return nil, false, fmt.Errorf("FeatureHub emitted %s", eventName)
+		case "config":
+			var config map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(payload), &config); err == nil {
+				if raw, ok := config["edge.stale"]; ok {
+					seconds, stale, parseErr := edgeStaleSeconds(raw)
+					if parseErr == nil && stale {
+						return nil, false, &edgeStaleError{delay: c.staleDelay(seconds)}
+					}
+				}
+			}
+		case "bye":
+			return nil, false, io.EOF
+		}
+		eventName = ""
+		data = data[:0]
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, false, err
+	}
+	return nil, false, io.EOF
 }
 
 func (c *Client) handleEvent(name, data string, revision uint64) error {
@@ -787,19 +1015,14 @@ func (c *Client) handleEvent(name, data string, revision uint64) error {
 			return fmt.Errorf("decode FeatureHub config event: %w", err)
 		}
 		if raw, ok := config["edge.stale"]; ok {
-			var seconds float64
-			if err := json.Unmarshal(raw, &seconds); err != nil {
-				var stale bool
-				if boolErr := json.Unmarshal(raw, &stale); boolErr != nil {
-					return fmt.Errorf("decode FeatureHub edge.stale: %w", err)
-				}
-				if stale {
-					seconds = c.reconnectDelay.Seconds()
-				}
+			seconds, stale, err := edgeStaleSeconds(raw)
+			if err != nil {
+				return fmt.Errorf("decode FeatureHub edge.stale: %w", err)
 			}
-			if seconds > 0 {
-				return &edgeStaleError{delay: time.Duration(seconds * float64(time.Second))}
+			if stale {
+				return &edgeStaleError{delay: c.staleDelay(seconds)}
 			}
+			return nil
 		}
 	case "features":
 		var features []*featureState
@@ -807,6 +1030,8 @@ func (c *Client) handleEvent(name, data string, revision uint64) error {
 			return fmt.Errorf("decode FeatureHub features event: %w", err)
 		}
 		c.applyFullFeatureSet(features)
+		c.clearStaleRetention()
+		c.featureEvents.Add(1)
 		c.markReady(revision)
 	case "feature":
 		var feature featureState
@@ -814,14 +1039,187 @@ func (c *Client) handleEvent(name, data string, revision uint64) error {
 			return fmt.Errorf("decode FeatureHub feature event: %w", err)
 		}
 		c.applyFeature(&feature)
+		c.clearStaleRetention()
+		c.featureEvents.Add(1)
 	case "delete_feature":
 		var feature featureState
 		if err := json.Unmarshal([]byte(data), &feature); err != nil {
 			return fmt.Errorf("decode FeatureHub delete event: %w", err)
 		}
 		c.deleteFeature(&feature)
+		c.clearStaleRetention()
+		c.featureEvents.Add(1)
 	}
 	return nil
+}
+
+func (c *Client) staleDelay(seconds float64) time.Duration {
+	minimum := c.retryDelay(nil)
+	if seconds <= 0 {
+		return minimum
+	}
+	delay := time.Duration(seconds * float64(time.Second))
+	if delay < minimum {
+		return minimum
+	}
+	if delay > maxReconnectInterval {
+		return maxReconnectInterval
+	}
+	return delay
+}
+
+// edgeStaleSeconds mirrors the useful FeatureHub JavaScript SDK coercions
+// without inheriting JavaScript's zero-delay loop for malformed/truthy values.
+// Numeric zero, negative values, false, null, and empty strings do not mark a
+// healthy stream stale. A true value is equivalent to one second, as it is in
+// JavaScript multiplication, and positive numeric strings are accepted.
+func edgeStaleSeconds(raw json.RawMessage) (float64, bool, error) {
+	var value interface{}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return 0, false, err
+	}
+	switch typed := value.(type) {
+	case nil:
+		return 0, false, nil
+	case bool:
+		if typed {
+			return 1, true, nil
+		}
+		return 0, false, nil
+	case float64:
+		if typed <= 0 {
+			return 0, false, nil
+		}
+		return typed, true, nil
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return 0, false, nil
+		}
+		seconds, err := strconv.ParseFloat(strings.TrimSpace(typed), 64)
+		if err != nil {
+			return 0, false, err
+		}
+		if seconds <= 0 {
+			return 0, false, nil
+		}
+		return seconds, true, nil
+	default:
+		return 0, false, fmt.Errorf("unsupported %T value", value)
+	}
+}
+
+func (c *Client) retryDelay(err error) time.Duration {
+	delay := c.reconnectDelay
+	var stale *edgeStaleError
+	if errors.As(err, &stale) && stale.delay > 0 {
+		delay = stale.delay
+	}
+	if delay <= 0 {
+		delay = defaultReconnectInterval
+	}
+	return delay
+}
+
+func (c *Client) retryDelayForAttempt(err error, attempt int) time.Duration {
+	delay := c.retryDelay(err)
+	var stale *edgeStaleError
+	if errors.As(err, &stale) {
+		return delay
+	}
+	var httpErr *featureHubHTTPError
+	if errors.As(err, &httpErr) && httpErr.retryAfter > delay {
+		delay = httpErr.retryAfter
+	}
+	for index := 1; index < attempt && delay < maxReconnectInterval; index++ {
+		if delay > maxReconnectInterval/2 {
+			delay = maxReconnectInterval
+			break
+		}
+		delay *= 2
+	}
+	if delay > maxReconnectInterval {
+		return maxReconnectInterval
+	}
+	return delay
+}
+
+func featureRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseUint(value, 10, 64); err == nil {
+		if seconds >= uint64(maxReconnectInterval/time.Second) {
+			return maxReconnectInterval
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	if retryAt, err := http.ParseTime(value); err == nil {
+		delay := retryAt.Sub(now)
+		if delay <= 0 {
+			return 0
+		}
+		if delay > maxReconnectInterval {
+			return maxReconnectInterval
+		}
+		return delay
+	}
+	// A syntactically numeric value larger than uint64 represents a very long
+	// server delay; cap it instead of accidentally treating it as no guidance.
+	for _, ch := range value {
+		if ch < '0' || ch > '9' {
+			return 0
+		}
+	}
+	return maxReconnectInterval
+}
+
+func (c *Client) allowStaleRefreshInterrupt() bool {
+	c.staleTimerMu.Lock()
+	defer c.staleTimerMu.Unlock()
+	minimum := c.retryDelay(nil)
+	if !c.lastStaleRefresh.IsZero() && time.Since(c.lastStaleRefresh) < minimum {
+		return false
+	}
+	c.lastStaleRefresh = time.Now()
+	return true
+}
+
+func (c *Client) retainReadyDuringStaleWindow(delay time.Duration) {
+	if delay <= 0 || delay > maxRetainedSnapshotAge {
+		delay = maxRetainedSnapshotAge
+	}
+	c.staleTimerMu.Lock()
+	defer c.staleTimerMu.Unlock()
+	if c.ctx == nil || c.ctx.Err() != nil {
+		return
+	}
+	c.staleGeneration++
+	generation := c.staleGeneration
+	if c.staleTimer != nil {
+		c.staleTimer.Stop()
+	}
+	c.staleTimer = time.AfterFunc(delay, func() {
+		c.staleTimerMu.Lock()
+		defer c.staleTimerMu.Unlock()
+		if generation != c.staleGeneration || c.ctx == nil || c.ctx.Err() != nil {
+			return
+		}
+		c.staleTimer = nil
+		c.setLastError(errors.New("FeatureHub cached snapshot expired while the edge remained stale"))
+		c.ready.Store(false)
+		c.signalReadyChange()
+	})
+}
+
+func (c *Client) clearStaleRetention() {
+	c.staleTimerMu.Lock()
+	c.staleGeneration++
+	if c.staleTimer != nil {
+		c.staleTimer.Stop()
+		c.staleTimer = nil
+	}
+	c.staleTimerMu.Unlock()
 }
 
 func (c *Client) applyFullFeatureSet(features []*featureState) {
@@ -867,14 +1265,19 @@ func (c *Client) deleteFeature(feature *featureState) {
 	}
 }
 
-func (c *Client) failInitial() {
-	c.initialFailOnce.Do(func() { close(c.terminalFailure) })
+func (c *Client) failTerminal() {
+	c.terminalFailOnce.Do(func() { close(c.terminalFailure) })
 }
 
 func (c *Client) markReady(revision uint64) {
 	c.readyRevision.Store(revision)
 	c.ready.Store(true)
 	c.receivedInitial.Store(true)
+	c.setLastError(nil)
+	c.signalReadyChange()
+}
+
+func (c *Client) signalReadyChange() {
 	c.readySignalMu.Lock()
 	close(c.readySignal)
 	c.readySignal = make(chan struct{})

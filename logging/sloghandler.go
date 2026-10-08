@@ -21,7 +21,9 @@ package logging
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"runtime"
 	"strings"
 	"sync"
 )
@@ -116,11 +118,18 @@ func (h *slogHandler) Handle(ctx context.Context, r slog.Record) error {
 	if ctx != nil {
 		logger = logger.WithContext(ctx)
 	}
+	if r.PC != 0 && slogToLevel(r.Level) >= LevelError {
+		frame, _ := runtime.CallersFrames([]uintptr{r.PC}).Next()
+		if frame.File != "" {
+			logger = logger.clone()
+			logger.caller = fmt.Sprintf("%s:%d", frame.File, frame.Line)
+		}
+	}
 
 	kvs := make([]interface{}, 0, len(h.attrs)+r.NumAttrs()*2)
 	kvs = append(kvs, h.attrs...)
 	r.Attrs(func(a slog.Attr) bool {
-		kvs = append(kvs, h.prefixedKey(a.Key), a.Value.Any())
+		appendSlogAttr(&kvs, h.groups, a)
 		return true
 	})
 
@@ -134,9 +143,31 @@ func (h *slogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	}
 	nh := h.clone()
 	for _, a := range attrs {
-		nh.attrs = append(nh.attrs, nh.prefixedKey(a.Key), a.Value.Any())
+		appendSlogAttr(&nh.attrs, nh.groups, a)
 	}
 	return nh
+}
+
+func appendSlogAttr(kvs *[]interface{}, groups []string, attr slog.Attr) {
+	attr.Value = attr.Value.Resolve()
+	if attr.Equal(slog.Attr{}) {
+		return
+	}
+	if attr.Value.Kind() == slog.KindGroup {
+		nestedGroups := groups
+		if attr.Key != "" {
+			nestedGroups = append(append([]string(nil), groups...), attr.Key)
+		}
+		for _, nested := range attr.Value.Group() {
+			appendSlogAttr(kvs, nestedGroups, nested)
+		}
+		return
+	}
+	key := attr.Key
+	if len(groups) > 0 {
+		key = strings.Join(groups, ".") + "." + key
+	}
+	*kvs = append(*kvs, key, attr.Value.Any())
 }
 
 func (h *slogHandler) WithGroup(name string) slog.Handler {

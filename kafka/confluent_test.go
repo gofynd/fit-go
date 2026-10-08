@@ -390,7 +390,7 @@ func TestConfluentProducer_MessageMapping(t *testing.T) {
 		}
 	})
 
-	t.Run("message with an empty but present key", func(t *testing.T) {
+	t.Run("legacy message with an empty key is keyless", func(t *testing.T) {
 		msg := Message{
 			Key:   []byte{},
 			Value: []byte("payload"),
@@ -398,8 +398,15 @@ func TestConfluentProducer_MessageMapping(t *testing.T) {
 
 		km := buildConfluentMessage("events", msg)
 
+		if km.Key != nil {
+			t.Fatalf("Key = %#v, want legacy nil wire key", km.Key)
+		}
+	})
+
+	t.Run("advanced message preserves an empty present key", func(t *testing.T) {
+		km := buildConfluentMessageAdvanced("events", Message{Key: []byte{}, Value: []byte("payload")})
 		if km.Key == nil || len(km.Key) != 0 {
-			t.Fatalf("Key = %#v, want a present empty key", km.Key)
+			t.Fatalf("Key = %#v, want an advanced present-empty key", km.Key)
 		}
 	})
 

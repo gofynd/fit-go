@@ -9,6 +9,7 @@
 package protofetch
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -32,6 +33,13 @@ const (
 	Get Mode = "get"
 	// GetAll fetches proto/type files for configured contract folders.
 	GetAll Mode = "getall"
+
+	maxClonedSourceBytes  int64 = 1 << 30
+	maxCloneEntries             = 200_000
+	maxSelectedFileBytes  int64 = 32 << 20
+	maxSelectedBytes      int64 = 256 << 20
+	maxSelectedFiles            = 10_000
+	maxGitDiagnosticBytes       = 16 << 10
 )
 
 // Generator generates language bindings inside the staged output directory.
@@ -274,14 +282,125 @@ func acquireSource(ctx context.Context, options Options) (string, func(), error)
 	if branch == "" {
 		branch = "master"
 	}
-	command := exec.CommandContext(ctx, git, "clone", "--depth", "1", "--branch", branch, "--", options.Specification.Repository(), repository)
+	repositoryURI := options.Specification.Repository()
+	command := exec.CommandContext(ctx, git, "clone", "--depth", "1", "--no-tags", "--branch", branch, "--", repositoryURI, repository)
+	var stderr boundedBuffer
+	stderr.limit = maxGitDiagnosticBytes
 	command.Stdout = io.Discard
-	command.Stderr = io.Discard
-	if err := command.Run(); err != nil {
+	command.Stderr = &stderr
+	if err := runBoundedClone(ctx, command, temporary); err != nil {
 		cleanup()
+		if diagnostic := safeGitDiagnostic(stderr.String()); diagnostic != "" {
+			return "", func() {}, fmt.Errorf("protofetch: git clone failed (%s): %w", diagnostic, err)
+		}
 		return "", func() {}, fmt.Errorf("protofetch: git clone failed: %w", err)
 	}
 	return repository, cleanup, nil
+}
+
+func runBoundedClone(ctx context.Context, command *exec.Cmd, directory string) error {
+	if err := command.Start(); err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				return err
+			}
+			return validateCloneSize(directory)
+		case <-ctx.Done():
+			_ = command.Process.Kill()
+			<-done
+			return ctx.Err()
+		case <-ticker.C:
+			if err := validateCloneSize(directory); err != nil {
+				_ = command.Process.Kill()
+				<-done
+				return err
+			}
+		}
+	}
+}
+
+func validateCloneSize(root string) error {
+	var bytesUsed int64
+	entries := 0
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if errors.Is(walkErr, os.ErrNotExist) {
+			return nil
+		}
+		if walkErr != nil {
+			return walkErr
+		}
+		entries++
+		if entries > maxCloneEntries {
+			return fmt.Errorf("protofetch: cloned repository exceeds %d entries", maxCloneEntries)
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		bytesUsed += info.Size()
+		if bytesUsed > maxClonedSourceBytes {
+			return fmt.Errorf("protofetch: cloned repository exceeds %d bytes", maxClonedSourceBytes)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+type boundedBuffer struct {
+	buffer bytes.Buffer
+	limit  int
+}
+
+func (buffer *boundedBuffer) Write(data []byte) (int, error) {
+	written := len(data)
+	remaining := buffer.limit - buffer.buffer.Len()
+	if remaining > 0 {
+		if len(data) > remaining {
+			data = data[:remaining]
+		}
+		_, _ = buffer.buffer.Write(data)
+	}
+	return written, nil
+}
+
+func (buffer *boundedBuffer) String() string { return buffer.buffer.String() }
+
+func safeGitDiagnostic(stderr string) string {
+	lower := strings.ToLower(stderr)
+	for _, candidate := range []struct {
+		phrase     string
+		diagnostic string
+	}{
+		{phrase: "authentication failed", diagnostic: "authentication failed"},
+		{phrase: "permission denied", diagnostic: "permission denied"},
+		{phrase: "repository not found", diagnostic: "repository not found"},
+		{phrase: "could not resolve host", diagnostic: "host resolution failed"},
+		{phrase: "connection timed out", diagnostic: "connection timed out"},
+		{phrase: "host key verification failed", diagnostic: "host key verification failed"},
+		{phrase: "remote branch", diagnostic: "configured branch was not found"},
+	} {
+		if strings.Contains(lower, candidate.phrase) {
+			return candidate.diagnostic
+		}
+	}
+	return ""
 }
 
 func copyNamedProto(contracts, stage, fileName string) ([]string, error) {
@@ -322,6 +441,7 @@ func copyNamedProto(contracts, stage, fileName string) ([]string, error) {
 		return nil, fmt.Errorf("protofetch: %s.proto not found", fileName)
 	}
 	seen := make(map[string]struct{}, len(candidates))
+	budget := &copyBudget{}
 	var copied []string
 	for _, item := range candidates {
 		destination := filepath.Join(item.serverType, fileName+".proto")
@@ -333,7 +453,7 @@ func copyNamedProto(contracts, stage, fileName string) ([]string, error) {
 			{item.proto, filepath.Join(stage, item.serverType, fileName+".proto")},
 			{item.typeJSON, filepath.Join(stage, item.serverType, fileName+".type.json")},
 		} {
-			if err := copyRegularFile(pair[0], pair[1]); err != nil {
+			if err := copyRegularFile(pair[0], pair[1], budget); err != nil {
 				return nil, err
 			}
 			relative, _ := filepath.Rel(stage, pair[1])
@@ -387,6 +507,7 @@ func copyFolders(contracts, stage string, folderNames []string) ([]string, error
 	}
 
 	var copied []string
+	budget := &copyBudget{}
 	for _, folder := range found {
 		source := folder.source
 		err := filepath.WalkDir(source, func(path string, entry fs.DirEntry, walkErr error) error {
@@ -407,7 +528,7 @@ func copyFolders(contracts, stage string, folderNames []string) ([]string, error
 				return fmt.Errorf("protofetch: unsafe relative path %s", path)
 			}
 			destination := filepath.Join(stage, folder.name, relative)
-			if err := copyRegularFile(path, destination); err != nil {
+			if err := copyRegularFile(path, destination, budget); err != nil {
 				return err
 			}
 			installed, _ := filepath.Rel(stage, destination)
@@ -442,13 +563,36 @@ func inferServerType(contracts, protoPath string) (string, error) {
 	return "", fmt.Errorf("protofetch: cannot infer server type for %s", relative)
 }
 
-func copyRegularFile(source, destination string) error {
+type copyBudget struct {
+	files int
+	bytes int64
+}
+
+func (budget *copyBudget) reserve(size int64) error {
+	if size < 0 || size > maxSelectedFileBytes {
+		return fmt.Errorf("protofetch: selected file exceeds %d bytes", maxSelectedFileBytes)
+	}
+	if budget.files+1 > maxSelectedFiles || budget.bytes+size > maxSelectedBytes {
+		return errors.New("protofetch: selected contracts exceed the safe copy limit")
+	}
+	budget.files++
+	budget.bytes += size
+	return nil
+}
+
+func copyRegularFile(source, destination string, budget *copyBudget) error {
 	info, err := os.Lstat(source)
 	if err != nil {
 		return fmt.Errorf("protofetch: inspect %s: %w", source, err)
 	}
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("protofetch: source is not a regular file: %s", source)
+	}
+	if budget == nil {
+		budget = &copyBudget{}
+	}
+	if err := budget.reserve(info.Size()); err != nil {
+		return fmt.Errorf("protofetch: inspect selected file %s: %w", source, err)
 	}
 	if err := os.MkdirAll(filepath.Dir(destination), 0o750); err != nil {
 		return fmt.Errorf("protofetch: create destination directory: %w", err)
@@ -462,9 +606,14 @@ func copyRegularFile(source, destination string) error {
 	if err != nil {
 		return fmt.Errorf("protofetch: create destination: %w", err)
 	}
-	if _, err := io.Copy(output, input); err != nil {
+	copied, err := io.Copy(output, io.LimitReader(input, maxSelectedFileBytes+1))
+	if err != nil {
 		output.Close()
 		return fmt.Errorf("protofetch: copy file: %w", err)
+	}
+	if copied != info.Size() {
+		output.Close()
+		return errors.New("protofetch: source file changed while it was being copied")
 	}
 	if err := output.Sync(); err != nil {
 		output.Close()
@@ -749,6 +898,7 @@ func containedDirectory(root, relative string) (string, error) {
 
 func listFiles(root string) ([]string, error) {
 	var result []string
+	budget := &copyBudget{}
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -761,6 +911,13 @@ func listFiles(root string) ([]string, error) {
 		}
 		if !entry.Type().IsRegular() {
 			return fmt.Errorf("protofetch: staged output is not a regular file: %s", path)
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if err := budget.reserve(info.Size()); err != nil {
+			return fmt.Errorf("protofetch: inspect staged output %s: %w", path, err)
 		}
 		relative, err := filepath.Rel(root, path)
 		if err != nil {

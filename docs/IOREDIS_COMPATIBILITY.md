@@ -64,6 +64,23 @@ The compatibility client and explicitly selected owned RESP transport provide:
   RESP plaintext byte counts, underlying socket byte counts (ciphertext under
   TLS), prefix replies, and conservative duplicate-execution exposure.
 
+Error safety is part of the transport boundary. Bootstrap, PING,
+Sentinel/Cluster discovery, redirect, and malformed-RESP errors omit raw server
+reply values, addresses learned from server replies, keys, and command
+arguments. Stable local/transport causes (`io.EOF`, `io.ErrUnexpectedEOF`,
+context cancellation/deadline, and the compatibility closed error) remain
+available through `errors.Is`/`errors.As`. Ordinary Redis command errors remain
+per-reply API results and can contain Redis-authored text; applications must
+redact those before logging.
+
+`WriteDisposition` and `MayHaveExecuted` answer different questions. A request
+can be `FullyWritten` because its bytes reached a Redis node while
+`MayHaveExecuted` is false because an authoritative MOVED/ASK response proves
+that node did not execute it. The same false side-effect outcome applies when
+the 16-redirect limit is reached after authoritative redirects. Callers can use
+`errors.As(err, *IORedisRedirectError)` to inspect both fields without matching
+message text.
+
 Deterministic tests use real loopback TCP, `net.Pipe`, and a generated test TLS
 certificate for startup command order, AUTH/SELECT/INFO boundaries, INFO loading,
 TLS, socket inactivity and partial-data reset, not-written and partial-write
@@ -106,15 +123,35 @@ The following remain adoption gates:
   ready); the transport currently fails closed on every SELECT error;
 - command-level transformations and modes not used by the raw transport
   contract, including Buffer-returning commands, HGETALL object transforms,
-  transactions, blocking commands, Pub/Sub, monitor mode, RESP3, and Unix
-  sockets, must be inventoried against actual application call sites before the
-  client can be treated as a general ioredis replacement;
+  transactions, unbounded blocking commands, Pub/Sub, monitor mode, RESP3, and
+  Unix sockets, must be inventoried against actual application call sites
+  before the client can be treated as a general ioredis replacement. The queue
+  currently rejects MULTI/EXEC/DISCARD/WATCH/UNWATCH, every SELECT, raw QUIT,
+  CLIENT REPLY/TRACKING/CACHING/PAUSE, DEBUG SLEEP, BRPOPLPUSH/BLMOVE and other
+  blocking pops unless their timeout is finite, numeric and strictly positive,
+  XREAD/XREADGROUP with a missing/non-numeric/non-positive BLOCK value,
+  subscription commands, MONITOR, WAIT/WAITAOF, RESET/SYNC/PSYNC, SHUTDOWN,
+  READONLY/READWRITE, HELLO without exactly the argument `2`, cluster
+  multi-key/count forms whose keys span slots, and cross-node pipelines.
+  Finite-timeout blocking operations use an exclusive,
+  no-ambiguous-replay boundary. Multi-key commands such as MGET/DEL are routed
+  by their first key rather than fanned out;
 - TLS fault injection must verify partial TLS-record and lost-reply disposition
   against the deployed proxy/Redis stack; the transport exposes underlying
   ciphertext progress but deterministic tests currently cover successful TLS;
 - application boot wiring, URI/GSM/environment precedence, client names,
   health, tracing, logging, error reporting, and shutdown ordering;
 - Redis Cluster and Sentinel queue/failover behavior.
+
+The owned RESP2 decoder has fixed safety ceilings of 512 MiB for one bulk
+string and 1,048,576 total decoded values. Because the top-level array consumes
+one value from that budget, it can contain at most 1,048,575 scalar members. It
+grows storage only as payload bytes or values arrive, so an untrusted length
+header alone does not reserve the advertised amount. Exceeding a decoder limit
+terminates that connection: the command receiving the oversized reply fails,
+and already-sent commands awaiting later replies on the same connection fail as
+well. Callers requiring larger result sets must page or stream them rather than
+treating this compatibility transport as an unbounded decoder.
 
 Until those gates close, use of this API is an implementation aid, not a parity
 claim, and production adoption must remain explicit.

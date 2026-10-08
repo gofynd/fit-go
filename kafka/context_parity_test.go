@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -410,8 +411,10 @@ func TestProduceTopicMessagesWithTrace_PerMessageSpansAndBrokerSemantics(t *test
 	}
 	deliveryErr := errors.New("broker delivery failed for user@example.com password=hunter2")
 	called := false
+	var produced []TopicMessages
 	err := produceTopicMessagesWithTrace(ctx, topicMessages, -1, func(got []TopicMessages, acks int) error {
 		called = true
+		produced = got
 		require.Equal(t, -1, acks, "acks must reach the broker unchanged")
 		require.Equal(t, []byte("order-1"), got[0].Messages[0].Key)
 		require.Equal(t, []byte(`{"id":1}`), got[0].Messages[0].Value)
@@ -440,17 +443,19 @@ func TestProduceTopicMessagesWithTrace_PerMessageSpansAndBrokerSemantics(t *test
 	}
 	require.Equal(t, map[string]int{"orders.created": 2, "refunds.created": 1}, topicCounts)
 
-	for topicIndex := range topicMessages {
-		for messageIndex := range topicMessages[topicIndex].Messages {
-			tp := propagationHeaderValues(topicMessages[topicIndex].Messages[messageIndex].Headers, "traceparent")
+	for topicIndex := range produced {
+		for messageIndex := range produced[topicIndex].Messages {
+			tp := propagationHeaderValues(produced[topicIndex].Messages[messageIndex].Headers, "traceparent")
 			require.Len(t, tp, 1)
 			_, spanID, sampled := tracing.ExtractTraceContext(tp[0])
 			require.True(t, sampled)
 			span, found := spanByID(producerSpans, spanID)
 			require.True(t, found, "message header must come from its own producer span")
-			require.Equal(t, topicMessages[topicIndex].Topic, spanStringAttribute(span, "messaging.destination"))
+			require.Equal(t, produced[topicIndex].Topic, spanStringAttribute(span, "messaging.destination"))
 		}
 	}
+	require.Empty(t, propagationHeaderValues(topicMessages[0].Messages[0].Headers, "traceparent"), "producer tracing must not mutate caller messages")
+	require.Empty(t, propagationHeaderValues(topicMessages[0].Messages[1].Headers, "traceparent"), "producer tracing must not mutate caller messages")
 }
 
 func TestProducerInjection_ReplacesCaseInsensitiveStalePropagationFields(t *testing.T) {
@@ -505,6 +510,60 @@ func TestProducerInjection_ReplacesCaseInsensitiveStalePropagationFields(t *test
 	require.Equal(t, []byte("keep-1"), got.Headers[0].Value)
 	require.Equal(t, "x-second", got.Headers[1].Key)
 	require.Equal(t, []byte("keep-2"), got.Headers[1].Value)
+}
+
+func TestProducerInjectionDoesNotMutateSharedHeaderBackingStorage(t *testing.T) {
+	tracer, _ := enabledKafkaTracer(t)
+	ctx, span := tracer.StartSpan(context.Background(), "caller", tracing.SpanKindServer)
+	defer span.End()
+
+	shared := []Header{
+		{Key: "traceparent", Value: []byte("stale")},
+		{Key: "x-contract", Value: []byte("preserve")},
+	}
+	first := Message{Headers: shared}
+	second := Message{Headers: shared}
+
+	InjectTraceHeaders(ctx, &first)
+
+	require.Equal(t, "stale", string(second.Headers[0].Value))
+	require.Equal(t, "traceparent", second.Headers[0].Key)
+	require.Equal(t, "preserve", string(second.Headers[1].Value))
+	require.NotEqual(t, "stale", string(first.Headers[0].Value))
+
+	first.Headers[1].Value[0] = 'P'
+	require.Equal(t, "preserve", string(second.Headers[1].Value), "header values must be independently owned after injection")
+}
+
+func TestConcurrentProduceCtxOwnsCallerMessageMemory(t *testing.T) {
+	tracer, _ := enabledKafkaTracer(t)
+	ctx, span := tracer.StartSpan(context.Background(), "caller", tracing.SpanKindServer)
+	defer span.End()
+
+	driver := &fakeConfluentProducerDriver{}
+	producer := newTestConfluentProducer(driver)
+	messages := []Message{{
+		Key: []byte("shared-key"), Value: []byte("shared-value"),
+		Headers: []Header{{Key: "x-contract", Value: []byte("shared-header")}},
+	}}
+	const calls = 32
+	errs := make(chan error, calls)
+	var wg sync.WaitGroup
+	for i := 0; i < calls; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- producer.ProduceCtx(ctx, "orders", messages, -1)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	require.Equal(t, "shared-key", string(messages[0].Key))
+	require.Equal(t, "shared-value", string(messages[0].Value))
+	require.Equal(t, []Header{{Key: "x-contract", Value: []byte("shared-header")}}, messages[0].Headers)
 }
 
 func TestProducerInjection_RemovesStaleFieldsAbsentFromNewContext(t *testing.T) {
@@ -568,6 +627,9 @@ func TestProduceTopicMessagesWithTrace_DisabledIsExactPassthrough(t *testing.T) 
 	err := produceTopicMessagesWithTrace(context.Background(), topicMessages, 0, func(got []TopicMessages, acks int) error {
 		require.Equal(t, 0, acks)
 		require.Equal(t, want, got)
+		got[0].Messages[0].Key[0] = 'K'
+		got[0].Messages[0].Value[0] = 'V'
+		got[0].Messages[0].Headers[0].Value[0] = 'H'
 		return wantErr
 	})
 	require.ErrorIs(t, err, wantErr)

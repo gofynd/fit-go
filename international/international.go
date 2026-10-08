@@ -20,7 +20,9 @@ package international
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -65,9 +67,27 @@ func AddressFormParser(template string, input []AddressField) ([][]AddressField,
 		switch template[i] {
 		case '{':
 			depth := 1
-			closing := i
+			closing := -1
+			inString := false
+			escaped := false
 			for j := i + 1; j < len(template); j++ {
-				if template[j] == '{' {
+				if inString {
+					if escaped {
+						escaped = false
+						continue
+					}
+					if template[j] == '\\' {
+						escaped = true
+						continue
+					}
+					if template[j] == '"' {
+						inString = false
+					}
+					continue
+				}
+				if template[j] == '"' {
+					inString = true
+				} else if template[j] == '{' {
 					depth++
 				} else if template[j] == '}' {
 					depth--
@@ -76,6 +96,9 @@ func AddressFormParser(template string, input []AddressField) ([][]AddressField,
 					closing = j
 					break
 				}
+			}
+			if closing < 0 {
+				return nil, errors.New("international: parsing field segment: unmatched opening brace")
 			}
 			var obj AddressField
 			if err := json.Unmarshal([]byte(template[i:closing+1]), &obj); err != nil {
@@ -106,7 +129,13 @@ func AddressFormParser(template string, input []AddressField) ([][]AddressField,
 // string form.
 func AddressDisplayParser(template string, input map[string]any) []string {
 	result := template
-	for key, val := range input {
+	keys := make([]string, 0, len(input))
+	for key := range input {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		val := input[key]
 		result = strings.Replace(result, "{"+key+"}", fmt.Sprintf("%v", val), 1)
 	}
 	return strings.Split(result, "_")

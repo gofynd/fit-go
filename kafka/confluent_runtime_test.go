@@ -1274,6 +1274,7 @@ type fakeConfluentConsumerDriver struct {
 	commitFn        func(*ckafka.Message) ([]ckafka.TopicPartition, error)
 	commitOffsetsFn func([]ckafka.TopicPartition) ([]ckafka.TopicPartition, error)
 	storeFn         func(*ckafka.Message) ([]ckafka.TopicPartition, error)
+	seekFn          func([]ckafka.TopicPartition) ([]ckafka.TopicPartition, error)
 	closeFn         func() error
 
 	mu                sync.Mutex
@@ -1281,7 +1282,12 @@ type fakeConfluentConsumerDriver struct {
 	commitCalls       int
 	commitOffsetCalls [][]ckafka.TopicPartition
 	storeCalls        int
+	seekCalls         [][]ckafka.TopicPartition
 	closeCalls        int
+}
+
+func (f *fakeConfluentConsumerDriver) SubscribeTopics([]string, ckafka.RebalanceCb) error {
+	return nil
 }
 
 func (f *fakeConfluentConsumerDriver) ReadMessage(timeout time.Duration) (*ckafka.Message, error) {
@@ -1329,6 +1335,18 @@ func (f *fakeConfluentConsumerDriver) StoreMessage(message *ckafka.Message) ([]c
 	return storeFn(message)
 }
 
+func (f *fakeConfluentConsumerDriver) SeekPartitions(partitions []ckafka.TopicPartition) ([]ckafka.TopicPartition, error) {
+	f.mu.Lock()
+	cloned := append([]ckafka.TopicPartition(nil), partitions...)
+	f.seekCalls = append(f.seekCalls, cloned)
+	seekFn := f.seekFn
+	f.mu.Unlock()
+	if seekFn == nil {
+		return partitions, nil
+	}
+	return seekFn(partitions)
+}
+
 func (f *fakeConfluentConsumerDriver) Close() error {
 	f.mu.Lock()
 	f.closeCalls++
@@ -1358,6 +1376,16 @@ func (f *fakeConfluentConsumerDriver) exactOffsetCommits() [][]ckafka.TopicParti
 	result := make([][]ckafka.TopicPartition, len(f.commitOffsetCalls))
 	for i := range f.commitOffsetCalls {
 		result[i] = append([]ckafka.TopicPartition(nil), f.commitOffsetCalls[i]...)
+	}
+	return result
+}
+
+func (f *fakeConfluentConsumerDriver) seeks() [][]ckafka.TopicPartition {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	result := make([][]ckafka.TopicPartition, len(f.seekCalls))
+	for i := range f.seekCalls {
+		result[i] = append([]ckafka.TopicPartition(nil), f.seekCalls[i]...)
 	}
 	return result
 }
@@ -1417,6 +1445,174 @@ func TestLegacyConfluentProducerIgnoresPerCallAcksAndCloseIsBestEffort(t *testin
 	flushes, closes := driver.calls()
 	if flushes != 1 || closes != 1 {
 		t.Fatalf("driver calls = flush:%d close:%d, want 1/1", flushes, closes)
+	}
+}
+
+func TestLegacyConfluentProducerExtensionsReuseConfiguredAcksDriver(t *testing.T) {
+	configured := &fakeConfluentProducerDriver{}
+	producer := newTestConfluentProducer(configured)
+	producer.legacy = true
+	producer.newProducer = func(*ckafka.ConfigMap) (confluentProducerDriver, error) {
+		return nil, errors.New("legacy extension allocated an acknowledgement-specific producer")
+	}
+
+	if err := producer.ProduceCtx(context.Background(), "orders", []Message{{Value: []byte("one")}}, 0); err != nil {
+		t.Fatalf("ProduceCtx: %v", err)
+	}
+	metadata, err := producer.ProduceCtxWithMetadata(context.Background(), "orders", []Message{{Value: []byte("two")}}, 1)
+	if err != nil {
+		t.Fatalf("ProduceCtxWithMetadata: %v", err)
+	}
+	if len(metadata) != 1 {
+		t.Fatalf("metadata = %#v, want one partition result", metadata)
+	}
+	if err := producer.ProduceBatchCtx(context.Background(), []TopicMessages{{
+		Topic: "orders", Messages: []Message{{Value: []byte("three")}},
+	}}, 0); err != nil {
+		t.Fatalf("ProduceBatchCtx: %v", err)
+	}
+	if err := producer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	flushes, closes := configured.calls()
+	if flushes != 1 || closes != 1 {
+		t.Fatalf("configured driver calls = flush:%d close:%d, want 1/1", flushes, closes)
+	}
+}
+
+func TestConfluentProducerConstructorSelectsEmptyKeyWireSemantics(t *testing.T) {
+	driver := &fakeConfluentProducerDriver{}
+	producer := newTestConfluentProducer(driver)
+	message := Message{Key: []byte{}, Value: []byte("payload")}
+
+	producer.legacy = true
+	legacyMessages, err := producer.buildBrokerMessages(context.Background(), driver, "orders", []Message{message})
+	if err != nil {
+		t.Fatalf("legacy buildBrokerMessages: %v", err)
+	}
+	if legacyMessages[0].Key != nil {
+		t.Fatalf("legacy wire key = %#v, want nil", legacyMessages[0].Key)
+	}
+
+	producer.legacy = false
+	advancedMessages, err := producer.buildBrokerMessages(context.Background(), driver, "orders", []Message{message})
+	if err != nil {
+		t.Fatalf("advanced buildBrokerMessages: %v", err)
+	}
+	if advancedMessages[0].Key == nil || len(advancedMessages[0].Key) != 0 {
+		t.Fatalf("advanced wire key = %#v, want present-empty", advancedMessages[0].Key)
+	}
+}
+
+func TestLegacyConfluentProducerCloseWaitsForContextDelivery(t *testing.T) {
+	accepted := make(chan struct{})
+	releaseDelivery := make(chan struct{})
+	driverClosed := make(chan struct{})
+	driver := &fakeConfluentProducerDriver{closeCalled: driverClosed}
+	driver.produceFn = func(message *ckafka.Message, reports chan ckafka.Event) error {
+		close(accepted)
+		go func() {
+			<-releaseDelivery
+			reports <- successfulDelivery(message, 3)
+		}()
+		return nil
+	}
+	producer := newTestConfluentProducer(driver)
+	producer.legacy = true
+	producer.newProducer = func(*ckafka.ConfigMap) (confluentProducerDriver, error) {
+		return driver, nil
+	}
+
+	produceDone := make(chan error, 1)
+	go func() {
+		produceDone <- producer.ProduceCtx(context.Background(), "orders", []Message{{Value: []byte("one")}}, 0)
+	}()
+	<-accepted
+	waitForConfluentPendingReports(t, producer, 1)
+
+	closeDone := make(chan error, 1)
+	secondCloseDone := make(chan error, 1)
+	go func() { closeDone <- producer.Close() }()
+	go func() { secondCloseDone <- producer.Close() }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before the accepted report drained: %v", err)
+	case err := <-secondCloseDone:
+		t.Fatalf("concurrent Close returned before the accepted report drained: %v", err)
+	case <-driverClosed:
+		t.Fatal("driver closed before the accepted report drained")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(releaseDelivery)
+	if err := <-produceDone; err != nil {
+		t.Fatalf("ProduceCtx: %v", err)
+	}
+	for name, result := range map[string]<-chan error{"first": closeDone, "second": secondCloseDone} {
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("%s Close: %v", name, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s Close did not finish after the delivery report drained", name)
+		}
+	}
+}
+
+func TestLegacyConfluentProducerCloseTimeoutReturnsWhileSafeCleanupContinues(t *testing.T) {
+	accepted := make(chan struct{})
+	releaseDelivery := make(chan struct{})
+	driverClosed := make(chan struct{})
+	driver := &fakeConfluentProducerDriver{closeCalled: driverClosed}
+	driver.produceFn = func(message *ckafka.Message, reports chan ckafka.Event) error {
+		close(accepted)
+		go func() {
+			<-releaseDelivery
+			reports <- successfulDelivery(message, 4)
+		}()
+		return nil
+	}
+	producer := newTestConfluentProducer(driver)
+	producer.legacy = true
+	producer.closeTimeout = 35 * time.Millisecond
+
+	produceDone := make(chan error, 1)
+	go func() {
+		produceDone <- producer.ProduceCtx(context.Background(), "orders", []Message{{Value: []byte("one")}}, -1)
+	}()
+	<-accepted
+	waitForConfluentPendingReports(t, producer, 1)
+
+	started := time.Now()
+	if err := producer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("legacy Close exceeded its bound: %s", elapsed)
+	}
+	select {
+	case <-driverClosed:
+		t.Fatal("driver closed while an accepted report still owned it")
+	default:
+	}
+
+	secondStarted := time.Now()
+	if err := producer.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if elapsed := time.Since(secondStarted); elapsed > 50*time.Millisecond {
+		t.Fatalf("second Close did not share the first close boundary: %s", elapsed)
+	}
+
+	close(releaseDelivery)
+	if err := <-produceDone; err != nil {
+		t.Fatalf("ProduceCtx: %v", err)
+	}
+	select {
+	case <-driverClosed:
+	case <-time.After(time.Second):
+		t.Fatal("background cleanup did not close the driver after delivery drained")
 	}
 }
 
@@ -1553,6 +1749,116 @@ func TestLegacyConfluentConsumerPreservesOfficialLifecycle(t *testing.T) {
 	}
 }
 
+func TestLegacyConfluentConsumerRejectsCompleteOptionsInsteadOfDroppingThem(t *testing.T) {
+	finalizer := func(context.Context, MessagePayload, error, ExactOffsetCommit) error { return nil }
+	tests := []struct {
+		name string
+		run  func(*ConfluentConsumer) error
+	}{
+		{
+			name: "advanced commit-before",
+			run: func(consumer *ConfluentConsumer) error {
+				return consumer.ConsumeAdvanced(func(MessagePayload) error { return nil }, ConsumerAdvancedOptions{CommitBeforeHandler: true})
+			},
+		},
+		{
+			name: "descriptive finalizer",
+			run: func(consumer *ConfluentConsumer) error {
+				return consumer.ConsumeWithOptions(func(MessagePayload) error { return nil }, ConsumeOptions{OffsetFinalizer: finalizer})
+			},
+		},
+		{
+			name: "descriptive polling",
+			run: func(consumer *ConfluentConsumer) error {
+				return consumer.ConsumeWithOptions(func(MessagePayload) error { return nil }, ConsumeOptions{PollTimeout: time.Second})
+			},
+		},
+		{
+			name: "advanced batch commit-before",
+			run: func(consumer *ConfluentConsumer) error {
+				return consumer.ConsumeBatchAdvanced(func(BatchPayload) error { return nil }, ConsumerAdvancedOptions{CommitBeforeHandler: true})
+			},
+		},
+		{
+			name: "context-aware polling",
+			run: func(consumer *ConfluentConsumer) error {
+				return consumer.ConsumeCtx(func(context.Context, MessagePayload) error { return nil }, ConsumerOptions{PollTimeout: time.Second})
+			},
+		},
+		{
+			name: "context-aware batch polling",
+			run: func(consumer *ConfluentConsumer) error {
+				return consumer.ConsumeBatchCtx(func(context.Context, BatchPayload) error { return nil }, ConsumerOptions{MaxRecords: 2})
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			driver := &fakeConfluentConsumerDriver{}
+			consumer := newTestConfluentConsumer(false, driver)
+			consumer.legacy = true
+			err := test.run(consumer)
+			if err == nil || !strings.Contains(err.Error(), "does not support complete run options") {
+				t.Fatalf("error = %v, want explicit unsupported-options error", err)
+			}
+			if reads := driver.reads(); len(reads) != 0 {
+				t.Fatalf("consumer polled before rejecting options: %v", reads)
+			}
+		})
+	}
+}
+
+func TestConfluentConsumerRebalanceLifecycleCloseDoesNotMisclassifyExternalClose(t *testing.T) {
+	driver := &fakeConfluentConsumerDriver{}
+	runDone := make(chan struct{})
+	consumer := newTestConfluentConsumer(false, driver)
+	consumer.runDone = runDone
+	hookCloseReturned := make(chan error, 1)
+	releaseHook := make(chan struct{})
+	consumer.config.OnPartitionsRevokedWithLifecycle = func(_ []PartitionAssignment, lifecycle RebalanceLifecycle) {
+		hookCloseReturned <- lifecycle.Close()
+		<-releaseHook
+	}
+
+	hookDone := make(chan struct{})
+	go func() {
+		consumer.invokePartitionsRevoked([]PartitionAssignment{{Topic: "orders", Partition: 0}})
+		close(hookDone)
+	}()
+
+	select {
+	case err := <-hookCloseReturned:
+		if err != nil {
+			t.Fatalf("Close from hook: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lifecycle Close deadlocked inside the rebalance hook")
+	}
+	externalClose := make(chan error, 1)
+	go func() { externalClose <- consumer.Close() }()
+	select {
+	case err := <-externalClose:
+		t.Fatalf("external Close returned while the rebalance hook was active: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(releaseHook)
+	<-hookDone
+	close(runDone)
+	select {
+	case err := <-externalClose:
+		if err != nil {
+			t.Fatalf("external Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("external Close did not finish after the callback and run drained")
+	}
+	_, _, closes := driver.operationCalls()
+	if closes != 1 {
+		t.Fatalf("driver closes = %d, want 1", closes)
+	}
+}
+
 func TestConfluentConsumerRejectsInvalidRunOptionsBeforePoll(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -1649,6 +1955,85 @@ func TestConfluentConsumerRunAutoCommitOverridesAreOperational(t *testing.T) {
 				t.Fatalf("offset operations = commits %d stores %d, want %d/%d", commits, stores, test.wantCommitCalls, test.wantStoreCalls)
 			}
 		})
+	}
+}
+
+func TestConfluentAdvancedConsumerSeeksExactOffsetAfterHandlerFailure(t *testing.T) {
+	topic := "orders"
+	handlerErr := errors.New("handler rejected record")
+	stopErr := errors.New("stop after replay")
+	firstReads := 0
+	first := &fakeConfluentConsumerDriver{}
+	first.readFn = func(time.Duration) (*ckafka.Message, error) {
+		firstReads++
+		if firstReads <= 2 {
+			return &ckafka.Message{TopicPartition: ckafka.TopicPartition{Topic: &topic, Partition: 1, Offset: 7}}, nil
+		}
+		return nil, stopErr
+	}
+	consumer := newTestConfluentConsumer(false, first)
+	consumer.configMap = &ckafka.ConfigMap{}
+	consumer.topics = []string{topic}
+	created := 0
+	consumer.newConsumer = func(*ckafka.ConfigMap) (confluentConsumerConnectDriver, error) {
+		created++
+		return &fakeConfluentConsumerDriver{}, nil
+	}
+
+	seen := make([]int64, 0, 2)
+	err := consumer.Consume(func(payload MessagePayload) error {
+		seen = append(seen, payload.Offset)
+		return handlerErr
+	}, ConsumerOptions{})
+	if !errors.Is(err, handlerErr) {
+		t.Fatalf("first Consume error = %v, want handler error", err)
+	}
+	if consumer.consumer != first {
+		t.Fatal("failed run discarded its healthy advanced Confluent driver")
+	}
+	_, _, firstCloses := first.operationCalls()
+	if firstCloses != 0 {
+		t.Fatalf("failed driver closes = %d, want 0", firstCloses)
+	}
+	seeks := first.seeks()
+	if len(seeks) != 1 || len(seeks[0]) != 1 || seeks[0][0].Topic == nil || *seeks[0][0].Topic != topic || seeks[0][0].Partition != 1 || seeks[0][0].Offset != 7 {
+		t.Fatalf("handler recovery seeks = %#v, want orders[1]@7", seeks)
+	}
+
+	err = consumer.Consume(func(payload MessagePayload) error {
+		seen = append(seen, payload.Offset)
+		return nil
+	}, ConsumerOptions{})
+	if !errors.Is(err, stopErr) {
+		t.Fatalf("second Consume error = %v, want stop error", err)
+	}
+	if created != 0 {
+		t.Fatalf("recreated consumers = %d, want 0", created)
+	}
+	if want := []int64{7, 7}; fmt.Sprint(seen) != fmt.Sprint(want) {
+		t.Fatalf("handled offsets = %v, want replay %v", seen, want)
+	}
+}
+
+func TestConfluentHandlerRecoveryRebuildsWhenExactSeekFails(t *testing.T) {
+	topic := "orders"
+	seekErr := errors.New("assignment changed")
+	driver := &fakeConfluentConsumerDriver{seekFn: func([]ckafka.TopicPartition) ([]ckafka.TopicPartition, error) {
+		return nil, seekErr
+	}}
+	consumer := newTestConfluentConsumer(false, driver)
+	err := newConsumerHandlerErrorAt("handler failed", errors.New("boom"), consumerRecordPosition{
+		topic: topic, partition: 2, offset: 17,
+	})
+	if got := consumer.prepareHandlerRunRetry(driver, err); got != err {
+		t.Fatalf("prepare error = %v, want original handler error", got)
+	}
+	if consumer.consumer != nil {
+		t.Fatal("failed exact seek retained the old Confluent driver")
+	}
+	_, _, closes := driver.operationCalls()
+	if closes != 1 {
+		t.Fatalf("driver closes = %d, want 1 after failed exact seek", closes)
 	}
 }
 

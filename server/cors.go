@@ -49,11 +49,11 @@ func DynamicCORS(opts CORSOptions) gin.HandlerFunc {
 			return
 		}
 		origin := c.GetHeader("Origin")
+		appendVary(c.Writer.Header(), "Origin")
 		allowed := origin != "" && opts.AllowOrigin != nil && opts.AllowOrigin(c, origin)
 		if allowed {
 			c.Header("Access-Control-Allow-Origin", origin)
 			c.Header("Access-Control-Allow-Credentials", "true")
-			c.Header("Vary", "Origin")
 		}
 		if c.Request.Method == http.MethodOptions {
 			if allowed {
@@ -69,4 +69,15 @@ func DynamicCORS(opts CORSOptions) gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+func appendVary(header http.Header, value string) {
+	for _, existing := range header.Values("Vary") {
+		for _, token := range strings.Split(existing, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), value) {
+				return
+			}
+		}
+	}
+	header.Add("Vary", value)
 }

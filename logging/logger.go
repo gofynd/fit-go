@@ -41,11 +41,12 @@ import (
 
 // implicitTraceEnabled gates the goroutine-local trace fallback in (*Logger).log,
 // so the runtime.Stack-based goroutine-id lookup only runs when tracing is on.
-// tracing.New keeps it in sync with the tracer's enabled state. Default false.
+// The managed tracing lifecycle keeps it in sync with the active opt-in tracer.
+// Original tracing constructors leave it disabled. Default false.
 var implicitTraceEnabled atomic.Bool
 
 // SetImplicitTraceEnabled toggles the implicit trace-in-logs fallback. Called by
-// tracing.New.
+// the managed tracing lifecycle.
 func SetImplicitTraceEnabled(b bool) { implicitTraceEnabled.Store(b) }
 
 // Context keys for trace propagation. These match the OpenTelemetry context
@@ -258,6 +259,8 @@ type Logger struct {
 	traceID                 string                 // bound trace context (via WithContext)
 	spanID                  string
 	traceFlags              byte
+	contextBound            bool
+	caller                  string
 	schema                  Schema
 	resource                map[string]interface{}
 	traceClueBodyLimit      int
@@ -440,6 +443,8 @@ func (l *Logger) clone() *Logger {
 		traceID:                 l.traceID,
 		spanID:                  l.spanID,
 		traceFlags:              l.traceFlags,
+		contextBound:            l.contextBound,
+		caller:                  l.caller,
 		schema:                  l.schema,
 		traceClueBodyLimit:      l.traceClueBodyLimit,
 		traceClueMetaLimit:      l.traceClueMetaLimit,
@@ -476,6 +481,7 @@ func (l *Logger) WithContext(ctx context.Context) *Logger {
 		c.traceID = sc.TraceID().String()
 		c.spanID = sc.SpanID().String()
 		c.traceFlags = byte(sc.TraceFlags())
+		c.contextBound = true
 		return c
 	}
 	if v, ok := ctx.Value(ctxKeyTraceID).(string); ok && v != "" {
@@ -489,6 +495,7 @@ func (l *Logger) WithContext(ctx context.Context) *Logger {
 	if v, ok := ctx.Value(ctxKeySpanID).(string); ok && v != "" {
 		c.spanID = v
 	}
+	c.contextBound = c.traceID != "" || c.spanID != ""
 	return c
 }
 
@@ -714,7 +721,7 @@ func (l *Logger) writeLog(
 	// active span overrides older bound compatibility IDs; fit-go-only IDs are a
 	// fallback when no native span is present. The runtime.Stack lookup remains
 	// gated off when tracing is disabled.
-	if implicitTraceEnabled.Load() {
+	if implicitTraceEnabled.Load() && !l.contextBound {
 		if gctx := goroutinectx.Active(); gctx != nil {
 			if sc := oteltrace.SpanContextFromContext(gctx); sc.IsValid() {
 				e.TraceID = sc.TraceID().String()
@@ -737,7 +744,9 @@ func (l *Logger) writeLog(
 
 	// Add caller info for error and fatal levels to aid debugging.
 	if lvl >= LevelError {
-		if _, file, line, ok := runtime.Caller(3); ok {
+		if l.caller != "" {
+			e.Caller = l.caller
+		} else if _, file, line, ok := runtime.Caller(3); ok {
 			e.Caller = fmt.Sprintf("%s:%d", file, line)
 		}
 	}

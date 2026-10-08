@@ -39,13 +39,40 @@ import (
 // With gin, this is gin.HandlerFunc.
 type Middleware = gin.HandlerFunc
 
+const ginKeyOwnedHealthProbe = "fit.ownedHealthProbe"
+
+func markOwnedStaticHealthProbe() Middleware {
+	return func(c *gin.Context) {
+		if isStaticHealthProbeRequest(c.Request.Method, c.Request.URL.Path) {
+			c.Set(ginKeyOwnedHealthProbe, true)
+		}
+		c.Next()
+	}
+}
+
+func isOwnedHealthProbe(c *gin.Context) bool {
+	if c == nil || c.Request == nil {
+		return false
+	}
+	if isHealthProbeRequest(c.Request.Method, c.Request.URL.Path) {
+		return true
+	}
+	owned, _ := c.Get(ginKeyOwnedHealthProbe)
+	marked, _ := owned.(bool)
+	return marked
+}
+
 // bypassHealthRoutes preserves fit.js ordering: the root liveness/readiness
 // router is mounted after fit's own logging/security middleware but before all
 // caller-supplied and built-in request middleware. Unsupported methods must
 // continue through the normal chain, matching Express router fallthrough.
-func bypassHealthRoutes(middleware Middleware) Middleware {
+func bypassHealthRoutes(middleware Middleware, staticCompatibility bool) Middleware {
 	return func(c *gin.Context) {
-		if isHealthProbeRequest(c.Request.Method, c.Request.URL.Path) {
+		bypass := isHealthProbeRequest(c.Request.Method, c.Request.URL.Path)
+		if staticCompatibility {
+			bypass = isStaticHealthProbeRequest(c.Request.Method, c.Request.URL.Path)
+		}
+		if bypass {
 			c.Next()
 			return
 		}
@@ -326,8 +353,10 @@ func LogRequestResponseAdvanced(cfg LogRequestResponseAdvancedConfig) gin.Handle
 		traceClueAccessLog := cfg.TraceClueAccessLog || cfg.LegacyTraceClue || traceClueLogSchemaEnabled()
 		requestURL := requestURLForLog(c, cfg, traceClueAccessLog)
 
-		// Skip health/readiness probes
-		if strings.Contains(path, "/_healthz") || strings.Contains(path, "/_readyz") {
+		// Skip only health/readiness requests owned by fit-go. Unsupported
+		// variants must remain observable when they fall through to application
+		// auth, parsers, or catch-all handlers.
+		if isOwnedHealthProbe(c) {
 			c.Next()
 			return
 		}
@@ -702,16 +731,16 @@ var defaultJWTAlgorithms = []string{"HS256"}
 // expected values. Decoded claims are stored in context - retrieve with
 // DecodedTokenFromContext.
 func AuthorizeJWTToken(opts JWTOptions) gin.HandlerFunc {
-	return authorizeJWTToken(JWTAdvancedOptions{JWTOptions: opts}, true)
+	return authorizeJWTToken(JWTAdvancedOptions{JWTOptions: opts}, true, false)
 }
 
 // AuthorizeJWTTokenAdvanced validates JWTs with post-main opt-in controls.
 // Deprecated: use AuthorizeJWTTokenWithOptions.
 func AuthorizeJWTTokenAdvanced(opts JWTAdvancedOptions) gin.HandlerFunc {
-	return authorizeJWTToken(opts, false)
+	return authorizeJWTToken(opts, false, true)
 }
 
-func authorizeJWTToken(opts JWTAdvancedOptions, allowPadding bool) gin.HandlerFunc {
+func authorizeJWTToken(opts JWTAdvancedOptions, allowPadding, allowScalarPayload bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		secret := opts.Secret
 		if secret == "" {
@@ -732,14 +761,15 @@ func authorizeJWTToken(opts JWTAdvancedOptions, allowPadding bool) gin.HandlerFu
 			algorithms = defaultJWTAlgorithms
 		}
 		decoded, err := verifyJWTToken(token, jwtVerificationOptions{
-			Secret:            secret,
-			RSAPublicKeyPEM:   opts.RSAPublicKeyPEM,
-			AllowedAlgorithms: algorithms,
-			AllowedClockSkew:  opts.AllowedClockSkew,
-			Issuer:            opts.Issuer,
-			Audience:          opts.Audience,
-			Subject:           opts.Subject,
-			AllowPadding:      allowPadding,
+			Secret:             secret,
+			RSAPublicKeyPEM:    opts.RSAPublicKeyPEM,
+			AllowedAlgorithms:  algorithms,
+			AllowedClockSkew:   opts.AllowedClockSkew,
+			Issuer:             opts.Issuer,
+			Audience:           opts.Audience,
+			Subject:            opts.Subject,
+			AllowPadding:       allowPadding,
+			AllowScalarPayload: allowScalarPayload,
 		})
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, map[string]string{"message": "Unauthorized"})
@@ -779,14 +809,15 @@ func authorizeJWTToken(opts JWTAdvancedOptions, allowPadding bool) gin.HandlerFu
 }
 
 type jwtVerificationOptions struct {
-	Secret            string
-	RSAPublicKeyPEM   string
-	AllowedAlgorithms []string
-	AllowedClockSkew  time.Duration
-	Issuer            string
-	Audience          string
-	Subject           string
-	AllowPadding      bool
+	Secret             string
+	RSAPublicKeyPEM    string
+	AllowedAlgorithms  []string
+	AllowedClockSkew   time.Duration
+	Issuer             string
+	Audience           string
+	Subject            string
+	AllowPadding       bool
+	AllowScalarPayload bool
 }
 
 type flexibleClaims struct {
@@ -865,6 +896,11 @@ func verifyJWTToken(tokenString string, options jwtVerificationOptions) (interfa
 	}
 	if !parsed.Valid || claims.value == nil {
 		return nil, fmt.Errorf("JWT is invalid")
+	}
+	if !options.AllowScalarPayload {
+		if _, ok := claims.value.(map[string]interface{}); !ok {
+			return nil, fmt.Errorf("JWT payload is not an object")
+		}
 	}
 	return claims.value, nil
 }
@@ -1134,7 +1170,7 @@ func RequestIDAdvanced() gin.HandlerFunc {
 func requestID(writeGeneratedRequestHeader bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id := c.GetHeader("X-Request-ID")
-		if id == "" {
+		if id == "" || (writeGeneratedRequestHeader && !validPropagatedRequestID(id)) {
 			id = generateRequestID()
 			if writeGeneratedRequestHeader {
 				c.Request.Header.Set("X-Request-ID", id)
@@ -1146,6 +1182,22 @@ func requestID(writeGeneratedRequestHeader bool) gin.HandlerFunc {
 		c.Request = c.Request.WithContext(ctx)
 		c.Next()
 	}
+}
+
+const maxPropagatedRequestIDLength = 128
+
+func validPropagatedRequestID(value string) bool {
+	if value == "" || len(value) > maxPropagatedRequestIDLength {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		// Keep advanced propagation safe for structured logs, span attributes,
+		// and downstream HTTP headers while accepting existing visible-ASCII IDs.
+		if value[i] < 0x21 || value[i] > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 // generateRequestID creates a simple UUID v4-like identifier without external deps.

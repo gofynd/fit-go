@@ -249,18 +249,23 @@ func RegisterProfileRoutesWithProfiler(engine *gin.Engine, profiler *profiling.P
 	})
 
 	engine.GET("/_profiling/start_cpu", func(c *gin.Context) {
-		if !profiler.GetConfig().Enabled {
+		config := profiler.GetConfig()
+		if !config.Enabled {
 			profilingOK(c, "Profiling is not enabled by global configuration")
+			return
+		}
+		if !config.CPUEnabled && !config.WallEnabled {
+			profilingOK(c, "CPU profiling is not enabled by configuration")
 			return
 		}
 		if profiler.IsCPUProfilingRunning() && profiler.IsWallProfilingRunning() {
 			profilingOK(c, "CPU profiling is already running")
 			return
 		}
-		if !profiler.IsCPUProfilingRunning() {
+		if config.CPUEnabled && !profiler.IsCPUProfilingRunning() {
 			profiler.StartCPUProfiling()
 		}
-		if !profiler.IsWallProfilingRunning() {
+		if config.WallEnabled && !profiler.IsWallProfilingRunning() {
 			profiler.StartWallProfiling()
 		}
 		profilingOK(c, "CPU profiling started")
@@ -281,8 +286,13 @@ func RegisterProfileRoutesWithProfiler(engine *gin.Engine, profiler *profiling.P
 	})
 
 	engine.GET("/_profiling/start_heap", func(c *gin.Context) {
-		if !profiler.GetConfig().Enabled {
+		config := profiler.GetConfig()
+		if !config.Enabled {
 			profilingOK(c, "Profiling is not enabled by global configuration")
+			return
+		}
+		if !config.HeapEnabled {
+			profilingOK(c, "Heap profiling is not enabled by configuration")
 			return
 		}
 		if profiler.IsHeapProfilingRunning() {
@@ -303,8 +313,13 @@ func RegisterProfileRoutesWithProfiler(engine *gin.Engine, profiler *profiling.P
 	})
 
 	engine.GET("/_profiling/start_wall", func(c *gin.Context) {
-		if !profiler.GetConfig().Enabled {
+		config := profiler.GetConfig()
+		if !config.Enabled {
 			profilingOK(c, "Profiling is not enabled by global configuration")
+			return
+		}
+		if !config.WallEnabled {
+			profilingOK(c, "Wall profiling is not enabled by configuration")
 			return
 		}
 		if profiler.IsWallProfilingRunning() {
@@ -348,9 +363,11 @@ func RegisterProfileRoutesWithProfiler(engine *gin.Engine, profiler *profiling.P
 		c.JSON(http.StatusOK, gin.H{
 			"status": "ok",
 			"configuration": gin.H{"profiler": gin.H{
-				"enabled": config.Enabled, "server": config.Server,
-				"cpuEnabled": config.CPUEnabled, "heapEnabled": config.HeapEnabled,
-				"cpuWallEnabled": config.WallEnabled, "tagsJson": config.TagsJSON,
+				"enabled":          config.Enabled,
+				"serverConfigured": config.Server != "",
+				"cpuEnabled":       config.CPUEnabled, "heapEnabled": config.HeapEnabled,
+				"cpuWallEnabled":             config.WallEnabled,
+				"tagsConfigured":             config.TagsJSON != "" && config.TagsJSON != "{}",
 				"flushIntervalMs":            config.FlushIntervalMs,
 				"heapSamplingIntervalBytes":  config.HeapSamplingIntervalBytes,
 				"heapStackDepth":             config.HeapStackDepth,

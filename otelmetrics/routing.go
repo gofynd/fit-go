@@ -8,6 +8,7 @@ package otelmetrics
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 
 	"go.opentelemetry.io/otel"
@@ -97,15 +98,37 @@ type routingMeter struct {
 	options       []metric.MeterOption
 	target        metric.Meter
 	instruments   []routedInstrument
+	instrumentSet map[instrumentKey]routedInstrument
 	registrations []*routingRegistration
+}
+
+type instrumentKey struct {
+	kind        string
+	name        string
+	description string
+	unit        string
+	boundaries  string
 }
 
 func newRoutingMeter(target metric.Meter, name string, options []metric.MeterOption) *routingMeter {
 	return &routingMeter{
-		Meter:   metricnoop.NewMeterProvider().Meter(name, options...),
-		name:    name,
-		options: append([]metric.MeterOption(nil), options...),
-		target:  target,
+		Meter:         metricnoop.NewMeterProvider().Meter(name, options...),
+		name:          name,
+		options:       append([]metric.MeterOption(nil), options...),
+		target:        target,
+		instrumentSet: make(map[instrumentKey]routedInstrument),
+	}
+}
+
+func (meter *routingMeter) cachedInstrument(key instrumentKey) (routedInstrument, bool) {
+	instrument, exists := meter.instrumentSet[key]
+	return instrument, exists
+}
+
+func (meter *routingMeter) rememberInstrument(key instrumentKey, instrument routedInstrument, cacheable bool) {
+	meter.instruments = append(meter.instruments, instrument)
+	if cacheable {
+		meter.instrumentSet[key] = instrument
 	}
 }
 
@@ -357,6 +380,11 @@ type routedObservable interface {
 func (meter *routingMeter) Int64Counter(name string, options ...metric.Int64CounterOption) (metric.Int64Counter, error) {
 	meter.mu.Lock()
 	defer meter.mu.Unlock()
+	config := metric.NewInt64CounterConfig(options...)
+	key := instrumentKey{kind: "int64_counter", name: name, description: config.Description(), unit: config.Unit()}
+	if cached, exists := meter.cachedInstrument(key); exists {
+		return cached.(*routingInt64Counter), nil
+	}
 	current, err := meter.target.Int64Counter(name, options...)
 	if err != nil {
 		return nil, err
@@ -366,13 +394,18 @@ func (meter *routingMeter) Int64Counter(name string, options ...metric.Int64Coun
 	instrument.bind = func(target metric.Meter) (metric.Int64Counter, error) {
 		return target.Int64Counter(name, options...)
 	}
-	meter.instruments = append(meter.instruments, instrument)
+	meter.rememberInstrument(key, instrument, true)
 	return instrument, nil
 }
 
 func (meter *routingMeter) Int64UpDownCounter(name string, options ...metric.Int64UpDownCounterOption) (metric.Int64UpDownCounter, error) {
 	meter.mu.Lock()
 	defer meter.mu.Unlock()
+	config := metric.NewInt64UpDownCounterConfig(options...)
+	key := instrumentKey{kind: "int64_up_down_counter", name: name, description: config.Description(), unit: config.Unit()}
+	if cached, exists := meter.cachedInstrument(key); exists {
+		return cached.(*routingInt64UpDownCounter), nil
+	}
 	current, err := meter.target.Int64UpDownCounter(name, options...)
 	if err != nil {
 		return nil, err
@@ -382,13 +415,18 @@ func (meter *routingMeter) Int64UpDownCounter(name string, options ...metric.Int
 	instrument.bind = func(target metric.Meter) (metric.Int64UpDownCounter, error) {
 		return target.Int64UpDownCounter(name, options...)
 	}
-	meter.instruments = append(meter.instruments, instrument)
+	meter.rememberInstrument(key, instrument, true)
 	return instrument, nil
 }
 
 func (meter *routingMeter) Int64Histogram(name string, options ...metric.Int64HistogramOption) (metric.Int64Histogram, error) {
 	meter.mu.Lock()
 	defer meter.mu.Unlock()
+	config := metric.NewInt64HistogramConfig(options...)
+	key := instrumentKey{kind: "int64_histogram", name: name, description: config.Description(), unit: config.Unit(), boundaries: fmt.Sprint(config.ExplicitBucketBoundaries())}
+	if cached, exists := meter.cachedInstrument(key); exists {
+		return cached.(*routingInt64Histogram), nil
+	}
 	current, err := meter.target.Int64Histogram(name, options...)
 	if err != nil {
 		return nil, err
@@ -398,13 +436,18 @@ func (meter *routingMeter) Int64Histogram(name string, options ...metric.Int64Hi
 	instrument.bind = func(target metric.Meter) (metric.Int64Histogram, error) {
 		return target.Int64Histogram(name, options...)
 	}
-	meter.instruments = append(meter.instruments, instrument)
+	meter.rememberInstrument(key, instrument, true)
 	return instrument, nil
 }
 
 func (meter *routingMeter) Int64Gauge(name string, options ...metric.Int64GaugeOption) (metric.Int64Gauge, error) {
 	meter.mu.Lock()
 	defer meter.mu.Unlock()
+	config := metric.NewInt64GaugeConfig(options...)
+	key := instrumentKey{kind: "int64_gauge", name: name, description: config.Description(), unit: config.Unit()}
+	if cached, exists := meter.cachedInstrument(key); exists {
+		return cached.(*routingInt64Gauge), nil
+	}
 	current, err := meter.target.Int64Gauge(name, options...)
 	if err != nil {
 		return nil, err
@@ -414,13 +457,18 @@ func (meter *routingMeter) Int64Gauge(name string, options ...metric.Int64GaugeO
 	instrument.bind = func(target metric.Meter) (metric.Int64Gauge, error) {
 		return target.Int64Gauge(name, options...)
 	}
-	meter.instruments = append(meter.instruments, instrument)
+	meter.rememberInstrument(key, instrument, true)
 	return instrument, nil
 }
 
 func (meter *routingMeter) Float64Counter(name string, options ...metric.Float64CounterOption) (metric.Float64Counter, error) {
 	meter.mu.Lock()
 	defer meter.mu.Unlock()
+	config := metric.NewFloat64CounterConfig(options...)
+	key := instrumentKey{kind: "float64_counter", name: name, description: config.Description(), unit: config.Unit()}
+	if cached, exists := meter.cachedInstrument(key); exists {
+		return cached.(*routingFloat64Counter), nil
+	}
 	current, err := meter.target.Float64Counter(name, options...)
 	if err != nil {
 		return nil, err
@@ -430,13 +478,18 @@ func (meter *routingMeter) Float64Counter(name string, options ...metric.Float64
 	instrument.bind = func(target metric.Meter) (metric.Float64Counter, error) {
 		return target.Float64Counter(name, options...)
 	}
-	meter.instruments = append(meter.instruments, instrument)
+	meter.rememberInstrument(key, instrument, true)
 	return instrument, nil
 }
 
 func (meter *routingMeter) Float64UpDownCounter(name string, options ...metric.Float64UpDownCounterOption) (metric.Float64UpDownCounter, error) {
 	meter.mu.Lock()
 	defer meter.mu.Unlock()
+	config := metric.NewFloat64UpDownCounterConfig(options...)
+	key := instrumentKey{kind: "float64_up_down_counter", name: name, description: config.Description(), unit: config.Unit()}
+	if cached, exists := meter.cachedInstrument(key); exists {
+		return cached.(*routingFloat64UpDownCounter), nil
+	}
 	current, err := meter.target.Float64UpDownCounter(name, options...)
 	if err != nil {
 		return nil, err
@@ -446,13 +499,18 @@ func (meter *routingMeter) Float64UpDownCounter(name string, options ...metric.F
 	instrument.bind = func(target metric.Meter) (metric.Float64UpDownCounter, error) {
 		return target.Float64UpDownCounter(name, options...)
 	}
-	meter.instruments = append(meter.instruments, instrument)
+	meter.rememberInstrument(key, instrument, true)
 	return instrument, nil
 }
 
 func (meter *routingMeter) Float64Histogram(name string, options ...metric.Float64HistogramOption) (metric.Float64Histogram, error) {
 	meter.mu.Lock()
 	defer meter.mu.Unlock()
+	config := metric.NewFloat64HistogramConfig(options...)
+	key := instrumentKey{kind: "float64_histogram", name: name, description: config.Description(), unit: config.Unit(), boundaries: fmt.Sprint(config.ExplicitBucketBoundaries())}
+	if cached, exists := meter.cachedInstrument(key); exists {
+		return cached.(*routingFloat64Histogram), nil
+	}
 	current, err := meter.target.Float64Histogram(name, options...)
 	if err != nil {
 		return nil, err
@@ -462,13 +520,18 @@ func (meter *routingMeter) Float64Histogram(name string, options ...metric.Float
 	instrument.bind = func(target metric.Meter) (metric.Float64Histogram, error) {
 		return target.Float64Histogram(name, options...)
 	}
-	meter.instruments = append(meter.instruments, instrument)
+	meter.rememberInstrument(key, instrument, true)
 	return instrument, nil
 }
 
 func (meter *routingMeter) Float64Gauge(name string, options ...metric.Float64GaugeOption) (metric.Float64Gauge, error) {
 	meter.mu.Lock()
 	defer meter.mu.Unlock()
+	config := metric.NewFloat64GaugeConfig(options...)
+	key := instrumentKey{kind: "float64_gauge", name: name, description: config.Description(), unit: config.Unit()}
+	if cached, exists := meter.cachedInstrument(key); exists {
+		return cached.(*routingFloat64Gauge), nil
+	}
 	current, err := meter.target.Float64Gauge(name, options...)
 	if err != nil {
 		return nil, err
@@ -478,13 +541,21 @@ func (meter *routingMeter) Float64Gauge(name string, options ...metric.Float64Ga
 	instrument.bind = func(target metric.Meter) (metric.Float64Gauge, error) {
 		return target.Float64Gauge(name, options...)
 	}
-	meter.instruments = append(meter.instruments, instrument)
+	meter.rememberInstrument(key, instrument, true)
 	return instrument, nil
 }
 
 func (meter *routingMeter) Int64ObservableCounter(name string, options ...metric.Int64ObservableCounterOption) (metric.Int64ObservableCounter, error) {
 	meter.mu.Lock()
 	defer meter.mu.Unlock()
+	config := metric.NewInt64ObservableCounterConfig(options...)
+	key := instrumentKey{kind: "int64_observable_counter", name: name, description: config.Description(), unit: config.Unit()}
+	cacheable := len(config.Callbacks()) == 0
+	if cacheable {
+		if cached, exists := meter.cachedInstrument(key); exists {
+			return cached.(*routingInt64ObservableCounter), nil
+		}
+	}
 	current, err := meter.target.Int64ObservableCounter(name, options...)
 	if err != nil {
 		return nil, err
@@ -494,13 +565,21 @@ func (meter *routingMeter) Int64ObservableCounter(name string, options ...metric
 	instrument.bind = func(target metric.Meter) (metric.Int64ObservableCounter, error) {
 		return target.Int64ObservableCounter(name, options...)
 	}
-	meter.instruments = append(meter.instruments, instrument)
+	meter.rememberInstrument(key, instrument, cacheable)
 	return instrument, nil
 }
 
 func (meter *routingMeter) Int64ObservableUpDownCounter(name string, options ...metric.Int64ObservableUpDownCounterOption) (metric.Int64ObservableUpDownCounter, error) {
 	meter.mu.Lock()
 	defer meter.mu.Unlock()
+	config := metric.NewInt64ObservableUpDownCounterConfig(options...)
+	key := instrumentKey{kind: "int64_observable_up_down_counter", name: name, description: config.Description(), unit: config.Unit()}
+	cacheable := len(config.Callbacks()) == 0
+	if cacheable {
+		if cached, exists := meter.cachedInstrument(key); exists {
+			return cached.(*routingInt64ObservableUpDownCounter), nil
+		}
+	}
 	current, err := meter.target.Int64ObservableUpDownCounter(name, options...)
 	if err != nil {
 		return nil, err
@@ -510,13 +589,21 @@ func (meter *routingMeter) Int64ObservableUpDownCounter(name string, options ...
 	instrument.bind = func(target metric.Meter) (metric.Int64ObservableUpDownCounter, error) {
 		return target.Int64ObservableUpDownCounter(name, options...)
 	}
-	meter.instruments = append(meter.instruments, instrument)
+	meter.rememberInstrument(key, instrument, cacheable)
 	return instrument, nil
 }
 
 func (meter *routingMeter) Int64ObservableGauge(name string, options ...metric.Int64ObservableGaugeOption) (metric.Int64ObservableGauge, error) {
 	meter.mu.Lock()
 	defer meter.mu.Unlock()
+	config := metric.NewInt64ObservableGaugeConfig(options...)
+	key := instrumentKey{kind: "int64_observable_gauge", name: name, description: config.Description(), unit: config.Unit()}
+	cacheable := len(config.Callbacks()) == 0
+	if cacheable {
+		if cached, exists := meter.cachedInstrument(key); exists {
+			return cached.(*routingInt64ObservableGauge), nil
+		}
+	}
 	current, err := meter.target.Int64ObservableGauge(name, options...)
 	if err != nil {
 		return nil, err
@@ -526,13 +613,21 @@ func (meter *routingMeter) Int64ObservableGauge(name string, options ...metric.I
 	instrument.bind = func(target metric.Meter) (metric.Int64ObservableGauge, error) {
 		return target.Int64ObservableGauge(name, options...)
 	}
-	meter.instruments = append(meter.instruments, instrument)
+	meter.rememberInstrument(key, instrument, cacheable)
 	return instrument, nil
 }
 
 func (meter *routingMeter) Float64ObservableCounter(name string, options ...metric.Float64ObservableCounterOption) (metric.Float64ObservableCounter, error) {
 	meter.mu.Lock()
 	defer meter.mu.Unlock()
+	config := metric.NewFloat64ObservableCounterConfig(options...)
+	key := instrumentKey{kind: "float64_observable_counter", name: name, description: config.Description(), unit: config.Unit()}
+	cacheable := len(config.Callbacks()) == 0
+	if cacheable {
+		if cached, exists := meter.cachedInstrument(key); exists {
+			return cached.(*routingFloat64ObservableCounter), nil
+		}
+	}
 	current, err := meter.target.Float64ObservableCounter(name, options...)
 	if err != nil {
 		return nil, err
@@ -542,13 +637,21 @@ func (meter *routingMeter) Float64ObservableCounter(name string, options ...metr
 	instrument.bind = func(target metric.Meter) (metric.Float64ObservableCounter, error) {
 		return target.Float64ObservableCounter(name, options...)
 	}
-	meter.instruments = append(meter.instruments, instrument)
+	meter.rememberInstrument(key, instrument, cacheable)
 	return instrument, nil
 }
 
 func (meter *routingMeter) Float64ObservableUpDownCounter(name string, options ...metric.Float64ObservableUpDownCounterOption) (metric.Float64ObservableUpDownCounter, error) {
 	meter.mu.Lock()
 	defer meter.mu.Unlock()
+	config := metric.NewFloat64ObservableUpDownCounterConfig(options...)
+	key := instrumentKey{kind: "float64_observable_up_down_counter", name: name, description: config.Description(), unit: config.Unit()}
+	cacheable := len(config.Callbacks()) == 0
+	if cacheable {
+		if cached, exists := meter.cachedInstrument(key); exists {
+			return cached.(*routingFloat64ObservableUpDownCounter), nil
+		}
+	}
 	current, err := meter.target.Float64ObservableUpDownCounter(name, options...)
 	if err != nil {
 		return nil, err
@@ -558,13 +661,21 @@ func (meter *routingMeter) Float64ObservableUpDownCounter(name string, options .
 	instrument.bind = func(target metric.Meter) (metric.Float64ObservableUpDownCounter, error) {
 		return target.Float64ObservableUpDownCounter(name, options...)
 	}
-	meter.instruments = append(meter.instruments, instrument)
+	meter.rememberInstrument(key, instrument, cacheable)
 	return instrument, nil
 }
 
 func (meter *routingMeter) Float64ObservableGauge(name string, options ...metric.Float64ObservableGaugeOption) (metric.Float64ObservableGauge, error) {
 	meter.mu.Lock()
 	defer meter.mu.Unlock()
+	config := metric.NewFloat64ObservableGaugeConfig(options...)
+	key := instrumentKey{kind: "float64_observable_gauge", name: name, description: config.Description(), unit: config.Unit()}
+	cacheable := len(config.Callbacks()) == 0
+	if cacheable {
+		if cached, exists := meter.cachedInstrument(key); exists {
+			return cached.(*routingFloat64ObservableGauge), nil
+		}
+	}
 	current, err := meter.target.Float64ObservableGauge(name, options...)
 	if err != nil {
 		return nil, err
@@ -574,7 +685,7 @@ func (meter *routingMeter) Float64ObservableGauge(name string, options ...metric
 	instrument.bind = func(target metric.Meter) (metric.Float64ObservableGauge, error) {
 		return target.Float64ObservableGauge(name, options...)
 	}
-	meter.instruments = append(meter.instruments, instrument)
+	meter.rememberInstrument(key, instrument, cacheable)
 	return instrument, nil
 }
 
@@ -591,6 +702,7 @@ func (meter *routingMeter) RegisterCallback(callback metric.Callback, instrument
 		callback:    callback,
 		instruments: append([]metric.Observable(nil), instruments...),
 		active:      true,
+		owner:       meter,
 	}
 	if err := registration.rebind(meter.target); err != nil {
 		return nil, err
@@ -607,6 +719,7 @@ type routingRegistration struct {
 	callback    metric.Callback
 	instruments []metric.Observable
 	active      bool
+	owner       *routingMeter
 }
 
 func (registration *routingRegistration) rebind(meter metric.Meter) error {
@@ -637,17 +750,36 @@ func (registration *routingRegistration) rebind(meter metric.Meter) error {
 
 func (registration *routingRegistration) Unregister() error {
 	registration.mu.Lock()
-	defer registration.mu.Unlock()
 	if !registration.active {
+		registration.mu.Unlock()
 		return nil
 	}
 	registration.active = false
-	if registration.current == nil {
-		return nil
+	var err error
+	if registration.current != nil {
+		err = registration.current.Unregister()
+		registration.current = nil
 	}
-	err := registration.current.Unregister()
-	registration.current = nil
+	owner := registration.owner
+	registration.owner = nil
+	registration.mu.Unlock()
+	if owner != nil {
+		owner.removeRegistration(registration)
+	}
 	return err
+}
+
+func (meter *routingMeter) removeRegistration(target *routingRegistration) {
+	meter.mu.Lock()
+	defer meter.mu.Unlock()
+	for index, registration := range meter.registrations {
+		if registration == target {
+			copy(meter.registrations[index:], meter.registrations[index+1:])
+			meter.registrations[len(meter.registrations)-1] = nil
+			meter.registrations = meter.registrations[:len(meter.registrations)-1]
+			return
+		}
+	}
 }
 
 func routeCallback(callback metric.Callback, observables map[routedObservable]metric.Observable) metric.Callback {

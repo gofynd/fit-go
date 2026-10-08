@@ -6,6 +6,7 @@ package feature
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -14,20 +15,24 @@ import (
 
 // EvaluationContext provides request-scoped FeatureHub attributes. For
 // client-evaluated keys, contexts share the immutable feature repository and
-// evaluate independently. FeatureHub's server-evaluated protocol exposes one
-// active context per edge stream, so Build replaces the parent client's active
-// server context before waiting for its evaluated feature set.
+// evaluate independently. Server-evaluated contexts obtain their own bounded
+// feature snapshot during Build so concurrent requests never replace the
+// parent client's active stream context.
 type EvaluationContext struct {
-	client     *Client
-	mu         sync.RWMutex
-	attributes map[string][]string
+	client       *Client
+	mu           sync.RWMutex
+	attributes   map[string][]string
+	features     map[string]*featureState
+	legacyValues map[string]interface{}
+	built        bool
+	revision     uint64
 }
 
 // NewContext returns an evaluation context initialized with the framework's
 // service and platform-version attributes.
 func (c *Client) NewContext() *EvaluationContext {
 	if c == nil {
-		return &EvaluationContext{}
+		return &EvaluationContext{attributes: make(map[string][]string)}
 	}
 	c.mu.RLock()
 	attributes := cloneAttributes(c.defaults)
@@ -77,11 +82,18 @@ func (c *EvaluationContext) AttributeValues(key string, values []string) *Evalua
 		return c
 	}
 	c.mu.Lock()
+	if c.attributes == nil {
+		c.attributes = make(map[string][]string)
+	}
 	if len(values) == 0 {
 		delete(c.attributes, key)
 	} else {
 		c.attributes[key] = append([]string(nil), values...)
 	}
+	c.features = nil
+	c.legacyValues = nil
+	c.built = false
+	c.revision++
 	c.mu.Unlock()
 	return c
 }
@@ -96,31 +108,79 @@ func (c *EvaluationContext) Clear() *EvaluationContext {
 	c.client.mu.RUnlock()
 	c.mu.Lock()
 	c.attributes = defaults
+	c.features = nil
+	c.legacyValues = nil
+	c.built = false
+	c.revision++
 	c.mu.Unlock()
 	return c
 }
 
 // Build makes this context active. Client-evaluated contexts only wait for the
-// shared repository. Server-evaluated contexts reconnect with the exact
-// x-featurehub encoding used by the JavaScript SDK and wait for the refreshed
-// full feature set.
+// shared repository. Server-evaluated contexts request an isolated feature
+// snapshot with the exact x-featurehub encoding used by the JavaScript SDK.
 func (c *EvaluationContext) Build(ctx context.Context) error {
 	if c == nil || c.client == nil {
 		return nil
 	}
 	c.mu.RLock()
 	attributes := cloneAttributes(c.attributes)
+	revision := c.revision
 	c.mu.RUnlock()
-	if !c.client.clientEvaluated {
-		c.client.replaceAttributes(attributes)
+	if c.client.legacy != nil {
+		values, err := c.client.legacy.snapshotFor(ctx, attributes)
+		if err != nil {
+			return err
+		}
+		c.mu.Lock()
+		if c.revision != revision {
+			c.mu.Unlock()
+			return errors.New("feature: evaluation context changed during Build")
+		}
+		c.legacyValues = values
+		c.features = nil
+		c.built = true
+		c.mu.Unlock()
+		return nil
 	}
-	return c.client.WaitReady(ctx)
+	if c.client.clientEvaluated {
+		if err := c.client.WaitReady(ctx); err != nil {
+			return err
+		}
+		c.mu.Lock()
+		if c.revision != revision {
+			c.mu.Unlock()
+			return errors.New("feature: evaluation context changed during Build")
+		}
+		c.built = true
+		c.mu.Unlock()
+		return nil
+	}
+	features, err := c.client.evaluatedFeaturesForContext(ctx, attributes)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	if c.revision != revision {
+		c.mu.Unlock()
+		return errors.New("feature: evaluation context changed during Build")
+	}
+	c.features = features
+	c.built = true
+	c.mu.Unlock()
+	return nil
 }
 
 // IsEnabled evaluates a BOOLEAN feature in this context.
 func (c *EvaluationContext) IsEnabled(key string) bool {
 	value, valueType, ok := c.evaluatedValue(key)
-	if !ok || valueType != featureTypeBoolean {
+	if !ok {
+		return false
+	}
+	if c != nil && c.client != nil && c.client.legacy != nil {
+		return legacyBoolean(value)
+	}
+	if valueType != featureTypeBoolean {
 		return false
 	}
 	boolean, ok := castBoolean(value)
@@ -175,9 +235,42 @@ func (c *EvaluationContext) evaluatedValue(key string) (interface{}, string, boo
 		return nil, "", false
 	}
 	c.mu.RLock()
+	feature, contextFeature := c.features[key]
+	legacyValue, legacyFeature := c.legacyValues[key]
+	built := c.built
+	c.mu.RUnlock()
+	if c.client.legacy != nil {
+		if !built {
+			return nil, "", false
+		}
+		return legacyValue, featureValueType(legacyValue), legacyFeature && legacyValue != nil
+	}
+	if !c.client.clientEvaluated {
+		if !built {
+			return nil, "", false
+		}
+		if !contextFeature || feature == nil {
+			return nil, "", false
+		}
+		return feature.Value, feature.Type, feature.Value != nil
+	}
+	c.mu.RLock()
 	attributes := cloneAttributes(c.attributes)
 	c.mu.RUnlock()
 	return c.client.evaluatedValueFor(key, attributes)
+}
+
+func legacyBoolean(value interface{}) bool {
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		return strings.EqualFold(strings.TrimSpace(typed), "true")
+	case float64:
+		return typed != 0
+	default:
+		return false
+	}
 }
 
 func featureHubContextHeader(attributes map[string][]string) string {

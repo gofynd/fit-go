@@ -452,6 +452,16 @@ func TestOriginalInitRetainsOfficialHealthAndRegistrationDefaults(t *testing.T) 
 	if afterRegistration.Status != healthpb.HealthCheckResponse_NOT_SERVING {
 		t.Fatalf("health after registration = %s, want NOT_SERVING", afterRegistration.Status)
 	}
+
+	server.mu.Lock()
+	server.running = true
+	server.mu.Unlock()
+	if err := server.AddServiceDefinitions(ServiceImplementation{}); err != nil {
+		t.Fatalf("original AddServiceDefinitions after Start changed behavior: %v", err)
+	}
+	server.mu.Lock()
+	server.running = false
+	server.mu.Unlock()
 }
 
 // ---------------------------------------------------------------------------
@@ -1033,6 +1043,32 @@ func TestMiddlewareChain(t *testing.T) {
 			t.Errorf("executed = %v, want only [first]", executed)
 		}
 	})
+}
+
+func TestMiddlewareDefaultErrorsPreserveOnlyLegacyContract(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		advanced bool
+		want     string
+	}{
+		{name: "legacy", want: "legacy detail"},
+		{name: "advanced", advanced: true, want: "Internal Server Error, Please try again!"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := &Server{
+				advanced: test.advanced,
+				logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+			}
+			var got error
+			server.executeChain([]HandlerFunc{
+				func(_ *CallInfo, _ Callback, next NextFunc) { next(errors.New("legacy detail")) },
+			}, &CallInfo{FullMethod: "/test"}, func(err error, _ map[string]interface{}) { got = err })
+			rpcErr, ok := got.(*RPCError)
+			if !ok || rpcErr.Message != test.want {
+				t.Fatalf("middleware error = %#v, want message %q", got, test.want)
+			}
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------

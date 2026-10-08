@@ -81,6 +81,37 @@ func TestTracerShutdownFlushesOnceAndCachesError(t *testing.T) {
 	}
 }
 
+func TestImplicitLogContextIsOptInForAdvancedTracing(t *testing.T) {
+	enabled := true
+	legacy, err := New(context.Background(), Options{
+		ServiceName:            "legacy",
+		Enabled:                &enabled,
+		SpanExporter:           &lifecycleExporter{},
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("New legacy tracer: %v", err)
+	}
+	defer legacy.Shutdown(context.Background())
+	if legacy.implicitLogContext {
+		t.Fatal("legacy tracing unexpectedly enabled goroutine-local log lookup")
+	}
+
+	advanced, err := NewAdvanced(context.Background(), AdvancedOptions{
+		ServiceName:            "advanced",
+		Enabled:                &enabled,
+		SpanExporter:           &lifecycleExporter{},
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("NewAdvanced tracer: %v", err)
+	}
+	defer advanced.Shutdown(context.Background())
+	if !advanced.implicitLogContext {
+		t.Fatal("advanced tracing did not enable goroutine-local log lookup")
+	}
+}
+
 func equalStringSets(left, right []string) bool {
 	if len(left) != len(right) {
 		return false
@@ -144,6 +175,167 @@ func TestGlobalInitFailureIsVisibleAndShutdownAllowsReinit(t *testing.T) {
 	}
 	if exporter.shutdowns.Load() != 1 {
 		t.Fatalf("valid exporter shutdowns = %d, want 1", exporter.shutdowns.Load())
+	}
+}
+
+func TestGlobalAfterShutdownReturnsRetiredTracerUntilExplicitReinit(t *testing.T) {
+	resetGlobalTracer()
+	t.Cleanup(func() {
+		_ = Shutdown(context.Background())
+		resetGlobalTracer()
+	})
+	enabled := true
+	firstExporter := &lifecycleExporter{}
+	first, err := InitWithAdvancedOptions(AdvancedOptions{
+		ServiceName:            "first",
+		Enabled:                &enabled,
+		SpanExporter:           firstExporter,
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("first InitWithAdvancedOptions: %v", err)
+	}
+	if err := first.Shutdown(context.Background()); err != nil {
+		t.Fatalf("first Shutdown: %v", err)
+	}
+	if got := Global(); got != first || got.IsEnabled() {
+		t.Fatalf("Global after Shutdown = %p enabled=%v, want retired %p", got, got.IsEnabled(), first)
+	}
+	if firstExporter.shutdowns.Load() != 1 {
+		t.Fatalf("first exporter shutdowns = %d, want 1", firstExporter.shutdowns.Load())
+	}
+
+	second, err := InitWithAdvancedOptions(AdvancedOptions{
+		ServiceName:            "second",
+		Enabled:                &enabled,
+		SpanExporter:           &lifecycleExporter{},
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("explicit reinit: %v", err)
+	}
+	if second == first || Global() != second || !second.IsEnabled() {
+		t.Fatal("explicit initialization did not replace the retired tracer")
+	}
+}
+
+func TestSetGlobalRestorePreservesRetiredGlobal(t *testing.T) {
+	resetGlobalTracer()
+	t.Cleanup(func() {
+		_ = Shutdown(context.Background())
+		resetGlobalTracer()
+	})
+	enabled := true
+	retired, err := InitWithAdvancedOptions(AdvancedOptions{
+		ServiceName: "retired", Enabled: &enabled,
+		SpanExporter: &lifecycleExporter{}, UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("InitWithAdvancedOptions: %v", err)
+	}
+	if err := retired.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	detached, err := NewAdvanced(context.Background(), AdvancedOptions{
+		ServiceName: "detached", Enabled: &enabled,
+		SpanExporter: &lifecycleExporter{}, UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("NewAdvanced: %v", err)
+	}
+	defer detached.Shutdown(context.Background())
+	restore := SetGlobal(detached)
+	if Global() != detached {
+		t.Fatal("SetGlobal did not install the detached tracer")
+	}
+	restore()
+	if got := Global(); got != retired {
+		t.Fatalf("Global after restore = %p; want retired tracer %p", got, retired)
+	}
+}
+
+func TestSetGlobalRestorePreservesLifecycleRetiredWhileDetached(t *testing.T) {
+	resetGlobalTracer()
+	t.Cleanup(func() {
+		_ = Shutdown(context.Background())
+		resetGlobalTracer()
+	})
+	enabled := true
+	processGlobal, err := InitWithAdvancedOptions(AdvancedOptions{
+		ServiceName: "process-global", Enabled: &enabled,
+		SpanExporter: &lifecycleExporter{}, UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("InitWithAdvancedOptions: %v", err)
+	}
+	detached, err := NewAdvanced(context.Background(), AdvancedOptions{
+		ServiceName: "detached", Enabled: &enabled,
+		SpanExporter: &lifecycleExporter{}, UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("NewAdvanced: %v", err)
+	}
+	defer detached.Shutdown(context.Background())
+
+	restore := SetGlobal(detached)
+	if err := processGlobal.Shutdown(context.Background()); err != nil {
+		t.Fatalf("process-global Shutdown: %v", err)
+	}
+	if got := Global(); got != detached {
+		t.Fatalf("Global while detached = %p; want %p", got, detached)
+	}
+	restore()
+	if got := Global(); got != processGlobal || got.IsEnabled() {
+		t.Fatalf("Global after restore = %p enabled=%v; want retired %p", got, got.IsEnabled(), processGlobal)
+	}
+}
+
+func TestIndependentTracerShutdownDoesNotRetirePackageGlobal(t *testing.T) {
+	resetGlobalTracer()
+	t.Cleanup(func() {
+		_ = Shutdown(context.Background())
+		resetGlobalTracer()
+	})
+	disabled := false
+	standalone, err := NewAdvanced(context.Background(), AdvancedOptions{Enabled: &disabled})
+	if err != nil {
+		t.Fatalf("NewAdvanced: %v", err)
+	}
+	if err := standalone.Shutdown(context.Background()); err != nil {
+		t.Fatalf("standalone Shutdown: %v", err)
+	}
+	if got := Global(); got == standalone {
+		t.Fatal("independent tracer was incorrectly retained as the package global")
+	}
+}
+
+func TestDetachedSetGlobalTracerShutdownDoesNotRetirePackageGlobal(t *testing.T) {
+	resetGlobalTracer()
+	t.Cleanup(func() {
+		_ = Shutdown(context.Background())
+		resetGlobalTracer()
+	})
+	disabled := false
+	detached, err := NewAdvanced(context.Background(), AdvancedOptions{Enabled: &disabled})
+	if err != nil {
+		t.Fatalf("NewAdvanced: %v", err)
+	}
+	restore := SetGlobal(detached)
+	if Global() != detached {
+		t.Fatal("SetGlobal did not install tracer")
+	}
+	restore()
+	if globalTracer.Load() != nil {
+		t.Fatal("restore did not detach tracer")
+	}
+	if err := detached.Shutdown(context.Background()); err != nil {
+		t.Fatalf("detached Shutdown: %v", err)
+	}
+	if retiredGlobalTracer == detached {
+		t.Fatal("detached SetGlobal tracer was retained as the retired process global")
+	}
+	if got := Global(); got == detached {
+		t.Fatal("Global returned detached tracer after shutdown")
 	}
 }
 

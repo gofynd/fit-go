@@ -506,7 +506,10 @@ func (s *Server) AddServiceDefinitions(implementations ServiceImplementation) er
 func (s *Server) AddServiceDefinitionsWithOptions(implementations ServiceImplementation, opts ServiceRegistrationOptions) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.running {
+	// Dynamic registration mutates the live grpc.Server and must finish before
+	// Start. The original Init path only stores FIT handlers in the compatibility
+	// map, and upstream main allowed that map to be replaced after Start.
+	if s.advanced && s.running {
 		return fmt.Errorf("grpc: service definitions must be registered before Start")
 	}
 	if !s.advanced {
@@ -755,7 +758,7 @@ func (s *Server) executeChainWithErrorHandler(chain []HandlerFunc, call *CallInf
 				return
 			}
 			s.logger.Error("gRPC middleware failed", "method", call.FullMethod, "error", redact.Text(err.Error()))
-			callback(&RPCError{Code: Internal, Message: "Internal Server Error, Please try again!"}, nil)
+			callback(&RPCError{Code: Internal, Message: s.internalErrorMessage(err.Error())}, nil)
 			return
 		}
 		nextCounter++
@@ -775,13 +778,23 @@ func (s *Server) executeChainWithErrorHandler(chain []HandlerFunc, call *CallInf
 					)
 					callback(&RPCError{
 						Code:    Internal,
-						Message: "Internal Server Error, Please try again!",
+						Message: s.internalErrorMessage(fmt.Sprintf("%v", r)),
 					}, nil)
 				}
 			}()
 			handler(call, callback, next)
 		}()
 	}
+}
+
+func (s *Server) internalErrorMessage(message string) string {
+	// Preserve the original fit-go Init contract for existing consumers. The
+	// advanced/managed server is the opt-in hardened path and never exposes
+	// internal handler or panic text to remote callers.
+	if s != nil && !s.advanced && message != "" {
+		return message
+	}
+	return "Internal Server Error, Please try again!"
 }
 
 // wrapWithResponseEncoding wraps the handler chain so that responses are

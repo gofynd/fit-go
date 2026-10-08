@@ -543,13 +543,15 @@ func (cp *ConfluentProducer) produceLegacy(topic string, messages []Message) err
 // broker delivery metadata grouped by topic/partition. It is intentionally a
 // concrete ConfluentProducer capability rather than a KafkaProducer interface
 // requirement, so existing drivers and callers that only need Produce remain
-// unchanged.
+// unchanged. Producers created through the original Producer constructor retain
+// their construction-time acknowledgement level; ProducerWithOptions enables
+// the additive per-call acknowledgement behavior.
 func (cp *ConfluentProducer) ProduceWithMetadata(topic string, messages []Message, acks int) ([]RecordMetadata, error) {
 	if cp.legacy {
 		return cp.produceWithMetadata(context.Background(), topic, messages, cp.configuredAcks)
 	}
 	ctx := automaticProducerContext()
-	topicMessages := []TopicMessages{{Topic: topic, Messages: messages}}
+	topicMessages := cloneTopicMessages([]TopicMessages{{Topic: topic, Messages: messages}})
 	spans := startProducerMessageSpansWithPolicy(ctx, topicMessages, cp.traceHeaders)
 	metadata, err := cp.produceWithMetadata(ctx, topic, topicMessages[0].Messages, acks)
 	endProducerMessageSpans(spans, err)
@@ -676,11 +678,18 @@ func (cp *ConfluentProducer) produceBatch(ctx context.Context, topicMessages []T
 
 // ProduceCtx is the canonical producer path. It creates one producer span per
 // message, matching KafkaJS instrumentation, and injects propagation headers
-// unless ProducerTraceHeadersPreserve was selected. It then performs the same
-// raw broker operation with the caller's acks value.
+// unless ProducerTraceHeadersPreserve was selected. ProducerWithOptions honors
+// the per-call acks value; the original Producer constructor keeps its configured
+// acknowledgement level and never allocates a hidden alternate driver.
 func (cp *ConfluentProducer) ProduceCtx(ctx context.Context, topic string, messages []Message, acks int) error {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	// Producer (the original constructor) has one configured librdkafka
+	// producer. Its additive context entry point must retain that constructor's
+	// acknowledgement contract instead of silently allocating a second driver.
+	if cp.legacy {
+		acks = cp.configuredAcks
 	}
 	return produceTopicMessagesWithTracePolicy(
 		ctx,
@@ -695,12 +704,16 @@ func (cp *ConfluentProducer) ProduceCtx(ctx context.Context, topic string, messa
 }
 
 // ProduceCtxWithMetadata is ProduceWithMetadata with a producer span and the
-// configured per-message trace-header policy.
+// configured per-message trace-header policy. Its acknowledgement semantics
+// match ProduceCtx.
 func (cp *ConfluentProducer) ProduceCtxWithMetadata(ctx context.Context, topic string, messages []Message, acks int) ([]RecordMetadata, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	topicMessages := []TopicMessages{{Topic: topic, Messages: messages}}
+	if cp.legacy {
+		acks = cp.configuredAcks
+	}
+	topicMessages := cloneTopicMessages([]TopicMessages{{Topic: topic, Messages: messages}})
 	spans := startProducerMessageSpansWithPolicy(ctx, topicMessages, cp.traceHeaders)
 	md, err := cp.produceWithMetadata(ctx, topic, topicMessages[0].Messages, acks)
 	endProducerMessageSpans(spans, err)
@@ -709,10 +722,14 @@ func (cp *ConfluentProducer) ProduceCtxWithMetadata(ctx context.Context, topic s
 
 // ProduceBatchCtx creates one correctly-labelled producer span per message across
 // every topic, injects from each message's span, and preserves the raw batch call's
-// message ordering, acks and delivery error.
+// message ordering and delivery error. Acks follow the same original-versus-
+// options-constructor rule as ProduceCtx.
 func (cp *ConfluentProducer) ProduceBatchCtx(ctx context.Context, topicMessages []TopicMessages, acks int) error {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if cp.legacy {
+		acks = cp.configuredAcks
 	}
 	return produceTopicMessagesWithTracePolicy(ctx, topicMessages, acks, cp.traceHeaders, func(traced []TopicMessages, tracedAcks int) error {
 		return cp.produceBatch(ctx, traced, tracedAcks)
@@ -808,15 +825,67 @@ func (cp *ConfluentProducer) Close() error {
 // Close so subsequent Connect calls remain no-ops.
 func (cp *ConfluentProducer) closeLegacy() error {
 	cp.mu.Lock()
-	defer cp.mu.Unlock()
+	if cp.closeDone != nil {
+		done := cp.closeDone
+		cp.mu.Unlock()
+		<-done
+		return nil
+	}
 	if cp.producer == nil || cp.closed {
+		cp.mu.Unlock()
 		return nil
 	}
 	cp.closed = true
-	cp.producer.Flush(int(defaultProducerCloseTimeout.Milliseconds()))
-	cp.producer.Close()
-	cp.logger.Info("kafka/confluent: producer closed")
+	cp.closeDone = make(chan struct{})
+	done := cp.closeDone
+	unique := make(map[confluentProducerDriver]struct{}, len(cp.producers)+1)
+	unique[cp.producer] = struct{}{}
+	for _, producer := range cp.producers {
+		if producer != nil {
+			unique[producer] = struct{}{}
+		}
+	}
+	timeout := cp.closeTimeout
+	if timeout <= 0 {
+		timeout = defaultProducerCloseTimeout
+	}
+	cp.mu.Unlock()
+
+	cleanupDone := make(chan struct{})
+	go cp.finishLegacyClose(unique, timeout, cleanupDone)
+	go func() {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case <-cleanupDone:
+		case <-timer.C:
+			cp.logger.Warn(
+				"kafka/confluent: legacy producer close timed out; safe cleanup continues in background",
+				"pendingReports", cp.pendingReports.Load(),
+			)
+		}
+		close(done)
+	}()
+	<-done
 	return nil
+}
+
+func (cp *ConfluentProducer) finishLegacyClose(
+	unique map[confluentProducerDriver]struct{},
+	timeout time.Duration,
+	cleanupDone chan<- struct{},
+) {
+	defer close(cleanupDone)
+	for producer := range unique {
+		producer.Flush(durationMilliseconds(timeout))
+	}
+	// Context/metadata extensions use the tracked delivery path. Do not close
+	// librdkafka while one of those accepted reports still owns its driver.
+	cp.inFlight.Wait()
+	for producer := range unique {
+		producer.Close()
+	}
+	cp.logger.Info("kafka/confluent: producer closed")
 }
 
 // finishKafkaJSAwaitedDelivery models an awaited KafkaJS disconnect without
@@ -1060,11 +1129,12 @@ func (cp *ConfluentProducer) produceAndDrain(
 // Consumer. It manages topic subscriptions, message dispatch, and graceful
 // shutdown.
 type ConfluentConsumer struct {
-	configMap *ckafka.ConfigMap
-	groupID   string
-	config    ConsumerAdvancedConfig
-	logger    *logging.Logger
-	legacy    bool
+	configMap   *ckafka.ConfigMap
+	groupID     string
+	config      ConsumerAdvancedConfig
+	logger      *logging.Logger
+	legacy      bool
+	newConsumer func(*ckafka.ConfigMap) (confluentConsumerConnectDriver, error)
 
 	mu        sync.Mutex
 	consumer  confluentConsumerDriver
@@ -1085,7 +1155,20 @@ type confluentConsumerDriver interface {
 	CommitMessage(message *ckafka.Message) ([]ckafka.TopicPartition, error)
 	CommitOffsets(offsets []ckafka.TopicPartition) ([]ckafka.TopicPartition, error)
 	StoreMessage(message *ckafka.Message) ([]ckafka.TopicPartition, error)
+	SeekPartitions(partitions []ckafka.TopicPartition) ([]ckafka.TopicPartition, error)
 	Close() error
+}
+
+type confluentConsumerConnectDriver interface {
+	confluentConsumerDriver
+	SubscribeTopics(topics []string, rebalanceCb ckafka.RebalanceCb) error
+}
+
+func (cc *ConfluentConsumer) createConsumer() (confluentConsumerConnectDriver, error) {
+	if cc.newConsumer != nil {
+		return cc.newConsumer(cc.configMap)
+	}
+	return ckafka.NewConsumer(cc.configMap)
 }
 
 // Connect subscribes to the given topics by creating a confluent Consumer.
@@ -1108,7 +1191,7 @@ func (cc *ConfluentConsumer) Connect(topics []TopicConfig) error {
 		_ = cc.configMap.SetKey("auto.offset.reset", "latest")
 	}
 
-	consumer, err := ckafka.NewConsumer(cc.configMap)
+	consumer, err := cc.createConsumer()
 	if err != nil {
 		return fmt.Errorf("kafka/confluent: consumer group connect failed: %w", err)
 	}
@@ -1211,15 +1294,11 @@ func (cc *ConfluentConsumer) rebalanceCb(consumer *ckafka.Consumer, event ckafka
 		}
 		cc.logger.Info("kafka/confluent: partitions assigned",
 			"groupId", cc.groupID, "partitions", formatPartitions(e.Partitions))
-		if cc.config.OnPartitionsAssigned != nil {
-			cc.config.OnPartitionsAssigned(toPartitionAssignments(e.Partitions))
-		}
+		cc.invokePartitionsAssigned(toPartitionAssignments(e.Partitions))
 	case ckafka.RevokedPartitions:
 		cc.logger.Info("kafka/confluent: partitions revoked",
 			"groupId", cc.groupID, "partitions", formatPartitions(e.Partitions))
-		if cc.config.OnPartitionsRevoked != nil {
-			cc.config.OnPartitionsRevoked(toPartitionAssignments(e.Partitions))
-		}
+		cc.invokePartitionsRevoked(toPartitionAssignments(e.Partitions))
 		var err error
 		if cooperative {
 			err = consumer.IncrementalUnassign(e.Partitions)
@@ -1232,6 +1311,24 @@ func (cc *ConfluentConsumer) rebalanceCb(consumer *ckafka.Consumer, event ckafka
 		}
 	}
 	return nil
+}
+
+func (cc *ConfluentConsumer) invokePartitionsAssigned(parts []PartitionAssignment) {
+	if cc.config.OnPartitionsAssigned != nil {
+		cc.config.OnPartitionsAssigned(parts)
+	}
+	if cc.config.OnPartitionsAssignedWithLifecycle != nil {
+		cc.config.OnPartitionsAssignedWithLifecycle(parts, rebalanceLifecycle{close: cc.requestCloseFromRebalance})
+	}
+}
+
+func (cc *ConfluentConsumer) invokePartitionsRevoked(parts []PartitionAssignment) {
+	if cc.config.OnPartitionsRevoked != nil {
+		cc.config.OnPartitionsRevoked(parts)
+	}
+	if cc.config.OnPartitionsRevokedWithLifecycle != nil {
+		cc.config.OnPartitionsRevokedWithLifecycle(parts, rebalanceLifecycle{close: cc.requestCloseFromRebalance})
+	}
 }
 
 // formatPartitions renders partitions as "topic[partition]" for logs.
@@ -1284,6 +1381,9 @@ func (cc *ConfluentConsumer) ConsumeAdvanced(handler MessageHandler, opts Consum
 	if handler == nil {
 		return fmt.Errorf("kafka/confluent: message handler is nil")
 	}
+	if err := cc.rejectUnsupportedLegacyRunOptions(opts); err != nil {
+		return err
+	}
 	handlerWithContext := func(_ context.Context, payload MessagePayload) error {
 		return handler(payload)
 	}
@@ -1296,6 +1396,18 @@ func (cc *ConfluentConsumer) ConsumeAdvanced(handler MessageHandler, opts Consum
 }
 
 func (cc *ConfluentConsumer) ConsumeCtx(handler MessageHandlerCtx, opts ConsumerOptions) error {
+	if cc.legacy {
+		if handler == nil {
+			return fmt.Errorf("kafka/confluent: message handler is nil")
+		}
+		advanced := advancedConsumerOptions(opts)
+		if err := cc.rejectUnsupportedLegacyRunOptions(advanced); err != nil {
+			return err
+		}
+		return cc.consumeMessages(func(ctx context.Context, payload MessagePayload) error {
+			return runTracedMessageHandler(ctx, payload, handler)
+		}, advanced)
+	}
 	return cc.ConsumeCtxAdvanced(handler, advancedConsumerOptions(opts))
 }
 
@@ -1304,6 +1416,9 @@ func (cc *ConfluentConsumer) ConsumeCtx(handler MessageHandlerCtx, opts Consumer
 func (cc *ConfluentConsumer) ConsumeCtxAdvanced(handler MessageHandlerCtx, opts ConsumerAdvancedOptions) error {
 	if handler == nil {
 		return fmt.Errorf("kafka/confluent: message handler is nil")
+	}
+	if err := cc.rejectUnsupportedLegacyRunOptions(opts); err != nil {
+		return err
 	}
 	if opts.OffsetFinalizer != nil {
 		return cc.consumeMessages(confluentMessageHandler(handler), opts)
@@ -1382,7 +1497,7 @@ func (cc *ConfluentConsumer) consumeMessages(handler confluentMessageHandler, op
 		} else if err := runConfluentPartitionGroups(ctx, groups, concurrency, func(groupCtx context.Context, group confluentBatchGroup) error {
 			return cc.processMessageGroup(groupCtx, consumer, group, handler, isAutoCommit, opts)
 		}); err != nil {
-			return err
+			return cc.prepareHandlerRunRetry(consumer, err)
 		}
 		if deferredReadErr != nil {
 			return fmt.Errorf("kafka/confluent: consume error: %w", deferredReadErr)
@@ -1406,7 +1521,10 @@ func (cc *ConfluentConsumer) processMessageGroup(
 		if !isAutoCommit && opts.CommitBeforeHandler {
 			if _, err := consumer.CommitMessage(message); err != nil {
 				cc.logMessageFailure("kafka/confluent: pre-handler commit failed", message, err)
-				return fmt.Errorf("kafka/confluent: pre-handler commit failed: %w", err)
+				return withConsumerRewindPosition(
+					fmt.Errorf("kafka/confluent: pre-handler commit failed: %w", err),
+					confluentRecordPosition(message),
+				)
 			}
 		}
 
@@ -1437,7 +1555,7 @@ func (cc *ConfluentConsumer) processMessageGroup(
 					}
 					if handlerErr != nil && errors.Is(finalizerErr, handlerErr) {
 						cc.logMessageFailure("kafka/confluent: message handler error", message, finalizerErr)
-						return fmt.Errorf("kafka/confluent: message handler failed: %w", finalizerErr)
+						return newConsumerHandlerErrorAt("kafka/confluent: message handler failed", finalizerErr, confluentRecordPosition(message))
 					}
 					cc.logMessageFailure("kafka/confluent: offset finalizer failed", message, finalizerErr)
 					return fmt.Errorf("kafka/confluent: offset finalizer failed: %w", finalizerErr)
@@ -1462,7 +1580,7 @@ func (cc *ConfluentConsumer) processMessageGroup(
 				return nil
 			})
 			if err != nil {
-				return err
+				return withConsumerRewindPosition(err, confluentRecordPosition(message))
 			}
 			continue
 		}
@@ -1477,7 +1595,10 @@ func (cc *ConfluentConsumer) processMessageGroup(
 			if cc.legacy {
 				continue
 			}
-			return fmt.Errorf("kafka/confluent: message handler failed: %w", handlerErr)
+			if !isAutoCommit && opts.CommitBeforeHandler {
+				return newConsumerHandlerError("kafka/confluent: message handler failed", handlerErr)
+			}
+			return newConsumerHandlerErrorAt("kafka/confluent: message handler failed", handlerErr, confluentRecordPosition(message))
 		}
 
 		if err := cc.resolveMessageOffset(consumer, message, isAutoCommit, opts.CommitBeforeHandler); err != nil {
@@ -1485,7 +1606,7 @@ func (cc *ConfluentConsumer) processMessageGroup(
 			if cc.legacy {
 				continue
 			}
-			return err
+			return withConsumerRewindPosition(err, confluentRecordPosition(message))
 		}
 	}
 	return nil
@@ -1504,6 +1625,9 @@ func (cc *ConfluentConsumer) ConsumeBatchAdvanced(handler BatchHandler, opts Con
 	if handler == nil {
 		return fmt.Errorf("kafka/confluent: batch handler is nil")
 	}
+	if err := cc.rejectUnsupportedLegacyRunOptions(opts); err != nil {
+		return err
+	}
 	if opts.OffsetFinalizer != nil {
 		return fmt.Errorf("kafka/confluent: OffsetFinalizer is supported only for message consumption")
 	}
@@ -1515,6 +1639,18 @@ func (cc *ConfluentConsumer) ConsumeBatchAdvanced(handler BatchHandler, opts Con
 }
 
 func (cc *ConfluentConsumer) ConsumeBatchCtx(handler BatchHandlerCtx, opts ConsumerOptions) error {
+	if cc.legacy {
+		if handler == nil {
+			return fmt.Errorf("kafka/confluent: batch handler is nil")
+		}
+		advanced := advancedConsumerOptions(opts)
+		if err := cc.rejectUnsupportedLegacyRunOptions(advanced); err != nil {
+			return err
+		}
+		return cc.consumeBatches(func(ctx context.Context, payload BatchPayload) error {
+			return runTracedBatchHandler(ctx, payload, handler)
+		}, advanced)
+	}
 	return cc.ConsumeBatchCtxAdvanced(handler, advancedConsumerOptions(opts))
 }
 
@@ -1524,12 +1660,25 @@ func (cc *ConfluentConsumer) ConsumeBatchCtxAdvanced(handler BatchHandlerCtx, op
 	if handler == nil {
 		return fmt.Errorf("kafka/confluent: batch handler is nil")
 	}
+	if err := cc.rejectUnsupportedLegacyRunOptions(opts); err != nil {
+		return err
+	}
 	if opts.OffsetFinalizer != nil {
 		return fmt.Errorf("kafka/confluent: OffsetFinalizer is supported only for message consumption")
 	}
 	return cc.consumeBatches(func(ctx context.Context, payload BatchPayload) error {
 		return runTracedBatchHandler(ctx, payload, handler)
 	}, opts)
+}
+
+func (cc *ConfluentConsumer) rejectUnsupportedLegacyRunOptions(opts ConsumerAdvancedOptions) error {
+	if !cc.legacy {
+		return nil
+	}
+	if opts.hasAdvancedControls() || opts.PartitionsConsumedConcurrently != 0 || opts.PollTimeout != 0 || opts.MaxRecords != 0 {
+		return fmt.Errorf("kafka/confluent: consumer created with Consumer does not support complete run options; create it with ConsumerWithSettings")
+	}
+	return nil
 }
 
 func (cc *ConfluentConsumer) consumeBatches(handler confluentBatchHandler, opts ConsumerAdvancedOptions) error {
@@ -1595,7 +1744,7 @@ func (cc *ConfluentConsumer) consumeBatches(handler confluentBatchHandler, opts 
 		} else if err := runConfluentPartitionGroups(ctx, groups, concurrency, func(groupCtx context.Context, group confluentBatchGroup) error {
 			return cc.processBatchGroup(groupCtx, consumer, group, handler, isAutoCommit, opts)
 		}); err != nil {
-			return err
+			return cc.prepareHandlerRunRetry(consumer, err)
 		}
 	}
 }
@@ -1611,7 +1760,10 @@ func (cc *ConfluentConsumer) processBatchGroup(
 	if !isAutoCommit && opts.CommitBeforeHandler {
 		if _, err := consumer.CommitMessage(group.lastMessage); err != nil {
 			cc.logBatchFailure("kafka/confluent: pre-handler batch commit failed", group.payload, err)
-			return fmt.Errorf("kafka/confluent: pre-handler batch commit failed: %w", err)
+			return withConsumerRewindPosition(
+				fmt.Errorf("kafka/confluent: pre-handler batch commit failed: %w", err),
+				confluentRecordPosition(group.messages[0]),
+			)
 		}
 	}
 	if err := handler(ctx, group.payload); err != nil {
@@ -1619,16 +1771,86 @@ func (cc *ConfluentConsumer) processBatchGroup(
 			return nil
 		}
 		cc.logBatchFailure("kafka/confluent: batch handler error", group.payload, err)
-		return err
+		if !isAutoCommit && opts.CommitBeforeHandler {
+			return newConsumerHandlerError("", err)
+		}
+		return newConsumerHandlerErrorAt("", err, confluentRecordPosition(group.messages[0]))
 	}
 	if err := cc.resolveMessageOffset(consumer, group.lastMessage, isAutoCommit, opts.CommitBeforeHandler); err != nil {
 		cc.logBatchFailure("kafka/confluent: post-handler batch offset resolution failed", group.payload, err)
 		if cc.legacy {
 			return nil
 		}
-		return err
+		return withConsumerRewindPosition(err, confluentRecordPosition(group.messages[0]))
 	}
 	return nil
+}
+
+func (cc *ConfluentConsumer) prepareHandlerRunRetry(runConsumer confluentConsumerDriver, err error) error {
+	positions, rewindDecided := consumerRewindPositions(err)
+	if !rewindDecided || runConsumer == nil {
+		return err
+	}
+	if len(positions) == 0 {
+		return err
+	}
+	wanted := make([]ckafka.TopicPartition, 0, len(positions))
+	for _, failed := range positions {
+		topic := failed.topic
+		wanted = append(wanted, ckafka.TopicPartition{
+			Topic: &topic, Partition: failed.partition, Offset: ckafka.Offset(failed.offset),
+		})
+	}
+	partitions, seekErr := runConsumer.SeekPartitions(wanted)
+	if seekErr == nil && len(partitions) == len(wanted) {
+		allRewound := true
+		for _, partition := range partitions {
+			if partition.Error != nil {
+				allRewound = false
+				break
+			}
+		}
+		if allRewound {
+			return err
+		}
+	}
+	if seekErr == nil {
+		seekErr = fmt.Errorf("partition seek did not rewind every failed partition")
+	}
+	cc.logger.Warn(
+		"kafka/confluent: exact processing offset rewind failed; rebuilding from committed offset",
+		"groupId", cc.groupID,
+		"error", redact.ErrorMessage(seekErr),
+	)
+	cc.mu.Lock()
+	if cc.closed || cc.consumer != runConsumer {
+		cc.mu.Unlock()
+		return err
+	}
+	cc.consumer = nil
+	cc.mu.Unlock()
+
+	if closeErr := runConsumer.Close(); closeErr != nil {
+		cc.logger.Warn(
+			"kafka/confluent: failed consumer reset after handler error",
+			"groupId", cc.groupID,
+			"error", redact.ErrorMessage(closeErr),
+		)
+	}
+	return err
+}
+
+func confluentRecordPosition(message *ckafka.Message) consumerRecordPosition {
+	if message == nil {
+		return consumerRecordPosition{}
+	}
+	topic := ""
+	if message.TopicPartition.Topic != nil {
+		topic = *message.TopicPartition.Topic
+	}
+	return consumerRecordPosition{
+		topic: topic, partition: message.TopicPartition.Partition, offset: int64(message.TopicPartition.Offset),
+	}
 }
 
 func (cc *ConfluentConsumer) resolveMessageOffset(
@@ -1687,36 +1909,37 @@ func runConfluentPartitionGroups(
 	if concurrency < 1 {
 		concurrency = 1
 	}
-	waveCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	sem := make(chan struct{}, concurrency)
+	errs := make(chan error, len(groups))
 	var wg sync.WaitGroup
-	var firstErr error
-	var errOnce sync.Once
 
+	launching := true
 	for _, group := range groups {
-		select {
-		case sem <- struct{}{}:
-		case <-waveCtx.Done():
+		if !launching {
 			break
 		}
-		if waveCtx.Err() != nil {
-			break
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			launching = false
+			continue
 		}
 		wg.Add(1)
 		go func(current confluentBatchGroup) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if err := handler(waveCtx, current); err != nil {
-				errOnce.Do(func() {
-					firstErr = err
-					cancel()
-				})
+			if err := handler(ctx, current); err != nil {
+				errs <- err
 			}
 		}(group)
 	}
 	wg.Wait()
-	return firstErr
+	close(errs)
+	var failures []error
+	for err := range errs {
+		failures = append(failures, err)
+	}
+	return errors.Join(failures...)
 }
 
 func isConfluentPollTimeout(err error) bool {
@@ -1733,7 +1956,19 @@ func (cc *ConfluentConsumer) beginConsumeRun() (
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	if cc.consumer == nil {
-		return nil, nil, nil, fmt.Errorf("kafka/confluent: consumer not connected")
+		if cc.closed || len(cc.topics) == 0 {
+			return nil, nil, nil, fmt.Errorf("kafka/confluent: consumer not connected")
+		}
+		consumer, err := cc.createConsumer()
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("kafka/confluent: reconnect consumer group failed: %w", err)
+		}
+		if err := consumer.SubscribeTopics(cc.topics, cc.rebalanceCb); err != nil {
+			_ = consumer.Close()
+			return nil, nil, nil, fmt.Errorf("kafka/confluent: reconnect subscribe failed: %w", err)
+		}
+		cc.consumer = consumer
+		cc.logger.Info("kafka/confluent: consumer reconnected from committed offset", "groupId", cc.groupID)
 	}
 	if cc.legacy {
 		// The original entry points allowed overlapping Consume calls and simply
@@ -1843,6 +2078,33 @@ func (cc *ConfluentConsumer) Close() error {
 	runDone := cc.runDone
 	consumer := cc.consumer
 	cc.mu.Unlock()
+	return cc.finishClose(cancel, runDone, consumer, done)
+}
+
+func (cc *ConfluentConsumer) requestCloseFromRebalance() error {
+	cc.mu.Lock()
+	if cc.closeDone != nil {
+		cc.mu.Unlock()
+		return nil
+	}
+	cc.closed = true
+	cc.closeDone = make(chan struct{})
+	done := cc.closeDone
+	cancel := cc.cancelFn
+	runDone := cc.runDone
+	consumer := cc.consumer
+	cc.mu.Unlock()
+
+	go cc.finishClose(cancel, runDone, consumer, done)
+	return nil
+}
+
+func (cc *ConfluentConsumer) finishClose(
+	cancel context.CancelFunc,
+	runDone chan struct{},
+	consumer confluentConsumerDriver,
+	done chan struct{},
+) error {
 
 	if cancel != nil {
 		cancel()
@@ -2056,7 +2318,10 @@ func (cp *ConfluentProducer) buildBrokerMessages(
 	}
 
 	for _, msg := range messages {
-		brokerMessage := buildConfluentMessage(topic, msg)
+		brokerMessage := buildConfluentMessageAdvanced(topic, msg)
+		if cp.legacy {
+			brokerMessage = buildConfluentMessage(topic, msg)
+		}
 		if cp.partitioner == ProducerPartitionerKafkaJSCompatible && msg.Partition < 0 && msg.Key == nil {
 			partition, err := cp.nextKafkaJSKeylessPartition(topic, partitionMetadata)
 			if err != nil {
@@ -2315,8 +2580,20 @@ func mapSASLMechanismToString(mechanism string) string {
 	}
 }
 
-// buildConfluentMessage converts a fit Message to a ckafka.Message.
+// buildConfluentMessage converts a fit Message using the original fit-go
+// contract: an empty key is keyless on the wire, regardless of whether the
+// caller represented it as nil or []byte{}.
 func buildConfluentMessage(topic string, msg Message) *ckafka.Message {
+	return buildConfluentMessageWithKeySemantics(topic, msg, false)
+}
+
+// buildConfluentMessageAdvanced preserves the additive advanced API's ability
+// to distinguish a null key from an explicitly present empty key.
+func buildConfluentMessageAdvanced(topic string, msg Message) *ckafka.Message {
+	return buildConfluentMessageWithKeySemantics(topic, msg, true)
+}
+
+func buildConfluentMessageWithKeySemantics(topic string, msg Message, preserveEmptyKey bool) *ckafka.Message {
 	km := &ckafka.Message{
 		TopicPartition: ckafka.TopicPartition{
 			Topic:     &topic,
@@ -2325,7 +2602,7 @@ func buildConfluentMessage(topic string, msg Message) *ckafka.Message {
 		Value: msg.Value,
 	}
 
-	if msg.Key != nil {
+	if len(msg.Key) > 0 || (preserveEmptyKey && msg.Key != nil) {
 		km.Key = msg.Key
 	}
 

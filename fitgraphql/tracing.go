@@ -45,7 +45,9 @@ type FieldPredicate func(*graphql.FieldContext) bool
 // should only be used when persisted queries enforce operation names.
 type OperationNameMapper func(string) (string, bool)
 
-// Options controls GraphQL tracing. Resolver spans are enabled by default.
+// Options controls GraphQL tracing. Resolver spans are disabled by default to
+// avoid producing one span per selected field for callers that only opt into
+// operation tracing. Set FieldSpans to a pointer to true to enable them.
 // Payload capture is intentionally not configurable: application data does not
 // belong in telemetry.
 type Options struct {
@@ -75,7 +77,7 @@ func New(opts Options) *Tracer {
 	if provider == nil {
 		provider = otel.GetTracerProvider()
 	}
-	fieldSpans := true
+	fieldSpans := false
 	if opts.FieldSpans != nil {
 		fieldSpans = *opts.FieldSpans
 	}

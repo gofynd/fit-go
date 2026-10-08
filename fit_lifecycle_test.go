@@ -5,6 +5,8 @@ package fit
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -93,6 +95,35 @@ func TestShutdownResetsLifecycleStateAndStopsHealthWork(t *testing.T) {
 	if err := second.Shutdown(context.Background()); err != nil {
 		t.Fatalf("second Shutdown: %v", err)
 	}
+}
+
+func TestShutdownBoundsInFlightHealthCheckByContext(t *testing.T) {
+	resetFitMetricsTestState(t)
+	t.Setenv("FIT_PROMETHEUS_ENABLED", "false")
+	t.Setenv("TRACING_ENABLED", "false")
+	t.Setenv("SERVICE_NAME", "fit-health-deadline")
+	t.Setenv("NODE_ENV", "test")
+
+	f, err := InitAdvanced(context.Background())
+	if err != nil {
+		t.Fatalf("InitAdvanced: %v", err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	f.Health.AddCheck(func() string {
+		close(started)
+		<-release
+		return ""
+	})
+	f.Health.StartPeriodicCheck(30)
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	shutdownErr := f.Shutdown(ctx)
+	if !errors.Is(shutdownErr, context.DeadlineExceeded) || !strings.Contains(shutdownErr.Error(), "health shutdown") {
+		t.Fatalf("Shutdown error = %v; want bounded health deadline", shutdownErr)
+	}
+	close(release)
 }
 
 func TestInitAppliesAndResetsServiceErrorIdentity(t *testing.T) {

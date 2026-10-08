@@ -88,7 +88,8 @@ func TestResolverSpanIsChildAndPrivacySafe(t *testing.T) {
 	recorder := tracetest.NewSpanRecorder()
 	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
 	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
-	tracer := New(Options{TracerProvider: provider})
+	enabled := true
+	tracer := New(Options{TracerProvider: provider, FieldSpans: &enabled})
 
 	ctx, parent := provider.Tracer("test").Start(context.Background(), "parent")
 	field := &graphql.FieldContext{
@@ -132,7 +133,8 @@ func TestResolverSpansCanBeDisabledOrFiltered(t *testing.T) {
 		t.Fatalf("disabled middleware changed resolver result: called=%v err=%v", called, err)
 	}
 
-	tracer = New(Options{FieldPredicate: func(*graphql.FieldContext) bool { return false }})
+	enabled := true
+	tracer = New(Options{FieldSpans: &enabled, FieldPredicate: func(*graphql.FieldContext) bool { return false }})
 	ctx := graphql.WithFieldContext(context.Background(), &graphql.FieldContext{})
 	called = false
 	_, err = tracer.InterceptField(ctx, func(context.Context) (any, error) {
@@ -141,6 +143,29 @@ func TestResolverSpansCanBeDisabledOrFiltered(t *testing.T) {
 	})
 	if err != nil || !called {
 		t.Fatalf("filtered middleware changed resolver result: called=%v err=%v", called, err)
+	}
+}
+
+func TestResolverSpansAreDisabledByDefault(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	tracer := New(Options{TracerProvider: provider})
+	ctx := graphql.WithFieldContext(context.Background(), &graphql.FieldContext{
+		Object: "Query",
+		Field:  graphql.CollectedField{Field: &ast.Field{Name: "viewer"}},
+	})
+
+	called := false
+	_, err := tracer.InterceptField(ctx, func(context.Context) (any, error) {
+		called = true
+		return nil, nil
+	})
+	if err != nil || !called {
+		t.Fatalf("default field middleware changed resolver result: called=%v err=%v", called, err)
+	}
+	if got := len(recorder.Ended()); got != 0 {
+		t.Fatalf("default resolver spans = %d, want 0", got)
 	}
 }
 

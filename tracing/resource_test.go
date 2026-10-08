@@ -139,6 +139,16 @@ func TestBuildResourceServiceNamePrecedence(t *testing.T) {
 		}
 	})
 
+	t.Run("default options preserve resource service", func(t *testing.T) {
+		t.Setenv("OTEL_SERVICE_NAME", "")
+		t.Setenv("SERVICE_NAME", "")
+		t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "service.name=resource-service")
+		values := resourceValues(buildResource(context.Background(), DefaultAdvancedOptions()))
+		if got := values["service.name"].AsString(); got != "resource-service" {
+			t.Fatalf("service.name = %q, want resource-service", got)
+		}
+	})
+
 	t.Run("otel service wins over legacy and resource", func(t *testing.T) {
 		t.Setenv("OTEL_SERVICE_NAME", "otel-service")
 		t.Setenv("SERVICE_NAME", "legacy-service")
@@ -176,6 +186,16 @@ func TestBuildResourceServiceNamePrecedence(t *testing.T) {
 		values := resourceValues(buildResource(context.Background(), AdvancedOptions{}))
 		if got := values["service.name"].AsString(); got != "unknown_service" {
 			t.Fatalf("service.name = %q, want unknown_service", got)
+		}
+	})
+
+	t.Run("default options preserve original unknown service", func(t *testing.T) {
+		t.Setenv("OTEL_SERVICE_NAME", "")
+		t.Setenv("SERVICE_NAME", "")
+		t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+		values := resourceValues(buildResource(context.Background(), DefaultAdvancedOptions()))
+		if got := values["service.name"].AsString(); got != "unknown" {
+			t.Fatalf("service.name = %q, want unknown", got)
 		}
 	})
 }

@@ -484,6 +484,19 @@ func TestNewPreservesReleasedPreStartAndStatusContract(t *testing.T) {
 	}
 }
 
+func TestWallProfilerInvalidIntervalCannotPanic(t *testing.T) {
+	profiler := NewAdvanced(AdvancedConfig{Config: Config{
+		Enabled:                    true,
+		WallEnabled:                true,
+		WallSamplingIntervalMicros: 0,
+	}})
+	profiler.StartWallProfiling()
+	if !profiler.IsWallProfilingRunning() {
+		t.Fatal("wall profiler did not start with safe fallback interval")
+	}
+	profiler.StopWallProfiling()
+}
+
 func TestSetDefaultRestoresPreviousProfiler(t *testing.T) {
 	baseline := Default()
 	first := New(Config{Enabled: true})

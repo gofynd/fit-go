@@ -61,7 +61,7 @@ func TestIORedisRESPCodec(t *testing.T) {
 		{name: "null bulk", wire: "$-1\r\n"},
 		{name: "null array", wire: "*-1\r\n"},
 		{name: "nested array", wire: "*3\r\n:1\r\n$3\r\nfoo\r\n*2\r\n+OK\r\n-ERR nested\r\n", wantValue: []any{int64(1), "foo", []any{"OK", errors.New("ERR nested")}}},
-		{name: "unsupported RESP3", wire: "_\r\n", wantFatal: "unsupported RESP2 prefix '_'"},
+		{name: "unsupported RESP3", wire: "_\r\n", wantFatal: "unsupported RESP2 type prefix"},
 		{name: "bad integer", wire: ":nan\r\n", wantFatal: "invalid RESP integer"},
 		{name: "bad bulk length", wire: "$-2\r\n", wantFatal: "invalid RESP bulk length"},
 		{name: "bad array length", wire: "*-2\r\n", wantFatal: "invalid RESP array length"},

@@ -18,6 +18,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -60,6 +63,74 @@ type IORedisAbortError struct{}
 
 func (IORedisAbortError) Error() string { return "Command aborted due to connection close" }
 
+// ioredisTerminalError marks local validation and routing failures that cannot
+// be repaired by reconnecting. Keeping this internal avoids expanding the
+// public compatibility API while letting the queue settle the bad request and
+// continue with later commands on the same healthy transport.
+type ioredisTerminalError struct {
+	cause          error
+	closeTransport bool
+}
+
+// IORedisRedirectError reports a terminal Cluster redirect outcome without
+// requiring callers to parse error text. MayHaveExecuted describes possible
+// command side effects; WriteDisposition describes socket progress and can be
+// FullyWritten even when an authoritative redirect proves no execution.
+type IORedisRedirectError struct {
+	MayHaveExecuted  bool
+	WriteDisposition IORedisWriteDisposition
+	cause            error
+}
+
+func (e *IORedisRedirectError) Error() string { return e.cause.Error() }
+func (e *IORedisRedirectError) Unwrap() error { return e.cause }
+
+func (e ioredisTerminalError) Error() string { return e.cause.Error() }
+func (e ioredisTerminalError) Unwrap() error { return e.cause }
+
+func newIORedisTerminalError(err error) error {
+	return ioredisTerminalError{cause: err}
+}
+
+func newIORedisRedirectError(err error) error {
+	return newIORedisRedirectOutcomeError(err, true)
+}
+
+func newIORedisRedirectOutcomeError(err error, mayHaveExecuted bool) error {
+	return ioredisTerminalError{
+		cause: &IORedisRedirectError{
+			MayHaveExecuted: mayHaveExecuted, WriteDisposition: IORedisFullyWritten, cause: err,
+		},
+		closeTransport: mayHaveExecuted,
+	}
+}
+
+// newIORedisSafeError keeps only stable error identity that callers can act on;
+// it never appends provider text to the returned message. Redis error replies,
+// malformed protocol bytes, addresses, and keys may contain tenant data.
+func newIORedisSafeError(message string, cause error) error {
+	switch {
+	case errors.Is(cause, context.Canceled):
+		return fmt.Errorf("%s: %w", message, context.Canceled)
+	case errors.Is(cause, context.DeadlineExceeded):
+		return fmt.Errorf("%s: %w", message, context.DeadlineExceeded)
+	case errors.Is(cause, io.ErrUnexpectedEOF):
+		return fmt.Errorf("%s: %w", message, io.ErrUnexpectedEOF)
+	case errors.Is(cause, io.EOF):
+		return fmt.Errorf("%s: %w", message, io.EOF)
+	}
+	var closed IORedisConnectionClosedError
+	if errors.As(cause, &closed) {
+		return fmt.Errorf("%s: %w", message, closed)
+	}
+	return errors.New(message)
+}
+
+func asIORedisTerminalError(err error) (ioredisTerminalError, bool) {
+	var terminal ioredisTerminalError
+	return terminal, errors.As(err, &terminal)
+}
+
 // IORedisReply is one RESP command result.
 type IORedisReply struct {
 	Value any
@@ -69,7 +140,11 @@ type IORedisReply struct {
 // IORedisExchange reports one ordered write/read attempt.
 //
 // A transport must make loss ambiguity explicit. MayHaveExecuted is true when
-// at least one command byte may have reached Redis before a transport error.
+// command side effects cannot be ruled out. It is false when no command bytes
+// were written or an authoritative redirect proves that the attempted command
+// was not executed, including redirect-limit exhaustion. WriteDisposition is
+// independent: the original command can have been fully written even when a
+// MOVED/ASK reply proves it did not execute on that node.
 // The state machine intentionally replays a direct command or a zero-reply
 // pipeline in that case, matching ioredis's duplicate-execution risk. Once a
 // pipeline reply has arrived, the remaining commands are aborted instead.
@@ -202,8 +277,10 @@ type ioredisRequest struct {
 	commands         [][]string
 	pipeline         bool
 	quit             bool
+	exclusive        bool
 	replays          int
 	ambiguousReplays int
+	retryFailures    int
 	future           *ioredisFutureState
 	span             trace.Span
 }
@@ -374,17 +451,27 @@ func (c *IORedisCompatClient) submit(ctx context.Context, commands [][]string, p
 	if len(commands) == 0 {
 		return completedIORedisFuture(IORedisResult{}, errors.New("ioredis command is empty"))
 	}
+	exclusive := false
 	for _, command := range commands {
 		if len(command) == 0 || command[0] == "" {
 			return completedIORedisFuture(IORedisResult{}, errors.New("ioredis command is empty"))
 		}
+		commandExclusive, err := validateIORedisQueuedCommand(command)
+		if err != nil {
+			return completedIORedisFuture(IORedisResult{}, err)
+		}
+		exclusive = exclusive || commandExclusive
+	}
+	if exclusive && pipeline && len(commands) != 1 {
+		return completedIORedisFuture(IORedisResult{}, errors.New("redis: ioredis RESP compatibility requires bounded blocking commands to be submitted without other pipeline commands"))
 	}
 	request := &ioredisRequest{
-		commands: commands,
-		pipeline: pipeline,
-		quit:     quit,
-		future:   newIORedisFutureState(),
-		span:     startIORedisCompatibilitySpan(ctx, commands, pipeline),
+		commands:  commands,
+		pipeline:  pipeline,
+		quit:      quit,
+		exclusive: exclusive,
+		future:    newIORedisFutureState(),
+		span:      startIORedisCompatibilitySpan(ctx, commands, pipeline),
 	}
 	c.mu.Lock()
 	if c.closed || c.closing || c.disconnecting {
@@ -397,6 +484,91 @@ func (c *IORedisCompatClient) submit(ctx context.Context, commands [][]string, p
 	c.mu.Unlock()
 	c.signal()
 	return &IORedisFuture{state: request.future}
+}
+
+func validateIORedisQueuedCommand(command []string) (bool, error) {
+	verb := strings.ToUpper(command[0])
+	unsupported := false
+	switch verb {
+	case "SUBSCRIBE", "PSUBSCRIBE", "SSUBSCRIBE", "UNSUBSCRIBE", "PUNSUBSCRIBE", "SUNSUBSCRIBE",
+		"MONITOR", "WAIT", "WAITAOF", "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH", "RESET", "SYNC", "PSYNC",
+		"SHUTDOWN", "READONLY", "READWRITE", "SELECT", "QUIT":
+		unsupported = true
+	case "HELLO":
+		// Reasserting RESP2 produces one ordinary reply and does not change the
+		// reply decoder. RESP3 and HELLO's stateful AUTH/SETNAME forms require a
+		// different decoder/reconnect contract and therefore remain unsupported.
+		unsupported = len(command) != 2 || command[1] != "2"
+	case "BLPOP", "BRPOP", "BRPOPLPUSH", "BLMOVE", "BLMPOP", "BZPOPMIN", "BZPOPMAX", "BZMPOP":
+		if !ioredisBoundedBlockingCommand(command) {
+			unsupported = true
+		} else {
+			return true, nil
+		}
+	case "CLIENT":
+		unsupported = len(command) > 1 && (strings.EqualFold(command[1], "reply") ||
+			strings.EqualFold(command[1], "tracking") || strings.EqualFold(command[1], "caching") ||
+			strings.EqualFold(command[1], "pause"))
+	case "XREAD", "XREADGROUP":
+		blocking, bounded := ioredisXReadBlockingMode(command)
+		if blocking && bounded {
+			return true, nil
+		}
+		unsupported = blocking
+	case "DEBUG":
+		unsupported = len(command) > 1 && strings.EqualFold(command[1], "sleep")
+	}
+	if unsupported {
+		name := verb
+		if len(command) > 1 && (verb == "CLIENT" || verb == "DEBUG") {
+			// These are fixed protocol subcommands, not caller data. Other second
+			// arguments can be keys or values and must never enter errors/logs.
+			name += " " + strings.ToUpper(command[1])
+		}
+		return false, fmt.Errorf("redis: ioredis RESP compatibility does not support %s because it changes connection reply semantics or cannot be replayed safely", name)
+	}
+	return false, nil
+}
+
+func ioredisBoundedBlockingCommand(command []string) bool {
+	if len(command) < 2 {
+		return false
+	}
+	timeoutIndex := len(command) - 1
+	switch strings.ToUpper(command[0]) {
+	case "BLMPOP", "BZMPOP":
+		timeoutIndex = 1
+	}
+	if timeoutIndex >= len(command) {
+		return false
+	}
+	timeout, err := strconv.ParseFloat(command[timeoutIndex], 64)
+	return err == nil && timeout > 0 && !math.IsInf(timeout, 0) && !math.IsNaN(timeout)
+}
+
+func ioredisXReadBlockingMode(command []string) (blocking, bounded bool) {
+	streamsIndex := len(command)
+	for index := 1; index < len(command); index++ {
+		if strings.EqualFold(command[index], "streams") {
+			streamsIndex = index
+			break
+		}
+	}
+	for index := 1; index < streamsIndex; index++ {
+		switch strings.ToUpper(command[index]) {
+		case "GROUP":
+			index += 2
+		case "COUNT":
+			index++
+		case "BLOCK":
+			if index+1 >= streamsIndex {
+				return true, false
+			}
+			timeout, err := strconv.ParseFloat(command[index+1], 64)
+			return true, err == nil && timeout > 0 && !math.IsInf(timeout, 0) && !math.IsNaN(timeout)
+		}
+	}
+	return false, false
 }
 
 // Quit appends QUIT after every already accepted command and waits for its
@@ -513,7 +685,7 @@ func (c *IORedisCompatClient) run() {
 					err = errors.New("ioredis transport factory returned nil transport")
 				}
 				c.settleFirstReady(err)
-				c.connectionFailed(err)
+				c.connectionFailed(err, c.queuedRequests())
 				needsRetryDelay = true
 				continue
 			}
@@ -521,7 +693,7 @@ func (c *IORedisCompatClient) run() {
 				_ = connected.Close()
 				err := errors.New("ioredis transport returned nil close signal")
 				c.settleFirstReady(err)
-				c.connectionFailed(err)
+				c.connectionFailed(err, c.queuedRequests())
 				needsRetryDelay = true
 				continue
 			}
@@ -542,8 +714,12 @@ func (c *IORedisCompatClient) run() {
 				return
 			}
 			c.setNotReady()
-			c.connectionFailed(sessionErr)
-			needsRetryDelay = true
+			if sessionErr != nil {
+				c.connectionFailed(sessionErr, nil)
+				needsRetryDelay = true
+			} else {
+				needsRetryDelay = false
+			}
 			continue
 		}
 
@@ -556,7 +732,7 @@ func (c *IORedisCompatClient) run() {
 				_ = transport.Close()
 				transport = nil
 				c.setNotReady()
-				c.connectionFailed(errors.New("ioredis transport closed"))
+				c.connectionFailed(errors.New("ioredis transport closed"), nil)
 				needsRetryDelay = true
 				continue
 			case <-c.ctx.Done():
@@ -582,6 +758,32 @@ func (c *IORedisCompatClient) run() {
 			}
 			continue
 		}
+		if terminal, ok := asIORedisTerminalError(exchange.Error); ok {
+			if terminal.closeTransport {
+				_ = transport.Close()
+				transport = nil
+				c.setNotReady()
+			}
+			c.pop(request)
+			if request.pipeline && len(exchange.Replies) > 0 {
+				replies := append([]IORedisReply(nil), exchange.Replies...)
+				for len(replies) < len(request.commands) {
+					replies = append(replies, IORedisReply{Error: IORedisAbortError{}})
+				}
+				c.complete(request, replies, nil)
+			} else {
+				c.complete(request, nil, exchange.Error)
+			}
+			continue
+		}
+		if request.exclusive && exchange.MayHaveExecuted {
+			_ = transport.Close()
+			transport = nil
+			c.setNotReady()
+			c.pop(request)
+			c.complete(request, nil, fmt.Errorf("redis: bounded blocking command was not replayed after an ambiguous transport failure: %w", exchange.Error))
+			continue
+		}
 
 		_ = transport.Close()
 		transport = nil
@@ -599,7 +801,7 @@ func (c *IORedisCompatClient) run() {
 				request.ambiguousReplays++
 			}
 		}
-		c.connectionFailed(exchange.Error)
+		c.connectionFailed(exchange.Error, []*ioredisRequest{request})
 		needsRetryDelay = true
 	}
 }
@@ -664,9 +866,9 @@ func (c *IORedisCompatClient) runDuplexSession(transport ioredisDuplexTransport)
 	for {
 		var nextWrite *ioredisRequest
 		var writeRequestChannel chan *ioredisRequest
-		if writing == nil {
+		if writing == nil && !ioredisExclusiveInFlight(inFlight) {
 			nextWrite = c.firstUnscheduled(scheduled)
-			if nextWrite != nil {
+			if nextWrite != nil && (!nextWrite.exclusive || len(inFlight) == 0) {
 				writeRequestChannel = writeRequests
 			}
 		}
@@ -699,6 +901,10 @@ func (c *IORedisCompatClient) runDuplexSession(transport ioredisDuplexTransport)
 						}
 					}
 				}
+				if writeResult.request.exclusive && writeResult.exchange.MayHaveExecuted {
+					c.settleDuplexTerminalFailure(inFlight, writeResult.request, fmt.Errorf("redis: bounded blocking command was not replayed after an ambiguous write failure: %w", writeResult.exchange.Error))
+					return false, nil
+				}
 				c.reconcileDuplexFailure(inFlight, writeResult.request, writeResult.exchange)
 				return false, writeResult.exchange.Error
 			}
@@ -714,10 +920,21 @@ func (c *IORedisCompatClient) runDuplexSession(transport ioredisDuplexTransport)
 					writing = nil
 					if writeResult.exchange.Error == nil {
 						inFlight = append(inFlight, &ioredisInFlight{request: writeResult.request})
+					} else if terminal, ok := asIORedisTerminalError(readResult.err); ok {
+						c.settleDuplexTerminalFailure(inFlight, writeResult.request, terminal)
+						return false, nil
 					} else {
 						c.reconcileDuplexFailure(inFlight, writeResult.request, writeResult.exchange)
 						return false, readResult.err
 					}
+				}
+				if terminal, ok := asIORedisTerminalError(readResult.err); ok {
+					c.settleDuplexTerminalFailure(inFlight, nil, terminal)
+					return false, nil
+				}
+				if len(inFlight) > 0 && inFlight[0].request.exclusive {
+					c.settleDuplexTerminalFailure(inFlight, nil, fmt.Errorf("redis: bounded blocking command was not replayed after a read failure: %w", readResult.err))
+					return false, nil
 				}
 				c.reconcileDuplexFailure(inFlight, nil, IORedisExchange{})
 				return false, readResult.err
@@ -735,6 +952,30 @@ func (c *IORedisCompatClient) runDuplexSession(transport ioredisDuplexTransport)
 			continue
 		case <-c.ctx.Done():
 			return true, c.ctx.Err()
+		}
+	}
+}
+
+func ioredisExclusiveInFlight(inFlight []*ioredisInFlight) bool {
+	for _, entry := range inFlight {
+		if entry.request.exclusive {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *IORedisCompatClient) settleDuplexTerminalFailure(inFlight []*ioredisInFlight, writing *ioredisRequest, err error) {
+	seen := make(map[*ioredisRequest]struct{}, len(inFlight)+1)
+	for _, entry := range inFlight {
+		seen[entry.request] = struct{}{}
+		c.remove(entry.request)
+		c.complete(entry.request, nil, err)
+	}
+	if writing != nil {
+		if _, exists := seen[writing]; !exists {
+			c.remove(writing)
+			c.complete(writing, nil, err)
 		}
 	}
 }
@@ -781,6 +1022,7 @@ func (c *IORedisCompatClient) firstUnscheduled(scheduled map[*ioredisRequest]boo
 }
 
 func (c *IORedisCompatClient) reconcileDuplexFailure(inFlight []*ioredisInFlight, writing *ioredisRequest, writeExchange IORedisExchange) {
+	retryRequests := make([]*ioredisRequest, 0, len(inFlight)+1)
 	for _, entry := range inFlight {
 		if entry.request.pipeline && len(entry.replies) > 0 {
 			replies := append([]IORedisReply(nil), entry.replies...)
@@ -793,13 +1035,16 @@ func (c *IORedisCompatClient) reconcileDuplexFailure(inFlight []*ioredisInFlight
 		}
 		entry.request.replays++
 		entry.request.ambiguousReplays++
+		retryRequests = append(retryRequests, entry.request)
 	}
 	if writing != nil {
 		writing.replays++
 		if writeExchange.MayHaveExecuted {
 			writing.ambiguousReplays++
 		}
+		retryRequests = append(retryRequests, writing)
 	}
+	c.markRequestFailures(retryRequests)
 }
 
 func (c *IORedisCompatClient) setNotReady() {
@@ -821,20 +1066,53 @@ func (c *IORedisCompatClient) currentRetryDelay() time.Duration {
 	return c.policy.retryDelay(attempts)
 }
 
-func (c *IORedisCompatClient) connectionFailed(_ error) {
+func (c *IORedisCompatClient) connectionFailed(_ error, affected []*ioredisRequest) {
 	c.mu.Lock()
 	c.retryAttempts++
-	flush := c.retryAttempts%(IORedisMaxRetriesPerRequest+1) == 0
-	var requests []*ioredisRequest
-	if flush {
-		requests = c.queue
+	c.mu.Unlock()
+	c.markRequestFailures(affected)
+}
+
+func (c *IORedisCompatClient) queuedRequests() []*ioredisRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]*ioredisRequest(nil), c.queue...)
+}
+
+func (c *IORedisCompatClient) markRequestFailures(requests []*ioredisRequest) {
+	if len(requests) == 0 {
+		return
+	}
+	targets := make(map[*ioredisRequest]struct{}, len(requests))
+	for _, request := range requests {
+		if request != nil {
+			targets[request] = struct{}{}
+		}
+	}
+	exhausted := make([]*ioredisRequest, 0)
+	c.mu.Lock()
+	retained := c.queue[:0]
+	for _, request := range c.queue {
+		if _, affected := targets[request]; !affected {
+			retained = append(retained, request)
+			continue
+		}
+		request.retryFailures++
+		if request.retryFailures > IORedisMaxRetriesPerRequest {
+			exhausted = append(exhausted, request)
+			continue
+		}
+		retained = append(retained, request)
+	}
+	for index := len(retained); index < len(c.queue); index++ {
+		c.queue[index] = nil
+	}
+	c.queue = retained
+	if len(c.queue) == 0 {
 		c.queue = nil
 	}
 	c.mu.Unlock()
-	if !flush {
-		return
-	}
-	for _, request := range requests {
+	for _, request := range exhausted {
 		if request.pipeline {
 			replies := make([]IORedisReply, len(request.commands))
 			for index := range replies {
@@ -844,6 +1122,21 @@ func (c *IORedisCompatClient) connectionFailed(_ error) {
 			continue
 		}
 		c.complete(request, nil, IORedisMaxRetriesError{})
+	}
+}
+
+func (c *IORedisCompatClient) removeLocked(request *ioredisRequest) {
+	for index, queued := range c.queue {
+		if queued != request {
+			continue
+		}
+		copy(c.queue[index:], c.queue[index+1:])
+		c.queue[len(c.queue)-1] = nil
+		c.queue = c.queue[:len(c.queue)-1]
+		if len(c.queue) == 0 {
+			c.queue = nil
+		}
+		return
 	}
 }
 
@@ -866,6 +1159,12 @@ func (c *IORedisCompatClient) pop(request *ioredisRequest) {
 			c.queue = nil
 		}
 	}
+}
+
+func (c *IORedisCompatClient) remove(request *ioredisRequest) {
+	c.mu.Lock()
+	c.removeLocked(request)
+	c.mu.Unlock()
 }
 
 func (c *IORedisCompatClient) complete(request *ioredisRequest, replies []IORedisReply, err error) {

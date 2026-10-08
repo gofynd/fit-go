@@ -182,8 +182,24 @@ func InjectTraceHeaders(ctx context.Context, msg *Message) {
 	if tracing.SpanFromContext(ctx) == nil {
 		return
 	}
+	// A Message value is commonly copied while its Headers slice still aliases
+	// caller-owned backing storage. Injection removes and replaces entries, so
+	// take ownership before mutating to prevent cross-message corruption and
+	// concurrent writes through shared slices.
+	msg.Headers = cloneHeaders(msg.Headers)
 	removePropagationHeaders(msg)
 	propagator().Inject(ctx, messageCarrier{msg: msg})
+}
+
+func cloneHeaders(headers []Header) []Header {
+	if headers == nil {
+		return nil
+	}
+	cloned := make([]Header, len(headers))
+	for i, header := range headers {
+		cloned[i] = Header{Key: header.Key, Value: cloneNullableBytes(header.Value)}
+	}
+	return cloned
 }
 
 // InjectTraceHeadersToMessages refreshes propagation headers on all messages in
@@ -249,9 +265,9 @@ func startProducerMessageSpan(ctx context.Context, topic string, msg Message) (c
 	return ctx, span
 }
 
-// startProducerMessageSpans starts and injects one span per message. The input
-// TopicMessages and Message slices are not rebuilt: values, keys, partitions,
-// timestamps and caller headers retain their original representation.
+// startProducerMessageSpans starts and injects one span per message. Callers of
+// this low-level helper must provide messages they own; the public producer
+// wrapper clones caller input before invoking it.
 func startProducerMessageSpans(ctx context.Context, topicMessages []TopicMessages) []*tracing.Span {
 	return startProducerMessageSpansWithPolicy(ctx, topicMessages, ProducerTraceHeadersInject)
 }
@@ -313,10 +329,32 @@ func produceTopicMessagesWithTracePolicy(
 	policy ProducerTraceHeaderPolicy,
 	produce func([]TopicMessages, int) error,
 ) error {
-	spans := startProducerMessageSpansWithPolicy(ctx, topicMessages, policy)
-	err := produce(topicMessages, acks)
+	owned := cloneTopicMessages(topicMessages)
+	spans := startProducerMessageSpansWithPolicy(ctx, owned, policy)
+	err := produce(owned, acks)
 	endProducerMessageSpans(spans, err)
 	return err
+}
+
+func cloneTopicMessages(topicMessages []TopicMessages) []TopicMessages {
+	if topicMessages == nil {
+		return nil
+	}
+	cloned := make([]TopicMessages, len(topicMessages))
+	for topicIndex, topicGroup := range topicMessages {
+		cloned[topicIndex].Topic = topicGroup.Topic
+		if topicGroup.Messages == nil {
+			continue
+		}
+		cloned[topicIndex].Messages = make([]Message, len(topicGroup.Messages))
+		for messageIndex, message := range topicGroup.Messages {
+			message.Key = cloneNullableBytes(message.Key)
+			message.Value = cloneNullableBytes(message.Value)
+			message.Headers = cloneHeaders(message.Headers)
+			cloned[topicIndex].Messages[messageIndex] = message
+		}
+	}
+	return cloned
 }
 
 // EndProducerSpan records the produce outcome and ends the span. Safe on a nil span.

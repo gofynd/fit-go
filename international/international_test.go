@@ -52,6 +52,26 @@ func TestAddressFormParser_InvalidSegment(t *testing.T) {
 	}
 }
 
+func TestAddressFormParserIgnoresBracesInsideJSONString(t *testing.T) {
+	input := []AddressField{{
+		"slug":         "line1",
+		"display_name": `Apartment {west} and \"east\"`,
+	}}
+	got, err := AddressFormParser("{line1}", input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || len(got[0]) != 1 || got[0][0]["display_name"] != input[0]["display_name"] {
+		t.Fatalf("AddressFormParser() = %#v, want original field", got)
+	}
+}
+
+func TestAddressFormParserRejectsUnmatchedOpeningBrace(t *testing.T) {
+	if _, err := AddressFormParser(`{"slug":"broken"`, nil); err == nil {
+		t.Fatal("AddressFormParser accepted unmatched opening brace")
+	}
+}
+
 func TestAddressDisplayParser(t *testing.T) {
 	got := AddressDisplayParser("{name}_{line1}_{city}", map[string]any{
 		"name":  "John Doe",

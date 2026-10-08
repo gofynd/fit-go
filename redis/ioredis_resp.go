@@ -34,6 +34,17 @@ const (
 	ioredisDefaultConnectTimeout = 10 * time.Second
 	ioredisDefaultLoadingRetry   = 10 * time.Second
 	ioredisLibraryVersion        = "5.11.1"
+
+	// Redis rejects protocol bulk strings larger than 512 MiB. Keep the owned
+	// RESP2 parser at the same boundary and add independent aggregate, element,
+	// line and nesting limits so a syntactically valid hostile reply cannot
+	// allocate unbounded memory or exhaust the goroutine stack.
+	ioredisRESPMaxBulkBytes      int64 = 512 << 20
+	ioredisRESPMaxAggregateBytes int64 = ioredisRESPMaxBulkBytes + (1 << 20)
+	ioredisRESPMaxValues         int64 = 1 << 20
+	ioredisRESPMaxArrayElements  int64 = 1 << 20
+	ioredisRESPMaxLineBytes            = 64 << 10
+	ioredisRESPMaxDepth                = 128
 )
 
 // IORedisRESPOptions configures the opt-in RESP2 compatibility transport.
@@ -182,10 +193,14 @@ func (f *IORedisRESPTransportFactory) Connect(ctx context.Context) (IORedisTrans
 		connection = tlsConnection
 	}
 
-	transport := newIORedisRESPTransport(connection, options.SocketTimeout, trackedConnection)
+	writeTimeout := options.SocketTimeout
+	if writeTimeout == 0 {
+		writeTimeout = options.ConnectTimeout
+	}
+	transport := newIORedisRESPTransport(connection, options.SocketTimeout, writeTimeout, trackedConnection)
 	// ioredis clears connectTimeout on TCP/TLS connect. AUTH, SELECT, client
-	// metadata and INFO therefore use the caller lifetime plus socket timeout,
-	// not the connect timeout.
+	// metadata and INFO therefore use the caller lifetime for replies. Writes
+	// retain a finite deadline so startup and Disconnect cannot hang forever.
 	if err := f.startup(ctx, transport); err != nil {
 		_ = transport.Close()
 		return nil, err
@@ -326,6 +341,7 @@ type ioredisRESPTransport struct {
 	connection    net.Conn
 	writeCounter  *ioredisRESPCountingConn
 	socketTimeout time.Duration
+	writeTimeout  time.Duration
 	replies       chan ioredisRESPRead
 	closed        chan struct{}
 	closeOnce     sync.Once
@@ -334,11 +350,12 @@ type ioredisRESPTransport struct {
 	awaitingReply atomic.Bool
 }
 
-func newIORedisRESPTransport(connection net.Conn, socketTimeout time.Duration, writeCounter *ioredisRESPCountingConn) *ioredisRESPTransport {
+func newIORedisRESPTransport(connection net.Conn, socketTimeout, writeTimeout time.Duration, writeCounter *ioredisRESPCountingConn) *ioredisRESPTransport {
 	transport := &ioredisRESPTransport{
 		connection:    connection,
 		writeCounter:  writeCounter,
 		socketTimeout: socketTimeout,
+		writeTimeout:  writeTimeout,
 		replies:       make(chan ioredisRESPRead, 1),
 		closed:        make(chan struct{}),
 	}
@@ -387,7 +404,7 @@ func (t *ioredisRESPTransport) Exchange(ctx context.Context, commands [][]string
 	return exchange
 }
 
-func (t *ioredisRESPTransport) writeCommands(_ context.Context, commands [][]string) IORedisExchange {
+func (t *ioredisRESPTransport) writeCommands(ctx context.Context, commands [][]string) IORedisExchange {
 	if t == nil || t.connection == nil {
 		return IORedisExchange{WriteDisposition: IORedisNotWritten, Error: errors.New("ioredis RESP transport is not configured")}
 	}
@@ -397,6 +414,32 @@ func (t *ioredisRESPTransport) writeCommands(_ context.Context, commands [][]str
 
 	t.writeMu.Lock()
 	defer t.writeMu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	deadline := time.Time{}
+	if t.writeTimeout > 0 {
+		deadline = time.Now().Add(t.writeTimeout)
+	}
+	contextDeadline, hasContextDeadline := ctx.Deadline()
+	if hasContextDeadline && (deadline.IsZero() || contextDeadline.Before(deadline)) {
+		deadline = contextDeadline
+	}
+	if err := t.connection.SetWriteDeadline(deadline); err != nil {
+		_ = t.Close()
+		return IORedisExchange{WriteDisposition: IORedisNotWritten, Error: err}
+	}
+	cancelApplied := make(chan struct{})
+	stopCancellation := context.AfterFunc(ctx, func() {
+		_ = t.connection.SetWriteDeadline(time.Now())
+		close(cancelApplied)
+	})
+	defer func() {
+		if !stopCancellation() {
+			<-cancelApplied
+		}
+		_ = t.connection.SetWriteDeadline(time.Time{})
+	}()
 	wire, err := encodeIORedisRESPCommands(commands)
 	if err != nil {
 		return IORedisExchange{WriteDisposition: IORedisNotWritten, Error: err}
@@ -419,7 +462,13 @@ func (t *ioredisRESPTransport) writeCommands(_ context.Context, commands [][]str
 				exchange.MayHaveExecuted = true
 				exchange.WriteDisposition = IORedisPartiallyWritten
 			}
-			exchange.Error = writeErr
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				exchange.Error = ctxErr
+			} else if hasContextDeadline && !time.Now().Before(contextDeadline) {
+				exchange.Error = context.DeadlineExceeded
+			} else {
+				exchange.Error = writeErr
+			}
 			_ = t.Close()
 			return exchange
 		}
@@ -507,6 +556,10 @@ func (t *ioredisRESPTransport) readLoop() {
 	for {
 		value, replyErr, err := readIORedisRESPValue(reader)
 		if err != nil {
+			var protocolError ioredisRESPProtocolError
+			if errors.As(err, &protocolError) {
+				err = newIORedisTerminalError(err)
+			}
 			select {
 			case t.replies <- ioredisRESPRead{err: err}:
 			case <-t.closed:
@@ -564,94 +617,192 @@ func encodeIORedisRESPCommands(commands [][]string) ([]byte, error) {
 	return buffer.Bytes(), nil
 }
 
+type ioredisRESPDecodeBudget struct {
+	bytesRemaining  int64
+	valuesRemaining int64
+}
+
+type ioredisRESPProtocolError struct{ cause error }
+
+func (e ioredisRESPProtocolError) Error() string { return e.cause.Error() }
+func (e ioredisRESPProtocolError) Unwrap() error { return e.cause }
+
+func newIORedisRESPDecodeBudget() *ioredisRESPDecodeBudget {
+	return &ioredisRESPDecodeBudget{
+		bytesRemaining:  ioredisRESPMaxAggregateBytes,
+		valuesRemaining: ioredisRESPMaxValues,
+	}
+}
+
+func (b *ioredisRESPDecodeBudget) consumeBytes(count int64) error {
+	if count < 0 || count > b.bytesRemaining {
+		return fmt.Errorf("RESP reply exceeds aggregate size limit of %d bytes", ioredisRESPMaxAggregateBytes)
+	}
+	b.bytesRemaining -= count
+	return nil
+}
+
+func (b *ioredisRESPDecodeBudget) consumeValue() error {
+	if b.valuesRemaining <= 0 {
+		return fmt.Errorf("RESP reply exceeds aggregate value limit of %d", ioredisRESPMaxValues)
+	}
+	b.valuesRemaining--
+	return nil
+}
+
 func readIORedisRESPValue(reader *bufio.Reader) (any, error, error) {
+	value, replyErr, err := readIORedisRESPValueWithBudget(reader, newIORedisRESPDecodeBudget(), 0)
+	if err != nil && !ioredisRESPIOError(err) {
+		err = ioredisRESPProtocolError{cause: err}
+	}
+	return value, replyErr, err
+}
+
+func ioredisRESPIOError(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError)
+}
+
+func readIORedisRESPValueWithBudget(reader *bufio.Reader, budget *ioredisRESPDecodeBudget, depth int) (any, error, error) {
+	if depth > ioredisRESPMaxDepth {
+		return nil, nil, fmt.Errorf("RESP nesting depth exceeds limit of %d", ioredisRESPMaxDepth)
+	}
+	if err := budget.consumeValue(); err != nil {
+		return nil, nil, err
+	}
 	prefix, err := reader.ReadByte()
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := budget.consumeBytes(1); err != nil {
+		return nil, nil, err
+	}
 	switch prefix {
 	case '+':
-		line, err := readIORedisRESPLine(reader)
+		line, err := readIORedisRESPLineWithBudget(reader, budget)
 		return line, nil, err
 	case '-':
-		line, err := readIORedisRESPLine(reader)
+		line, err := readIORedisRESPLineWithBudget(reader, budget)
 		if err != nil {
 			return nil, nil, err
 		}
 		return nil, errors.New(line), nil
 	case ':':
-		line, err := readIORedisRESPLine(reader)
+		line, err := readIORedisRESPLineWithBudget(reader, budget)
 		if err != nil {
 			return nil, nil, err
 		}
 		integer, err := strconv.ParseInt(line, 10, 64)
 		if err != nil {
-			return nil, nil, fmt.Errorf("invalid RESP integer %q: %w", line, err)
+			return nil, nil, errors.New("invalid RESP integer")
 		}
 		return integer, nil, nil
 	case '$':
-		line, err := readIORedisRESPLine(reader)
+		line, err := readIORedisRESPLineWithBudget(reader, budget)
 		if err != nil {
 			return nil, nil, err
 		}
 		length, err := strconv.ParseInt(line, 10, 64)
 		if err != nil || length < -1 {
-			return nil, nil, fmt.Errorf("invalid RESP bulk length %q", line)
+			return nil, nil, errors.New("invalid RESP bulk length")
 		}
 		if length == -1 {
 			return nil, nil, nil
+		}
+		if length > ioredisRESPMaxBulkBytes {
+			return nil, nil, fmt.Errorf("RESP bulk length %d exceeds limit of %d", length, ioredisRESPMaxBulkBytes)
 		}
 		if length > int64(^uint(0)>>1)-2 {
 			return nil, nil, errors.New("RESP bulk length overflows int")
 		}
-		payload := make([]byte, int(length)+2)
-		if _, err := io.ReadFull(reader, payload); err != nil {
+		if err := budget.consumeBytes(length + 2); err != nil {
 			return nil, nil, err
 		}
-		if payload[len(payload)-2] != '\r' || payload[len(payload)-1] != '\n' {
+		var payload strings.Builder
+		// Do not reserve the complete server-declared size before any payload
+		// arrives. A forged but protocol-valid 512 MiB header must not cause a
+		// 512 MiB allocation on an otherwise empty connection.
+		if _, err := io.CopyN(&payload, reader, length); err != nil {
+			return nil, nil, err
+		}
+		var terminator [2]byte
+		if _, err := io.ReadFull(reader, terminator[:]); err != nil {
+			return nil, nil, err
+		}
+		if terminator != [2]byte{'\r', '\n'} {
 			return nil, nil, errors.New("invalid RESP bulk terminator")
 		}
-		return string(payload[:len(payload)-2]), nil, nil
+		return payload.String(), nil, nil
 	case '*':
-		line, err := readIORedisRESPLine(reader)
+		line, err := readIORedisRESPLineWithBudget(reader, budget)
 		if err != nil {
 			return nil, nil, err
 		}
 		length, err := strconv.ParseInt(line, 10, 64)
 		if err != nil || length < -1 {
-			return nil, nil, fmt.Errorf("invalid RESP array length %q", line)
+			return nil, nil, errors.New("invalid RESP array length")
 		}
 		if length == -1 {
 			return nil, nil, nil
 		}
+		if length > ioredisRESPMaxArrayElements {
+			return nil, nil, fmt.Errorf("RESP array length %d exceeds limit of %d", length, ioredisRESPMaxArrayElements)
+		}
+		if length > budget.valuesRemaining {
+			return nil, nil, fmt.Errorf("RESP array length %d exceeds remaining aggregate value limit", length)
+		}
 		if length > int64(^uint(0)>>1) {
 			return nil, nil, errors.New("RESP array length overflows int")
 		}
-		values := make([]any, int(length))
-		for index := range values {
-			value, replyErr, err := readIORedisRESPValue(reader)
+		capacity := int(length)
+		if capacity > 1024 {
+			capacity = 1024
+		}
+		values := make([]any, 0, capacity)
+		for index := int64(0); index < length; index++ {
+			value, replyErr, err := readIORedisRESPValueWithBudget(reader, budget, depth+1)
 			if err != nil {
 				return nil, nil, err
 			}
 			if replyErr != nil {
-				values[index] = replyErr
+				values = append(values, replyErr)
 			} else {
-				values[index] = value
+				values = append(values, value)
 			}
 		}
 		return values, nil, nil
 	default:
-		return nil, nil, fmt.Errorf("unsupported RESP2 prefix %q", prefix)
+		return nil, nil, errors.New("unsupported RESP2 type prefix")
 	}
 }
 
 func readIORedisRESPLine(reader *bufio.Reader) (string, error) {
-	line, err := reader.ReadString('\n')
-	if err != nil {
+	return readIORedisRESPLineWithBudget(reader, newIORedisRESPDecodeBudget())
+}
+
+func readIORedisRESPLineWithBudget(reader *bufio.Reader, budget *ioredisRESPDecodeBudget) (string, error) {
+	var line []byte
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		if len(line)+len(fragment) > ioredisRESPMaxLineBytes {
+			return "", fmt.Errorf("RESP line exceeds limit of %d bytes", ioredisRESPMaxLineBytes)
+		}
+		line = append(line, fragment...)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, bufio.ErrBufferFull) {
+			return "", err
+		}
+	}
+	if err := budget.consumeBytes(int64(len(line))); err != nil {
 		return "", err
 	}
-	if len(line) < 2 || line[len(line)-2:] != "\r\n" {
+	if len(line) < 2 || string(line[len(line)-2:]) != "\r\n" {
 		return "", errors.New("invalid RESP line terminator")
 	}
-	return line[:len(line)-2], nil
+	return string(line[:len(line)-2]), nil
 }

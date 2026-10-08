@@ -329,6 +329,51 @@ func TestFetchRejectsUnsafeInputsAndSymlinks(t *testing.T) {
 	}
 }
 
+func TestFetchRejectsOversizedSelectedFile(t *testing.T) {
+	source := fixtureRepository(t)
+	path := filepath.Join(source, "contracts", "services", "internal", "proto", "user.proto")
+	if err := os.Truncate(path, maxSelectedFileBytes+1); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	_, err := Fetch(context.Background(), Options{
+		Mode: Get, Specification: Specification{FileName: "user"},
+		SourceDirectory: source, OutputDirectory: filepath.Join(root, "proto"), OutputRoot: root,
+	})
+	if err == nil || !strings.Contains(err.Error(), "selected file exceeds") {
+		t.Fatalf("Fetch() error = %v, want selected-file limit", err)
+	}
+}
+
+func TestAcquireSourceRejectsOversizedClone(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture is Unix-specific")
+	}
+	git := filepath.Join(t.TempDir(), "fake-git")
+	writeFile(t, git, "#!/bin/sh\nfor argument do destination=$argument; done\nmkdir -p \"$destination\"\ntruncate -s 1073741825 \"$destination/oversized\"\n")
+	if err := os.Chmod(git, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, cleanup, err := acquireSource(context.Background(), Options{
+		Specification: Specification{GitURI: "https://example.com/contracts.git", FileName: "user"},
+		GitExecutable: git,
+	})
+	cleanup()
+	if err == nil || !strings.Contains(err.Error(), "cloned repository exceeds") {
+		t.Fatalf("acquireSource() error = %v, want clone size limit", err)
+	}
+}
+
+func TestSafeGitDiagnosticDoesNotReturnRawStderr(t *testing.T) {
+	stderr := "fatal: Authentication failed for https://token@example.com/private.git secret-value"
+	if got := safeGitDiagnostic(stderr); got != "authentication failed" {
+		t.Fatalf("safeGitDiagnostic() = %q", got)
+	}
+	if got := safeGitDiagnostic("remote supplied untrusted secret-value"); got != "" {
+		t.Fatalf("safeGitDiagnostic returned raw unclassified output: %q", got)
+	}
+}
+
 func TestProtocGeneratorPassesEveryProtoWithoutShellExpansion(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell fixture is Unix-specific")
@@ -385,6 +430,32 @@ func TestFetchRejectsConflictingGitAliases(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "conflict") {
 		t.Fatalf("Fetch() error = %v", err)
+	}
+}
+
+func TestSpecificationRejectsUnsafeRepositorySchemes(t *testing.T) {
+	for _, repository := range []string{
+		"file:///tmp/contracts",
+		"git://example.com/contracts.git",
+		"https://user:password@example.com/contracts.git",
+		"https://example.com/contracts.git?token=secret",
+		"--upload-pack=malicious",
+		"https://example.com/contracts.git\n--config=bad",
+	} {
+		specification := Specification{GitURI: repository, FileName: "user"}
+		if err := specification.validate(Get, ""); err == nil {
+			t.Fatalf("validate accepted repository %q", repository)
+		}
+	}
+	for _, repository := range []string{
+		"https://example.com/contracts.git",
+		"ssh://git@example.com/contracts.git",
+		"git@ssh.dev.azure.com:v3/GoFynd/FyndPlatformCore/api-specifications",
+	} {
+		specification := Specification{GitURI: repository, FileName: "user"}
+		if err := specification.validate(Get, ""); err != nil {
+			t.Fatalf("validate rejected repository %q: %v", repository, err)
+		}
 	}
 }
 

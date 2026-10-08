@@ -233,6 +233,60 @@ func TestRoutingProviderReusesEquivalentMeterScopes(t *testing.T) {
 	}
 }
 
+func TestRoutingMeterReusesEquivalentInstruments(t *testing.T) {
+	provider := newRoutingMeterProvider(metricnoop.NewMeterProvider())
+	meter := provider.Meter("instrument-scope").(*routingMeter)
+	first, err := meter.Int64Counter("requests", metric.WithDescription("request count"), metric.WithUnit("{request}"))
+	if err != nil {
+		t.Fatalf("first Int64Counter: %v", err)
+	}
+	second, err := meter.Int64Counter("requests", metric.WithUnit("{request}"), metric.WithDescription("request count"))
+	if err != nil {
+		t.Fatalf("second Int64Counter: %v", err)
+	}
+	if first != second {
+		t.Fatal("equivalent synchronous instruments were not reused")
+	}
+	if got := len(meter.instruments); got != 1 {
+		t.Fatalf("retained equivalent instruments = %d, want 1", got)
+	}
+	if _, err := meter.Int64Counter("requests", metric.WithDescription("different")); err != nil {
+		t.Fatalf("distinct Int64Counter: %v", err)
+	}
+	if got := len(meter.instruments); got != 2 {
+		t.Fatalf("retained distinct instruments = %d, want 2", got)
+	}
+}
+
+func TestRoutingMeterReusesCallbackFreeObservableAndReleasesRegistration(t *testing.T) {
+	provider := newRoutingMeterProvider(metricnoop.NewMeterProvider())
+	meter := provider.Meter("observable-scope").(*routingMeter)
+	first, err := meter.Int64ObservableGauge("queue.depth")
+	if err != nil {
+		t.Fatalf("first Int64ObservableGauge: %v", err)
+	}
+	second, err := meter.Int64ObservableGauge("queue.depth")
+	if err != nil {
+		t.Fatalf("second Int64ObservableGauge: %v", err)
+	}
+	if first != second || len(meter.instruments) != 1 {
+		t.Fatalf("observable dedupe = same:%v retained:%d, want true/1", first == second, len(meter.instruments))
+	}
+	registration, err := meter.RegisterCallback(func(context.Context, metric.Observer) error { return nil }, first)
+	if err != nil {
+		t.Fatalf("RegisterCallback: %v", err)
+	}
+	if got := len(meter.registrations); got != 1 {
+		t.Fatalf("registrations = %d, want 1", got)
+	}
+	if err := registration.Unregister(); err != nil {
+		t.Fatalf("Unregister: %v", err)
+	}
+	if got := len(meter.registrations); got != 0 {
+		t.Fatalf("retained inactive registrations = %d, want 0", got)
+	}
+}
+
 func TestInstallCannotRaceBlockingShutdown(t *testing.T) {
 	provider := testProvider(t)
 	InstallGlobal(provider)

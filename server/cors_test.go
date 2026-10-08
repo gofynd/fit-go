@@ -33,12 +33,12 @@ func TestCORS_ReflectSkipAndPreflight(t *testing.T) {
 	}
 
 	// allowed origin reflected on the actual request
-	if w := do(http.MethodGet, "https://x.fynd.com", ""); w.Header().Get("Access-Control-Allow-Origin") != "https://x.fynd.com" || w.Header().Get("Access-Control-Allow-Credentials") != "true" {
+	if w := do(http.MethodGet, "https://x.fynd.com", ""); w.Header().Get("Access-Control-Allow-Origin") != "https://x.fynd.com" || w.Header().Get("Access-Control-Allow-Credentials") != "true" || w.Header().Get("Vary") != "Origin" {
 		t.Errorf("allowed origin not reflected: %+v", w.Header())
 	}
-	// disallowed origin: no ACAO
-	if w := do(http.MethodGet, "https://evil.com", ""); w.Header().Get("Access-Control-Allow-Origin") != "" {
-		t.Errorf("disallowed origin must not be reflected")
+	// disallowed origin: no ACAO, but caches must still vary by Origin.
+	if w := do(http.MethodGet, "https://evil.com", ""); w.Header().Get("Access-Control-Allow-Origin") != "" || w.Header().Get("Vary") != "Origin" {
+		t.Errorf("disallowed origin response headers = %+v", w.Header())
 	}
 	// preflight to the GET-only path is answered 204 with headers (engine-level → runs on no-route)
 	if w := do(http.MethodOptions, "https://x.fynd.com", ""); w.Code != http.StatusNoContent || w.Header().Get("Access-Control-Allow-Headers") != "content-type" || w.Header().Get("Access-Control-Max-Age") != "86400" {
@@ -51,6 +51,25 @@ func TestCORS_ReflectSkipAndPreflight(t *testing.T) {
 	// X-Skip-Cors bypass
 	if w := do(http.MethodGet, "https://x.fynd.com", "true"); w.Header().Get("Access-Control-Allow-Origin") != "" {
 		t.Errorf("X-Skip-Cors must bypass")
+	}
+}
+
+func TestCORS_PreservesExistingVaryValues(t *testing.T) {
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Header("Vary", "Accept-Encoding")
+		c.Next()
+	})
+	r.Use(DynamicCORS(CORSOptions{AllowOrigin: func(_ *gin.Context, _ string) bool { return true }}))
+	r.GET("/", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Origin", "https://x.fynd.com")
+	r.ServeHTTP(w, req)
+	values := strings.Join(w.Header().Values("Vary"), ",")
+	if !strings.Contains(values, "Accept-Encoding") || !strings.Contains(values, "Origin") {
+		t.Fatalf("Vary = %q, want existing value plus Origin", values)
 	}
 }
 

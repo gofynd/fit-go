@@ -335,6 +335,41 @@ func TestSanitizeSentryValueHandlesTypedValuesAndCycles(t *testing.T) {
 	}
 }
 
+func TestSanitizeSentryEventDoesNotMutateSharedBreadcrumbs(t *testing.T) {
+	shared := &sentrylib.Breadcrumb{
+		Category: "request private@example.com",
+		Message:  "Bearer shared-secret",
+		Data: map[string]interface{}{
+			"authorization_token": "shared-secret",
+			"nested":              map[string]interface{}{"email": "private@example.com"},
+		},
+	}
+	const captures = 64
+	start := make(chan struct{})
+	results := make(chan *sentrylib.Event, captures)
+	var wait sync.WaitGroup
+	for index := 0; index < captures; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			results <- sanitizeSentryEvent(&sentrylib.Event{Breadcrumbs: []*sentrylib.Breadcrumb{shared}})
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+
+	if shared.Message != "Bearer shared-secret" || shared.Data["authorization_token"] != "shared-secret" {
+		t.Fatalf("shared breadcrumb was mutated: %#v", shared)
+	}
+	for event := range results {
+		if event.Breadcrumbs[0] == shared || event.Breadcrumbs[0].Data["authorization_token"] != redact.Mask {
+			t.Fatalf("breadcrumb was not independently sanitized: %#v", event.Breadcrumbs[0])
+		}
+	}
+}
+
 func TestWithSentryContextIsolatesConcurrentRequestScopes(t *testing.T) {
 	transport := &mockTransport{}
 	s := newTestSentry()

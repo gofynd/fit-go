@@ -1149,6 +1149,20 @@ func TestStaticHealthRoutesPreserveExpressBytes(t *testing.T) {
 		}
 	}
 
+	for _, path := range []string{"/_healthz", "/_healthz/", "/_READYZ/"} {
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodOptions, path, nil))
+		if recorder.Code != http.StatusOK || recorder.Body.String() != "GET, HEAD" {
+			t.Fatalf("OPTIONS %s = %d body %q", path, recorder.Code, recorder.Body.String())
+		}
+		if recorder.Header().Get("Allow") != "GET, HEAD" ||
+			recorder.Header().Get("Content-Type") != "text/plain" ||
+			recorder.Header().Get("Content-Length") != "9" ||
+			recorder.Header().Get("ETag") != "" {
+			t.Fatalf("OPTIONS %s headers = %#v", path, recorder.Header())
+		}
+	}
+
 	t.Run("request connection close", func(t *testing.T) {
 		request := httptest.NewRequest(http.MethodGet, "/_healthz", nil)
 		request.Close = true
@@ -1284,6 +1298,38 @@ func TestProfileRoutesControlTheProvidedProfiler(t *testing.T) {
 	engine.ServeHTTP(stop, httptest.NewRequest(http.MethodGet, "/_profiling/stop_heap", nil))
 	if stop.Code != http.StatusOK || profiler.IsHeapProfilingRunning() {
 		t.Fatalf("stop_heap status/running = %d/%v", stop.Code, profiler.IsHeapProfilingRunning())
+	}
+}
+
+func TestProfileRoutesRespectTypeFlagsAndHideSensitiveConfig(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	profiler := profiling.NewAdvanced(profiling.AdvancedConfig{Config: profiling.Config{
+		Enabled:     true,
+		Server:      "https://user:secret@profiler.internal",
+		TagsJSON:    `{"tenant":"private"}`,
+		CPUEnabled:  false,
+		HeapEnabled: false,
+		WallEnabled: false,
+	}})
+	engine := gin.New()
+	RegisterProfileRoutesWithProfiler(engine, profiler)
+
+	for _, path := range []string{"/_profiling/start_cpu", "/_profiling/start_heap", "/_profiling/start_wall"} {
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusOK || profiler.IsRunning() {
+			t.Fatalf("%s status/running = %d/%v", path, response.Code, profiler.IsRunning())
+		}
+	}
+
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/_profiling/config", nil))
+	body := response.Body.String()
+	if strings.Contains(body, "secret") || strings.Contains(body, "tenant") || strings.Contains(body, "tagsJson") {
+		t.Fatalf("profiling config exposed sensitive values: %s", body)
+	}
+	if !strings.Contains(body, `"serverConfigured":true`) || !strings.Contains(body, `"tagsConfigured":true`) {
+		t.Fatalf("profiling config omitted safe presence flags: %s", body)
 	}
 }
 
@@ -1604,7 +1650,7 @@ func TestServer_Init(t *testing.T) {
 	})
 }
 
-func TestServerInit_RequestMiddlewareAndBuiltInParsersBypassHealthRoutes(t *testing.T) {
+func TestServerInit_OnlyRegisteredHealthRoutesBypassRequestMiddleware(t *testing.T) {
 	t.Setenv("SERVER_TYPE", "platform")
 	t.Setenv("DISABLE_REQUEST_MIDDLEWARES", "false")
 	t.Setenv("DISABLE_RESPONSE_MIDDLEWARES", "true")
@@ -1661,17 +1707,18 @@ func TestServerInit_RequestMiddlewareAndBuiltInParsersBypassHealthRoutes(t *test
 				request.Header.Set("x-application-data", "not-json")
 				recorder := httptest.NewRecorder()
 				s.App.ServeHTTP(recorder, request)
-				if method == http.MethodGet && !strings.HasSuffix(path, "/") && recorder.Code != http.StatusOK {
+				canonicalGet := method == http.MethodGet && !strings.HasSuffix(path, "/")
+				if canonicalGet && recorder.Code != http.StatusOK {
 					t.Fatalf("status = %d, want 200; body = %s", recorder.Code, recorder.Body.String())
 				}
-				if recorder.Code == http.StatusBadRequest || recorder.Code == http.StatusUnauthorized {
-					t.Fatalf("probe parser status = %d; body = %s", recorder.Code, recorder.Body.String())
+				if (method == http.MethodHead || method == http.MethodOptions) && recorder.Code != http.StatusBadRequest {
+					t.Fatalf("unsupported health variant bypassed request middleware: status = %d; body = %s", recorder.Code, recorder.Body.String())
 				}
 			})
 		}
 	}
-	if requestMiddlewareCalls != 0 {
-		t.Fatalf("request middleware called %d times for health routes, want 0", requestMiddlewareCalls)
+	if requestMiddlewareCalls != 8 {
+		t.Fatalf("request middleware called %d times, want 8 unsupported method variants", requestMiddlewareCalls)
 	}
 	for _, key := range []string{"GET /_healthz", "GET /_readyz"} {
 		if responseMiddlewareRequests[key] != 1 {
@@ -1690,15 +1737,15 @@ func TestServerInit_RequestMiddlewareAndBuiltInParsersBypassHealthRoutes(t *test
 			}
 		}
 	}
-	if requestMiddlewareCalls != 4 {
-		t.Fatalf("request middleware called %d times, want 4 unsupported health requests", requestMiddlewareCalls)
+	if requestMiddlewareCalls != 12 {
+		t.Fatalf("request middleware called %d times, want 12 unsupported health requests", requestMiddlewareCalls)
 	}
 
 	request := httptest.NewRequest(http.MethodGet, "/probe", nil)
 	recorder := httptest.NewRecorder()
 	s.App.ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusNoContent || requestMiddlewareCalls != 5 {
-		t.Fatalf("application request = status %d, middleware calls %d; want 204/5", recorder.Code, requestMiddlewareCalls)
+	if recorder.Code != http.StatusNoContent || requestMiddlewareCalls != 13 {
+		t.Fatalf("application request = status %d, middleware calls %d; want 204/13", recorder.Code, requestMiddlewareCalls)
 	}
 }
 
@@ -1716,6 +1763,110 @@ func TestServerInit_OriginalRequestMiddlewareStillRunsOnHealth(t *testing.T) {
 	server.App.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/_healthz", nil))
 	if recorder.Code != http.StatusTeapot {
 		t.Fatalf("original health middleware status = %d, want %d", recorder.Code, http.StatusTeapot)
+	}
+}
+
+func TestServerInit_ExplicitHealthCompatibilityOwnsVariantsBeforeCallerMiddleware(t *testing.T) {
+	t.Setenv("SERVER_TYPE", "platform")
+	t.Setenv("DISABLE_REQUEST_MIDDLEWARES", "true")
+	server := NewRuntime(RuntimeConfig{Config: Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}})
+	if err := server.UseHealthRouteMiddleware(func(c *gin.Context) {
+		if isStaticHealthProbeRequest(c.Request.Method, c.Request.URL.Path) {
+			staticHealthOptionsHandler()(c)
+			c.Abort()
+			return
+		}
+		c.Next()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	blocked := 0
+	block := func(c *gin.Context) {
+		blocked++
+		c.AbortWithStatus(http.StatusUnauthorized)
+	}
+	if err := server.Init(map[ServerType]http.Handler{
+		ServerTypePlatform: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }),
+	}, []Middleware{block}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	owned := httptest.NewRecorder()
+	server.App.ServeHTTP(owned, httptest.NewRequest(http.MethodOptions, "/_HEALTHZ/", nil))
+	if owned.Code != http.StatusOK || owned.Body.String() != "GET, HEAD" || blocked != 0 {
+		t.Fatalf("owned health variant = %d body %q blocked=%d", owned.Code, owned.Body.String(), blocked)
+	}
+
+	unowned := httptest.NewRecorder()
+	server.App.ServeHTTP(unowned, httptest.NewRequest(http.MethodPost, "/_HEALTHZ/", nil))
+	if unowned.Code != http.StatusUnauthorized || blocked != 1 {
+		t.Fatalf("unowned health variant = %d blocked=%d, want 401/1", unowned.Code, blocked)
+	}
+
+	if err := server.UseHealthRouteMiddleware(func(*gin.Context) {}); err == nil {
+		t.Fatal("post-Init health middleware configuration succeeded")
+	}
+}
+
+func TestServerInit_CustomHealthFallthroughRemainsInAccessLogs(t *testing.T) {
+	t.Setenv("SERVER_TYPE", "platform")
+	t.Setenv("DISABLE_REQUEST_MIDDLEWARES", "true")
+	var logs bytes.Buffer
+	server := NewRuntime(RuntimeConfig{Config: Config{Logger: slog.New(slog.NewJSONHandler(&logs, nil))}})
+	if err := server.UseHealthRouteMiddleware(func(c *gin.Context) { c.Next() }); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Init(
+		map[ServerType]http.Handler{ServerTypePlatform: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		})},
+		[]Middleware{func(c *gin.Context) { c.AbortWithStatus(http.StatusUnauthorized) }},
+		nil,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := httptest.NewRecorder()
+	server.App.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/_HEALTHZ/", nil))
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", recorder.Code)
+	}
+	if output := logs.String(); !strings.Contains(output, `"request_url":"/_HEALTHZ/"`) || !strings.Contains(output, `"response_status":401`) {
+		t.Fatalf("fallthrough health variant was hidden from access logs: %s", output)
+	}
+}
+
+func TestServerInit_StaticHealthPreflightReceivesCORSHeaders(t *testing.T) {
+	t.Setenv("SERVER_TYPE", "platform")
+	t.Setenv("DISABLE_REQUEST_MIDDLEWARES", "true")
+	cors := CORSOptions{
+		AllowOrigin:  func(_ *gin.Context, origin string) bool { return origin == "https://console.example" },
+		AllowHeaders: "authorization,x-request-id",
+		AllowMethods: "GET,HEAD",
+	}
+	server := NewRuntime(RuntimeConfig{
+		Config:               Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))},
+		StaticHealthResponse: true,
+		CORS:                 &cors,
+	})
+	if err := server.Init(map[ServerType]http.Handler{
+		ServerTypePlatform: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }),
+	}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodOptions, "/_HEALTHZ/", nil)
+	request.Header.Set("Origin", "https://console.example")
+	request.Header.Set("Access-Control-Request-Method", http.MethodGet)
+	recorder := httptest.NewRecorder()
+	server.App.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", recorder.Code)
+	}
+	if recorder.Header().Get("Access-Control-Allow-Origin") != "https://console.example" ||
+		recorder.Header().Get("Access-Control-Allow-Methods") != "GET,HEAD" ||
+		!strings.Contains(recorder.Header().Get("Vary"), "Origin") {
+		t.Fatalf("health preflight CORS headers = %#v", recorder.Header())
 	}
 }
 

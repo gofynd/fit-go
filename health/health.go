@@ -16,9 +16,9 @@
 package health
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,9 +35,15 @@ type Checker struct {
 	// skipCounter is used for adaptive health checking to reduce load
 	skipCounter int
 
-	periodicMu   sync.Mutex
-	periodicStop chan struct{}
-	periodicDone chan struct{}
+	periodicMu     sync.Mutex
+	periodicStops  []chan struct{}
+	periodicDones  []chan struct{}
+	periodicStates []*periodicCheckState
+}
+
+type periodicCheckState struct {
+	mu      sync.Mutex
+	stopped bool
 }
 
 // NewChecker creates a new health checker.
@@ -76,19 +82,27 @@ func (c *Checker) IsHealthy() bool {
 // StartPeriodicCheck starts a periodic health check that writes to /tmp/_healthz
 // for Kubernetes liveness probes. Port startHealthCheck().
 func (c *Checker) StartPeriodicCheck(intervalSeconds int) {
-	if intervalSeconds <= 0 {
-		intervalSeconds = 30
-	}
-
-	// Override from env
-	if envVal := os.Getenv("HEALTH_CHECK_INTERVAL_SECONDS"); envVal != "" {
-		if configured, err := strconv.Atoi(strings.TrimSpace(envVal)); err == nil && configured > 0 {
-			intervalSeconds = configured
-		}
-	}
-	c.startPeriodicCheck(time.Duration(intervalSeconds) * time.Second)
+	intervalSeconds = periodicIntervalSeconds(intervalSeconds, os.Getenv("HEALTH_CHECK_INTERVAL_SECONDS"))
+	c.startAdditionalPeriodicCheck(time.Duration(intervalSeconds) * time.Second)
 }
 
+func periodicIntervalSeconds(configured int, environment string) int {
+	if configured <= 0 {
+		configured = 30
+	}
+	if environment != "" {
+		parsed := configured
+		if _, err := fmt.Sscanf(environment, "%d", &parsed); err == nil && parsed > 0 {
+			configured = parsed
+		}
+	}
+	return configured
+}
+
+// startPeriodicCheck owns one replaceable loop for managed framework tests and
+// lifecycles. The public StartPeriodicCheck keeps official-main multi-call
+// behavior by adding a loop on every call; StopPeriodicCheck can still clean up
+// all loops during managed shutdown.
 func (c *Checker) startPeriodicCheck(interval time.Duration) {
 	if c == nil {
 		return
@@ -98,67 +112,122 @@ func (c *Checker) startPeriodicCheck(interval time.Duration) {
 	}
 
 	c.periodicMu.Lock()
-	c.stopPeriodicCheckLocked()
+	_ = c.stopPeriodicCheckLocked(context.Background())
+	c.startPeriodicCheckLocked(interval)
+	c.periodicMu.Unlock()
+}
+
+func (c *Checker) startAdditionalPeriodicCheck(interval time.Duration) {
+	if c == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	c.periodicMu.Lock()
+	c.startPeriodicCheckLocked(interval)
+	c.periodicMu.Unlock()
+}
+
+func (c *Checker) startPeriodicCheckLocked(interval time.Duration) {
 	stop := make(chan struct{})
 	done := make(chan struct{})
-	c.periodicStop = stop
-	c.periodicDone = done
+	state := &periodicCheckState{}
+	c.periodicStops = append(c.periodicStops, stop)
+	c.periodicDones = append(c.periodicDones, done)
+	c.periodicStates = append(c.periodicStates, state)
 
 	go func() {
 		defer close(done)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		// Run immediately
-		c.writeHealthFile()
+		// Run immediately. A stop that arrives while Check is blocked prevents
+		// that stale result from recreating the liveness file during shutdown.
+		if !c.writeHealthFileIfActive(state) {
+			return
+		}
 
 		for {
 			select {
 			case <-ticker.C:
-				c.writeHealthFile()
+				if !c.writeHealthFileIfActive(state) {
+					return
+				}
 			case <-stop:
 				return
 			}
 		}
 	}()
-	c.periodicMu.Unlock()
 }
 
 // StopPeriodicCheck stops periodic health-file work and waits for an in-flight
 // check/write to finish. It is safe to call repeatedly and concurrently with
 // StartPeriodicCheck.
 func (c *Checker) StopPeriodicCheck() {
-	if c == nil {
-		return
-	}
-	c.periodicMu.Lock()
-	c.stopPeriodicCheckLocked()
-	c.periodicMu.Unlock()
+	_ = c.StopPeriodicCheckContext(context.Background())
 }
 
-func (c *Checker) stopPeriodicCheckLocked() {
-	if c.periodicStop == nil {
-		return
+// StopPeriodicCheckContext stops periodic health-file work and waits for
+// in-flight checks only until ctx is done. The stop signal is always delivered,
+// even when the caller's shutdown deadline expires.
+func (c *Checker) StopPeriodicCheckContext(ctx context.Context) error {
+	if c == nil {
+		return nil
 	}
-	close(c.periodicStop)
-	<-c.periodicDone
-	c.periodicStop = nil
-	c.periodicDone = nil
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.periodicMu.Lock()
+	err := c.stopPeriodicCheckLocked(ctx)
+	c.periodicMu.Unlock()
+	return err
+}
+
+func (c *Checker) stopPeriodicCheckLocked(ctx context.Context) error {
+	for _, state := range c.periodicStates {
+		state.mu.Lock()
+		state.stopped = true
+		state.mu.Unlock()
+	}
+	for _, stop := range c.periodicStops {
+		close(stop)
+	}
+	dones := c.periodicDones
+	c.periodicStops = nil
+	c.periodicDones = nil
+	c.periodicStates = nil
+	for _, done := range dones {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 // Reset stops background work, removes all registered checks, and removes the
 // liveness file written by this checker. A reset checker can be reused, though
 // fit.Init installs a fresh checker for each framework lifecycle.
 func (c *Checker) Reset() {
+	_ = c.ResetContext(context.Background())
+}
+
+// ResetContext resets the checker while bounding the wait for an in-flight
+// periodic check by ctx. Registered checks and the liveness file are cleared
+// even if the wait reaches its deadline.
+func (c *Checker) ResetContext(ctx context.Context) error {
 	if c == nil {
-		return
+		return nil
 	}
-	c.StopPeriodicCheck()
+	err := c.StopPeriodicCheckContext(ctx)
 	c.mu.Lock()
 	c.checks = nil
 	c.skipCounter = 0
 	c.mu.Unlock()
 	_ = os.Remove("/tmp/_healthz")
+	return err
 }
 
 // writeHealthFile writes to /tmp/_healthz if healthy.
@@ -170,6 +239,21 @@ func (c *Checker) writeHealthFile() {
 		// Remove health file on failure
 		os.Remove("/tmp/_healthz")
 	}
+}
+
+func (c *Checker) writeHealthFileIfActive(state *periodicCheckState) bool {
+	errs := c.Check()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.stopped {
+		return false
+	}
+	if len(errs) == 0 {
+		_ = os.WriteFile("/tmp/_healthz", []byte("ok"), 0644)
+	} else {
+		_ = os.Remove("/tmp/_healthz")
+	}
+	return true
 }
 
 // MongoCheck returns a health check function for MongoDB connections.

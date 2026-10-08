@@ -6,6 +6,100 @@ the module follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- Preserve official-main runtime behavior for original APIs: GSM results stay
+  base64-encoded, legacy datastore initializers retain best-effort TLS behavior,
+  Redis retains its historical TLS verification default, and original gRPC
+  initialization retains post-start registration behavior. Explicit decoded,
+  strict, and managed entry points remain available for new integrations.
+- Prevent process crashes and hangs in Sentry breadcrumb sanitization, disabled
+  feature clients, oversized/deep RESP input, unroutable Redis cluster commands,
+  unsupported Redis reply-count modes, and Kafka consumer/producer lifecycle
+  paths. Redis request retry budgets now survive reconnects, protocol-limit
+  failures settle once, MOVED/ASK are handled for single commands, bounded
+  blocking commands are never replayed after ambiguous execution, and
+  cross-node pipelines fail before any write rather than risk duplicate
+  mutations or mis-associated replies.
+- Apply advanced Kafka consume options instead of silently discarding them,
+  flush franz manual commit marks when per-run auto-commit is requested, retain
+  the original producer's configured acknowledgements, bound legacy close,
+  deep-clone traced messages, preserve original nil/empty Kafka-key semantics,
+  rewind advanced consumers to failed records after handler failure, and keep
+  lost-partition callbacks separate from the safe revoke-commit boundary.
+- Keep FeatureHub polling evaluation functional, retry transient edge responses,
+  isolate request-scoped server evaluation, ignore non-positive `edge.stale`
+  hints, accept the JavaScript SDK's positive boolean/numeric-string stale
+  hints, stop retrying permanent HTTP failures, and report a terminal failure to
+  waiters even when it occurs after readiness. Reject stale in-flight context
+  snapshots, preserve legacy boolean coercion/cancellation, and remove API
+  keys/user context from returned errors. Unbuilt or failed request contexts no
+  longer fall back to values evaluated for the parent client. Streaming retries
+  now use bounded exponential backoff, honor bounded `Retry-After` guidance,
+  reset only after feature-state events, floor/cap `edge.stale` delays, expire
+  retained stale snapshots after 30 seconds, coalesce rapid context refreshes,
+  and cannot arm a stale-expiry timer after `Stop`.
+- Retire the global tracer after shutdown until an explicit reinitialization,
+  prefer an explicitly bound logger context, preserve slog groups and caller
+  PCs, deduplicate routed metric instruments, and respect an explicit resource
+  `service.name`. Legacy tracing constructors retain explicit-context-only log
+  enrichment; goroutine-local lookup remains opt-in through the managed SDK.
+- Restrict health middleware bypass to routes the server actually owns, append
+  rather than replace `Vary: Origin`, validate propagated request IDs on the
+  advanced path, and make GraphQL resolver spans opt-in.
+- Bound proto fetching and copy size, validate repository schemes, make
+  international rendering deterministic and JSON-string aware, prevent
+  migration identifier collisions/overflow, and improve secret redaction for
+  whole-token Luhn-valid payment cards, labelled and supported international
+  phone numbers, short password aliases, and validated JWTs. The scanner keeps
+  hostnames, Kafka topics, UUIDs, IP addresses, explicitly labelled timestamps,
+  event-path epoch milliseconds, and explicitly labelled order/invoice IDs.
+- Preserve the original health check's additive multi-call behavior and numeric
+  environment prefix parsing while allowing managed shutdown to stop every
+  tracked periodic loop within the caller's shutdown context.
+- Rewind advanced Franz and Confluent consumers to the exact failed record after
+  a handler error without changing a fresh group's configured latest/earliest
+  fallback; collect every failed partition in a poll wave, rewind finalizer and
+  post-handler commit failures, and do not replay records whose
+  `CommitBeforeHandler` boundary already succeeded. Preserve the revoke-hook
+  notification fallback for lost partitions without committing them, and
+  reject unsupported options on additive context-aware legacy-consumer entry
+  points instead of dropping them.
+- Preserve completed same-node pipeline replies when Redis Cluster reports a
+  redirect, close nodes whose connection races with cluster shutdown, process
+  queued retry failures linearly, and allocate large RESP payloads incrementally
+  instead of trusting a length header up front. Bootstrap, PING, topology,
+  redirect, and malformed-protocol errors omit raw server values and command
+  arguments while retaining stable causes such as `io.EOF` for `errors.Is`.
+- Preserve retired global-tracer state across temporary `SetGlobal` ownership,
+  bound pre-initialization health cleanup by the initialization context, and
+  retain original gRPC handler-error text only on the legacy `Init` path while
+  managed servers stay sanitized. Redact compound password keys, compact
+  JWE/JWT tokens, grouped cards, loose numeric codes, and supported
+  international phone forms while retaining known operational numeric lists,
+  durations, decimals, labelled timestamps, coordinates, versions and labelled
+  IDs. Ambiguous unlabelled Luhn-valid 13-digit values remain fail-closed.
+- Update gRPC to 1.83.2 for GO-2026-6443 and the OpenTelemetry core/exporter
+  and matching contrib families to 1.45.0/0.70.0 for GO-2026-6505 (exporter
+  configuration log leakage).
+
+### Added
+- `redis.IORedisRedirectError` exposes redirect-side-effect ambiguity and write
+  disposition through `errors.As`, without requiring callers to parse error
+  strings or exposing Redis-authored reply text.
+- `config.GetDecodedSecretFromGSM`, `mongo.InitWithTLSValidation`, and
+  `mysql.InitWithTLSValidation` provide explicit decoded/strict behavior without
+  changing existing consumers.
+- `server.Server.UseHealthRouteMiddleware` lets an application explicitly own
+  legacy health-route variants without giving unrelated routes an auth bypass.
+- Kafka advanced consumer settings expose callback-scoped
+  `RebalanceLifecycle` hooks for deadlock-free shutdown without weakening the
+  synchronous external `Close` contract. Legacy callbacks must return; calling
+  ordinary `Close` from inside one can deadlock, while an external close cannot
+  reclaim a callback goroutine that never returns.
+- `health.Checker.ResetContext` and `StopPeriodicCheckContext` let managed
+  shutdown honor its deadline while the original blocking methods remain
+  source- and behavior-compatible wrappers.
+
 ## [0.2.0-rc.1] - 2026-10-07
 
 ### Compatibility

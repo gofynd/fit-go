@@ -411,14 +411,17 @@ type Tracer struct {
 	shutdownOnce       sync.Once
 	shutdownErr        error
 	closed             atomic.Bool
+	globalLifecycle    atomic.Bool
+	implicitLogContext bool
 }
 
 var (
-	globalTracer       atomic.Pointer[Tracer]
-	globalTracerMu     sync.Mutex
-	globalInitErr      error
-	implicitTraceMu    sync.Mutex
-	globalTracerOwners = struct {
+	globalTracer        atomic.Pointer[Tracer]
+	globalTracerMu      sync.Mutex
+	globalInitErr       error
+	retiredGlobalTracer *Tracer
+	implicitTraceMu     sync.Mutex
+	globalTracerOwners  = struct {
 		current *globalTracerOwner
 		active  map[*globalTracerOwner]struct{}
 	}{active: make(map[*globalTracerOwner]struct{})}
@@ -430,12 +433,13 @@ var (
 )
 
 type globalTracerOwner struct {
-	tracer      *Tracer
-	initErr     error
-	previous    *globalTracerOwner
-	baseline    *Tracer
-	baselineErr error
-	active      bool
+	tracer          *Tracer
+	initErr         error
+	previous        *globalTracerOwner
+	baseline        *Tracer
+	baselineErr     error
+	baselineRetired *Tracer
+	active          bool
 }
 
 type otelGlobalOwner struct {
@@ -490,10 +494,11 @@ func newTracer(ctx context.Context, opts AdvancedOptions, upstreamDefaults bool)
 		}
 	}
 	t := &Tracer{
-		serviceName: opts.ServiceName,
-		env:         opts.Env,
-		enabled:     enabled,
-		options:     opts,
+		serviceName:        opts.ServiceName,
+		env:                opts.Env,
+		enabled:            enabled,
+		options:            opts,
+		implicitLogContext: !upstreamDefaults,
 	}
 
 	if t.enabled {
@@ -599,11 +604,17 @@ func resolveOTLPProtocol(opts AdvancedOptions) string {
 }
 
 func httpTraceEndpoint(endpoint string, source otlpEndpointSource) string {
-	if endpoint == "" || source != otlpEndpointCommon {
+	if endpoint == "" || (source != otlpEndpointCommon && source != otlpEndpointExplicit) {
 		return endpoint
 	}
 	u, err := url.Parse(endpoint)
 	if err != nil {
+		return endpoint
+	}
+	if source == otlpEndpointExplicit && strings.Trim(u.Path, "/") != "" {
+		return endpoint
+	}
+	if strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/v1/traces") {
 		return endpoint
 	}
 	u.Path = strings.TrimRight(u.Path, "/") + "/v1/traces"
@@ -817,7 +828,7 @@ func buildPropagator(value string) (propagation.TextMapPropagator, error) {
 		case "baggage":
 			propagators = append(propagators, propagation.Baggage{})
 		case "b3":
-			propagators = append(propagators, b3.New())
+			propagators = append(propagators, b3.New(b3.WithInjectEncoding(b3.B3SingleHeader)))
 		case "b3multi":
 			propagators = append(propagators, b3.New(b3.WithInjectEncoding(b3.B3MultipleHeader)))
 		case "jaeger":
@@ -960,11 +971,21 @@ func buildResource(ctx context.Context, opts AdvancedOptions) *resource.Resource
 		fallbackServiceName = strings.TrimSpace(os.Getenv("SERVICE_NAME"))
 	}
 	// DefaultOptions preserves the historical public ServiceName value sourced
-	// from SERVICE_NAME. Internally it is still only a fallback: a standard
-	// OTEL_RESOURCE_ATTRIBUTES service.name must take precedence.
-	if strings.TrimSpace(os.Getenv("OTEL_SERVICE_NAME")) == "" &&
-		fallbackServiceName != "" && serviceName == fallbackServiceName {
-		serviceName = ""
+	// from SERVICE_NAME (or "unknown"). Internally those defaults are fallbacks
+	// only when a resource-level service.name is actually configured.
+	resourceServiceName := parseResourceAttributes(os.Getenv("OTEL_RESOURCE_ATTRIBUTES"))["service.name"]
+	if resourceServiceName == "" {
+		resourceServiceName = parseResourceAttributes(opts.ResourceAttributes)["service.name"]
+	}
+	if resourceServiceName == "" && opts.Attributes != nil {
+		resourceServiceName = opts.Attributes["service.name"]
+	}
+	if strings.TrimSpace(os.Getenv("OTEL_SERVICE_NAME")) == "" && strings.TrimSpace(resourceServiceName) != "" {
+		legacyDefault := fallbackServiceName != "" && serviceName == fallbackServiceName
+		unknownDefault := fallbackServiceName == "" && serviceName == "unknown"
+		if legacyDefault || unknownDefault {
+			serviceName = ""
+		}
 	}
 	environment := opts.Env
 	if environment == "" {
@@ -1392,6 +1413,7 @@ func initWithOptions(opts AdvancedOptions, upstreamDefaults bool) (*Tracer, erro
 		globalInitErr = err
 		return nil, err
 	}
+	t.globalLifecycle.Store(true)
 	installGlobalTracerLocked(t, err)
 	refreshImplicitTraceEnabled()
 	return t, err
@@ -1414,6 +1436,12 @@ func GlobalWithError() (*Tracer, error) {
 		err := globalInitErr
 		globalTracerMu.Unlock()
 		return current, err
+	}
+	if retiredGlobalTracer != nil {
+		retired := retiredGlobalTracer
+		err := globalInitErr
+		globalTracerMu.Unlock()
+		return retired, err
 	}
 	globalTracerMu.Unlock()
 	return InitWithOptions(DefaultOptions())
@@ -1460,37 +1488,50 @@ func installGlobalTracerLocked(t *Tracer, initErr error) *globalTracerOwner {
 		previous = nil
 	}
 	owner := &globalTracerOwner{
-		tracer:      t,
-		initErr:     initErr,
-		previous:    previous,
-		baseline:    current,
-		baselineErr: globalInitErr,
-		active:      true,
+		tracer:          t,
+		initErr:         initErr,
+		previous:        previous,
+		baseline:        current,
+		baselineErr:     globalInitErr,
+		baselineRetired: retiredGlobalTracer,
+		active:          true,
 	}
 	globalTracerOwners.current = owner
 	globalTracerOwners.active[owner] = struct{}{}
 	globalTracer.Store(t)
 	globalInitErr = initErr
+	retiredGlobalTracer = nil
 	return owner
 }
 
-func effectiveGlobalTracerPredecessor(owner *globalTracerOwner) (*globalTracerOwner, *Tracer, error) {
+func effectiveGlobalTracerPredecessor(owner *globalTracerOwner) (*globalTracerOwner, *Tracer, error, *Tracer) {
 	previous := owner.previous
 	fallback := owner.baseline
 	fallbackErr := owner.baselineErr
+	fallbackRetired := owner.baselineRetired
+	retiredFromChain := false
 	for previous != nil && !previous.active {
 		fallback = previous.baseline
 		fallbackErr = previous.baselineErr
+		// A process-global lifecycle can be shut down while a temporary
+		// SetGlobal owner is installed. Preserve that retired lifecycle across
+		// restoration so a late Global call cannot create a second exporter.
+		if !retiredFromChain && previous.tracer != nil && previous.tracer.globalLifecycle.Load() && previous.tracer.closed.Load() {
+			fallbackRetired = previous.tracer
+			retiredFromChain = true
+		} else if !retiredFromChain {
+			fallbackRetired = previous.baselineRetired
+		}
 		previous = previous.previous
 	}
-	return previous, fallback, fallbackErr
+	return previous, fallback, fallbackErr, fallbackRetired
 }
 
 func restoreGlobalTracerOwnerLocked(owner *globalTracerOwner) {
 	if globalTracerOwners.current != owner {
 		return
 	}
-	previous, fallback, fallbackErr := effectiveGlobalTracerPredecessor(owner)
+	previous, fallback, fallbackErr, fallbackRetired := effectiveGlobalTracerPredecessor(owner)
 	globalTracerOwners.current = previous
 	if globalTracer.Load() != owner.tracer {
 		return
@@ -1498,10 +1539,12 @@ func restoreGlobalTracerOwnerLocked(owner *globalTracerOwner) {
 	if previous != nil {
 		globalTracer.Store(previous.tracer)
 		globalInitErr = previous.initErr
+		retiredGlobalTracer = previous.baselineRetired
 		return
 	}
 	globalTracer.Store(fallback)
 	globalInitErr = fallbackErr
+	retiredGlobalTracer = fallbackRetired
 }
 
 func deactivateGlobalTracerOwner(owner *globalTracerOwner) {
@@ -1535,6 +1578,14 @@ func relinquishGlobalTracer(t *Tracer) {
 		globalTracer.Store(nil)
 		globalInitErr = nil
 	}
+	if t.globalLifecycle.Load() {
+		// Preserve the released sync.Once behavior for lazy callers: after the
+		// process-wide tracer has shut down, Global keeps returning that inert
+		// tracer instead of silently starting a second exporter during drain,
+		// including when a temporary SetGlobal tracer currently masks it. An
+		// explicit Init call still starts a fresh lifecycle.
+		retiredGlobalTracer = t
+	}
 	globalTracerMu.Unlock()
 	refreshImplicitTraceEnabled()
 }
@@ -1542,13 +1593,13 @@ func relinquishGlobalTracer(t *Tracer) {
 func refreshImplicitTraceEnabled() {
 	implicitTraceMu.Lock()
 	defer implicitTraceMu.Unlock()
-	if current := globalTracer.Load(); current != nil && current.enabled && !current.closed.Load() {
+	if current := globalTracer.Load(); current != nil && current.enabled && !current.closed.Load() && current.implicitLogContext {
 		logging.SetImplicitTraceEnabled(true)
 		return
 	}
 	otelOwners.Lock()
 	owner := otelOwners.current
-	enabled := owner != nil && owner.active && owner.tracer != nil && !owner.tracer.closed.Load()
+	enabled := owner != nil && owner.active && owner.tracer != nil && !owner.tracer.closed.Load() && owner.tracer.implicitLogContext
 	otelOwners.Unlock()
 	logging.SetImplicitTraceEnabled(enabled)
 }

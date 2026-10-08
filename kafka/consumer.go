@@ -18,6 +18,7 @@ package kafka
 import (
 	"context"
 	"errors"
+	"sort"
 	"time"
 )
 
@@ -82,6 +83,153 @@ type TransientConsumerError struct {
 
 func (e *TransientConsumerError) Error() string { return e.cause.Error() }
 func (e *TransientConsumerError) Unwrap() error { return e.cause }
+
+type consumerHandlerError struct {
+	message string
+	cause   error
+	failed  *consumerRecordPosition
+}
+
+// consumerRewindError records the earliest offset that must be retried when a
+// non-handler processing step (for example an offset finalizer or a
+// post-handler commit) fails. It is deliberately internal: callers still see
+// and can inspect the original error through errors.Is/errors.As.
+type consumerRewindError struct {
+	cause  error
+	failed consumerRecordPosition
+}
+
+type consumerRecordPosition struct {
+	topic       string
+	partition   int32
+	offset      int64
+	leaderEpoch int32
+}
+
+func (e *consumerHandlerError) Error() string {
+	if e.message == "" {
+		return e.cause.Error()
+	}
+	return e.message + ": " + e.cause.Error()
+}
+func (e *consumerHandlerError) Unwrap() error { return e.cause }
+
+func (e *consumerHandlerError) consumerRewindPositions() []consumerRecordPosition {
+	if e.failed == nil {
+		// A handler failure after CommitBeforeHandler has no work to rewind. The
+		// empty, but authoritative, plan prevents the retry path from falling
+		// back to the handler's already committed position.
+		return nil
+	}
+	return []consumerRecordPosition{*e.failed}
+}
+
+func (e *consumerRewindError) Error() string { return e.cause.Error() }
+func (e *consumerRewindError) Unwrap() error { return e.cause }
+func (e *consumerRewindError) consumerRewindPositions() []consumerRecordPosition {
+	return []consumerRecordPosition{e.failed}
+}
+
+func newConsumerHandlerError(message string, cause error) error {
+	if cause == nil {
+		return nil
+	}
+	return &consumerHandlerError{message: message, cause: cause}
+}
+
+func newConsumerHandlerErrorAt(message string, cause error, position consumerRecordPosition) error {
+	if cause == nil {
+		return nil
+	}
+	return &consumerHandlerError{message: message, cause: cause, failed: &position}
+}
+
+func isConsumerHandlerError(err error) bool {
+	var handlerErr *consumerHandlerError
+	return errors.As(err, &handlerErr)
+}
+
+func consumerHandlerPosition(err error) (consumerRecordPosition, bool) {
+	var handlerErr *consumerHandlerError
+	if !errors.As(err, &handlerErr) || handlerErr.failed == nil {
+		return consumerRecordPosition{}, false
+	}
+	return *handlerErr.failed, true
+}
+
+// withConsumerRewindPosition attaches an exact retry boundary unless an inner
+// layer has already made an authoritative rewind decision. This distinction is
+// important for CommitBeforeHandler, whose correct decision is "rewind
+// nothing" after the pre-handler commit succeeds.
+func withConsumerRewindPosition(err error, position consumerRecordPosition) error {
+	if err == nil {
+		return nil
+	}
+	if _, decided := consumerRewindPositions(err); decided {
+		return err
+	}
+	return &consumerRewindError{cause: err, failed: position}
+}
+
+// consumerRewindPositions returns the earliest requested offset per partition
+// from a single error or an errors.Join tree. decided is true even when the
+// authoritative plan is empty.
+func consumerRewindPositions(err error) (positions []consumerRecordPosition, decided bool) {
+	if err == nil {
+		return nil, false
+	}
+	type rewindPlanner interface {
+		consumerRewindPositions() []consumerRecordPosition
+	}
+	type multiUnwrapper interface {
+		Unwrap() []error
+	}
+	type singleUnwrapper interface {
+		Unwrap() error
+	}
+
+	add := func(position consumerRecordPosition) {
+		for i := range positions {
+			if positions[i].topic == position.topic && positions[i].partition == position.partition {
+				if position.offset < positions[i].offset {
+					positions[i] = position
+				}
+				return
+			}
+		}
+		positions = append(positions, position)
+	}
+	var walk func(error)
+	walk = func(current error) {
+		if current == nil {
+			return
+		}
+		if plan, ok := current.(rewindPlanner); ok {
+			decided = true
+			for _, position := range plan.consumerRewindPositions() {
+				add(position)
+			}
+			return
+		}
+		if joined, ok := current.(multiUnwrapper); ok {
+			for _, child := range joined.Unwrap() {
+				walk(child)
+			}
+			return
+		}
+		if wrapped, ok := current.(singleUnwrapper); ok {
+			walk(wrapped.Unwrap())
+		}
+	}
+	walk(err)
+	sort.Slice(positions, func(i, j int) bool {
+		if positions[i].topic != positions[j].topic {
+			return positions[i].topic < positions[j].topic
+		}
+		return positions[i].partition < positions[j].partition
+	})
+	return positions, decided
+}
 
 // NewTransientConsumerError marks cause as a retryable running-consumer
 // transport failure. Driver adapters should call this only after classifying
@@ -246,11 +394,29 @@ type ConsumerAdvancedConfig struct {
 
 	// OnPartitionsAssigned, if set, is invoked after partitions are assigned to
 	// this consumer during a group rebalance (visibility / app hook). Optional.
+	// Do not call the consumer's Close method synchronously from this legacy hook;
+	// use OnPartitionsAssignedWithLifecycle when the hook may request shutdown.
 	OnPartitionsAssigned func([]PartitionAssignment)
+	// OnPartitionsAssignedWithLifecycle is the shutdown-safe form of
+	// OnPartitionsAssigned. lifecycle.Close requests shutdown without waiting for
+	// the callback itself; an external consumer Close still waits for completion.
+	OnPartitionsAssignedWithLifecycle func([]PartitionAssignment, RebalanceLifecycle)
 
 	// OnPartitionsRevoked, if set, is invoked before partitions are revoked from
-	// this consumer during a group rebalance. Optional.
+	// this consumer during a group rebalance. Optional. When automatic commits
+	// are configured, fit-go performs the franz-go final marked-offset commit
+	// before invoking this hook. Do not call the consumer's Close method
+	// synchronously from this legacy hook; use the lifecycle form below.
 	OnPartitionsRevoked func([]PartitionAssignment)
+	// OnPartitionsRevokedWithLifecycle is the shutdown-safe form of
+	// OnPartitionsRevoked.
+	OnPartitionsRevokedWithLifecycle func([]PartitionAssignment, RebalanceLifecycle)
+
+	// OnPartitionsLost is franz-go specific and reports assignments that were
+	// lost without a safe final-commit boundary. It never triggers fit-go's final
+	// revoke commit. Use the lifecycle form when the hook may request shutdown.
+	OnPartitionsLost              func([]PartitionAssignment)
+	OnPartitionsLostWithLifecycle func([]PartitionAssignment, RebalanceLifecycle)
 
 	// ShutdownPolicy selects how the KafkaJS-compatible backend stops an active
 	// consume run. The zero value preserves fit-go's existing behavior: cancel
@@ -291,8 +457,29 @@ func (config ConsumerAdvancedConfig) ConsumerConfig() ConsumerConfig {
 func (config ConsumerAdvancedConfig) hasAdvancedControls() bool {
 	return config.Backend != ConsumerBackendConfluent ||
 		config.PartitionAssignmentStrategy != "" || config.AutoCreateTopics ||
-		config.OnPartitionsAssigned != nil || config.OnPartitionsRevoked != nil ||
+		config.OnPartitionsAssigned != nil || config.OnPartitionsAssignedWithLifecycle != nil ||
+		config.OnPartitionsRevoked != nil || config.OnPartitionsRevokedWithLifecycle != nil ||
+		config.OnPartitionsLost != nil || config.OnPartitionsLostWithLifecycle != nil ||
 		config.ShutdownPolicy != ConsumerShutdownCancelInFlight
+}
+
+// RebalanceLifecycle is valid only for the duration of an advanced partition
+// callback. Close requests consumer shutdown without waiting for that callback
+// to return. This explicit scope avoids goroutine-identity heuristics: external
+// calls to KafkaConsumer.Close remain synchronous.
+type RebalanceLifecycle interface {
+	Close() error
+}
+
+type rebalanceLifecycle struct {
+	close func() error
+}
+
+func (l rebalanceLifecycle) Close() error {
+	if l.close == nil {
+		return nil
+	}
+	return l.close()
 }
 
 // ConsumerBackend selects a fit-go Kafka consumer implementation. Producers

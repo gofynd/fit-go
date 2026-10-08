@@ -100,8 +100,9 @@ statically linked Go equivalent, not plugin byte parity.
 Legacy GraphQL instrumentation automatically patched supported runtimes and
 could capture documents, variables, arguments, results, and errors. The
 `fitgraphql` gqlgen extension must be registered explicitly and intentionally
-exports operation type, allowlisted operation identity, field identity, and
-generic error state. Raw client operation names are omitted unless an explicit
+exports operation type, allowlisted operation identity, and generic error
+state. Resolver field identity is exported only when `FieldSpans` is explicitly
+enabled, avoiding a span-per-field default. Raw client operation names are omitted unless an explicit
 `OperationNameMapper` maps them to a bounded persisted/allowlisted identity.
 Payload capture has no opt-in because application data does not belong in
 telemetry.

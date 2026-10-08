@@ -160,15 +160,17 @@ Application-specific Convict/Pydantic formats still require an explicit
 
 ### GraphQL
 
-Register `fitgraphql.New` on each gqlgen server. It creates operation and
-resolver spans but deliberately cannot capture GraphQL documents, variables,
+Register `fitgraphql.New` on each gqlgen server. It creates operation spans;
+resolver spans are an explicit `FieldSpans` opt-in to avoid unbounded span
+volume on large selections. The extension deliberately cannot capture GraphQL documents, variables,
 arguments, response values, or raw error text. Client-supplied operation names
 are omitted by default; `Options.OperationName` may map persisted or allowlisted
 names to bounded telemetry identities.
 
 ```go
 graphqlServer := handler.NewDefaultServer(schema)
-graphqlServer.Use(fitgraphql.New(fitgraphql.Options{}))
+resolverSpans := true
+graphqlServer.Use(fitgraphql.New(fitgraphql.Options{FieldSpans: &resolverSpans}))
 ```
 
 ### Workers, Crons, And Jobs

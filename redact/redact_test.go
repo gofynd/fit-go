@@ -18,6 +18,9 @@ func TestSafeURL(t *testing.T) {
 		"https://x.com":                                                     "https://x.com/",
 		"https://api.x.com/reset-password/path-secret?token=query-secret":   "https://api.x.com/reset-password/[REDACTED]",
 		"https://api.x.com/users/jane%40example.com":                        "https://api.x.com/users/[REDACTED]",
+		"https://api.x.com/traces/550e8400-e29b-41d4-a716-123456789012":     "https://api.x.com/traces/550e8400-e29b-41d4-a716-123456789012",
+		"https://api.x.com/events/1791331200000":                            "https://api.x.com/events/1791331200000",
+		"https://api.x.com/users/415.555.2671":                              "https://api.x.com/users/[REDACTED]",
 		"mongodb://user:pass@mongo.internal/customer?authSource=admin":      "mongodb://mongo.internal/[REDACTED]",
 		"postgresql://user:pass@postgres.internal/customer?sslmode=require": "postgresql://postgres.internal/[REDACTED]",
 		"redis://default:pass@redis.internal:6379/4?token=secret":           "redis://redis.internal:6379/[REDACTED]",
@@ -153,5 +156,173 @@ func TestTextRedactsDiagnosticSecretsAndPII(t *testing.T) {
 		if !strings.Contains(got, host) {
 			t.Fatalf("Text removed safe DSN host %q: %s", host, got)
 		}
+	}
+}
+
+func TestTextRedactsStructuredCodesNumericSecretsAndBareJWT(t *testing.T) {
+	jwt := "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123"
+	input := `{"password":1234,"otp":987654,"pin":4321,"cvv":123} token ` + jwt
+	got := Text(input)
+	for _, secret := range []string{"1234", "987654", "4321", `"cvv":123`, jwt} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("Text leaked %q: %s", secret, got)
+		}
+	}
+}
+
+func TestTextDoesNotTreatIPsOrDatesAsPhones(t *testing.T) {
+	input := "redis 10.12.3.45:5432 at 2026-10-07 12:00:00 timestamp=1791331200000 request=550e8400-e29b-41d4-a716-123456789012; call +919876543210"
+	got := Text(input)
+	for _, safe := range []string{"10.12.3.45", "2026-10-07", "1791331200000", "550e8400-e29b-41d4-a716-123456789012"} {
+		if !strings.Contains(got, safe) {
+			t.Fatalf("Text redacted operational value %q: %s", safe, got)
+		}
+	}
+	if strings.Contains(got, "+919876543210") || !strings.Contains(got, "[REDACTED_PHONE]") {
+		t.Fatalf("Text did not redact phone: %s", got)
+	}
+}
+
+func TestTextRedactsCardsDottedPhonesAndShortSecretAliases(t *testing.T) {
+	input := `card=4111 1111 1111 1111 phone=415.555.2671 pwd=hunter2 pass=opensesame`
+	got := Text(input)
+	for _, secret := range []string{"4111 1111 1111 1111", "415.555.2671", "hunter2", "opensesame"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("Text leaked %q: %s", secret, got)
+		}
+	}
+	for _, marker := range []string{"[REDACTED_CARD]", "[REDACTED_PHONE]", "pwd=[REDACTED]", "pass=[REDACTED]"} {
+		if !strings.Contains(got, marker) {
+			t.Fatalf("Text omitted marker %q: %s", marker, got)
+		}
+	}
+}
+
+func TestTextJWTDetectionRequiresDecodableJWTHeaderAndClaims(t *testing.T) {
+	jwt := "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123"
+	input := strings.Join([]string{
+		"host=metroplex.services.internal:8080",
+		"topic=fulfillment.shipments.dispatched",
+		"token=" + jwt,
+	}, " ")
+	got := Text(input)
+	for _, safe := range []string{"metroplex.services.internal:8080", "fulfillment.shipments.dispatched"} {
+		if !strings.Contains(got, safe) {
+			t.Fatalf("Text redacted safe dotted value %q: %s", safe, got)
+		}
+	}
+	if strings.Contains(got, jwt) {
+		t.Fatalf("Text leaked JWT: %s", got)
+	}
+}
+
+func TestTextDoesNotRedactLuhnInvalidLongNumbersAsCards(t *testing.T) {
+	const reference = "4111 1111 1111 1112"
+	if got := Text("reference=" + reference); !strings.Contains(got, reference) {
+		t.Fatalf("Text redacted a Luhn-invalid reference: %s", got)
+	}
+}
+
+func TestTextKeepsOperationalDottedNumbers(t *testing.T) {
+	input := strings.Join([]string{
+		"timestamp=12:34:56.123456789Z",
+		"timestamp=1791331200",
+		"latency_ms=1234.5678",
+		"amount=12345678.90",
+		"coordinates=19.07601234,72.87771234",
+		"build=1.45.0+20261007.1234",
+		"peers=10.4.0.128 10.4.0.129",
+		"partitions=12 18 23 41 57 64",
+		"durations=1000-2000-3000",
+		"origin=0.000000 0.000000",
+		"retry pass: 3",
+		"PWD=/app",
+	}, " ")
+	if got := Text(input); got != input {
+		t.Fatalf("Text redacted operational dotted values:\n got: %s\nwant: %s", got, input)
+	}
+}
+
+func TestPaymentCardScannerUsesWholeStructuredTokens(t *testing.T) {
+	for _, input := range []string{
+		"peers 10.4.0.128 10.4.0.129",
+		"version 1.45.0+20261007.1234",
+		"partitions 12 18 23 41 57 64",
+		"durations 1000-2000-3000",
+		"zeros 0.000000 0.000000",
+	} {
+		if got := redactPaymentCards(input); got != input {
+			t.Fatalf("payment-card scanner redacted operational input %q as %q", input, got)
+		}
+	}
+	for _, input := range []string{
+		"card_4111111111111111",
+		"pan4111111111111111",
+		"card=4000000000000000006",
+	} {
+		if got := redactPaymentCards(input); !strings.Contains(got, "[REDACTED_CARD]") {
+			t.Fatalf("payment-card scanner leaked %q as %q", input, got)
+		}
+	}
+}
+
+func TestPaymentCardScannerDoesNotAllocatePerDigitCandidate(t *testing.T) {
+	input := strings.Repeat("partitions=12,18,23,41,57,64;", 1<<15)
+	if allocations := testing.AllocsPerRun(10, func() { _ = redactPaymentCards(input) }); allocations > 1 {
+		t.Fatalf("safe card scan allocations = %.0f, want at most one", allocations)
+	}
+}
+
+func TestTextRedactsLooseCodesAndInternationalDottedPhone(t *testing.T) {
+	input := "cvv 123 phone=+91.98765.43210"
+	got := Text(input)
+	for _, secret := range []string{"123", "+91.98765.43210"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("Text leaked %q: %s", secret, got)
+		}
+	}
+}
+
+func TestTextRedactsBoundedAndAdjacentCardsWithoutMaskingOrderIDs(t *testing.T) {
+	for _, input := range []string{
+		"card=4111 1111 1111 1111 12/27",
+		"order 12 4111 1111 1111 1111",
+		"cards=4111 1111 1111 1111 5555 5555 5555 4444",
+		"card=4111.1111.1111.1111",
+	} {
+		got := Text(input)
+		if strings.Contains(got, "4111") {
+			t.Fatalf("Text leaked a payment card from %q: %s", input, got)
+		}
+	}
+	if got := Text("cards=4111 1111 1111 1111 5555 5555 5555 4444"); strings.Count(got, "[REDACTED_CARD]") != 2 {
+		t.Fatalf("adjacent card markers = %q; want two", got)
+	}
+	const orderID = "FY6512345678901239"
+	if got := Text("order=" + orderID); !strings.Contains(got, orderID) {
+		t.Fatalf("Text masked a Fynd order ID: %s", got)
+	}
+}
+
+func TestTextRedactsCompoundPasswordKeys(t *testing.T) {
+	input := `passphrase=open-sesame db_password=db-secret {"database_password":"json-secret"}`
+	got := Text(input)
+	for _, secret := range []string{"open-sesame", "db-secret", "json-secret"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("Text leaked %q: %s", secret, got)
+		}
+	}
+}
+
+func TestTextRedactsJWTAfterDottedPrefixAndCompactJWE(t *testing.T) {
+	jwt := "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123"
+	jwe := "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0..aXYxMjM0NTY3ODkw.Y2lwaGVydGV4dA.dGFnMTIzNDU2Nzg5MA"
+	input := "topic=fulfillment.shipments." + jwt + " jwe=" + jwe
+	got := Text(input)
+	if strings.Contains(got, jwt) || strings.Contains(got, jwe) {
+		t.Fatalf("Text leaked a compact token: %s", got)
+	}
+	if !strings.Contains(got, "topic=fulfillment.shipments."+Mask) {
+		t.Fatalf("Text did not preserve safe dotted prefix: %s", got)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -52,9 +53,18 @@ func CreateFileContext(ctx context.Context, directory, packageName, version, nam
 	if versionParts == nil {
 		return CreatedFile{}, fmt.Errorf("migration: invalid version %q; want vX.Y.Z", version)
 	}
-	major, _ := strconv.ParseUint(versionParts[1], 10, 64)
-	minor, _ := strconv.ParseUint(versionParts[2], 10, 64)
-	patch, _ := strconv.ParseUint(versionParts[3], 10, 64)
+	major, err := parseVersionPart("major", versionParts[1])
+	if err != nil {
+		return CreatedFile{}, err
+	}
+	minor, err := parseVersionPart("minor", versionParts[2])
+	if err != nil {
+		return CreatedFile{}, err
+	}
+	patch, err := parseVersionPart("patch", versionParts[3])
+	if err != nil {
+		return CreatedFile{}, err
+	}
 	canonicalVersion := fmt.Sprintf("v%d.%d.%d", major, minor, patch)
 
 	if directory == "" {
@@ -109,6 +119,9 @@ func CreateFileContext(ctx context.Context, directory, packageName, version, nam
 			continue
 		}
 		number, parseErr := strconv.ParseUint(remainder[:separator], 10, 64)
+		if parseErr == nil && number == math.MaxUint64 {
+			return CreatedFile{}, fmt.Errorf("migration: sequence exhausted for %s", canonicalVersion)
+		}
 		if parseErr == nil && number >= sequence {
 			sequence = number + 1
 		}
@@ -117,7 +130,9 @@ func CreateFileContext(ctx context.Context, directory, packageName, version, nam
 	id := fmt.Sprintf("%s-%d-%s", canonicalVersion, sequence, name)
 	fileName := fmt.Sprintf("%s%d_%s.go", prefix, sequence, strings.ToLower(name))
 	path := filepath.Join(directory, fileName)
-	variable := exportedIdentifier(fmt.Sprintf("V%d_%d_%d_%d_%s", major, minor, patch, sequence, name))
+	// Keep the numeric separators in the Go identifier. Concatenating the
+	// components makes distinct versions such as v1.2.31 and v1.23.1 collide.
+	variable := fmt.Sprintf("V%d_%d_%d_%d_%s", major, minor, patch, sequence, exportedIdentifier(name))
 	template := fmt.Sprintf(`package %s
 
 import (
@@ -179,6 +194,14 @@ var %s = migration.Migration{
 		return CreatedFile{}, fmt.Errorf("migration: sync directory: %w", errors.Join(syncErr, closeErr))
 	}
 	return CreatedFile{ID: id, Path: path}, nil
+}
+
+func parseVersionPart(label, value string) (uint64, error) {
+	part, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("migration: invalid %s version component %q: %w", label, value, err)
+	}
+	return part, nil
 }
 
 func exportedIdentifier(value string) string {

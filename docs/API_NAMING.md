@@ -9,6 +9,8 @@ removed in a future major release.
 |---|---|
 | Framework-owned lifecycle | `fit.InitManaged` |
 | PostgreSQL pool controls | `fit.WithPostgresPoolOptions`, `postgres.ConnectionPoolOptions`, `postgres.InitWithPoolOptions` |
+| Decoded GSM secret values | `config.GetDecodedSecretFromGSM` |
+| Strict datastore TLS | `mongo.InitWithTLSValidation`, `mysql.InitWithTLSValidation`, `postgres.InitWithPoolOptions`, `redis.InitWithCompatibility` |
 | OpenTelemetry SDK lifecycle | `tracing.SDKOptions`, `tracing.NewSDK`, `tracing.InitSDK` |
 | TraceClue/runtime logging | `logging.RuntimeOptions`, `logging.NewRuntime` |
 | Prometheus textfile lifecycle | `metrics.TextfileOptions`, `metrics.NewTextfileRegistry` |
@@ -19,6 +21,7 @@ removed in a future major release.
 | Redis protocol/ioredis compatibility | `redis.CompatibilityOptions`, `redis.InitWithCompatibility`, `DefaultConfigured*DialFunc` |
 | Kafka construction and run controls | `kafka.ProducerOptions`, `kafka.ConsumerSettings`, `kafka.ConsumeOptions`, `NewProducer`, `NewConsumer`, `Consume*WithOptions` |
 | HTTP server runtime | `server.RuntimeConfig`, `server.NewRuntime` |
+| Application-owned legacy health variants | `Server.UseHealthRouteMiddleware` |
 | Redacted access logs | `server.AccessLogConfig`, `server.AccessLog`, `server.GinAccessLog` |
 | Request-ID request-header propagation | `server.RequestIDWithHeaderPropagation` |
 | HTTP OpenTelemetry options | `server.OTelMiddlewareOptions`, `server.OTelMiddlewareWithOptions` |

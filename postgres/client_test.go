@@ -241,6 +241,20 @@ func TestTLSConfig(t *testing.T) {
 			t.Fatalf("loadPostgresTLSConfig() = (%v, %v), want configuration error", cfg, err)
 		}
 	})
+
+	t.Run("legacy mode ignores partial TLS while advanced mode rejects it", func(t *testing.T) {
+		t.Setenv("POSTGRES_TEST_SSL_CA", "/does/not/exist")
+		os.Unsetenv("POSTGRES_TEST_SSL_CERT")
+		os.Unsetenv("POSTGRES_TEST_SSL_KEY")
+		os.Unsetenv("POSTGRES_TEST_SSL_SERVER_NAME")
+
+		if cfg, err := postgresTLSConfigForMode("TEST", false); err != nil || cfg != nil {
+			t.Fatalf("legacy TLS selection = (%v, %v), want nil, nil", cfg, err)
+		}
+		if _, err := postgresTLSConfigForMode("TEST", true); err == nil {
+			t.Fatal("strict TLS selection accepted partial configuration")
+		}
+	})
 }
 
 func TestClient_Service(t *testing.T) {

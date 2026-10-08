@@ -22,7 +22,7 @@ func TestBuildPropagator(t *testing.T) {
 		{name: "default", value: "", fields: []string{"baggage", "traceparent", "tracestate"}},
 		{name: "trace context only", value: "tracecontext", fields: []string{"traceparent", "tracestate"}},
 		{name: "baggage only", value: "baggage", fields: []string{"baggage"}},
-		{name: "b3 single", value: "b3", fields: []string{"x-b3-flags", "x-b3-sampled", "x-b3-spanid", "x-b3-traceid"}},
+		{name: "b3 single", value: "b3", fields: []string{"b3"}},
 		{name: "b3 multi", value: "b3multi", fields: []string{"x-b3-flags", "x-b3-sampled", "x-b3-spanid", "x-b3-traceid"}},
 		{name: "jaeger", value: "jaeger", fields: []string{"uber-trace-id"}},
 		{name: "none", value: "none", fields: []string{}},

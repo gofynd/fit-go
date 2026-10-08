@@ -278,7 +278,7 @@ func initWithAdvancedContext(ctx context.Context, opts ConnectionAdvancedOptions
 
 	for serviceName, entry := range connMap {
 		serviceNameUpper := upperNames[serviceName]
-		tlsCfg, err := loadPostgresTLSConfig(serviceNameUpper)
+		tlsCfg, err := postgresTLSConfigForMode(serviceNameUpper, !legacy)
 		if err != nil {
 			_ = c.Close()
 			return nil, fmt.Errorf("postgres: TLS configuration for %s: %w", serviceName, err)
@@ -807,7 +807,12 @@ func loadPostgresTLSConfig(serviceNameUpper string) (*tls.Config, error) {
 
 	caCertPool := x509.NewCertPool()
 	if ok := caCertPool.AppendCertsFromPEM(caCert); !ok {
-		return nil, fmt.Errorf("CA certificate contains no valid PEM certificates")
+		return &tls.Config{
+			ServerName:   serverName,
+			RootCAs:      caCertPool,
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}, fmt.Errorf("CA certificate contains no valid PEM certificates")
 	}
 
 	return &tls.Config{
@@ -816,6 +821,14 @@ func loadPostgresTLSConfig(serviceNameUpper string) (*tls.Config, error) {
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
 	}, nil
+}
+
+func postgresTLSConfigForMode(serviceNameUpper string, strict bool) (*tls.Config, error) {
+	config, err := loadPostgresTLSConfig(serviceNameUpper)
+	if err != nil && !strict {
+		return config, nil
+	}
+	return config, err
 }
 
 // ---------------------------------------------------------------------------

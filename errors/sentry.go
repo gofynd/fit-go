@@ -524,7 +524,14 @@ func sanitizeSentryEvent(event *sentrylib.Event) *sentrylib.Event {
 			sanitizeSentryMap(event.Exception[i].Mechanism.Data)
 		}
 	}
-	for _, breadcrumb := range event.Breadcrumbs {
+	// sentry-go scope cloning copies the breadcrumb pointer slice, not the
+	// breadcrumb values themselves. BeforeSend can therefore receive events whose
+	// breadcrumbs (and Data maps) are shared with another in-flight event. Clone
+	// each breadcrumb before sanitizing so concurrent captures never write the
+	// same object or map.
+	for index, original := range event.Breadcrumbs {
+		breadcrumb := cloneSentryBreadcrumb(original)
+		event.Breadcrumbs[index] = breadcrumb
 		if breadcrumb == nil {
 			continue
 		}
@@ -596,6 +603,20 @@ func sanitizeSentryEvent(event *sentrylib.Event) *sentrylib.Event {
 		}
 	}
 	return event
+}
+
+func cloneSentryBreadcrumb(original *sentrylib.Breadcrumb) *sentrylib.Breadcrumb {
+	if original == nil {
+		return nil
+	}
+	cloned := *original
+	if original.Data != nil {
+		cloned.Data = make(map[string]interface{}, len(original.Data))
+		for key, value := range original.Data {
+			cloned.Data[key] = value
+		}
+	}
+	return &cloned
 }
 
 func sanitizeSentryStacktrace(stacktrace *sentrylib.Stacktrace) {

@@ -74,16 +74,16 @@ func (c *ioredisConnection) Ping(ctx context.Context) error {
 	}
 	result, err := c.client.SubmitContext(ctx, "PING").Wait(ctx)
 	if err != nil {
-		return err
+		return newIORedisSafeError("redis: ioredis PING failed", err)
 	}
 	if len(result.Replies) != 1 {
 		return fmt.Errorf("redis: ioredis PING returned %d replies", len(result.Replies))
 	}
 	if result.Replies[0].Error != nil {
-		return result.Replies[0].Error
+		return newIORedisSafeError("redis: ioredis PING failed", result.Replies[0].Error)
 	}
 	if pong, ok := result.Replies[0].Value.(string); !ok || pong != "PONG" {
-		return fmt.Errorf("redis: ioredis PING returned %v", result.Replies[0].Value)
+		return errors.New("redis: ioredis PING returned an invalid reply")
 	}
 	return nil
 }

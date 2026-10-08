@@ -40,8 +40,21 @@ var gsmHTTPClient = &http.Client{
 // - secretName: the secret ID within the project (not the full resource path)
 // - version: the secret version ("latest", "1", "2", etc.)
 //
-// Returns the secret payload as a string, or an error if retrieval fails.
+// Returns the base64-encoded transport payload, preserving the contract of the
+// original fit-go API. Call GetDecodedSecretFromGSM when the decoded secret
+// value is required.
 func GetSecretFromGSM(secretName, version string) (string, error) {
+	return getSecretFromGSM(secretName, version, false)
+}
+
+// GetDecodedSecretFromGSM fetches and base64-decodes a Google Secret Manager
+// payload. This explicit API avoids changing the original GetSecretFromGSM
+// return contract for existing consumers that already perform the decode.
+func GetDecodedSecretFromGSM(secretName, version string) (string, error) {
+	return getSecretFromGSM(secretName, version, true)
+}
+
+func getSecretFromGSM(secretName, version string, decode bool) (string, error) {
 	if secretName == "" {
 		return "", fmt.Errorf("gsm: secret name must not be empty")
 	}
@@ -93,10 +106,13 @@ func GetSecretFromGSM(secretName, version string) (string, error) {
 		)
 	}
 
-	return decodeSecretVersionResponse(body, secretPath)
+	if decode {
+		return decodeSecretVersionResponse(body, secretPath)
+	}
+	return encodedSecretVersionResponse(body, secretPath)
 }
 
-func decodeSecretVersionResponse(body []byte, secretPath string) (string, error) {
+func encodedSecretVersionResponse(body []byte, secretPath string) (string, error) {
 	var result secretVersionResponse
 	if err := json.Unmarshal(body, &result); err != nil {
 		return "", fmt.Errorf("gsm: failed to parse response: %w", err)
@@ -106,7 +122,14 @@ func decodeSecretVersionResponse(body []byte, secretPath string) (string, error)
 	if encoded == "" {
 		return "", fmt.Errorf("gsm: secret value is empty for %s", secretPath)
 	}
+	return encoded, nil
+}
 
+func decodeSecretVersionResponse(body []byte, secretPath string) (string, error) {
+	encoded, err := encodedSecretVersionResponse(body, secretPath)
+	if err != nil {
+		return "", err
+	}
 	secretValue, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
 		return "", fmt.Errorf("gsm: failed to decode secret payload for %s: %w", secretPath, err)
@@ -123,8 +146,8 @@ type secretVersionResponse struct {
 
 type secretPayload struct {
 	// Data is the base64-encoded secret payload returned by the GCP REST API.
-	// JSON unmarshalling preserves the encoded string; GetSecretFromGSM decodes
-	// it before returning the secret to callers.
+	// JSON unmarshalling preserves the encoded string. GetSecretFromGSM returns
+	// it unchanged; GetDecodedSecretFromGSM performs the explicit decode.
 	Data string `json:"data"`
 }
 

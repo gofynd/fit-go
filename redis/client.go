@@ -528,14 +528,22 @@ func initConnections(opts AdvancedConnectionOptions, legacy bool) (*Client, erro
 				connString = "redis://" + connString
 			}
 
-			tlsCfg, err := loadTLSConfig("REDIS", j.serviceNameUpper)
-			if err != nil {
-				results <- connResult{
-					serviceName: j.serviceName,
-					connType:    j.connType,
-					err:         fmt.Errorf("redis: TLS configuration for %s_%s: %w", j.serviceName, j.connType, err),
+			var tlsCfg *tls.Config
+			if legacy {
+				// Preserve the original main behavior: incomplete or invalid
+				// certificate configuration is ignored and valid mTLS skips
+				// server verification. Strict validation is an advanced opt-in.
+				tlsCfg = loadLegacyTLSConfig("REDIS", j.serviceNameUpper)
+			} else {
+				tlsCfg, err = loadTLSConfig("REDIS", j.serviceNameUpper)
+				if err != nil {
+					results <- connResult{
+						serviceName: j.serviceName,
+						connType:    j.connType,
+						err:         fmt.Errorf("redis: TLS configuration for %s_%s: %w", j.serviceName, j.connType, err),
+					}
+					return
 				}
-				return
 			}
 			envOpts := getRedisEnvOptions(j.serviceNameUpper, j.connType)
 			if legacy {
@@ -545,7 +553,7 @@ func initConnections(opts AdvancedConnectionOptions, legacy bool) (*Client, erro
 				envOpts = legacyRedisEnvOptions(envOpts)
 			}
 
-			conn, err := dialFromURIAdvanced(ctx, connString, j, opts, clientName, tlsCfg, envOpts)
+			conn, err := dialFromURIWithMode(ctx, connString, j, opts, clientName, tlsCfg, envOpts, !legacy)
 			if err != nil {
 				results <- connResult{
 					serviceName: j.serviceName,
@@ -797,7 +805,7 @@ func dialFromURI(
 	tlsCfg *tls.Config,
 	envOpts envPoolOpts,
 ) (Connection, error) {
-	return dialFromURIAdvanced(ctx, connString, job, advancedConnectionOptions(opts), clientName, tlsCfg, envOpts)
+	return dialFromURIWithMode(ctx, connString, job, advancedConnectionOptions(opts), clientName, tlsCfg, envOpts, false)
 }
 
 func dialFromURIAdvanced(
@@ -809,13 +817,28 @@ func dialFromURIAdvanced(
 	tlsCfg *tls.Config,
 	envOpts envPoolOpts,
 ) (Connection, error) {
+	return dialFromURIWithMode(ctx, connString, job, opts, clientName, tlsCfg, envOpts, true)
+}
+
+func dialFromURIWithMode(
+	ctx context.Context,
+	connString string,
+	job connJobEntry,
+	opts AdvancedConnectionOptions,
+	clientName string,
+	tlsCfg *tls.Config,
+	envOpts envPoolOpts,
+	strictTLS bool,
+) (Connection, error) {
 	parsed, err := parseRedisURI(connString)
 	if err != nil {
 		return nil, fmt.Errorf("redis: parse URI for %s_%s: %w", job.serviceName, job.connType, err)
 	}
-	tlsCfg, err = applyRedisURITLS(parsed, tlsCfg)
-	if err != nil {
-		return nil, fmt.Errorf("redis: TLS options for %s_%s: %w", job.serviceName, job.connType, err)
+	if strictTLS {
+		tlsCfg, err = applyRedisURITLS(parsed, tlsCfg)
+		if err != nil {
+			return nil, fmt.Errorf("redis: TLS options for %s_%s: %w", job.serviceName, job.connType, err)
+		}
 	}
 
 	connectTimeout := opts.DefaultConnectTimeout
@@ -1227,7 +1250,12 @@ func loadTLSConfig(dbType, serviceNameUpper string) (*tls.Config, error) {
 
 	caCertPool := x509.NewCertPool()
 	if ok := caCertPool.AppendCertsFromPEM(caCert); !ok {
-		return nil, fmt.Errorf("CA certificate contains no valid PEM certificates")
+		return &tls.Config{
+			RootCAs:            caCertPool,
+			Certificates:       []tls.Certificate{cert},
+			InsecureSkipVerify: false,
+			MinVersion:         tls.VersionTLS12,
+		}, fmt.Errorf("CA certificate contains no valid PEM certificates")
 	}
 
 	return &tls.Config{
@@ -1238,6 +1266,18 @@ func loadTLSConfig(dbType, serviceNameUpper string) (*tls.Config, error) {
 		InsecureSkipVerify: false,
 		MinVersion:         tls.VersionTLS12,
 	}, nil
+}
+
+func loadLegacyTLSConfig(dbType, serviceNameUpper string) *tls.Config {
+	configuration, _ := loadTLSConfig(dbType, serviceNameUpper)
+	if configuration == nil {
+		return nil
+	}
+	legacy := configuration.Clone()
+	// Compatibility with original fit-go:main. New integrations should use
+	// InitAdvanced/InitWithCompatibility, which retain full verification.
+	legacy.InsecureSkipVerify = true
+	return legacy
 }
 
 // resolveConnectionString resolves a value as either a direct connection string
@@ -1271,7 +1311,7 @@ var (
 
 // SetGSMResolver configures the function used to fetch secrets from GSM.
 // Must be called before Init when DB_CONNECTION_PROVIDER=GSM.
-// Typically: redis.SetGSMResolver(config.GetSecretFromGSM)
+// Typically: redis.SetGSMResolver(config.GetDecodedSecretFromGSM)
 func SetGSMResolver(fn GSMResolverFunc) {
 	gsmMu.Lock()
 	defer gsmMu.Unlock()

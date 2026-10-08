@@ -179,6 +179,9 @@ func Init(ctx context.Context, opts ...Option) (*Fit, error) {
 // It retains the behavior previously shipped by the fit-go fork.
 // Deprecated: use InitManaged.
 func InitAdvanced(ctx context.Context, opts ...Option) (*Fit, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	f := Instance()
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -191,7 +194,9 @@ func InitAdvanced(ctx context.Context, opts ...Option) (*Fit, error) {
 	// Every Init owns a fresh set of mutable framework state. This also cleans up
 	// work started through Instance().Health before the first initialization.
 	if f.Health != nil {
-		f.Health.Reset()
+		if err := f.Health.ResetContext(ctx); err != nil {
+			return nil, fmt.Errorf("fit: reset previous health lifecycle: %w", err)
+		}
 	}
 	f.Connections = Connections{}
 	f.Config = nil
@@ -550,16 +555,22 @@ func (f *Fit) Shutdown(ctx context.Context) error {
 				legacyErrs = append(legacyErrs, fmt.Errorf("metrics shutdown: %w", err))
 			}
 		}
+		// A component shutdown error must not leave the original lifecycle latched
+		// forever. The concrete components cache their shutdown result, so retrying
+		// cannot repair them; allow a subsequent managed initialization to replace
+		// the stale handles while still returning the error to this caller.
+		f.legacyInitialized = false
 		if len(legacyErrs) > 0 {
 			return fmt.Errorf("fit: shutdown errors: %v", legacyErrs)
 		}
-		f.legacyInitialized = false
 		return nil
 	}
 
 	var errs []error
 	if f.Health != nil {
-		f.Health.Reset()
+		if err := f.Health.ResetContext(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("health shutdown: %w", err))
+		}
 	}
 	if f.Instrumentations != nil {
 		if err := f.Instrumentations.Shutdown(ctx); err != nil {
@@ -631,7 +642,7 @@ func (f *Fit) Shutdown(ctx context.Context) error {
 	f.initialized = false
 
 	if len(errs) > 0 {
-		return fmt.Errorf("fit: shutdown errors: %v", errs)
+		return fmt.Errorf("fit: shutdown errors: %w", stderrors.Join(errs...))
 	}
 	return nil
 }

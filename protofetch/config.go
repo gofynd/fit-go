@@ -14,12 +14,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
 )
 
-var refPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]*$`)
+var (
+	refPattern           = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]*$`)
+	scpRepositoryPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[A-Za-z0-9._~/-]+$`)
+)
 
 // Config is the fit.config.json root.
 type Config struct {
@@ -65,6 +69,11 @@ func (spec Specification) validate(mode Mode, sourceDirectory string) error {
 	if strings.TrimSpace(sourceDirectory) == "" && spec.Repository() == "" {
 		return errors.New("protofetch: apiSpecifications.gitURI or gitlabURI is required")
 	}
+	if strings.TrimSpace(sourceDirectory) == "" {
+		if err := validateRepositoryURI(spec.Repository()); err != nil {
+			return err
+		}
+	}
 	branch := strings.TrimSpace(spec.Branch)
 	if branch != "" && (!refPattern.MatchString(branch) || strings.HasPrefix(branch, "-") || strings.Contains(branch, "..")) {
 		return fmt.Errorf("protofetch: unsafe branch %q", branch)
@@ -91,6 +100,29 @@ func (spec Specification) validate(mode Mode, sourceDirectory string) error {
 		}
 	default:
 		return fmt.Errorf("protofetch: unsupported mode %q", mode)
+	}
+	return nil
+}
+
+func validateRepositoryURI(repository string) error {
+	repository = strings.TrimSpace(repository)
+	if strings.HasPrefix(repository, "-") || strings.ContainsAny(repository, "\r\n\x00") {
+		return errors.New("protofetch: unsafe repository URI")
+	}
+	if scpRepositoryPattern.MatchString(repository) {
+		return nil
+	}
+	parsed, err := url.Parse(repository)
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "ssh") || parsed.Host == "" || parsed.Path == "" || parsed.Path == "/" {
+		return errors.New("protofetch: repository URI must use https, ssh, or user@host:path")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("protofetch: repository URI must not contain a query or fragment")
+	}
+	if parsed.User != nil {
+		if _, hasPassword := parsed.User.Password(); hasPassword {
+			return errors.New("protofetch: repository URI must not contain a password")
+		}
 	}
 	return nil
 }

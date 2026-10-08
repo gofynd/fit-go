@@ -199,6 +199,17 @@ func TestTLSConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("legacy mode ignores incomplete config while strict mode rejects it", func(t *testing.T) {
+		clearMySQLTLSEnv(t)
+		t.Setenv("MYSQL_TEST_SSL_CA", "/does/not/exist")
+		if cfg, serverName, err := mysqlTLSConfigForMode("TEST", false); err != nil || cfg != nil || serverName != "" {
+			t.Fatalf("legacy TLS selection = (%v, %q, %v), want nil, empty, nil", cfg, serverName, err)
+		}
+		if _, _, err := mysqlTLSConfigForMode("TEST", true); err == nil {
+			t.Fatal("strict TLS selection accepted incomplete configuration")
+		}
+	})
+
 	t.Run("fails on unreadable material", func(t *testing.T) {
 		clearMySQLTLSEnv(t)
 		t.Setenv("MYSQL_TEST_SSL_CA", "/does/not/exist")
@@ -266,14 +277,14 @@ func TestTLSConfig(t *testing.T) {
 	})
 }
 
-func TestInitFailsBeforeOpeningConnectionWithInvalidTLS(t *testing.T) {
+func TestStrictInitFailsBeforeOpeningConnectionWithInvalidTLS(t *testing.T) {
 	clearMySQLEnv(t)
 	t.Setenv("MYSQL_TLSFAIL_READ_WRITE", "mysql://user:pass@localhost:3306/test")
 	t.Setenv("MYSQL_TLSFAIL_SSL_CA", "/does/not/exist")
 
-	_, err := Init(ConnectionOptions{})
+	_, err := InitWithTLSValidation(ConnectionOptions{})
 	if err == nil || !strings.Contains(err.Error(), "TLS configuration") {
-		t.Fatalf("Init() error = %v, want TLS configuration error", err)
+		t.Fatalf("InitWithTLSValidation() error = %v, want TLS configuration error", err)
 	}
 }
 
