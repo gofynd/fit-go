@@ -17,6 +17,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -727,11 +729,69 @@ var standardClaims = map[string]struct{}{
 var defaultJWTAlgorithms = []string{"HS256"}
 
 // AuthorizeJWTToken returns a gin middleware that validates a Bearer JWT token
-// and optionally checks that the decoded payload matches the
+// using HS256 and optionally checks that the decoded payload matches the
 // expected values. Decoded claims are stored in context - retrieve with
 // DecodedTokenFromContext.
+//
+// This entry point intentionally preserves the original (upstream main)
+// verification semantics byte-for-byte: hand-rolled HS256 verification,
+// exp/nbf only enforced when numeric, now==exp accepted, and an empty
+// secret is used as-is. Stricter verification (golang-jwt, algorithm
+// allow-lists, RSA, leeway, iss/aud/sub, fail-closed empty secret) is
+// available via AuthorizeJWTTokenWithOptions / AuthorizeJWTTokenAdvanced.
 func AuthorizeJWTToken(opts JWTOptions) gin.HandlerFunc {
-	return authorizeJWTToken(JWTAdvancedOptions{JWTOptions: opts}, true, false)
+	return func(c *gin.Context) {
+		secret := opts.Secret
+		if secret == "" {
+			secret = envGet("JWT_SECRET_DELETE_ENTITY", "")
+		}
+
+		// Extract Bearer token
+		authHeader := c.GetHeader("Authorization")
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		token = strings.TrimSpace(token)
+		if token == "" || token == authHeader {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, map[string]string{"message": "Unauthorized"})
+			return
+		}
+
+		// Decode and verify HS256
+		claims, err := verifyHS256(token, secret)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, map[string]string{"message": "Unauthorized"})
+			return
+		}
+
+		// Store decoded token in gin context and standard context
+		c.Set(ginKeyDecodedToken, claims)
+		ctx := context.WithValue(c.Request.Context(), ctxKeyDecodedToken, claims)
+		c.Request = c.Request.WithContext(ctx)
+
+		// Build expected payload
+		expected := opts.ExpectedPayload
+		if expected == nil {
+			companyID := c.Param("company_id")
+			if companyID != "" {
+				expected = map[string]interface{}{"company_id": companyID}
+			}
+		}
+
+		// Compare non-standard claims if expected is set
+		if expected != nil {
+			actual := make(map[string]interface{})
+			for k, v := range claims {
+				if _, skip := standardClaims[k]; !skip {
+					actual[k] = v
+				}
+			}
+			if !jsonEqual(expected, actual) {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, map[string]string{"message": "Unauthorized"})
+				return
+			}
+		}
+
+		c.Next()
+	}
 }
 
 // AuthorizeJWTTokenAdvanced validates JWTs with post-main opt-in controls.
@@ -905,36 +965,67 @@ func verifyJWTToken(tokenString string, options jwtVerificationOptions) (interfa
 	return claims.value, nil
 }
 
-// verifyHS256 is retained for package compatibility and delegates to the
-// hardened verifier.
-func verifyHS256(tokenString, secret string) (map[string]interface{}, error) {
-	parts := strings.Split(tokenString, ".")
+// legacyJWTNow is the clock used by verifyHS256. It is a variable only so
+// tests can pin time deterministically; production uses time.Now exactly as
+// upstream main did.
+var legacyJWTNow = time.Now
+
+// verifyHS256 decodes a JWT token signed with HMAC-SHA256 and returns the
+// claims payload. It validates the signature and checks exp/nbf if present.
+// This is the original upstream-main algorithm, kept verbatim so that
+// AuthorizeJWTToken accepts and rejects exactly the same tokens as before.
+func verifyHS256(tokenStr, secret string) (map[string]interface{}, error) {
+	parts := strings.Split(tokenStr, ".")
 	if len(parts) != 3 {
-		return nil, fmt.Errorf("JWT is malformed")
+		return nil, fmt.Errorf("jwt: invalid token format")
 	}
+
+	// Decode header
 	headerBytes, err := base64URLDecode(parts[0])
 	if err != nil {
-		return nil, fmt.Errorf("JWT is malformed: %w", err)
+		return nil, fmt.Errorf("jwt: invalid header encoding: %w", err)
 	}
-	var header struct {
-		Algorithm string `json:"alg"`
-	}
+	var header map[string]interface{}
 	if err := json.Unmarshal(headerBytes, &header); err != nil {
-		return nil, fmt.Errorf("JWT is malformed: %w", err)
+		return nil, fmt.Errorf("jwt: invalid header JSON: %w", err)
 	}
-	if header.Algorithm != "HS256" {
-		return nil, fmt.Errorf("unsupported algorithm %q", header.Algorithm)
+	if alg, _ := header["alg"].(string); alg != "HS256" {
+		return nil, fmt.Errorf("jwt: unsupported algorithm %q", alg)
 	}
-	decoded, err := verifyJWTToken(tokenString, jwtVerificationOptions{
-		Secret: secret, AllowedAlgorithms: []string{"HS256"}, AllowPadding: true,
-	})
+
+	// Verify signature
+	signingInput := parts[0] + "." + parts[1]
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(signingInput))
+	expectedSig := mac.Sum(nil)
+	actualSig, err := base64URLDecode(parts[2])
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("jwt: invalid signature encoding: %w", err)
 	}
-	claims, ok := decoded.(map[string]interface{})
-	if !ok {
-		return nil, fmt.Errorf("JWT payload is not an object")
+	if !hmac.Equal(expectedSig, actualSig) {
+		return nil, fmt.Errorf("jwt: signature verification failed")
 	}
+
+	// Decode payload
+	payloadBytes, err := base64URLDecode(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("jwt: invalid payload encoding: %w", err)
+	}
+	var claims map[string]interface{}
+	if err := json.Unmarshal(payloadBytes, &claims); err != nil {
+		return nil, fmt.Errorf("jwt: invalid payload JSON: %w", err)
+	}
+
+	// Check exp
+	now := float64(legacyJWTNow().Unix())
+	if exp, ok := claims["exp"].(float64); ok && now > exp {
+		return nil, fmt.Errorf("jwt: token expired")
+	}
+	// Check nbf
+	if nbf, ok := claims["nbf"].(float64); ok && now < nbf {
+		return nil, fmt.Errorf("jwt: token not yet valid")
+	}
+
 	return claims, nil
 }
 
