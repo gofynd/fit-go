@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
+	mathrand "math/rand/v2"
 	"net/http"
 	"os"
 	"strconv"
@@ -74,6 +76,10 @@ type Client struct {
 	reconnectDelay  time.Duration
 	snapshotTimeout time.Duration
 	refresh         chan struct{}
+	// retryJitter and staleRetention are injectable for deterministic tests.
+	// Nil/zero select equalRetryJitter and maxRetainedSnapshotAge.
+	retryJitter    func(time.Duration) time.Duration
+	staleRetention time.Duration
 
 	ctx              context.Context
 	cancel           context.CancelFunc
@@ -93,7 +99,6 @@ type Client struct {
 	staleTimerMu     sync.Mutex
 	staleTimer       *time.Timer
 	staleGeneration  uint64
-	lastStaleRefresh time.Time
 }
 
 // legacyClient retains the released polling transport and synchronous context
@@ -107,8 +112,11 @@ type legacyClient struct {
 	userKey string
 	session string
 	client  *http.Client
-	stopCh  chan struct{}
-	stopped bool
+	// snapshotTimeout bounds per-request EvaluationContext snapshots; it does
+	// not affect the released polling refresh path.
+	snapshotTimeout time.Duration
+	stopCh          chan struct{}
+	stopped         bool
 }
 
 // Options configures a FeatureHub client. Zero durations use the corresponding
@@ -143,6 +151,8 @@ func Init() (*Client, error) {
 		flags:  make(map[string]interface{}),
 		client: &http.Client{Timeout: 10 * time.Second},
 		stopCh: make(chan struct{}),
+
+		snapshotTimeout: durationFromEnv("FEATURE_FLAG_INIT_TIMEOUT", defaultInitTimeout),
 	}
 	if err := legacy.refresh(); err != nil {
 		return nil, fmt.Errorf("feature: initial flag fetch failed: %w", err)
@@ -463,13 +473,22 @@ func (c *legacyClient) snapshotFor(ctx context.Context, attributes map[string][]
 	if c == nil {
 		return map[string]interface{}{}, nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timeout := c.snapshotTimeout
+	if timeout <= 0 {
+		timeout = defaultInitTimeout
+	}
+	requestContext, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	first := func(key string) string {
 		if values := attributes[key]; len(values) > 0 {
 			return values[0]
 		}
 		return ""
 	}
-	return c.fetchContext(ctx, first("userkey"), first("session"))
+	return c.fetchContext(requestContext, first("userkey"), first("session"))
 }
 
 func (c *legacyClient) stop() {
@@ -687,6 +706,15 @@ func (c *Client) contextChanged() {
 func (c *Client) run() {
 	defer close(c.done)
 	retryAttempt := 0
+	// A server-directed stale window allows one immediate context-change
+	// interrupt. Later changes are coalesced until the window ends; they are
+	// already recorded in c.attributes, so the next request sends the latest
+	// context without turning rapid SetUserKey calls into a reconnect storm.
+	// staleRegimeDelay is the latest edge.stale delay while the edge keeps
+	// replying stale; zero means no stale regime is active.
+	var staleWindowEnd time.Time
+	var staleRegimeDelay time.Duration
+	staleInterrupted := false
 	for {
 		revision := c.contextRevision.Load()
 		featureEventsBefore := c.featureEvents.Load()
@@ -726,21 +754,56 @@ func (c *Client) run() {
 		if c.ctx.Err() != nil {
 			return
 		}
-		if refreshed {
-			continue
-		}
 
-		permanent, err := result.permanent, result.err
 		featureEventReceived := c.featureEvents.Load() != featureEventsBefore
 		if featureEventReceived {
+			// Only feature-state events prove useful stream progress; they reset
+			// outage backoff and end any server-directed stale window.
 			retryAttempt = 0
+			staleWindowEnd = time.Time{}
+			staleRegimeDelay = 0
+			staleInterrupted = false
 		}
+		if refreshed && retryAttempt == 0 {
+			if staleRegimeDelay <= 0 {
+				continue
+			}
+			// The edge is still in a stale regime. A context change that cancels
+			// an in-flight request is that window's single interrupt; once it has
+			// been used, later changes wait for the window to end below.
+			if now := time.Now(); !now.Before(staleWindowEnd) {
+				staleWindowEnd = now.Add(staleRegimeDelay)
+				staleInterrupted = true
+				continue
+			}
+			if !staleInterrupted {
+				staleInterrupted = true
+				continue
+			}
+		}
+
+		// A refresh-cancelled stream reports only its own cancellation; it is
+		// not a stream failure and must not alter readiness or backoff.
+		permanent, err := result.permanent, result.err
 		var stale *edgeStaleError
-		isStale := errors.As(err, &stale)
-		if err != nil {
+		isStale := !refreshed && errors.As(err, &stale)
+		if isStale {
+			staleRegimeDelay = stale.delay
+			now := time.Now()
+			if staleWindowEnd.IsZero() || !now.Before(staleWindowEnd) {
+				staleWindowEnd = now.Add(stale.delay)
+				staleInterrupted = false
+			}
+		}
+		if !refreshed && !isStale {
+			staleWindowEnd = time.Time{}
+			staleRegimeDelay = 0
+			staleInterrupted = false
+		}
+		if !refreshed && err != nil {
 			c.setLastError(err)
 			if isStale && c.ready.Load() {
-				c.retainReadyDuringStaleWindow(stale.delay)
+				c.retainReadyDuringStaleWindow()
 			} else {
 				c.ready.Store(false)
 			}
@@ -756,12 +819,15 @@ func (c *Client) run() {
 			if debugFeatureLogs() {
 				slog.Warn("fit/feature: FeatureHub stream disconnected; reconnecting")
 			}
+			if !isStale && !featureEventReceived {
+				retryAttempt++
+			}
 		}
 
-		if err != nil && !isStale && !featureEventReceived {
-			retryAttempt++
-		}
 		delay := c.retryDelayForAttempt(err, retryAttempt)
+		if staleInterrupted && time.Now().Before(staleWindowEnd) {
+			delay = time.Until(staleWindowEnd)
+		}
 		timer := time.NewTimer(delay)
 		waiting := true
 		for waiting {
@@ -770,16 +836,17 @@ func (c *Client) run() {
 				timer.Stop()
 				return
 			case <-c.refresh:
-				if !isStale {
-					// Context changes during an outage update the next request but
-					// do not bypass the shared failure backoff.
-					continue
-				}
-				if c.allowStaleRefreshInterrupt() {
+				// Context changes during an outage update the next request but do
+				// not bypass the shared failure backoff. A stale wait may be
+				// interrupted once per stale window.
+				if isStale && !staleInterrupted {
+					staleInterrupted = true
 					timer.Stop()
 					waiting = false
 				}
 			case <-timer.C:
+				// An ended stale window is replaced by the next stale reply or by
+				// the next context-change interrupt.
 				waiting = false
 			}
 		}
@@ -1055,15 +1122,18 @@ func (c *Client) handleEvent(name, data string, revision uint64) error {
 
 func (c *Client) staleDelay(seconds float64) time.Duration {
 	minimum := c.retryDelay(nil)
-	if seconds <= 0 {
+	if minimum > maxReconnectInterval {
+		minimum = maxReconnectInterval
+	}
+	if math.IsNaN(seconds) || seconds <= 0 {
 		return minimum
+	}
+	if math.IsInf(seconds, 1) || seconds >= maxReconnectInterval.Seconds() {
+		return maxReconnectInterval
 	}
 	delay := time.Duration(seconds * float64(time.Second))
 	if delay < minimum {
 		return minimum
-	}
-	if delay > maxReconnectInterval {
-		return maxReconnectInterval
 	}
 	return delay
 }
@@ -1099,6 +1169,10 @@ func edgeStaleSeconds(raw json.RawMessage) (float64, bool, error) {
 		if err != nil {
 			return 0, false, err
 		}
+		// ParseFloat accepts "NaN" and "Inf"; neither is a usable delay.
+		if math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+			return 0, false, errors.New("non-finite numeric value")
+		}
 		if seconds <= 0 {
 			return 0, false, nil
 		}
@@ -1124,23 +1198,57 @@ func (c *Client) retryDelayForAttempt(err error, attempt int) time.Duration {
 	delay := c.retryDelay(err)
 	var stale *edgeStaleError
 	if errors.As(err, &stale) {
+		// edge.stale is server-directed pacing already capped by staleDelay; it
+		// is not mixed with outage backoff or jitter.
 		return delay
 	}
-	var httpErr *featureHubHTTPError
-	if errors.As(err, &httpErr) && httpErr.retryAfter > delay {
-		delay = httpErr.retryAfter
+	maximum := maxReconnectInterval
+	if delay > maximum {
+		// A configured base interval is a lower bound even when it exceeds the
+		// package's normal backoff ceiling.
+		maximum = delay
 	}
-	for index := 1; index < attempt && delay < maxReconnectInterval; index++ {
-		if delay > maxReconnectInterval/2 {
-			delay = maxReconnectInterval
+	for index := 1; index < attempt && delay < maximum; index++ {
+		if delay > maximum/2 {
+			delay = maximum
 			break
 		}
 		delay *= 2
 	}
-	if delay > maxReconnectInterval {
-		return maxReconnectInterval
+	if delay > maximum {
+		delay = maximum
+	}
+	jitter := c.retryJitter
+	if jitter == nil {
+		jitter = equalRetryJitter
+	}
+	if jittered := jitter(delay); jittered > 0 {
+		delay = jittered
+	}
+	var httpErr *featureHubHTTPError
+	if errors.As(err, &httpErr) && httpErr.retryAfter > delay {
+		// featureRetryAfter already caps the server hint at 30s.
+		delay = httpErr.retryAfter
+		if delay > maximum {
+			delay = maximum
+		}
 	}
 	return delay
+}
+
+// equalRetryJitter keeps retry delays in the upper half of the exponential
+// window so many clients recovering from one edge outage do not reconnect in
+// lockstep.
+func equalRetryJitter(delay time.Duration) time.Duration {
+	if delay <= time.Nanosecond {
+		return delay
+	}
+	half := delay / 2
+	span := delay - half
+	if span <= time.Nanosecond {
+		return delay
+	}
+	return half + time.Duration(mathrand.Int64N(int64(span)))
 }
 
 func featureRetryAfter(value string, now time.Time) time.Duration {
@@ -1174,32 +1282,28 @@ func featureRetryAfter(value string, now time.Time) time.Duration {
 	return maxReconnectInterval
 }
 
-func (c *Client) allowStaleRefreshInterrupt() bool {
-	c.staleTimerMu.Lock()
-	defer c.staleTimerMu.Unlock()
-	minimum := c.retryDelay(nil)
-	if !c.lastStaleRefresh.IsZero() && time.Since(c.lastStaleRefresh) < minimum {
-		return false
-	}
-	c.lastStaleRefresh = time.Now()
-	return true
-}
-
-func (c *Client) retainReadyDuringStaleWindow(delay time.Duration) {
-	if delay <= 0 || delay > maxRetainedSnapshotAge {
-		delay = maxRetainedSnapshotAge
+// retainReadyDuringStaleWindow keeps a ready snapshot available while the
+// edge reports edge.stale. The expiry deadline is fixed by the first stale
+// notice of a window: later stale replies never extend it, so a continuously
+// stale edge cannot keep a snapshot ready for longer than the retention bound.
+// Only a features/feature/delete_feature event (clearStaleRetention) ends the
+// window.
+func (c *Client) retainReadyDuringStaleWindow() {
+	window := c.staleRetention
+	if window <= 0 || window > maxRetainedSnapshotAge {
+		window = maxRetainedSnapshotAge
 	}
 	c.staleTimerMu.Lock()
 	defer c.staleTimerMu.Unlock()
 	if c.ctx == nil || c.ctx.Err() != nil {
 		return
 	}
+	if c.staleTimer != nil {
+		return
+	}
 	c.staleGeneration++
 	generation := c.staleGeneration
-	if c.staleTimer != nil {
-		c.staleTimer.Stop()
-	}
-	c.staleTimer = time.AfterFunc(delay, func() {
+	c.staleTimer = time.AfterFunc(window, func() {
 		c.staleTimerMu.Lock()
 		defer c.staleTimerMu.Unlock()
 		if generation != c.staleGeneration || c.ctx == nil || c.ctx.Err() != nil {

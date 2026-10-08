@@ -42,9 +42,9 @@ func TestFeatureStaleDelayHasFloorAndCap(t *testing.T) {
 
 func TestFeatureStaleRetentionExpiresAndCannotArmAfterStop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	client := &Client{ctx: ctx, cancel: cancel, readySignal: make(chan struct{})}
+	client := &Client{ctx: ctx, cancel: cancel, readySignal: make(chan struct{}), staleRetention: 5 * time.Millisecond}
 	client.ready.Store(true)
-	client.retainReadyDuringStaleWindow(5 * time.Millisecond)
+	client.retainReadyDuringStaleWindow()
 	time.Sleep(20 * time.Millisecond)
 	if client.Ready() {
 		t.Fatal("expired stale snapshot still reports ready")
@@ -54,7 +54,9 @@ func TestFeatureStaleRetentionExpiresAndCannotArmAfterStop(t *testing.T) {
 	}
 
 	cancel()
-	client.retainReadyDuringStaleWindow(time.Second)
+	client.staleRetention = time.Second
+	client.ready.Store(true)
+	client.retainReadyDuringStaleWindow()
 	client.staleTimerMu.Lock()
 	timer := client.staleTimer
 	client.staleTimerMu.Unlock()
@@ -66,7 +68,7 @@ func TestFeatureStaleRetentionExpiresAndCannotArmAfterStop(t *testing.T) {
 func TestFeatureBackoffResetsOnlyAfterFeatureEvents(t *testing.T) {
 	t.Parallel()
 
-	client := &Client{reconnectDelay: 10 * time.Millisecond}
+	client := &Client{reconnectDelay: 10 * time.Millisecond, retryJitter: func(delay time.Duration) time.Duration { return delay }}
 	failure := errors.New("stream failed")
 	if got := client.retryDelayForAttempt(failure, 4); got != 80*time.Millisecond {
 		t.Fatalf("fourth retry delay = %s; want exponential backoff", got)
