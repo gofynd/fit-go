@@ -20,7 +20,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"sync"
 	"testing"
 	"time"
 
@@ -32,8 +31,14 @@ import (
 
 // resetGlobalTracer resets the global tracer for test isolation.
 func resetGlobalTracer() {
-	globalTracer = nil
-	globalTracerOnce = sync.Once{}
+	globalTracerMu.Lock()
+	defer globalTracerMu.Unlock()
+	globalTracer.Store(nil)
+	globalInitErr = nil
+	globalInitFailed = false
+	retiredGlobalTracer = nil
+	globalTracerOwners.current = nil
+	globalTracerOwners.active = make(map[*globalTracerOwner]struct{})
 }
 
 // ---------------------------------------------------------------------------
@@ -44,9 +49,9 @@ func TestTracerInit_Disabled(t *testing.T) {
 	os.Unsetenv("TRACING_ENABLED")
 	defer os.Unsetenv("TRACING_ENABLED")
 
-	tracer, err := New(context.Background(), Options{ServiceName: "test-disabled"})
+	tracer, err := NewAdvanced(context.Background(), AdvancedOptions{ServiceName: "test-disabled"})
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("NewAdvanced() error = %v", err)
 	}
 	if tracer.IsEnabled() {
 		t.Error("Tracer should be disabled when TRACING_ENABLED is not set")
@@ -77,13 +82,28 @@ func TestTracerInit_Disabled(t *testing.T) {
 	}
 }
 
+func TestContextWithTracePreservesPrivateKeyOnlyContract(t *testing.T) {
+	traceID := "0123456789abcdef0123456789abcdef"
+	spanID := "0123456789abcdef"
+	ctx := ContextWithTrace(context.Background(), traceID, spanID)
+	if native := oteltrace.SpanContextFromContext(ctx); native.IsValid() {
+		t.Fatalf("ContextWithTrace installed native OTel parent: %s", native.TraceID())
+	}
+	if got := TraceIDFromContext(ctx); got != traceID {
+		t.Fatalf("TraceIDFromContext = %q", got)
+	}
+	if got := SpanIDFromContext(ctx); got != spanID {
+		t.Fatalf("SpanIDFromContext = %q", got)
+	}
+}
+
 func TestTracerInit_ProgrammaticEnableOverridesEnvironment(t *testing.T) {
 	os.Unsetenv("TRACING_ENABLED")
 	defer os.Unsetenv("TRACING_ENABLED")
 
 	enabled := true
 	exporter := tracetest.NewInMemoryExporter()
-	tracer, err := New(context.Background(), Options{
+	tracer, err := NewAdvanced(context.Background(), AdvancedOptions{
 		Enabled:                &enabled,
 		ServiceName:            "programmatically-enabled",
 		SampleRate:             1,
@@ -91,7 +111,7 @@ func TestTracerInit_ProgrammaticEnableOverridesEnvironment(t *testing.T) {
 		UseSimpleSpanProcessor: true,
 	})
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("NewAdvanced() error = %v", err)
 	}
 	t.Cleanup(func() { _ = tracer.Shutdown(context.Background()) })
 
@@ -115,7 +135,7 @@ func TestTracerInit_Enabled(t *testing.T) {
 
 	exporter := tracetest.NewInMemoryExporter()
 
-	tracer, err := New(context.Background(), Options{
+	tracer, err := NewAdvanced(context.Background(), AdvancedOptions{
 		ServiceName:            "test-enabled",
 		Env:                    "test",
 		SampleRate:             1.0,
@@ -123,7 +143,7 @@ func TestTracerInit_Enabled(t *testing.T) {
 		UseSimpleSpanProcessor: true,
 	})
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("NewAdvanced() error = %v", err)
 	}
 	if !tracer.IsEnabled() {
 		t.Error("Tracer should be enabled")
@@ -164,14 +184,14 @@ func TestTracerExporter_AppendsOTLPTracePathToBaseURL(t *testing.T) {
 	}))
 	t.Cleanup(receiver.Close)
 
-	tracer, err := New(context.Background(), Options{
+	tracer, err := NewAdvanced(context.Background(), AdvancedOptions{
 		ServiceName:            "endpoint-path-test",
 		Endpoint:               receiver.URL,
 		SampleRate:             1,
 		UseSimpleSpanProcessor: true,
 	})
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("NewAdvanced() error = %v", err)
 	}
 	t.Cleanup(func() { _ = tracer.Shutdown(context.Background()) })
 
@@ -197,7 +217,7 @@ func TestStartSpan_ContextPropagation(t *testing.T) {
 	defer os.Unsetenv("TRACING_ENABLED")
 
 	exporter := tracetest.NewInMemoryExporter()
-	tracer, _ := New(context.Background(), Options{
+	tracer, _ := NewAdvanced(context.Background(), AdvancedOptions{
 		ServiceName:            "test-ctx",
 		SpanExporter:           exporter,
 		SampleRate:             1.0,
@@ -249,7 +269,7 @@ func TestSpanAttributes(t *testing.T) {
 	defer os.Unsetenv("TRACING_ENABLED")
 
 	exporter := tracetest.NewInMemoryExporter()
-	tracer, _ := New(context.Background(), Options{
+	tracer, _ := NewAdvanced(context.Background(), AdvancedOptions{
 		ServiceName:            "test-attrs",
 		SpanExporter:           exporter,
 		SampleRate:             1.0,
@@ -389,14 +409,14 @@ func TestDecorators(t *testing.T) {
 	}()
 
 	exporter := tracetest.NewInMemoryExporter()
-	tracer, _ := New(context.Background(), Options{
+	tracer, _ := NewAdvanced(context.Background(), AdvancedOptions{
 		ServiceName:            "test-decorators",
 		SpanExporter:           exporter,
 		SampleRate:             1.0,
 		UseSimpleSpanProcessor: true,
 	})
 	// Set as global tracer.
-	globalTracer = tracer
+	globalTracer.Store(tracer)
 
 	t.Run("Trace decorator success", func(t *testing.T) {
 		called := false
@@ -520,7 +540,7 @@ func TestSpan_End_Idempotent(t *testing.T) {
 func TestSpanFromContext(t *testing.T) {
 	t.Run("with span", func(t *testing.T) {
 		os.Unsetenv("TRACING_ENABLED")
-		tracer, _ := New(context.Background(), Options{})
+		tracer, _ := NewAdvanced(context.Background(), AdvancedOptions{})
 		ctx, expected := tracer.StartSpan(context.Background(), "test", SpanKindServer)
 		got := SpanFromContext(ctx)
 		if got != expected {
@@ -569,7 +589,7 @@ func TestFormatTraceContext(t *testing.T) {
 
 func TestSetSpanAttributesWithStatus(t *testing.T) {
 	os.Unsetenv("TRACING_ENABLED")
-	tracer, _ := New(context.Background(), Options{})
+	tracer, _ := NewAdvanced(context.Background(), AdvancedOptions{})
 
 	t.Run("sets both attributes and status", func(t *testing.T) {
 		ctx, span := tracer.StartSpan(context.Background(), "test", SpanKindServer)
@@ -632,13 +652,13 @@ func TestSamplerConfigurations(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			exporter := tracetest.NewInMemoryExporter()
-			tracer, err := New(context.Background(), Options{
+			tracer, err := NewAdvanced(context.Background(), AdvancedOptions{
 				ServiceName:  "test-sampler",
 				SpanExporter: exporter,
 				SampleRate:   tt.sampleRate,
 			})
 			if err != nil {
-				t.Fatalf("New() error = %v", err)
+				t.Fatalf("NewAdvanced() error = %v", err)
 			}
 			tracer.Shutdown(context.Background())
 		})
@@ -678,7 +698,7 @@ func TestOTelSpanKindMapping(t *testing.T) {
 	defer os.Unsetenv("TRACING_ENABLED")
 
 	exporter := tracetest.NewInMemoryExporter()
-	tracer, _ := New(context.Background(), Options{
+	tracer, _ := NewAdvanced(context.Background(), AdvancedOptions{
 		ServiceName:            "test-kinds",
 		SpanExporter:           exporter,
 		SampleRate:             1.0,
@@ -763,14 +783,14 @@ func TestTracerRegistersW3CPropagation(t *testing.T) {
 	t.Setenv("TRACING_ENABLED", "true")
 	exporter := tracetest.NewInMemoryExporter()
 
-	tracer, err := New(context.Background(), Options{
+	tracer, err := NewAdvanced(context.Background(), AdvancedOptions{
 		ServiceName:            "propagation-test",
 		SampleRate:             1,
 		SpanExporter:           exporter,
 		UseSimpleSpanProcessor: true,
 	})
 	if err != nil {
-		t.Fatalf("New() error = %v", err)
+		t.Fatalf("NewAdvanced() error = %v", err)
 	}
 	t.Cleanup(func() { _ = tracer.Shutdown(context.Background()) })
 
@@ -806,13 +826,13 @@ func TestSpanReportsActualSamplingDecision(t *testing.T) {
 		{name: "not sampled", sampleRate: 0, want: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			tracer, err := New(context.Background(), Options{
+			tracer, err := NewAdvanced(context.Background(), AdvancedOptions{
 				ServiceName:  "sampling-test",
 				SampleRate:   test.sampleRate,
 				SpanExporter: tracetest.NewInMemoryExporter(),
 			})
 			if err != nil {
-				t.Fatalf("New() error = %v", err)
+				t.Fatalf("NewAdvanced() error = %v", err)
 			}
 			_, span := tracer.StartSpan(context.Background(), "sampling", SpanKindServer)
 			if got := span.IsSampled(); got != test.want {

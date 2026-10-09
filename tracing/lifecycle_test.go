@@ -1,0 +1,634 @@
+// Copyright 2026 Fynd (Shopsense Retail Technologies Limited)
+// Licensed under the Apache License, Version 2.0.
+
+package tracing
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"sync/atomic"
+	"testing"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+)
+
+type lifecycleExporter struct {
+	exports     atomic.Int32
+	shutdowns   atomic.Int32
+	shutdownErr error
+}
+
+type lifecyclePropagator struct {
+	field string
+}
+
+func (p *lifecyclePropagator) Inject(context.Context, propagation.TextMapCarrier) {}
+
+func (p *lifecyclePropagator) Extract(ctx context.Context, _ propagation.TextMapCarrier) context.Context {
+	return ctx
+}
+
+func (p *lifecyclePropagator) Fields() []string { return []string{p.field} }
+
+func (e *lifecycleExporter) ExportSpans(context.Context, []sdktrace.ReadOnlySpan) error {
+	e.exports.Add(1)
+	return nil
+}
+
+func (e *lifecycleExporter) Shutdown(context.Context) error {
+	e.shutdowns.Add(1)
+	return e.shutdownErr
+}
+
+func TestTracerShutdownFlushesOnceAndCachesError(t *testing.T) {
+	baselinePropagator := snapshotPropagator(otel.GetTextMapPropagator())
+	t.Cleanup(func() { otel.SetTextMapPropagator(baselinePropagator) })
+	enabled := true
+	wantErr := errors.New("exporter shutdown failed")
+	exporter := &lifecycleExporter{shutdownErr: wantErr}
+	tracer, err := NewAdvanced(context.Background(), AdvancedOptions{
+		ServiceName:            "lifecycle",
+		Enabled:                &enabled,
+		Sampler:                "always_on",
+		SpanExporter:           exporter,
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, span := tracer.StartSpan(context.Background(), "flush", SpanKindInternal)
+	span.End()
+
+	if err := tracer.Shutdown(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("first Shutdown error = %v, want %v", err, wantErr)
+	}
+	if err := tracer.Shutdown(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("second Shutdown error = %v, want cached %v", err, wantErr)
+	}
+	if got := exporter.exports.Load(); got != 1 {
+		t.Fatalf("exports = %d, want 1", got)
+	}
+	if got := exporter.shutdowns.Load(); got != 1 {
+		t.Fatalf("exporter shutdowns = %d, want exactly 1", got)
+	}
+	if otel.GetTracerProvider() != tracer.previousTP {
+		t.Fatal("Shutdown did not restore the captured global tracer provider snapshot")
+	}
+	// Shutdown keeps the tracer's propagator installed so outbound propagation
+	// continues during graceful drain.
+	if !ownedByPropagator(otel.GetTextMapPropagator(), tracer.otelOwner.propagator) {
+		t.Fatal("Shutdown uninstalled the tracer's propagator")
+	}
+}
+
+func TestImplicitLogContextIsOptInForAdvancedTracing(t *testing.T) {
+	enabled := true
+	legacy, err := New(context.Background(), Options{
+		ServiceName:            "legacy",
+		Enabled:                &enabled,
+		SpanExporter:           &lifecycleExporter{},
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("New legacy tracer: %v", err)
+	}
+	defer legacy.Shutdown(context.Background())
+	if legacy.implicitLogContext {
+		t.Fatal("legacy tracing unexpectedly enabled goroutine-local log lookup")
+	}
+
+	advanced, err := NewAdvanced(context.Background(), AdvancedOptions{
+		ServiceName:            "advanced",
+		Enabled:                &enabled,
+		SpanExporter:           &lifecycleExporter{},
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("NewAdvanced tracer: %v", err)
+	}
+	defer advanced.Shutdown(context.Background())
+	if !advanced.implicitLogContext {
+		t.Fatal("advanced tracing did not enable goroutine-local log lookup")
+	}
+}
+
+func equalStringSets(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	counts := make(map[string]int, len(left))
+	for _, value := range left {
+		counts[value]++
+	}
+	for _, value := range right {
+		counts[value]--
+	}
+	for _, count := range counts {
+		if count != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func TestGlobalInitFailureIsVisibleAndShutdownAllowsReinit(t *testing.T) {
+	resetGlobalTracer()
+	t.Cleanup(func() {
+		_ = Shutdown(context.Background())
+		resetGlobalTracer()
+	})
+
+	enabled := true
+	failed, err := InitWithAdvancedOptions(AdvancedOptions{
+		ServiceName: "invalid",
+		Enabled:     &enabled,
+		Endpoint:    "://invalid-endpoint",
+		Protocol:    "http/protobuf",
+	})
+	if err == nil || failed != nil {
+		t.Fatalf("InitWithOptions = (%v, %v), want nil tracer and error", failed, err)
+	}
+	if globalTracer.Load() != nil || InitError() == nil {
+		t.Fatalf("failed initialization state = tracer:%v err:%v, want nil tracer and visible error", globalTracer.Load(), InitError())
+	}
+	if shutdownErr := Shutdown(context.Background()); shutdownErr != nil {
+		t.Fatalf("Shutdown after failed initialization: %v", shutdownErr)
+	}
+	if globalTracer.Load() != nil || InitError() == nil {
+		t.Fatalf("shutdown lost failed initialization diagnostic: tracer=%v err=%v", globalTracer.Load(), InitError())
+	}
+	if tracer, cachedErr := GlobalWithError(); tracer != nil || cachedErr == nil {
+		t.Fatalf("GlobalWithError after failed-init shutdown = (%v, %v), want nil tracer and cached error", tracer, cachedErr)
+	}
+
+	exporter := &lifecycleExporter{}
+	valid, err := InitWithAdvancedOptions(AdvancedOptions{
+		ServiceName:            "valid",
+		Enabled:                &enabled,
+		Propagators:            "tracecontext,baggage",
+		Sampler:                "always_on",
+		SpanExporter:           exporter,
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil || valid == nil || !valid.IsEnabled() {
+		t.Fatalf("reinitialize after reset = (%v, %v)", valid, err)
+	}
+	if InitError() != nil {
+		t.Fatalf("successful explicit reinitialization retained stale error: %v", InitError())
+	}
+	if err := Shutdown(context.Background()); err != nil {
+		t.Fatalf("valid Shutdown: %v", err)
+	}
+	if exporter.shutdowns.Load() != 1 {
+		t.Fatalf("valid exporter shutdowns = %d, want 1", exporter.shutdowns.Load())
+	}
+}
+
+func TestGlobalAfterShutdownReturnsRetiredTracerUntilExplicitReinit(t *testing.T) {
+	resetGlobalTracer()
+	t.Cleanup(func() {
+		_ = Shutdown(context.Background())
+		resetGlobalTracer()
+	})
+	enabled := true
+	firstExporter := &lifecycleExporter{}
+	first, err := InitWithAdvancedOptions(AdvancedOptions{
+		ServiceName:            "first",
+		Enabled:                &enabled,
+		SpanExporter:           firstExporter,
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("first InitWithAdvancedOptions: %v", err)
+	}
+	if err := first.Shutdown(context.Background()); err != nil {
+		t.Fatalf("first Shutdown: %v", err)
+	}
+	if got := Global(); got != first || got.IsEnabled() {
+		t.Fatalf("Global after Shutdown = %p enabled=%v, want retired %p", got, got.IsEnabled(), first)
+	}
+	if firstExporter.shutdowns.Load() != 1 {
+		t.Fatalf("first exporter shutdowns = %d, want 1", firstExporter.shutdowns.Load())
+	}
+
+	second, err := InitWithAdvancedOptions(AdvancedOptions{
+		ServiceName:            "second",
+		Enabled:                &enabled,
+		SpanExporter:           &lifecycleExporter{},
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("explicit reinit: %v", err)
+	}
+	if second == first || Global() != second || !second.IsEnabled() {
+		t.Fatal("explicit initialization did not replace the retired tracer")
+	}
+}
+
+func TestSetGlobalRestorePreservesRetiredGlobal(t *testing.T) {
+	resetGlobalTracer()
+	t.Cleanup(func() {
+		_ = Shutdown(context.Background())
+		resetGlobalTracer()
+	})
+	enabled := true
+	retired, err := InitWithAdvancedOptions(AdvancedOptions{
+		ServiceName: "retired", Enabled: &enabled,
+		SpanExporter: &lifecycleExporter{}, UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("InitWithAdvancedOptions: %v", err)
+	}
+	if err := retired.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	detached, err := NewAdvanced(context.Background(), AdvancedOptions{
+		ServiceName: "detached", Enabled: &enabled,
+		SpanExporter: &lifecycleExporter{}, UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("NewAdvanced: %v", err)
+	}
+	defer detached.Shutdown(context.Background())
+	restore := SetGlobal(detached)
+	if Global() != detached {
+		t.Fatal("SetGlobal did not install the detached tracer")
+	}
+	restore()
+	if got := Global(); got != retired {
+		t.Fatalf("Global after restore = %p; want retired tracer %p", got, retired)
+	}
+}
+
+func TestSetGlobalRestorePreservesLifecycleRetiredWhileDetached(t *testing.T) {
+	resetGlobalTracer()
+	t.Cleanup(func() {
+		_ = Shutdown(context.Background())
+		resetGlobalTracer()
+	})
+	enabled := true
+	processGlobal, err := InitWithAdvancedOptions(AdvancedOptions{
+		ServiceName: "process-global", Enabled: &enabled,
+		SpanExporter: &lifecycleExporter{}, UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("InitWithAdvancedOptions: %v", err)
+	}
+	detached, err := NewAdvanced(context.Background(), AdvancedOptions{
+		ServiceName: "detached", Enabled: &enabled,
+		SpanExporter: &lifecycleExporter{}, UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("NewAdvanced: %v", err)
+	}
+	defer detached.Shutdown(context.Background())
+
+	restore := SetGlobal(detached)
+	if err := processGlobal.Shutdown(context.Background()); err != nil {
+		t.Fatalf("process-global Shutdown: %v", err)
+	}
+	if got := Global(); got != detached {
+		t.Fatalf("Global while detached = %p; want %p", got, detached)
+	}
+	restore()
+	if got := Global(); got != processGlobal || got.IsEnabled() {
+		t.Fatalf("Global after restore = %p enabled=%v; want retired %p", got, got.IsEnabled(), processGlobal)
+	}
+}
+
+func TestIndependentTracerShutdownDoesNotRetirePackageGlobal(t *testing.T) {
+	resetGlobalTracer()
+	t.Cleanup(func() {
+		_ = Shutdown(context.Background())
+		resetGlobalTracer()
+	})
+	disabled := false
+	standalone, err := NewAdvanced(context.Background(), AdvancedOptions{Enabled: &disabled})
+	if err != nil {
+		t.Fatalf("NewAdvanced: %v", err)
+	}
+	if err := standalone.Shutdown(context.Background()); err != nil {
+		t.Fatalf("standalone Shutdown: %v", err)
+	}
+	if got := Global(); got == standalone {
+		t.Fatal("independent tracer was incorrectly retained as the package global")
+	}
+}
+
+func TestDetachedSetGlobalTracerShutdownDoesNotRetirePackageGlobal(t *testing.T) {
+	resetGlobalTracer()
+	t.Cleanup(func() {
+		_ = Shutdown(context.Background())
+		resetGlobalTracer()
+	})
+	disabled := false
+	detached, err := NewAdvanced(context.Background(), AdvancedOptions{Enabled: &disabled})
+	if err != nil {
+		t.Fatalf("NewAdvanced: %v", err)
+	}
+	restore := SetGlobal(detached)
+	if Global() != detached {
+		t.Fatal("SetGlobal did not install tracer")
+	}
+	restore()
+	if globalTracer.Load() != nil {
+		t.Fatal("restore did not detach tracer")
+	}
+	if err := detached.Shutdown(context.Background()); err != nil {
+		t.Fatalf("detached Shutdown: %v", err)
+	}
+	if retiredGlobalTracer == detached {
+		t.Fatal("detached SetGlobal tracer was retained as the retired process global")
+	}
+	if got := Global(); got == detached {
+		t.Fatal("Global returned detached tracer after shutdown")
+	}
+}
+
+func TestShutdownRestoresPreexistingCustomGlobals(t *testing.T) {
+	baselineProvider := snapshotTracerProvider(otel.GetTracerProvider())
+	baselinePropagator := snapshotPropagator(otel.GetTextMapPropagator())
+	t.Cleanup(func() {
+		otel.SetTracerProvider(baselineProvider)
+		otel.SetTextMapPropagator(baselinePropagator)
+	})
+
+	customProvider := sdktrace.NewTracerProvider()
+	defer customProvider.Shutdown(context.Background())
+	customPropagator := propagation.TraceContext{}
+	otel.SetTracerProvider(customProvider)
+	otel.SetTextMapPropagator(customPropagator)
+
+	enabled := true
+	tracer, err := NewAdvanced(context.Background(), AdvancedOptions{
+		ServiceName:            "restore-custom",
+		Enabled:                &enabled,
+		SpanExporter:           &lifecycleExporter{},
+		UseSimpleSpanProcessor: true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := tracer.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if got := otel.GetTracerProvider(); got != customProvider {
+		t.Fatalf("restored provider = %T %p, want custom %T %p", got, got, customProvider, customProvider)
+	}
+	// The propagator is intentionally NOT restored on Shutdown (graceful-drain
+	// propagation); SetGlobal restore still restores it.
+	if !ownedByPropagator(otel.GetTextMapPropagator(), tracer.otelOwner.propagator) {
+		t.Fatalf("Shutdown propagator = %T, want the tracer's propagator kept installed", otel.GetTextMapPropagator())
+	}
+}
+
+func TestTracerShutdownRewiresOutOfOrderGlobalOwnership(t *testing.T) {
+	baselineProvider := snapshotTracerProvider(otel.GetTracerProvider())
+	baselinePropagator := snapshotPropagator(otel.GetTextMapPropagator())
+	t.Cleanup(func() {
+		otel.SetTracerProvider(baselineProvider)
+		otel.SetTextMapPropagator(baselinePropagator)
+	})
+	otel.SetTracerProvider(baselineProvider)
+	otel.SetTextMapPropagator(baselinePropagator)
+
+	enabled := true
+	first, err := NewAdvanced(context.Background(), AdvancedOptions{
+		ServiceName:            "owner-first",
+		Enabled:                &enabled,
+		SpanExporter:           &lifecycleExporter{},
+		UseSimpleSpanProcessor: true,
+		Propagators:            "tracecontext",
+	})
+	if err != nil {
+		t.Fatalf("first New: %v", err)
+	}
+	second, err := NewAdvanced(context.Background(), AdvancedOptions{
+		ServiceName:            "owner-second",
+		Enabled:                &enabled,
+		SpanExporter:           &lifecycleExporter{},
+		UseSimpleSpanProcessor: true,
+		Propagators:            "baggage",
+	})
+	if err != nil {
+		t.Fatalf("second New: %v", err)
+	}
+	if otel.GetTracerProvider() != second.provider {
+		t.Fatal("second tracer did not own the global provider")
+	}
+
+	if err := first.Shutdown(context.Background()); err != nil {
+		t.Fatalf("first Shutdown: %v", err)
+	}
+	if otel.GetTracerProvider() != second.provider {
+		t.Fatal("out-of-order first shutdown clobbered the second provider")
+	}
+	if second.previousTP != baselineProvider {
+		t.Fatal("second owner was not rewired around the shut-down first owner")
+	}
+
+	if err := second.Shutdown(context.Background()); err != nil {
+		t.Fatalf("second Shutdown: %v", err)
+	}
+	if otel.GetTracerProvider() != baselineProvider {
+		t.Fatal("last owner restored a shut-down predecessor instead of the baseline")
+	}
+	// The last owner's propagator stays installed after its Shutdown.
+	if !ownedByPropagator(otel.GetTextMapPropagator(), second.otelOwner.propagator) {
+		t.Fatalf("last owner propagator fields = %v, want second owner's kept installed", otel.GetTextMapPropagator().Fields())
+	}
+}
+
+func TestSetGlobalAndNewRestoreOutOfOrder(t *testing.T) {
+	resetGlobalTracer()
+	baselineProvider := snapshotTracerProvider(otel.GetTracerProvider())
+	baselinePropagator := snapshotPropagator(otel.GetTextMapPropagator())
+	t.Cleanup(func() {
+		resetGlobalTracer()
+		otel.SetTracerProvider(baselineProvider)
+		otel.SetTextMapPropagator(baselinePropagator)
+	})
+
+	enabled := true
+	first, err := NewAdvanced(context.Background(), AdvancedOptions{
+		ServiceName:            "set-global-first",
+		Enabled:                &enabled,
+		SpanExporter:           &lifecycleExporter{},
+		UseSimpleSpanProcessor: true,
+		Propagators:            "tracecontext",
+	})
+	if err != nil {
+		t.Fatalf("first New: %v", err)
+	}
+	restoreFirst := SetGlobal(first)
+	second, err := NewAdvanced(context.Background(), AdvancedOptions{
+		ServiceName:            "set-global-second",
+		Enabled:                &enabled,
+		SpanExporter:           &lifecycleExporter{},
+		UseSimpleSpanProcessor: true,
+		Propagators:            "baggage",
+	})
+	if err != nil {
+		t.Fatalf("second New: %v", err)
+	}
+	restoreSecond := SetGlobal(second)
+
+	restoreFirst()
+	if Global() != second || otel.GetTracerProvider() != second.provider {
+		t.Fatal("restoring the older owner clobbered the newer tracer")
+	}
+	if err := first.Shutdown(context.Background()); err != nil {
+		t.Fatalf("first Shutdown: %v", err)
+	}
+	if Global() != second || otel.GetTracerProvider() != second.provider {
+		t.Fatal("out-of-order first shutdown clobbered the newer tracer")
+	}
+
+	if err := second.Shutdown(context.Background()); err != nil {
+		t.Fatalf("second Shutdown: %v", err)
+	}
+	restoreSecond() // idempotent after shutdown
+	if globalTracer.Load() != nil {
+		t.Fatalf("global tracer = %p, want nil baseline", globalTracer.Load())
+	}
+	if otel.GetTracerProvider() != baselineProvider {
+		t.Fatal("final shutdown did not restore the baseline provider")
+	}
+	// second was the current owner when it shut down, so its propagator stays
+	// installed; the later restoreSecond is a no-op for the retired owner.
+	if got := otel.GetTextMapPropagator().Fields(); !equalStringSets(got, []string{"baggage"}) {
+		t.Fatalf("final propagator fields = %v, want second owner's [baggage]", got)
+	}
+}
+
+func TestTracerRestorationPreservesIndependentGlobalReplacement(t *testing.T) {
+	t.Run("provider", func(t *testing.T) {
+		baselineProvider := snapshotTracerProvider(otel.GetTracerProvider())
+		baselinePropagator := snapshotPropagator(otel.GetTextMapPropagator())
+		t.Cleanup(func() {
+			otel.SetTracerProvider(baselineProvider)
+			otel.SetTextMapPropagator(baselinePropagator)
+		})
+
+		enabled := true
+		tracer, err := NewAdvanced(context.Background(), AdvancedOptions{
+			ServiceName:            "external-provider",
+			Enabled:                &enabled,
+			SpanExporter:           &lifecycleExporter{},
+			UseSimpleSpanProcessor: true,
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		external := sdktrace.NewTracerProvider()
+		t.Cleanup(func() { _ = external.Shutdown(context.Background()) })
+		otel.SetTracerProvider(external)
+
+		if err := tracer.Shutdown(context.Background()); err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+		if otel.GetTracerProvider() != external {
+			t.Fatal("shutdown clobbered an independently replaced provider")
+		}
+		if !ownedByPropagator(otel.GetTextMapPropagator(), tracer.otelOwner.propagator) {
+			t.Fatalf("Shutdown uninstalled the owned propagator: %T", otel.GetTextMapPropagator())
+		}
+	})
+
+	t.Run("propagator", func(t *testing.T) {
+		baselineProvider := snapshotTracerProvider(otel.GetTracerProvider())
+		baselinePropagator := snapshotPropagator(otel.GetTextMapPropagator())
+		t.Cleanup(func() {
+			otel.SetTracerProvider(baselineProvider)
+			otel.SetTextMapPropagator(baselinePropagator)
+		})
+
+		enabled := true
+		tracer, err := NewAdvanced(context.Background(), AdvancedOptions{
+			ServiceName:            "external-propagator",
+			Enabled:                &enabled,
+			SpanExporter:           &lifecycleExporter{},
+			UseSimpleSpanProcessor: true,
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		external := &lifecyclePropagator{field: "x-external-trace"}
+		otel.SetTextMapPropagator(external)
+
+		if err := tracer.Shutdown(context.Background()); err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+		if otel.GetTracerProvider() != baselineProvider {
+			t.Fatal("owned provider was not restored")
+		}
+		if otel.GetTextMapPropagator() != external {
+			t.Fatal("shutdown clobbered an independently replaced propagator")
+		}
+	})
+}
+
+func TestConcurrentGlobalOwnerTeardownRestoresBaseline(t *testing.T) {
+	resetGlobalTracer()
+	baselineProvider := snapshotTracerProvider(otel.GetTracerProvider())
+	baselinePropagator := snapshotPropagator(otel.GetTextMapPropagator())
+	t.Cleanup(func() {
+		resetGlobalTracer()
+		otel.SetTracerProvider(baselineProvider)
+		otel.SetTextMapPropagator(baselinePropagator)
+	})
+
+	const ownerCount = 8
+	enabled := true
+	tracers := make([]*Tracer, 0, ownerCount)
+	restores := make([]func(), 0, ownerCount)
+	for index := 0; index < ownerCount; index++ {
+		tracer, err := NewAdvanced(context.Background(), AdvancedOptions{
+			ServiceName:            "concurrent-owner",
+			Enabled:                &enabled,
+			SpanExporter:           &lifecycleExporter{},
+			UseSimpleSpanProcessor: true,
+		})
+		if err != nil {
+			t.Fatalf("New owner %d: %v", index, err)
+		}
+		tracers = append(tracers, tracer)
+		restores = append(restores, SetGlobal(tracer))
+	}
+
+	var wg sync.WaitGroup
+	for index, tracer := range tracers {
+		wg.Add(2)
+		go func(restore func()) {
+			defer wg.Done()
+			restore()
+		}(restores[index])
+		go func(tracer *Tracer) {
+			defer wg.Done()
+			_ = tracer.Shutdown(context.Background())
+		}(tracer)
+	}
+	wg.Wait()
+
+	if globalTracer.Load() != nil {
+		t.Fatalf("global tracer = %p, want nil", globalTracer.Load())
+	}
+	if otel.GetTracerProvider() != baselineProvider {
+		t.Fatal("concurrent teardown did not restore baseline provider")
+	}
+	// Depending on whether restore or Shutdown wins per owner, the final
+	// propagator is the baseline or an owner's kept (TraceContext+Baggage)
+	// propagator.
+	ownerFields := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}).Fields()
+	if got := otel.GetTextMapPropagator().Fields(); !equalStringSets(got, baselinePropagator.Fields()) && !equalStringSets(got, ownerFields) {
+		t.Fatalf("concurrent teardown propagator fields = %v, want baseline %v or owner %v", got, baselinePropagator.Fields(), ownerFields)
+	}
+	for index, tracer := range tracers {
+		if tracer.IsEnabled() {
+			t.Errorf("tracer %d remained enabled after shutdown", index)
+		}
+	}
+}

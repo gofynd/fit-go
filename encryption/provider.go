@@ -13,8 +13,10 @@
 // limitations under the License.
 
 // Package encryption provides AES-256-GCM encryption and decryption with LRU
-// caching and pluggable key providers (Vault, GCP KMS). Port
-// modules/encryption.
+// caching and pluggable key providers (Vault, GCP KMS). It preserves the
+// original fit.js/pyfit fixed-IV wire format for interoperability. Reusing an
+// IV with one AES-GCM key is unsafe, so new designs should use a versioned
+// format with a random nonce per value. Port modules/encryption.
 package encryption
 
 // Provider is the interface for key providers that supply a Data Encryption Key
@@ -22,8 +24,8 @@ package encryption
 // secrets from external systems (e.g. HashiCorp Vault, GCP KMS).
 type Provider interface {
 	// Init fetches and returns the plaintext DEK and IV. The DEK must be
-	// exactly 32 bytes (AES-256) and the IV must be 12 bytes (GCM standard
-	// nonce size). Implementations should validate these sizes before
-	// returning.
+	// exactly 32 bytes (AES-256). The IV must be non-empty; 12 bytes is the
+	// standard GCM nonce size, but legacy fit.js/pyfit deployments use Vault IVs
+	// with other lengths, so providers must not reject a non-empty non-12-byte IV.
 	Init() (dek []byte, iv []byte, err error)
 }

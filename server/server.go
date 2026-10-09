@@ -44,6 +44,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gofynd/fit-go/metrics"
+	"github.com/gofynd/fit-go/profiling"
 )
 
 // Config holds the configuration for creating a new Server instance.
@@ -84,15 +86,77 @@ type Config struct {
 	HealthChecker HealthChecker
 }
 
+// AdvancedConfig contains opt-in server controls added after the original
+// public Config contract. Keeping those controls here preserves Config's exact
+// field layout for downstream consumers that still use positional literals.
+// Deprecated: use RuntimeConfig.
+type AdvancedConfig struct {
+	Config
+
+	// ReadHeaderTimeout is the maximum duration for reading request headers.
+	// A zero value preserves net/http's existing behavior of using ReadTimeout.
+	ReadHeaderTimeout time.Duration
+
+	// DisableWriteTimeout explicitly disables the response write deadline. It is
+	// opt-in because a zero WriteTimeout retains fit-go's existing 30-second
+	// default. When set, it takes precedence over WriteTimeout.
+	DisableWriteTimeout bool
+
+	// MaxHeaderBytes configures net/http's request-header parse limit. A zero
+	// value preserves net/http's default. Set this only for compatibility with a
+	// service whose deployed legacy runtime used a smaller limit.
+	MaxHeaderBytes int
+
+	// RequestID controls whether to forward/generate X-Request-ID and attach it
+	// to request context. Defaults to true. Set false only for compatibility
+	// with pinned legacy servers which had no request-ID middleware.
+	RequestID *bool
+
+	// RequestLogging controls whether the server emits the fit-go REQ/RES access
+	// log pair. Defaults to true. Metrics are still recorded when this is false,
+	// allowing a legacy service without access logs to preserve its Prometheus
+	// observability without adding a new log contract.
+	RequestLogging *bool
+
+	// ReadinessChecker is used by /_readyz. When nil, HealthChecker is used,
+	// preserving fit.js behavior while allowing pyfit-style independent readiness.
+	ReadinessChecker HealthChecker
+
+	// StaticHealthResponse returns unconditional Express-compatible health
+	// responses instead of invoking HealthChecker or ReadinessChecker.
+	StaticHealthResponse bool
+
+	// LegacyStaticHealthResponse is retained for source compatibility.
+	// Deprecated: use StaticHealthResponse.
+	LegacyStaticHealthResponse bool
+
+	// Profiler owns the profiling routes registered by this server. When nil,
+	// the process default installed by fit.Init is used.
+	Profiler *profiling.Profiler
+
+	// CORS, when non-nil, installs the dynamic CORS middleware (see DynamicCORS/CORSOptions)
+	// engine-level so it also answers preflights on the no-route path. Nil disables
+	// CORS entirely (a service whose config.enable_cors is off simply leaves this nil).
+	CORS *CORSOptions
+
+	// OTelMiddleware, when non-nil, customizes the built-in server tracing
+	// middleware. Nil retains the upstream defaults, including response
+	// propagation headers.
+	OTelMiddleware *OTelMiddlewareAdvancedConfig
+}
+
 // Server is the fit.go HTTP server. It wraps net/http.Server and uses
 // gin.Engine for routing and middleware chains, plus lifecycle management.
 type Server struct {
-	mu              sync.RWMutex
-	cfg             Config
-	engine          *gin.Engine
-	server          *http.Server
-	logger          *slog.Logger
-	fallbackHandler http.Handler // used for single-type or internal-type root mounting
+	mu               sync.RWMutex
+	cfg              AdvancedConfig
+	engine           *gin.Engine
+	server           *http.Server
+	logger           *slog.Logger
+	fallbackHandler  http.Handler // used for single-type or internal-type root mounting
+	healthRouteMW    []Middleware
+	upstreamDefaults bool
+	profilerOwned    bool
 
 	// App is the top-level http.Handler with all middleware applied.
 	// Points to the gin engine.
@@ -103,31 +167,80 @@ type Server struct {
 	Router *gin.Engine
 }
 
+// UseHealthRouteMiddleware installs application-owned health compatibility
+// middleware after fit-go's security/access-log/CORS boundary and before caller
+// middleware and request parsers. It is intended for applications that
+// explicitly implement Express-style case/slash/HEAD/OPTIONS health variants.
+// Each middleware must call Next for every path or method it does not own.
+// It must be configured before Init.
+func (s *Server) UseHealthRouteMiddleware(middlewares ...Middleware) error {
+	if s == nil {
+		return fmt.Errorf("server: nil server")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.App != nil {
+		return fmt.Errorf("server: health route middleware must be configured before Init")
+	}
+	for _, middleware := range middlewares {
+		if middleware != nil {
+			s.healthRouteMW = append(s.healthRouteMW, middleware)
+		}
+	}
+	return nil
+}
+
 // New creates a new Server with the given configuration.
 func New(cfg Config) *Server {
-	if cfg.Logger == nil {
-		cfg.Logger = slog.Default()
+	return newServer(AdvancedConfig{Config: cfg}, true)
+}
+
+// NewAdvanced creates a Server with opt-in controls that are intentionally
+// kept out of Config to preserve the original public struct layout.
+// Deprecated: use NewRuntime.
+func NewAdvanced(cfg AdvancedConfig) *Server {
+	return newServer(cfg, false)
+}
+
+func newServer(cfg AdvancedConfig, upstreamDefaults bool) *Server {
+	if cfg.Config.Logger == nil {
+		cfg.Config.Logger = slog.Default()
 	}
-	if cfg.ReadTimeout == 0 {
-		cfg.ReadTimeout = 30 * time.Second
+	if cfg.Config.ReadTimeout == 0 {
+		cfg.Config.ReadTimeout = 30 * time.Second
 	}
-	if cfg.WriteTimeout == 0 {
-		cfg.WriteTimeout = 30 * time.Second
+	if cfg.DisableWriteTimeout {
+		cfg.Config.WriteTimeout = 0
+	} else if cfg.Config.WriteTimeout == 0 {
+		cfg.Config.WriteTimeout = 30 * time.Second
 	}
-	if cfg.IdleTimeout == 0 {
-		cfg.IdleTimeout = 120 * time.Second
+	if cfg.Config.IdleTimeout == 0 {
+		cfg.Config.IdleTimeout = 120 * time.Second
 	}
-	if cfg.HealthChecker != nil {
-		SetHealthChecker(cfg.HealthChecker)
+	if cfg.Config.HealthChecker != nil {
+		SetHealthChecker(cfg.Config.HealthChecker)
+	}
+	// NewAdvanced historically treated an explicitly supplied profiler as part
+	// of the server lifecycle and stopped it during Shutdown. A profiler found
+	// through profiling.Default is process-owned instead and must be borrowed.
+	profilerOwned := !upstreamDefaults && cfg.Profiler != nil
+	if !upstreamDefaults && cfg.Profiler == nil {
+		cfg.Profiler = profiling.Default()
+		if envGetBool("PROFILING_ENABLED") && (cfg.Profiler == nil || cfg.Profiler.GetConfig().Enabled == false) {
+			cfg.Profiler = profiling.NewAdvanced(profiling.DefaultAdvancedConfig())
+			profilerOwned = true
+		}
 	}
 
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 	s := &Server{
-		cfg:    cfg,
-		engine: engine,
-		Router: engine,
-		logger: cfg.Logger,
+		cfg:              cfg,
+		engine:           engine,
+		Router:           engine,
+		logger:           cfg.Config.Logger,
+		upstreamDefaults: upstreamDefaults,
+		profilerOwned:    profilerOwned,
 	}
 	return s
 }
@@ -155,6 +268,7 @@ func (s *Server) Init(
 	// Create a fresh engine for this init
 	gin.SetMode(gin.ReleaseMode)
 	root := gin.New()
+	staticHealthCompatibility := !s.upstreamDefaults && (s.cfg.StaticHealthResponse || s.cfg.LegacyStaticHealthResponse)
 
 	// 1. Build middleware chain on the engine
 
@@ -166,25 +280,114 @@ func (s *Server) Init(
 	if secureHeaders {
 		root.Use(SecureHeaders())
 	}
+	if staticHealthCompatibility {
+		// Mark the exact legacy-static requests owned by fit-go before access
+		// logging runs. Unowned health-like variants remain in the normal chain.
+		root.Use(markOwnedStaticHealthProbe())
+	}
 
-	// Request logging
-	root.Use(GinLogRequestResponse(LogRequestResponseConfig{
-		Logger:          s.logger,
-		IncludeHeaders:  coalesce(s.cfg.IncludeHeadersInLog, os.Getenv("INCLUDE_HEADERS_IN_LOG")),
-		MetricsRecorder: s.cfg.MetricsRecorder,
-	}))
+	// Request ID: forward an inbound X-Request-ID or mint one, expose it on the
+	// response header and request context. Installed before OTel/logging so the
+	// id is attached to the server span and every access-log line, and pairs with
+	// the outbound x-request-id the httpclient sets for end-to-end correlation.
+	// NOTE: this is an ENHANCEMENT beyond legacy fit.js — the Node fit server had
+	// no request-id middleware, and fit/axios only logged a per-call UUID (it did
+	// not propagate an x-request-id header). Additive and harmless.
+	if !s.upstreamDefaults {
+		requestID := true
+		if s.cfg.RequestID != nil {
+			requestID = *s.cfg.RequestID
+		}
+		if requestID {
+			root.Use(RequestIDAdvanced())
+		}
+
+		// Per-request OpenTelemetry server span. Self-gated: a no-op passthrough when
+		// TRACING_ENABLED is off (default), so there is no added latency unless tracing
+		// is enabled. Installed before request logging and the user/parse middlewares so
+		// the entire request — including the access-log line and every handler — runs
+		// within the span. This restores the auto-instrumentation Node got from the
+		// OTel express plugin, with no per-service wiring. (/_healthz and /_readyz are
+		// skipped inside the middleware via tracing.ShouldTrace.)
+		if s.cfg.OTelMiddleware != nil {
+			root.Use(OTelMiddlewareWithAdvancedConfig(*s.cfg.OTelMiddleware))
+		} else {
+			root.Use(OTelMiddleware())
+		}
+		// Finalize the server span with the resolved route template. Nested service
+		// routers install this middleware on their own engine as well.
+		root.Use(OTelRouteMiddleware())
+
+		// Make the server span the goroutine-local active context so handler logs
+		// carry the trace without explicit threading (implicit propagation).
+		root.Use(GoroutineContextMiddleware())
+	}
+
+	// Request logging. fit.Init installs the enabled process-default metrics
+	// registry, while an explicit Config callback always takes precedence.
+	metricsRecorder := s.cfg.MetricsRecorder
+	if !s.upstreamDefaults && metricsRecorder == nil {
+		if registry := metrics.Default(); registry != nil && registry.ShouldRecordServerMetrics() {
+			metricsRecorder = registry.ServerRecorderFunc()
+		}
+	}
+	logConfig := LogRequestResponseConfig{
+		Logger: s.logger, IncludeHeaders: coalesce(s.cfg.IncludeHeadersInLog, os.Getenv("INCLUDE_HEADERS_IN_LOG")),
+		MetricsRecorder: metricsRecorder,
+	}
+	if s.upstreamDefaults {
+		root.Use(GinLogRequestResponse(logConfig))
+	} else {
+		requestLogging := true
+		if s.cfg.RequestLogging != nil {
+			requestLogging = *s.cfg.RequestLogging
+		}
+		root.Use(GinLogRequestResponseAdvanced(LogRequestResponseAdvancedConfig{
+			LogRequestResponseConfig: logConfig,
+			DisableLogging:           !requestLogging,
+		}))
+	}
+
+	// CORS (dynamic, callback-based). Install it before explicit health
+	// compatibility so health preflights receive the same CORS contract as every
+	// other route. Request logging remains outside CORS and static health probes
+	// remain suppressed by their explicit ownership marker.
+	if s.cfg.CORS != nil {
+		root.Use(DynamicCORS(*s.cfg.CORS))
+	}
+
+	// Explicit health compatibility runs after fit-go's security/logging/CORS
+	// layer but before application parsing/auth. Only static compatibility is
+	// marked before logging: a caller-supplied health middleware may fall through,
+	// and those requests must remain visible to access logging and auth.
+	if staticHealthCompatibility {
+		root.Use(staticHealthCompatibilityMiddleware())
+	}
+	for _, middleware := range s.healthRouteMW {
+		root.Use(middleware)
+	}
 
 	// Request middlewares provided by user (pre-parse)
 	for _, mw := range requestMiddlewares {
-		root.Use(mw)
+		if s.upstreamDefaults {
+			root.Use(mw)
+		} else {
+			root.Use(bypassHealthRoutes(mw, staticHealthCompatibility))
+		}
 	}
 
 	// Built-in request parsing middlewares (unless disabled)
 	if !envGetBool("DISABLE_REQUEST_MIDDLEWARES") {
 		payloadSize := coalesce(s.cfg.MaxPayloadSize, os.Getenv("MAX_REQUEST_PAYLOAD_SIZE"), "2mb")
-		root.Use(GinMaxPayloadSize(payloadSize))
-		root.Use(GinParseUserData)
-		root.Use(GinParseApplicationData)
+		if s.upstreamDefaults {
+			root.Use(GinMaxPayloadSize(payloadSize))
+			root.Use(GinParseUserData)
+			root.Use(GinParseApplicationData)
+		} else {
+			root.Use(bypassHealthRoutes(GinMaxPayloadSize(payloadSize), staticHealthCompatibility))
+			root.Use(bypassHealthRoutes(GinParseUserData, staticHealthCompatibility))
+			root.Use(bypassHealthRoutes(GinParseApplicationData, staticHealthCompatibility))
+		}
 	}
 
 	// Response middlewares
@@ -193,11 +396,20 @@ func (s *Server) Init(
 	}
 
 	// 2. Register health routes (before service routes)
-	RegisterHealthRoutes(root)
+	if s.upstreamDefaults {
+		RegisterHealthRoutes(root)
+	} else if s.cfg.StaticHealthResponse || s.cfg.LegacyStaticHealthResponse {
+		RegisterStaticHealthRoutes(root)
+	} else {
+		RegisterHealthRoutesWithCheckers(root, s.cfg.HealthChecker, s.cfg.ReadinessChecker)
+	}
 
 	// 3. Register profiling routes if enabled
-	if envGetBool("PROFILING_ENABLED") {
+	if s.upstreamDefaults && envGetBool("PROFILING_ENABLED") {
 		RegisterProfileRoutes(root)
+		s.logger.Info("[Profiling] Profiling routes registered")
+	} else if !s.upstreamDefaults && s.cfg.Profiler != nil && s.cfg.Profiler.GetConfig().Enabled {
+		RegisterProfileRoutesWithProfiler(root, s.cfg.Profiler)
 		s.logger.Info("[Profiling] Profiling routes registered")
 	}
 
@@ -250,13 +462,7 @@ func (s *Server) Start() error {
 	}
 
 	addr := net.JoinHostPort("", port)
-	s.server = &http.Server{
-		Addr:         addr,
-		Handler:      s.App,
-		ReadTimeout:  s.cfg.ReadTimeout,
-		WriteTimeout: s.cfg.WriteTimeout,
-		IdleTimeout:  s.cfg.IdleTimeout,
-	}
+	s.server = s.buildHTTPServer(addr)
 	s.mu.Unlock()
 
 	s.logger.Info("Server started", "addr", "http://localhost:"+port)
@@ -267,12 +473,60 @@ func (s *Server) Start() error {
 	return err
 }
 
+func (s *Server) buildHTTPServer(addr string) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           limitRequestHeaderBytes(s.App, s.cfg.MaxHeaderBytes),
+		ReadTimeout:       s.cfg.ReadTimeout,
+		ReadHeaderTimeout: s.cfg.ReadHeaderTimeout,
+		WriteTimeout:      s.cfg.WriteTimeout,
+		IdleTimeout:       s.cfg.IdleTimeout,
+		MaxHeaderBytes:    s.cfg.MaxHeaderBytes,
+	}
+}
+
+func limitRequestHeaderBytes(next http.Handler, maxBytes int) http.Handler {
+	if next == nil || maxBytes <= 0 {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if requestHeaderBytes(request) > maxBytes {
+			w.Header().Set("Connection", "close")
+			w.WriteHeader(http.StatusRequestHeaderFieldsTooLarge)
+			return
+		}
+		next.ServeHTTP(w, request)
+	})
+}
+
+func requestHeaderBytes(request *http.Request) int {
+	if request == nil {
+		return 0
+	}
+	// Count the minimum HTTP/1 request line and serialized header fields. Using
+	// the compact "name:value" form avoids rejecting a raw request that is still
+	// within the configured limit; net/http separately bounds raw parsing.
+	size := len(request.Method) + 1 + len(request.RequestURI) + 1 + len(request.Proto) + 2
+	if request.Host != "" {
+		size += len("Host") + 1 + len(request.Host) + 2
+	}
+	for name, values := range request.Header {
+		for _, value := range values {
+			size += len(name) + 1 + len(value) + 2
+		}
+	}
+	return size + 2
+}
+
 // Shutdown gracefully shuts down the server.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.RLock()
 	srv := s.server
 	s.mu.RUnlock()
 
+	if s.profilerOwned && s.cfg.Profiler != nil {
+		s.cfg.Profiler.Stop()
+	}
 	if srv == nil {
 		return nil
 	}

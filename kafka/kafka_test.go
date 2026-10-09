@@ -15,11 +15,113 @@
 package kafka
 
 import (
+	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
 	"time"
 )
+
+type healthDriver struct{ err error }
+
+func (d *healthDriver) Producer(ProducerConfig) (KafkaProducer, error) { return nil, nil }
+func (d *healthDriver) Consumer(ConsumerConfig) (KafkaConsumer, error) { return nil, nil }
+func (d *healthDriver) Close() error                                   { return nil }
+func (d *healthDriver) Ping(context.Context) error                     { return d.err }
+
+type noHealthDriver struct{}
+
+func (*noHealthDriver) Producer(ProducerConfig) (KafkaProducer, error) { return nil, nil }
+func (*noHealthDriver) Consumer(ConsumerConfig) (KafkaConsumer, error) { return nil, nil }
+func (*noHealthDriver) Close() error                                   { return nil }
+
+type producerConfigDriver struct {
+	producerConfig ProducerConfig
+}
+
+func (d *producerConfigDriver) Producer(config ProducerConfig) (KafkaProducer, error) {
+	d.producerConfig = config
+	return nil, nil
+}
+func (*producerConfigDriver) Consumer(ConsumerConfig) (KafkaConsumer, error) { return nil, nil }
+func (*producerConfigDriver) Close() error                                   { return nil }
+
+type advancedProducerConfigDriver struct {
+	producerConfigDriver
+	advancedConfig ProducerAdvancedConfig
+}
+
+func (d *advancedProducerConfigDriver) ProducerAdvanced(config ProducerAdvancedConfig) (KafkaProducer, error) {
+	d.advancedConfig = config
+	return nil, nil
+}
+
+func TestClientPing(t *testing.T) {
+	want := errors.New("broker unavailable password=hunter2 for user@example.com")
+	client := &Client{Driver: &healthDriver{err: want}}
+	err := client.Ping(context.Background())
+	if !errors.Is(err, want) {
+		t.Fatalf("Ping error = %v, want %v", err, want)
+	}
+	for _, secret := range []string{"hunter2", "user@example.com"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("Ping error leaked %q: %v", secret, err)
+		}
+	}
+	if got := safeKafkaHealthMessage("SASL password=hunter2 owner=user@example.com"); strings.Contains(got, "hunter2") || strings.Contains(got, "user@example.com") {
+		t.Fatalf("safeKafkaHealthMessage leaked health details: %q", got)
+	}
+	if err := (&Client{Driver: &noHealthDriver{}}).Ping(context.Background()); err == nil {
+		t.Fatal("Ping unsupported driver: expected error")
+	}
+	if err := (&Client{}).Ping(context.Background()); err == nil {
+		t.Fatal("Ping missing driver: expected error")
+	}
+}
+
+func TestNewProducerAdvanced(t *testing.T) {
+	t.Run("rejects nil client", func(t *testing.T) {
+		if _, err := NewProducerAdvanced(nil, ProducerAdvancedConfig{}); err == nil {
+			t.Fatal("NewProducerAdvanced() accepted a nil client")
+		}
+	})
+
+	t.Run("adapts base fields for an original driver", func(t *testing.T) {
+		driver := &producerConfigDriver{}
+		_, err := NewProducerAdvanced(driver, ProducerAdvancedConfig{
+			Acks:         -1,
+			MaxRetries:   3,
+			RetryBackoff: 25 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("NewProducerAdvanced() error = %v", err)
+		}
+		if driver.producerConfig.Acks != -1 || driver.producerConfig.MaxRetries != 3 || driver.producerConfig.RetryBackoff != 25*time.Millisecond {
+			t.Fatalf("adapted ProducerConfig = %#v", driver.producerConfig)
+		}
+	})
+
+	t.Run("does not discard advanced controls for an original driver", func(t *testing.T) {
+		driver := &producerConfigDriver{}
+		_, err := NewProducerAdvanced(driver, ProducerAdvancedConfig{AcksSet: true})
+		if err == nil || !strings.Contains(err.Error(), "does not support advanced producer configuration") {
+			t.Fatalf("NewProducerAdvanced() error = %v, want unsupported advanced configuration", err)
+		}
+	})
+
+	t.Run("dispatches the complete config to an advanced driver", func(t *testing.T) {
+		driver := &advancedProducerConfigDriver{}
+		want := ProducerAdvancedConfig{Acks: 0, AcksSet: true, CloseTimeout: time.Second}
+		_, err := NewProducerAdvanced(driver, want)
+		if err != nil {
+			t.Fatalf("NewProducerAdvanced() error = %v", err)
+		}
+		if driver.advancedConfig != want {
+			t.Fatalf("advanced ProducerConfig = %#v, want %#v", driver.advancedConfig, want)
+		}
+	})
+}
 
 // ---------------------------------------------------------------------------
 // LogLevel tests

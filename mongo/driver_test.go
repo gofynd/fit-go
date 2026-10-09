@@ -17,9 +17,12 @@ package mongo
 import (
 	"context"
 	"crypto/tls"
+	"reflect"
 	"testing"
 	"time"
 
+	"github.com/gofynd/fit-go/internal/tracingtest"
+	"github.com/gofynd/fit-go/tracing"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
@@ -32,6 +35,58 @@ func TestDefaultDialFunc_ReturnsDialFunc(t *testing.T) {
 	dial := DefaultDialFunc()
 	if dial == nil {
 		t.Fatal("DefaultDialFunc() should return a non-nil DialFunc")
+	}
+}
+
+func TestAdvancedDialerAddsOnlyTracingToUpstreamDriverOptions(t *testing.T) {
+	restore := tracing.SetGlobal(tracingtest.Enabled(t))
+	defer restore()
+
+	original := clientOptionsForMode("mongodb://localhost:27017", nil, false)
+	advanced := clientOptionsForMode("mongodb://localhost:27017", nil, true)
+	if original.Monitor != nil {
+		t.Fatal("original dialer unexpectedly installed tracing")
+	}
+	if advanced.Monitor == nil {
+		t.Fatal("advanced dialer did not install tracing")
+	}
+}
+
+type fakeAdaptiveRetriesSetter struct{ retries uint }
+
+func (f *fakeAdaptiveRetriesSetter) SetMaxAdaptiveRetries(retries uint) *options.ClientOptions {
+	f.retries = retries
+	return nil
+}
+
+func TestOriginalDialerDisablesAdaptiveRetriesWhenSelectedDriverSupportsThem(t *testing.T) {
+	setter := &fakeAdaptiveRetriesSetter{retries: 9}
+	if !disableAdaptiveRetriesIfSupported(setter) {
+		t.Fatal("v2.6-compatible adaptive retry setter was not detected")
+	}
+	if setter.retries != 0 {
+		t.Fatalf("adaptive retries = %d, want disabled", setter.retries)
+	}
+	if disableAdaptiveRetriesIfSupported(struct{}{}) {
+		t.Fatal("unsupported v2.5-style value reported adaptive retry support")
+	}
+}
+
+func TestSelectedDriverAdaptiveRetryCompatibilitySplit(t *testing.T) {
+	original := clientOptionsForMode("mongodb://localhost:27017", nil, false)
+	originalField := reflect.ValueOf(original).Elem().FieldByName("MaxAdaptiveRetries")
+	if !originalField.IsValid() {
+		// Official main's v2.5 baseline has no adaptive-retry facility.
+		return
+	}
+	if originalField.IsNil() || originalField.Elem().Uint() != 0 {
+		t.Fatalf("original MaxAdaptiveRetries = %v, want explicit zero", originalField.Interface())
+	}
+
+	advanced := clientOptionsForMode("mongodb://localhost:27017", nil, true)
+	advancedField := reflect.ValueOf(advanced).Elem().FieldByName("MaxAdaptiveRetries")
+	if !advancedField.IsNil() {
+		t.Fatalf("advanced MaxAdaptiveRetries = %v, want selected driver default", advancedField.Interface())
 	}
 }
 

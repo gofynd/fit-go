@@ -23,7 +23,9 @@ import (
 	"sync"
 	"testing"
 
-	"go.opentelemetry.io/otel/trace"
+	oteltrace "go.opentelemetry.io/otel/trace"
+
+	"github.com/gofynd/fit-go/internal/goroutinectx"
 )
 
 // ---------------------------------------------------------------------------
@@ -352,12 +354,12 @@ func TestLogger_WithContextReadsOpenTelemetrySpanContext(t *testing.T) {
 	var buf bytes.Buffer
 	logger, _ := New(Options{Level: "info", Output: &buf, Env: "production"})
 
-	traceID, _ := trace.TraceIDFromHex("0af7651916cd43dd8448eb211c80319c")
-	spanID, _ := trace.SpanIDFromHex("b7ad6b7169203331")
-	spanContext := trace.NewSpanContext(trace.SpanContextConfig{
-		TraceID: traceID, SpanID: spanID, TraceFlags: trace.FlagsSampled,
+	traceID, _ := oteltrace.TraceIDFromHex("0af7651916cd43dd8448eb211c80319c")
+	spanID, _ := oteltrace.SpanIDFromHex("b7ad6b7169203331")
+	spanContext := oteltrace.NewSpanContext(oteltrace.SpanContextConfig{
+		TraceID: traceID, SpanID: spanID, TraceFlags: oteltrace.FlagsSampled,
 	})
-	ctx := trace.ContextWithSpanContext(context.Background(), spanContext)
+	ctx := oteltrace.ContextWithSpanContext(context.Background(), spanContext)
 	logger.WithContext(ctx).Info("otel context")
 
 	var entry map[string]interface{}
@@ -740,6 +742,31 @@ func TestContextWithTrace(t *testing.T) {
 	}
 }
 
+func TestContextWithTraceFlags(t *testing.T) {
+	ctx := ContextWithTraceFlags(context.Background(), "trace-abc", "span-xyz", 1)
+	if got := ctx.Value(ctxKeyTraceFlags).(byte); got != 1 {
+		t.Fatalf("TraceFlags = %d, want 1", got)
+	}
+
+	var buf bytes.Buffer
+	logger, err := NewAdvanced(AdvancedOptions{
+		Schema: SchemaTraceClue,
+		Env:    "production",
+		Output: &buf,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	logger.WithContext(ctx).Info("sampled")
+	var record map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &record); err != nil {
+		t.Fatalf("decode log: %v", err)
+	}
+	if got := record["trace_flags"]; got != float64(1) {
+		t.Fatalf("trace_flags = %v, want 1", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Helper types
 // ---------------------------------------------------------------------------
@@ -750,4 +777,93 @@ type testError struct {
 
 func (e *testError) Error() string {
 	return e.msg
+}
+
+// When no trace context is explicitly bound, a plain log call must pick up the
+// goroutine-local active context's OTel span (implicit trace propagation).
+func TestLog_ImplicitTraceFromGoroutineLocal(t *testing.T) {
+	// The goroutine-local fallback is gated on the implicit-trace flag that
+	// tracing.New sets to the tracer's enabled state; enable it for this test.
+	SetImplicitTraceEnabled(true)
+	defer SetImplicitTraceEnabled(false)
+
+	var buf bytes.Buffer
+	lg, err := New(Options{Level: "info", Env: "production", Output: &buf})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	tid, _ := oteltrace.TraceIDFromHex("0123456789abcdef0123456789abcdef")
+	sid, _ := oteltrace.SpanIDFromHex("0123456789abcdef")
+	sc := oteltrace.NewSpanContext(oteltrace.SpanContextConfig{TraceID: tid, SpanID: sid})
+	ctx := oteltrace.ContextWithSpanContext(context.Background(), sc)
+
+	cleanup := goroutinectx.Inject(ctx)
+	defer cleanup()
+
+	lg.Info("hello") // no WithContext — must still carry the trace
+
+	out := buf.String()
+	if !strings.Contains(out, "0123456789abcdef0123456789abcdef") {
+		t.Fatalf("log line missing implicit trace_id; got: %s", out)
+	}
+	if !strings.Contains(out, "0123456789abcdef") {
+		t.Fatalf("log line missing implicit span_id; got: %s", out)
+	}
+}
+
+func TestLog_ExplicitContextOverridesGoroutineLocalTrace(t *testing.T) {
+	SetImplicitTraceEnabled(true)
+	defer SetImplicitTraceEnabled(false)
+	var buf bytes.Buffer
+	lg, err := New(Options{Level: "info", Env: "production", Output: &buf})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	parentTrace, _ := oteltrace.TraceIDFromHex("11111111111111111111111111111111")
+	parentSpan, _ := oteltrace.SpanIDFromHex("1111111111111111")
+	childTrace, _ := oteltrace.TraceIDFromHex("22222222222222222222222222222222")
+	childSpan, _ := oteltrace.SpanIDFromHex("2222222222222222")
+	parent := oteltrace.ContextWithSpanContext(context.Background(), oteltrace.NewSpanContext(oteltrace.SpanContextConfig{
+		TraceID: parentTrace, SpanID: parentSpan,
+	}))
+	child := oteltrace.ContextWithSpanContext(context.Background(), oteltrace.NewSpanContext(oteltrace.SpanContextConfig{
+		TraceID: childTrace, SpanID: childSpan,
+	}))
+	restore := goroutinectx.Inject(parent)
+	defer restore()
+
+	lg.WithContext(child).Info("explicit child")
+	output := buf.String()
+	if !strings.Contains(output, childTrace.String()) || !strings.Contains(output, childSpan.String()) {
+		t.Fatalf("explicit trace context was not preserved: %s", output)
+	}
+	if strings.Contains(output, parentTrace.String()) || strings.Contains(output, parentSpan.String()) {
+		t.Fatalf("goroutine trace overrode explicit trace context: %s", output)
+	}
+}
+
+// Without any goroutine-local context, logs carry no trace id (no false data).
+func TestLog_NoImplicitTraceWhenNoneInjected(t *testing.T) {
+	var buf bytes.Buffer
+	lg, err := New(Options{Level: "info", Env: "production", Output: &buf})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	lg.Info("plain")
+	if strings.Contains(buf.String(), "trace_id") {
+		t.Fatalf("unexpected trace_id in log without injected context: %s", buf.String())
+	}
+}
+
+func TestNewIgnoresAdvancedTraceClueEnvironment(t *testing.T) {
+	t.Setenv("FIT_TRACECLUE_BODY_TRUNCATION", "not-a-valid-mode")
+
+	logger, err := New(Options{Timezone: "UTC", Env: "test"})
+	if err != nil {
+		t.Fatalf("New() was affected by an Advanced-only TraceClue variable: %v", err)
+	}
+	if logger.schema != SchemaPlatform {
+		t.Fatalf("New() schema = %q, want %q", logger.schema, SchemaPlatform)
+	}
 }

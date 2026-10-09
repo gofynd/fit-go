@@ -15,10 +15,13 @@
 package health
 
 import (
+	"context"
 	"errors"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -409,4 +412,140 @@ func TestChecker_WriteHealthFile(t *testing.T) {
 			t.Error("Health file should be removed when unhealthy")
 		}
 	})
+}
+
+func TestCheckerPeriodicLifecycleStopsRestartsAndResets(t *testing.T) {
+	c := NewChecker()
+	t.Cleanup(c.Reset)
+
+	var calls atomic.Int32
+	c.AddCheck(func() string {
+		calls.Add(1)
+		return ""
+	})
+	c.startPeriodicCheck(2 * time.Millisecond)
+	waitForHealthCalls(t, &calls, 2)
+
+	c.StopPeriodicCheck()
+	stoppedAt := calls.Load()
+	time.Sleep(10 * time.Millisecond)
+	if got := calls.Load(); got != stoppedAt {
+		t.Fatalf("periodic check continued after StopPeriodicCheck: %d -> %d", stoppedAt, got)
+	}
+	c.StopPeriodicCheck() // idempotent
+
+	c.startPeriodicCheck(2 * time.Millisecond)
+	waitForHealthCalls(t, &calls, stoppedAt+2)
+	c.Reset()
+	resetAt := calls.Load()
+	time.Sleep(10 * time.Millisecond)
+	if got := calls.Load(); got != resetAt {
+		t.Fatalf("periodic check continued after Reset: %d -> %d", resetAt, got)
+	}
+	if errs := c.Check(); len(errs) != 0 {
+		t.Fatalf("reset checker returned errors: %v", errs)
+	}
+	c.mu.RLock()
+	checks := len(c.checks)
+	c.mu.RUnlock()
+	if checks != 0 {
+		t.Fatalf("Reset retained %d checks", checks)
+	}
+}
+
+func TestCheckerPeriodicLifecycleConcurrentStartStop(t *testing.T) {
+	c := NewChecker()
+	t.Cleanup(c.Reset)
+	c.AddCheck(func() string { return "" })
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.startPeriodicCheck(time.Millisecond)
+			_ = c.Check()
+			c.StopPeriodicCheck()
+		}()
+	}
+	wg.Wait()
+	c.Reset()
+}
+
+func TestResetContextHonorsShutdownDeadline(t *testing.T) {
+	c := NewChecker()
+	_ = os.Remove("/tmp/_healthz")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	c.AddCheck(func() string {
+		close(started)
+		<-release
+		return ""
+	})
+	c.startPeriodicCheck(time.Hour)
+	<-started
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	startedAt := time.Now()
+	err := c.ResetContext(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ResetContext error = %v; want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 250*time.Millisecond {
+		t.Fatalf("ResetContext exceeded shutdown bound: %s", elapsed)
+	}
+	if errs := c.Check(); len(errs) != 0 {
+		t.Fatalf("ResetContext retained checks after timeout: %v", errs)
+	}
+	close(release)
+	time.Sleep(10 * time.Millisecond)
+	if _, statErr := os.Stat("/tmp/_healthz"); !os.IsNotExist(statErr) {
+		t.Fatalf("stopped in-flight check recreated liveness file: %v", statErr)
+	}
+}
+
+func TestCheckerPeriodicLegacyMultiCallStartsAdditionalLoops(t *testing.T) {
+	c := NewChecker()
+	t.Cleanup(c.Reset)
+
+	var calls atomic.Int32
+	c.AddCheck(func() string {
+		calls.Add(1)
+		return ""
+	})
+	c.startAdditionalPeriodicCheck(time.Hour)
+	c.startAdditionalPeriodicCheck(time.Hour)
+	waitForHealthCalls(t, &calls, 2)
+
+	c.periodicMu.Lock()
+	loops := len(c.periodicStops)
+	c.periodicMu.Unlock()
+	if loops != 2 {
+		t.Fatalf("legacy multi-call loops = %d, want 2", loops)
+	}
+	c.StopPeriodicCheck()
+}
+
+func TestCheckerPeriodicIntervalParsingRetainsNumericPrefix(t *testing.T) {
+	if got := periodicIntervalSeconds(30, "17seconds"); got != 17 {
+		t.Fatalf("numeric-prefix interval = %d, want 17", got)
+	}
+	if got := periodicIntervalSeconds(12, "invalid"); got != 12 {
+		t.Fatalf("invalid interval fallback = %d, want 12", got)
+	}
+	if got := periodicIntervalSeconds(12, "0"); got != 12 {
+		t.Fatalf("non-positive interval fallback = %d, want 12", got)
+	}
+}
+
+func waitForHealthCalls(t *testing.T, calls *atomic.Int32, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for calls.Load() < want && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := calls.Load(); got < want {
+		t.Fatalf("health calls = %d, want at least %d", got, want)
+	}
 }
