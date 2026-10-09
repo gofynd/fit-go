@@ -2,6 +2,89 @@
 
 ## Status and scope
 
+### 2026-10-09 release candidate `v0.2.0-rc.7`
+
+This candidate packages the independently reviewed post-rc.6 corrections and
+all 15 permanent regression test families below. It is a new immutable revision,
+not a rewrite of any existing tag. The publication workflow verifies the remote
+PR branch/tag and downloaded module checksum before Metroplex adoption; that
+consumer's canonical library document records its separate `GOWORK=off` tests.
+The dated local preparation notes below become historical after publication.
+
+No additional runtime change was made during publication. Original-main APIs,
+constructor defaults, Kafka/Redis runtime, dependency versions and the Go
+1.25.10 minimum remain unchanged by this follow-up. The existing `otelhttp`
+v0.70.0 requirement is direct solely because the regression test imports it.
+Known x/net security, live-infrastructure, reverse-consumer and deployment
+gates remain; publication does not certify merge readiness or zero behavior
+differences for existing main users.
+
+### 2026-10-09 post-rc.6 contract-closure preparation (historical after rc.7 publication)
+
+These changes are local on top of `8d20a1f` / immutable `v0.2.0-rc.6`.
+They are **not in the published tag or remote PR**. Earlier fixes remain present;
+this pass closes related cases that their regression tests did not cover.
+Remote PR #3 still describes rc.5; updating that description and publishing a
+new immutable revision are separate authorized steps, not part of this local pass.
+
+| Remaining contract gap | Local correction | Permanent regression boundary |
+|---|---|---|
+| Sentry copied shared breadcrumbs but still wrote into other caller-owned surfaces | Detach every object modified by the sanitizer before either mandatory pass | Actual SDK shared-context capture under race; shared contexts/extras/tags/requests/mechanisms/frames/threads/spans at the sanitizer boundary; hook-introduced shared diagnostic graphs |
+| A sensitive Go field name disappeared behind a harmless JSON alias | Classify both the Go name and JSON output name, respecting `json:"-"` | Actual SDK export of `Pwd json:"value"` and numeric `CVV json:"verification"`; safe fields and cached serialization controls |
+| A repeated non-cyclic reference was classified as a cycle | Track only the active recursion path, including slice length | Shared DAGs, overlapping subslices and genuine map/slice/pointer cycles; an 8192-node traversal budget bounds alias expansion |
+| Feature versions crossed user-context and flag-identity namespaces | Reset server-evaluated repositories when accepting a new context's first event; compare versions within known UUIDs | Public HTTP lower-version current-user snapshot; recreated UUID full/incremental updates; old-UUID deletes; same-context rollback controls; missing-ID compatibility; buffered old-stream rejection |
+| Native OTel HTTP wrapping still called lazy FIT tracing initialization | Check FIT trace suppression before calling `tracing.Global` | Fresh-process tests with enabled/disabled/invalid FIT configuration; original provider/propagator, exactly native spans, request ownership, logging and metrics |
+
+Blast-radius boundaries: public APIs, legacy constructor defaults, Kafka/Redis
+runtime, dependency versions, Go minimum, Metroplex source/pin and deployment
+configuration are unchanged. Existing `otelhttp` v0.70.0 is marked as a direct
+dependency because the regression test imports the real transport; no new module
+or version is introduced. Legacy FeatureHub polling is untouched; client-evaluated
+attribute changes retain their shared version namespace. Key-only feature events
+cannot prove UUID recreation and retain historical version ordering.
+
+Sentry before-send hooks now receive detached diagnostic payloads. Span snapshots
+retain every public SDK field but intentionally do not copy private live-span
+context, parent, recorder, mutex or `sync.Once` state. Do not use these payloads
+as active span lifecycle objects. Existing 12-depth/100-entry nested collection
+limits remain; the new total-node budget masks exhausted diagnostic branches.
+The library cannot prevent the unchanged upstream SDK's frame preprocessing
+from modifying shared stack frames **before** `BeforeSend`; callers must not
+concurrently reuse a live/preprocessed SDK frame graph. The actual SDK context-map
+probe and post-processing hook probe are distinct from the direct-boundary test.
+
+Fresh validation uses `/tmp/fitgo-rc6-followup.RT3jfX/`; prior rc.6 results
+below do not certify this working tree. All 15 new top-level regression tests
+were matched with `go test -list` and passed under `-race -count=10` across
+`./errors ./feature ./httpclient`. The concrete defects reproduced before their
+fixes; the initial expanded SDK-frame fixture also exposed SDK preprocessing
+outside the sanitizer boundary. It was replaced with separate direct-boundary,
+SDK shared-context and post-processing-hook controls, not represented as an SDK
+preprocessing repair. Only the `*-final.json` fit-go runs below are final receipts.
+All five reported code findings are closed for this working tree by permanent
+regression tests and independent checks. This is not an unrestricted parity,
+security-clean, publication or deployment certification.
+
+| Fresh proof | Result | Artifact / command boundary |
+|---|---|---|
+| Fit-go full normal suite | 33 test-bearing packages; 3511 named test/subtest passes; 10 conditional infrastructure skips; zero failures | `GOWORK=off GOTOOLCHAIN=go1.25.10 go test -p 2 -count=1 -json ./...`; `fitgo-tests-final.json` |
+| Fit-go full race suite | 33 test-bearing packages; 3510 named test/subtest passes; the same 10 skips; zero failures | Go 1.26.9, `GOWORK=off go test -race -p 2 -count=1 -json ./...`; `fitgo-race-final.json` |
+| Fit-go build/vet/module/API | Build/vet pass on Go 1.25.10; tidy diff clean and module verification passes; zero incompatible exports against official main `df96a28` | Go 1.26.9 `apidiff -m -incompatible upstream.exp candidate.exp`; internal packages excluded |
+| Repeated contract probes | All 15 matched permanent test families pass race ten times; independent output-ownership/SDK-field/DAG probes also pass | `permanent-regressions-race.log`; the HTTP ownership test uses fresh subprocesses |
+| Affected package coverage | errors 87.5%; feature 80.7%; httpclient 91.8% | Go 1.25.10 `go test -coverprofile=affected.cover ./errors ./feature ./httpclient` |
+| Metroplex candidate workspace | Build/vet pass; full normal and full race suites each pass 270 test-bearing packages, 39332 named test/subtest passes, 106 conditional skips, zero failures | Explicit existing workfile plus `FIT_GO_LOCAL_INTEGRATION=1`; `metroplex-candidate-tests.json`, `metroplex-candidate-race.json` |
+| Metroplex published rc.6 | Build/vet and focused cmd/shared-observability/shared-httpx race suites pass | `GOWORK=off`; this does not select the unpublished fit-go source |
+| Security scanner | Five reachable x/net advisories remain; no reachable standard-library advisories on Go 1.26.9 | Fresh `govulncheck.json`; retained x/net v0.58.0 decision is unchanged |
+
+Normal and race named subtest counts differ slightly because of test-generated
+cases; the package outcomes and zero-failure results are the validation gate.
+Candidate and published-pin results are distinct. Metroplex's existing dirty
+source/pin and untracked-file hashes were verified unchanged. Fixture-dependent
+skips are not runtime proof: live Kafka/Sentinel/Cluster, provider/contract
+integration, production/UAT, organization-wide reverse consumers, and the
+accepted x/net security gates remain open. Contract packages whose TestMain
+exits without a live server were not executed as endpoint integration tests.
+
 ### 2026-10-09 release candidate `v0.2.0-rc.6`
 
 This candidate packages the post-rc.5 Sentry credential-key and HTTP abnormal-

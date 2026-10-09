@@ -170,7 +170,13 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// (proxy, x-request-id, safe logging) regardless. Do not swap to otelhttp.
 	var span *tracing.Span
 	spanEnded := false
-	if tracer := tracing.Global(); t.traceRequests && tracer != nil && tracer.IsEnabled() {
+	var tracer *tracing.Tracer
+	if t.traceRequests {
+		// Global may initialize and install FIT's OTel provider. Native OTel
+		// transports own tracing, so suppression must precede that side effect.
+		tracer = tracing.Global()
+	}
+	if tracer != nil && tracer.IsEnabled() {
 		ctx, s := tracer.StartSpan(req.Context(), "HTTP "+req.Method, tracing.SpanKindClient)
 		span = s
 		defer func() {

@@ -202,8 +202,8 @@ Selecting this release raises, through minimum version selection, these
 modules in every consumer's build (`go.mod`):
 
 - OpenTelemetry `otel`, `sdk`, `trace`, `metric`, `otlptracehttp` 1.43.0 →
-  1.45.0; gRPC 1.80.0 → 1.83.2; contrib 0.70.0 (`otelgrpc` direct, `otelhttp`
-  indirect); `golang.org/x/net`, `x/crypto`, `x/sys`, `x/text`, `x/sync`;
+  1.45.0; gRPC 1.80.0 → 1.83.2; contrib 0.70.0 (`otelgrpc` and `otelhttp`
+  direct); `golang.org/x/net`, `x/crypto`, `x/sys`, `x/text`, `x/sync`;
   `google.golang.org/genproto/googleapis/{api,rpc}`; gin's transitive
   dependencies (`bytedance/sonic`, `gin-contrib/sse`, `validator`, `go-json`,
   `quic-go`, …). Gin itself stays 1.12.0.
@@ -283,6 +283,21 @@ client cancels its one owned expiry timer before another can be armed. Legacy
 never opens an SSE stream. Context revision changes and full/incremental/delete
 event application are serialized: a buffered event from an older
 server-evaluated stream cannot mutate the newer context or publish readiness.
+The post-rc.6 correction included in rc.7 also scopes cached versions to the evaluated
+context and known flag UUID: a new context's first accepted event cannot retain
+the prior user's values, and a recreated flag can restart its version. Missing
+UUIDs retain historical key-based version ordering; client-evaluated attribute
+changes keep the shared repository. This correction is not backported into rc.6.
+
+The rc.7 Sentry follow-up sanitizes detached diagnostic payloads, checks both
+Go field names and JSON aliases, and preserves acyclic shared references under
+an 8192-node traversal budget. Public span fields are retained, but before-send
+span snapshots are not live SDK lifecycle objects: private context/parent/
+recorder/lock state is not copied. SDK preprocessing before the hooks is unchanged.
+Native OTel HTTP wrapping no longer initializes FIT tracing when FIT spans are
+suppressed; native tracing ownership and FIT logging/metrics/request IDs remain.
+These follow-ups are packaged in the new immutable rc.7 candidate. Verify its
+remote publication and checksum before consumer adoption; rc.6 remains unchanged.
 
 KafkaJS-compatible processing recovery rewinds the active Franz or Confluent
 group member to the earliest unprocessed record in every partition that failed

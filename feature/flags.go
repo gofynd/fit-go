@@ -69,12 +69,16 @@ type Client struct {
 	apiKey          string
 	clientEvaluated bool
 	features        map[string]*featureState
-	attributes      map[string][]string
-	defaults        map[string][]string
-	httpClient      *http.Client
-	reconnectDelay  time.Duration
-	snapshotTimeout time.Duration
-	refresh         chan struct{}
+	// featureContextRevision is guarded by mu. Server-evaluated values and
+	// their versions belong to one context; client-evaluated values instead
+	// share the global repository across attribute changes.
+	featureContextRevision uint64
+	attributes             map[string][]string
+	defaults               map[string][]string
+	httpClient             *http.Client
+	reconnectDelay         time.Duration
+	snapshotTimeout        time.Duration
+	refresh                chan struct{}
 	// retryJitter and staleRetention are injectable for deterministic tests.
 	// Nil/zero select equalRetryJitter and maxRetainedSnapshotAge.
 	retryJitter    func(time.Duration) time.Duration
@@ -1306,6 +1310,23 @@ func (c *Client) clearStaleRetention() {
 	c.staleTimerMu.Unlock()
 }
 
+// prepareFeatureNamespaceLocked runs only after rejecting an old stream
+// revision. A current-context event must not merge values or compare versions
+// against another user's repository. An incremental event can populate this
+// new namespace, but only a full snapshot publishes its readiness.
+func (c *Client) prepareFeatureNamespaceLocked(revision uint64) {
+	if c.features == nil || !c.clientEvaluated && c.featureContextRevision != revision {
+		c.features = make(map[string]*featureState)
+	}
+	c.featureContextRevision = revision
+}
+
+func featureIdentityChanged(current, incoming *featureState) bool {
+	// Key-only payloads cannot prove a recreation. Keep their historical
+	// version ordering until both snapshots identify distinct UUIDs.
+	return current.ID != "" && incoming.ID != "" && current.ID != incoming.ID
+}
+
 func (c *Client) applyFullFeatureSet(features []*featureState, revision uint64) bool {
 	incoming := make(map[string]struct{}, len(features))
 	c.mu.Lock()
@@ -1313,12 +1334,13 @@ func (c *Client) applyFullFeatureSet(features []*featureState, revision uint64) 
 		c.mu.Unlock()
 		return false
 	}
+	c.prepareFeatureNamespaceLocked(revision)
 	for _, feature := range features {
 		if feature == nil || feature.Key == "" {
 			continue
 		}
 		incoming[feature.Key] = struct{}{}
-		if current := c.features[feature.Key]; current == nil || featureVersion(feature) >= featureVersion(current) {
+		if current := c.features[feature.Key]; current == nil || featureIdentityChanged(current, feature) || featureVersion(feature) >= featureVersion(current) {
 			c.features[feature.Key] = feature
 		}
 	}
@@ -1351,7 +1373,8 @@ func (c *Client) applyFeature(feature *featureState, revision uint64) bool {
 		c.mu.Unlock()
 		return false
 	}
-	if current := c.features[feature.Key]; current == nil || featureVersion(feature) >= featureVersion(current) {
+	c.prepareFeatureNamespaceLocked(revision)
+	if current := c.features[feature.Key]; current == nil || featureIdentityChanged(current, feature) || featureVersion(feature) >= featureVersion(current) {
 		c.features[feature.Key] = feature
 	}
 	c.clearStaleRetention()
@@ -1369,8 +1392,12 @@ func (c *Client) deleteFeature(feature *featureState, revision uint64) bool {
 		c.mu.Unlock()
 		return false
 	}
+	c.prepareFeatureNamespaceLocked(revision)
 	current := c.features[feature.Key]
-	if current == nil || feature.Version == nil || *feature.Version == 0 || *feature.Version >= featureVersion(current) {
+	// Older UUIDs can still have buffered delete events after a key is reused.
+	// Key-only deletes retain the existing version-gated compatibility behavior.
+	sameIdentity := current == nil || feature.ID == "" || current.ID == "" || feature.ID == current.ID
+	if sameIdentity && (current == nil || feature.Version == nil || *feature.Version == 0 || *feature.Version >= featureVersion(current)) {
 		delete(c.features, feature.Key)
 	}
 	c.clearStaleRetention()

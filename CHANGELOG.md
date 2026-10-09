@@ -7,6 +7,10 @@ the module follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Release candidate publication
+- Release candidate `v0.2.0-rc.7` packages the reviewed post-rc.6 Sentry
+  diagnostic-ownership/credential-alias fixes, FeatureHub version namespaces,
+  native OTel HTTP ownership and their permanent regression tests. Existing
+  tags, runtime defaults, dependency versions and the Go minimum are unchanged.
 - Release candidate `v0.2.0-rc.6` packages structured Sentry credential masking,
   abnormal-exit HTTP span cleanup, and the README/example corrections below.
   It is a new immutable candidate on top of rc.5; no older tag is moved.
@@ -47,6 +51,19 @@ the module follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `InitSentryWithHooks` path supports retryable startup.
 
 ### Fixed
+- Post-rc.6 follow-up, included in rc.7 (not backported into rc.6): sanitize detached
+  Sentry diagnostic copies rather than mutating shared event contexts, requests,
+  frames, maps or span payloads. Classify both Go field names and JSON aliases;
+  preserve acyclic shared references while bounding their expansion to 8192
+  traversal nodes. Span payloads retain public SDK fields, not private live-span
+  context/recorder/lock state; SDK preprocessing before these hooks is unchanged.
+- Follow-up included in rc.7: scope streaming FeatureHub versions to the evaluated
+  context and known flag UUID. Accept a recreated flag's restarted version,
+  reject old-UUID deletes, and retain historical version guards for key-only
+  payloads. Legacy polling and client-evaluated context sharing are unchanged.
+- Follow-up included in rc.7: do not lazily initialize FIT tracing when wrapping
+  native `otelhttp.Transport`. Application provider/propagator ownership and
+  native spans are retained alongside FIT request IDs, logging and metrics.
 - Follow-up to published `v0.2.0-rc.5`, included in rc.6: mask structured Sentry
   credential aliases and numeric CVV/OTP/PIN/card values, including request
   headers, without matching harmless short-name substrings or changing opaque

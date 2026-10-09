@@ -29,8 +29,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"maps"
 	"os"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -518,6 +520,7 @@ func sanitizeSentryEvent(event *sentrylib.Event) *sentrylib.Event {
 	if event == nil {
 		return nil
 	}
+	event = detachSentryEvent(event)
 	// The SDK freezes dynamic sampling context before BeforeSend and keeps it
 	// outside the JSON event. Redacting Transaction alone does not redact the
 	// envelope header. Its public getter returns a copy, with no direct setter.
@@ -541,14 +544,7 @@ func sanitizeSentryEvent(event *sentrylib.Event) *sentrylib.Event {
 			sanitizeSentryMap(event.Exception[i].Mechanism.Data)
 		}
 	}
-	// sentry-go scope cloning copies the breadcrumb pointer slice, not the
-	// breadcrumb values themselves. BeforeSend can therefore receive events whose
-	// breadcrumbs (and Data maps) are shared with another in-flight event. Clone
-	// each breadcrumb before sanitizing so concurrent captures never write the
-	// same object or map.
-	for index, original := range event.Breadcrumbs {
-		breadcrumb := cloneSentryBreadcrumb(original)
-		event.Breadcrumbs[index] = breadcrumb
+	for _, breadcrumb := range event.Breadcrumbs {
 		if breadcrumb == nil {
 			continue
 		}
@@ -685,6 +681,84 @@ func cloneSentryBreadcrumb(original *sentrylib.Breadcrumb) *sentrylib.Breadcrumb
 	return &cloned
 }
 
+// detachSentryEvent copies every public object this sanitizer modifies. The SDK
+// clones scope maps, but event-provided maps, frame slices and span pointers can
+// still be shared by otherwise independent captures. Nested variable values are
+// copied by the bounded reflected walk; no original graph is changed here.
+// Event has no locks. Its private caches/DSC survive this shallow copy only until
+// the existing cache-free public projection at the end of sanitization.
+func detachSentryEvent(original *sentrylib.Event) *sentrylib.Event {
+	cloned := *original
+	cloned.Breadcrumbs = slices.Clone(original.Breadcrumbs)
+	for index, breadcrumb := range original.Breadcrumbs {
+		cloned.Breadcrumbs[index] = cloneSentryBreadcrumb(breadcrumb)
+	}
+	cloned.Extra = maps.Clone(original.Extra)
+	cloned.Contexts = maps.Clone(original.Contexts)
+	for key, values := range original.Contexts {
+		cloned.Contexts[key] = maps.Clone(values)
+	}
+	cloned.Tags = maps.Clone(original.Tags)
+	cloned.Fingerprint = slices.Clone(original.Fingerprint)
+	cloned.Exception = slices.Clone(original.Exception)
+	for index := range cloned.Exception {
+		exception := &cloned.Exception[index]
+		exception.Stacktrace = cloneSentryStacktrace(exception.Stacktrace)
+		if exception.Mechanism != nil {
+			mechanism := *exception.Mechanism
+			mechanism.Data = maps.Clone(mechanism.Data)
+			exception.Mechanism = &mechanism
+		}
+	}
+	cloned.Threads = slices.Clone(original.Threads)
+	for index := range cloned.Threads {
+		cloned.Threads[index].Stacktrace = cloneSentryStacktrace(cloned.Threads[index].Stacktrace)
+	}
+	if original.Request != nil {
+		request := *original.Request
+		request.Headers = maps.Clone(request.Headers)
+		request.Env = maps.Clone(request.Env)
+		cloned.Request = &request
+	}
+	cloned.Spans = slices.Clone(original.Spans)
+	for index, span := range original.Spans {
+		cloned.Spans[index] = cloneSentrySpanSnapshot(span)
+	}
+	return &cloned
+}
+
+func cloneSentryStacktrace(original *sentrylib.Stacktrace) *sentrylib.Stacktrace {
+	if original == nil {
+		return nil
+	}
+	cloned := *original
+	cloned.Frames = slices.Clone(original.Frames)
+	for index := range cloned.Frames {
+		frame := &cloned.Frames[index]
+		frame.Vars = maps.Clone(frame.Vars)
+		frame.PreContext = slices.Clone(frame.PreContext)
+		frame.PostContext = slices.Clone(frame.PostContext)
+	}
+	return &cloned
+}
+
+// BeforeSend receives spans as diagnostic export payloads, not live span
+// lifecycles. Project their public fields without copying SDK mutex/Once state
+// or starting synthetic spans. Private Context/parent/recorder state is not
+// reproduced; the snapshot retains every public wire and sampling field.
+func cloneSentrySpanSnapshot(original *sentrylib.Span) *sentrylib.Span {
+	if original == nil {
+		return nil
+	}
+	return &sentrylib.Span{
+		TraceID: original.TraceID, SpanID: original.SpanID, ParentSpanID: original.ParentSpanID,
+		Name: original.Name, Op: original.Op, Description: original.Description, Status: original.Status,
+		Tags: maps.Clone(original.Tags), StartTime: original.StartTime, EndTime: original.EndTime,
+		Extra: maps.Clone(original.Extra), Data: maps.Clone(original.Data), Sampled: original.Sampled,
+		Source: original.Source, Origin: original.Origin,
+	}
+}
+
 func sanitizeSentryStacktrace(stacktrace *sentrylib.Stacktrace) {
 	if stacktrace == nil {
 		return
@@ -709,27 +783,52 @@ func sanitizeSentryStacktrace(stacktrace *sentrylib.Stacktrace) {
 }
 
 func sanitizeSentryMap(values map[string]interface{}) {
-	visited := make(map[sentryVisit]struct{})
+	state := newSentryValueTraversal()
 	for key, value := range values {
-		values[key] = sanitizeSentryValueDepth(key, value, visited, 0)
+		values[key] = sanitizeSentryValueDepth(key, value, state, 0)
 	}
 }
 
 func sanitizeSentryValue(key string, value interface{}) interface{} {
-	return sanitizeSentryValueDepth(key, value, make(map[sentryVisit]struct{}), 0)
+	return sanitizeSentryValueDepth(key, value, newSentryValueTraversal(), 0)
 }
 
 const (
 	maxSentryValueDepth = 12
 	maxSentryCollection = 100
+	maxSentryValueNodes = 8192
 )
 
 type sentryVisit struct {
 	typ reflect.Type
 	ptr uintptr
+	len int // Overlapping acyclic subslices may share a backing pointer.
 }
 
-func sanitizeSentryValueDepth(key string, value interface{}, visited map[sentryVisit]struct{}, depth int) interface{} {
+type sentryValueTraversal struct {
+	active map[sentryVisit]struct{}
+	nodes  int
+}
+
+func newSentryValueTraversal() *sentryValueTraversal {
+	return &sentryValueTraversal{active: make(map[sentryVisit]struct{})}
+}
+
+// Shared acyclic values must not be mistaken for cycles, but expanding a DAG
+// can grow exponentially. Bound the complete walk and mask exhausted branches;
+// this is diagnostic truncation, not a restriction on application payloads.
+func (s *sentryValueTraversal) takeNode() bool {
+	if s.nodes >= maxSentryValueNodes {
+		return false
+	}
+	s.nodes++
+	return true
+}
+
+func sanitizeSentryValueDepth(key string, value interface{}, state *sentryValueTraversal, depth int) interface{} {
+	if !state.takeNode() {
+		return redact.Mask
+	}
 	if sensitiveSentryKey(key) {
 		return redact.Mask
 	}
@@ -757,7 +856,7 @@ func sanitizeSentryValueDepth(key string, value interface{}, visited map[sentryV
 	case time.Time:
 		return typed.UTC().Format(time.RFC3339Nano)
 	default:
-		return sanitizeReflectedSentryValue(reflect.ValueOf(value), visited, depth)
+		return sanitizeReflectedSentryValue(reflect.ValueOf(value), state, depth)
 	}
 }
 
@@ -782,7 +881,7 @@ func validSentryCorrelationID(key, value string) bool {
 	return true
 }
 
-func sanitizeReflectedSentryValue(value reflect.Value, visited map[sentryVisit]struct{}, depth int) interface{} {
+func sanitizeReflectedSentryValue(value reflect.Value, state *sentryValueTraversal, depth int) interface{} {
 	if !value.IsValid() {
 		return nil
 	}
@@ -811,22 +910,27 @@ func sanitizeReflectedSentryValue(value reflect.Value, visited map[sentryVisit]s
 		if value.IsNil() {
 			return nil
 		}
-		if seenSentryReference(value, visited) {
+		if seenSentryReference(value, state.active) {
 			return redact.Mask
 		}
-		return sanitizeReflectedSentryValue(value.Elem(), visited, depth+1)
+		defer delete(state.active, sentryReference(value))
+		if !state.takeNode() {
+			return redact.Mask
+		}
+		return sanitizeReflectedSentryValue(value.Elem(), state, depth+1)
 	case reflect.Map:
 		if value.IsNil() {
 			return nil
 		}
-		if seenSentryReference(value, visited) || value.Type().Key().Kind() != reflect.String {
+		if value.Type().Key().Kind() != reflect.String || seenSentryReference(value, state.active) {
 			return redact.Mask
 		}
+		defer delete(state.active, sentryReference(value))
 		result := make(map[string]interface{})
 		iter := value.MapRange()
 		for len(result) < maxSentryCollection && iter.Next() {
 			nestedKey := iter.Key().String()
-			result[nestedKey] = sanitizeSentryValueDepth(nestedKey, iter.Value().Interface(), visited, depth+1)
+			result[nestedKey] = sanitizeSentryValueDepth(nestedKey, iter.Value().Interface(), state, depth+1)
 		}
 		return result
 	case reflect.Slice, reflect.Array:
@@ -837,9 +941,10 @@ func sanitizeReflectedSentryValue(value reflect.Value, visited map[sentryVisit]s
 			if value.IsNil() {
 				return nil
 			}
-			if seenSentryReference(value, visited) {
+			if seenSentryReference(value, state.active) {
 				return redact.Mask
 			}
+			defer delete(state.active, sentryReference(value))
 		}
 		length := value.Len()
 		if length > maxSentryCollection {
@@ -847,7 +952,7 @@ func sanitizeReflectedSentryValue(value reflect.Value, visited map[sentryVisit]s
 		}
 		result := make([]interface{}, length)
 		for i := 0; i < length; i++ {
-			result[i] = sanitizeSentryValueDepth("", value.Index(i).Interface(), visited, depth+1)
+			result[i] = sanitizeSentryValueDepth("", value.Index(i).Interface(), state, depth+1)
 		}
 		return result
 	case reflect.Struct:
@@ -866,7 +971,11 @@ func sanitizeReflectedSentryValue(value reflect.Value, visited map[sentryVisit]s
 			if jsonName != "" {
 				name = jsonName
 			}
-			result[name] = sanitizeSentryValueDepth(name, value.Field(i).Interface(), visited, depth+1)
+			if sensitiveSentryKey(field.Name) || sensitiveSentryKey(name) {
+				result[name] = redact.Mask
+			} else {
+				result[name] = sanitizeSentryValueDepth(name, value.Field(i).Interface(), state, depth+1)
+			}
 		}
 		return result
 	default:
@@ -875,7 +984,7 @@ func sanitizeReflectedSentryValue(value reflect.Value, visited map[sentryVisit]s
 }
 
 func seenSentryReference(value reflect.Value, visited map[sentryVisit]struct{}) bool {
-	visit := sentryVisit{typ: value.Type(), ptr: value.Pointer()}
+	visit := sentryReference(value)
 	if visit.ptr == 0 {
 		return false
 	}
@@ -884,6 +993,14 @@ func seenSentryReference(value reflect.Value, visited map[sentryVisit]struct{}) 
 	}
 	visited[visit] = struct{}{}
 	return false
+}
+
+func sentryReference(value reflect.Value) sentryVisit {
+	visit := sentryVisit{typ: value.Type(), ptr: value.Pointer()}
+	if value.Kind() == reflect.Slice {
+		visit.len = value.Len()
+	}
+	return visit
 }
 
 // sensitiveSentryCredentialAlias recognizes short credential names as complete
