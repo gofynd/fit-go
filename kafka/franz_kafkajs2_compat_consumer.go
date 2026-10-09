@@ -428,9 +428,15 @@ func (c *franzKafkaJS2CompatConsumer) consumeMessages(handler kafkaJSMessageHand
 			return nil
 		}
 		groups := groupKafkaJSRecords(fetches.Records())
-		if err = runKafkaJSRecordGroups(runCtx, groups, concurrency, func(group []*kgo.Record) error {
+		if err = runKafkaJSRecordGroups(runCtx, groups, concurrency, func(groupCtx context.Context, group []*kgo.Record) error {
 			for index, record := range group {
-				if err := c.processRecord(runCtx, client, record, handler, isAutoCommit, opts); err != nil {
+				var next *consumerRecordPosition
+				if index+1 < len(group) {
+					position := kafkaJSRecordPosition(group[index+1])
+					next = &position
+				}
+				setConsumerWorkerPosition(groupCtx, kafkaJSRecordPosition(record), next)
+				if err := c.processRecord(groupCtx, client, record, handler, isAutoCommit, opts); err != nil {
 					if errors.Is(err, errKafkaJSUnresolvedRecordRewound) {
 						return err
 					}
@@ -534,7 +540,7 @@ func groupKafkaJSRecords(records []*kgo.Record) [][]*kgo.Record {
 	return groups
 }
 
-func runKafkaJSRecordGroups(ctx context.Context, groups [][]*kgo.Record, concurrency int, process func([]*kgo.Record) error) error {
+func runKafkaJSRecordGroups(ctx context.Context, groups [][]*kgo.Record, concurrency int, process func(context.Context, []*kgo.Record) error) error {
 	if len(groups) == 0 {
 		return nil
 	}
@@ -555,7 +561,16 @@ func runKafkaJSRecordGroups(ctx context.Context, groups [][]*kgo.Record, concurr
 			case <-ctx.Done():
 				return
 			}
-			if err := process(group); err != nil {
+			var position *consumerRecordPosition
+			if len(group) > 0 {
+				first := kafkaJSRecordPosition(group[0])
+				position = &first
+			}
+			workerCtx, progress := newConsumerWorkerContext(ctx, position)
+			defer progress.reportIncomplete(errs)
+			err := process(workerCtx, group)
+			progress.completed = true
+			if err != nil {
 				errs <- err
 			}
 		}()
@@ -605,6 +620,7 @@ func (c *franzKafkaJS2CompatConsumer) processRecord(
 		// pre-handler commit succeeds, at-most-once must never replay the record,
 		// including when its handler fails while the member loses ownership.
 		c.completeRecoveryPosition(kafkaJSRecordPosition(record))
+		markConsumerWorkerCommitted(ctx)
 	}
 	if opts.OffsetFinalizer != nil {
 		return runTracedMessageLifecycle(ctx, payload, MessageHandlerCtx(handler), func(messageCtx context.Context, handlerErr error) error {
@@ -861,7 +877,7 @@ func (c *franzKafkaJS2CompatConsumer) consumeBatches(handler kafkaJSBatchHandler
 			return nil
 		}
 		groups := groupKafkaJSRecords(fetches.Records())
-		if err = runKafkaJSRecordGroups(runCtx, groups, concurrency, func(group []*kgo.Record) error {
+		if err = runKafkaJSRecordGroups(runCtx, groups, concurrency, func(groupCtx context.Context, group []*kgo.Record) error {
 			if len(group) == 0 {
 				return nil
 			}
@@ -874,7 +890,7 @@ func (c *franzKafkaJS2CompatConsumer) consumeBatches(handler kafkaJSBatchHandler
 			}
 			if len(visible) == 0 {
 				resolutionErr := withConsumerRewindPosition(
-					resolveKafkaJSRecord(runCtx, client, lastFetched, isAutoCommit, c.config.AutoCommit, false),
+					resolveKafkaJSRecord(groupCtx, client, lastFetched, isAutoCommit, c.config.AutoCommit, false),
 					kafkaJSRecordPosition(lastFetched),
 				)
 				if resolutionErr == nil {
@@ -883,17 +899,19 @@ func (c *franzKafkaJS2CompatConsumer) consumeBatches(handler kafkaJSBatchHandler
 				return resolutionErr
 			}
 			firstPosition := kafkaJSRecordPosition(visible[0])
+			setConsumerWorkerPosition(groupCtx, firstPosition, nil)
 			messages := make([]MessagePayload, len(visible))
 			for i, record := range visible {
 				messages[i] = kafkaJSPayload(record)
 			}
 			if !isAutoCommit && opts.CommitBeforeHandler {
-				if err := client.CommitRecords(runCtx, lastFetched); err != nil {
+				if err := client.CommitRecords(groupCtx, lastFetched); err != nil {
 					return withConsumerRewindPosition(classifyKafkaJSTransientConsumerError(
 						fmt.Errorf("kafka/kafkajs: pre-handler batch commit failed: %w", err),
 					), firstPosition)
 				}
 				c.completeRecoveryPosition(kafkaJSRecordPosition(lastFetched))
+				markConsumerWorkerCommitted(groupCtx)
 			}
 			lastVisible := visible[len(visible)-1]
 			payload := BatchPayload{
@@ -904,7 +922,7 @@ func (c *franzKafkaJS2CompatConsumer) consumeBatches(handler kafkaJSBatchHandler
 				LastOffset:  lastVisible.Offset,
 			}
 			handlerErr := func() error {
-				callbackCtx, cleanup := enterConsumerCallback(runCtx, c)
+				callbackCtx, cleanup := enterConsumerCallback(groupCtx, c)
 				defer cleanup()
 				return handler(callbackCtx, payload)
 			}()
@@ -918,7 +936,7 @@ func (c *franzKafkaJS2CompatConsumer) consumeBatches(handler kafkaJSBatchHandler
 				return nil
 			}
 			resolutionErr := withConsumerRewindPosition(
-				resolveKafkaJSRecord(runCtx, client, lastFetched, isAutoCommit, c.config.AutoCommit, false),
+				resolveKafkaJSRecord(groupCtx, client, lastFetched, isAutoCommit, c.config.AutoCommit, false),
 				firstPosition,
 			)
 			if resolutionErr == nil {
@@ -948,11 +966,7 @@ func (c *franzKafkaJS2CompatConsumer) consumeBatches(handler kafkaJSBatchHandler
 // time as shutdown. Only an error wrapping the run context's own terminal
 // error is suppressed; unrelated processing failures must remain visible.
 func isKafkaJSRunCancellation(ctx context.Context, err error) bool {
-	if ctx == nil || err == nil {
-		return false
-	}
-	runErr := ctx.Err()
-	return runErr != nil && errors.Is(err, runErr)
+	return isConsumerRunCancellation(ctx, err)
 }
 
 func (c *franzKafkaJS2CompatConsumer) beginRun() (franzKafkaJS2CompatClient, context.Context, context.Context, func(), error) {

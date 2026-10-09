@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -288,6 +289,8 @@ type ioredisClusterTransport struct {
 	stop       chan struct{}
 	closedOnce sync.Once
 	stopOnce   sync.Once
+	closeOnce  sync.Once
+	closeErr   error
 	stopped    bool
 }
 
@@ -338,30 +341,37 @@ func (t *ioredisClusterTransport) Close() error {
 	if t == nil {
 		return nil
 	}
-	failures := 0
-	t.stopOnce.Do(func() { close(t.stop) })
-	t.closedOnce.Do(func() { close(t.closed) })
-	t.mu.Lock()
-	t.stopped = true
-	nodes := make(map[string]IORedisTransport, len(t.nodes))
-	for address, node := range t.nodes {
-		nodes[address] = node
-	}
-	t.mu.Unlock()
-	for _, node := range nodes {
-		if err := node.Close(); err != nil {
-			failures++
+	t.closeOnce.Do(func() {
+		failures := 0
+		t.stopOnce.Do(func() { close(t.stop) })
+		t.closedOnce.Do(func() { close(t.closed) })
+		t.mu.Lock()
+		t.stopped = true
+		nodes := make([]IORedisTransport, 0, len(t.nodes))
+		for _, node := range t.nodes {
+			nodes = append(nodes, node)
 		}
-	}
-	if failures > 0 {
-		return fmt.Errorf("redis: %d Cluster node connections failed to close", failures)
-	}
-	return nil
+		t.mu.Unlock()
+		for _, node := range nodes {
+			if err := node.Close(); err != nil {
+				failures++
+			}
+		}
+		if failures > 0 {
+			t.closeErr = fmt.Errorf("redis: %d Cluster node connections failed to close", failures)
+		}
+	})
+	return t.closeErr
 }
 
 func (t *ioredisClusterTransport) Exchange(ctx context.Context, commands [][]string) IORedisExchange {
 	if t == nil || len(commands) == 0 {
 		return IORedisExchange{WriteDisposition: IORedisNotWritten, Error: errors.New("redis: empty Cluster exchange")}
+	}
+	if len(commands) == 1 && len(commands[0]) == 1 && strings.EqualFold(commands[0][0], "QUIT") {
+		// The public Quit helper queues this control command after all admitted
+		// requests. Raw Submit("QUIT") remains rejected by queue validation.
+		return t.quit(ctx)
 	}
 	type commandRoute struct {
 		index   int
@@ -436,6 +446,64 @@ func (t *ioredisClusterTransport) Exchange(ctx context.Context, commands [][]str
 		}
 	}
 	return IORedisExchange{Replies: replies, WriteDisposition: IORedisFullyWritten, MayHaveExecuted: true}
+}
+
+func (t *ioredisClusterTransport) quit(ctx context.Context) IORedisExchange {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	t.mu.Lock()
+	if t.stopped {
+		t.mu.Unlock()
+		return IORedisExchange{Error: newIORedisTerminalError(IORedisConnectionClosedError{})}
+	}
+	// Prevent a concurrently connecting redirect node from joining after the
+	// snapshot; nodeForAddress closes such a connection instead of leaking it.
+	t.stopped = true
+	addresses := make([]string, 0, len(t.nodes))
+	for address := range t.nodes {
+		addresses = append(addresses, address)
+	}
+	sort.Strings(addresses)
+	nodes := make([]IORedisTransport, 0, len(addresses))
+	for _, address := range addresses {
+		nodes = append(nodes, t.nodes[address])
+	}
+	t.mu.Unlock()
+	t.stopOnce.Do(func() { close(t.stop) })
+	stopCancellation := context.AfterFunc(ctx, func() { _ = t.Close() })
+	defer stopCancellation()
+
+	var quitErr error
+	for _, node := range nodes {
+		if err := ctx.Err(); err != nil {
+			quitErr = err
+			break
+		}
+		exchange := node.Exchange(ctx, [][]string{{"quit"}})
+		var err error
+		switch {
+		case exchange.Error != nil:
+			err = exchange.Error
+		case len(exchange.Replies) != 1:
+			err = errors.New("redis: Cluster node returned an invalid QUIT reply count")
+		case exchange.Replies[0].Error != nil:
+			err = exchange.Replies[0].Error
+		case exchange.Replies[0].Value != "OK":
+			err = errors.New("redis: Cluster node returned an invalid QUIT reply")
+		}
+		if err != nil && quitErr == nil {
+			quitErr = newIORedisSafeError("redis: Cluster node QUIT failed", err)
+		}
+	}
+	closeErr := t.Close()
+	if quitErr == nil {
+		quitErr = closeErr
+	}
+	if quitErr != nil {
+		return IORedisExchange{WriteDisposition: IORedisFullyWritten, Error: newIORedisTerminalError(quitErr)}
+	}
+	return IORedisExchange{Replies: []IORedisReply{{Value: "OK"}}, WriteDisposition: IORedisFullyWritten}
 }
 
 func (t *ioredisClusterTransport) route(command []string) (string, error) {

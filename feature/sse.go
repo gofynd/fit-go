@@ -19,8 +19,56 @@ package feature
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"io"
+	"strings"
 )
+
+var errFeatureSSEEventTooLarge = errors.New("FeatureHub SSE event exceeds the 16 MiB size limit")
+
+// featureSSEEvent bounds the complete event, not just each scanner line. Count
+// fields even when they replace earlier metadata or are unrecognized, so a
+// malformed event cannot bypass the limit by spreading data across lines. SSE
+// comments are not event fields and do not accumulate state.
+type featureSSEEvent struct {
+	name      string
+	data      strings.Builder
+	bytes     int
+	dataLines int
+}
+
+func (e *featureSSEEvent) appendLine(line string) error {
+	if strings.HasPrefix(line, ":") {
+		return nil
+	}
+	// Include a normalized line terminator; subtraction avoids integer overflow
+	// and also bounds the newline inserted between empty data fields.
+	if len(line) >= maxSSEEventSize-e.bytes {
+		return errFeatureSSEEventTooLarge
+	}
+	e.bytes += len(line) + 1
+	field, value, found := strings.Cut(line, ":")
+	if found {
+		value = strings.TrimPrefix(value, " ")
+	}
+	switch field {
+	case "event":
+		e.name = value
+	case "data":
+		if e.dataLines > 0 {
+			e.data.WriteByte('\n')
+		}
+		e.data.WriteString(value)
+		e.dataLines++
+	}
+	return nil
+}
+
+func (e *featureSSEEvent) empty() bool { return e.name == "" && e.dataLines == 0 }
+
+// Reset releases the previous event's buffer instead of retaining the largest
+// event for the entire lifetime of a streaming client.
+func (e *featureSSEEvent) reset() { *e = featureSSEEvent{} }
 
 // SSE permits LF, CRLF and lone CR, and ignores one UTF-8 BOM at stream start.
 // Consume CR immediately so a live stream ending its event with CR does not

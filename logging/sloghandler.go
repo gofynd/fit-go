@@ -22,6 +22,8 @@ package logging
 import (
 	"context"
 	"fmt"
+	"io"
+	"log"
 	"log/slog"
 	"runtime"
 	"strings"
@@ -45,6 +47,13 @@ type slogDefaultOwner struct {
 	previous  *slogDefaultOwner
 	baseline  *slog.Logger
 	active    bool
+	// slog.SetDefault also replaces the standard logger's writer and flags.
+	// Track those independently: an application may replace either without
+	// changing slog.Default. Prefix is not changed by our installation or restore.
+	standardWriterBefore    io.Writer
+	standardWriterInstalled io.Writer
+	standardFlagsBefore     int
+	standardFlagsInstalled  int
 }
 
 // NewSlogHandler returns a slog.Handler that writes through l using the logger's
@@ -55,8 +64,9 @@ func NewSlogHandler(l *Logger) slog.Handler {
 
 // SetAsDefaultSlog installs l as the process-wide log/slog default, so plain
 // slog.Info/Warn/Error calls (including from dependencies) land in the fit log
-// stream. Call once at boot; fit.Init does this automatically. The returned
-// function restores the previous default if this installation still owns it.
+// stream. Call once at boot; fit.InitManaged does this automatically. The returned
+// function restores owned slog and standard-log state without replacing later
+// independent changes. The original fit.Init does not install this bridge.
 func SetAsDefaultSlog(l *Logger) (restore func()) {
 	installed := slog.New(NewSlogHandler(l))
 	slogDefaultOwners.Lock()
@@ -68,13 +78,17 @@ func SetAsDefaultSlog(l *Logger) (restore func()) {
 		previousOwner = nil
 	}
 	owner := &slogDefaultOwner{
-		installed: installed,
-		previous:  previousOwner,
-		baseline:  slog.Default(),
-		active:    true,
+		installed:            installed,
+		previous:             previousOwner,
+		baseline:             slog.Default(),
+		active:               true,
+		standardWriterBefore: log.Writer(),
+		standardFlagsBefore:  log.Flags(),
 	}
 	slogDefaultOwners.current = owner
 	slog.SetDefault(installed)
+	owner.standardWriterInstalled = log.Writer()
+	owner.standardFlagsInstalled = log.Flags()
 	slogDefaultOwners.Unlock()
 
 	var once sync.Once
@@ -97,13 +111,51 @@ func SetAsDefaultSlog(l *Logger) (restore func()) {
 			if slog.Default() != installed {
 				return
 			}
+			writer, flags := standardLogRestoreState(owner)
 			if previous != nil {
 				slog.SetDefault(previous.installed)
 			} else {
 				slog.SetDefault(fallback)
 			}
+			// Restore exact snapshots after SetDefault: a baseline defaultHandler
+			// does not restore its log writer, while a custom handler replaces it.
+			// Independently changed fields are retained by the state calculation.
+			log.SetOutput(writer)
+			log.SetFlags(flags)
 		})
 	}
+}
+
+func standardLogRestoreState(owner *slogDefaultOwner) (io.Writer, int) {
+	writer, flags := log.Writer(), log.Flags()
+	writerOwned := writer == owner.standardWriterInstalled
+	flagsOwned := flags == owner.standardFlagsInstalled
+	if writerOwned {
+		writer = owner.standardWriterBefore
+	}
+	if flagsOwned {
+		flags = owner.standardFlagsBefore
+	}
+	for previous := owner.previous; previous != nil && !previous.active; previous = previous.previous {
+		// Installed writers are comparable standard-library handler pointers.
+		// Before snapshots may be any io.Writer; differing dynamic types compare
+		// safely, including an application writer whose value is not comparable.
+		if writerOwned {
+			if writer == previous.standardWriterInstalled {
+				writer = previous.standardWriterBefore
+			} else {
+				writerOwned = false
+			}
+		}
+		if flagsOwned {
+			if flags == previous.standardFlagsInstalled {
+				flags = previous.standardFlagsBefore
+			} else {
+				flagsOwned = false
+			}
+		}
+	}
+	return writer, flags
 }
 
 func (h *slogHandler) Enabled(_ context.Context, lvl slog.Level) bool {

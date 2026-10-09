@@ -106,6 +106,105 @@ type consumerRecordPosition struct {
 	leaderEpoch int32
 }
 
+var errConsumerWorkerAborted = errors.New("kafka: partition worker exited before processing completed")
+
+type consumerWorkerContextKey struct{}
+
+// consumerWorkerProgress belongs exclusively to one partition worker. Deferred
+// reporting runs before its wait-group completion, so readers observe the plan
+// only after the worker has stopped. No process-wide callback state is involved.
+type consumerWorkerProgress struct {
+	position    consumerRecordPosition
+	next        consumerRecordPosition
+	hasPosition bool
+	hasNext     bool
+	completed   bool
+}
+
+type consumerWorkerAbortedError struct {
+	position    consumerRecordPosition
+	hasPosition bool
+}
+
+func (e *consumerWorkerAbortedError) Error() string { return errConsumerWorkerAborted.Error() }
+func (e *consumerWorkerAbortedError) Unwrap() error { return errConsumerWorkerAborted }
+func (e *consumerWorkerAbortedError) consumerRewindPositions() []consumerRecordPosition {
+	if !e.hasPosition {
+		return nil // The pre-handler commit already covered all admitted records.
+	}
+	return []consumerRecordPosition{e.position}
+}
+
+func newConsumerWorkerContext(ctx context.Context, position *consumerRecordPosition) (context.Context, *consumerWorkerProgress) {
+	progress := &consumerWorkerProgress{}
+	if position != nil {
+		progress.position, progress.hasPosition = *position, true
+	}
+	return context.WithValue(ctx, consumerWorkerContextKey{}, progress), progress
+}
+
+func setConsumerWorkerPosition(ctx context.Context, position consumerRecordPosition, next *consumerRecordPosition) {
+	progress, _ := ctx.Value(consumerWorkerContextKey{}).(*consumerWorkerProgress)
+	if progress == nil {
+		return // Original-main synchronous handlers have no worker checkpoint.
+	}
+	progress.position, progress.hasPosition = position, true
+	progress.hasNext = next != nil
+	if next != nil {
+		progress.next = *next
+	}
+}
+
+func markConsumerWorkerCommitted(ctx context.Context) {
+	if progress, _ := ctx.Value(consumerWorkerContextKey{}).(*consumerWorkerProgress); progress != nil {
+		progress.position, progress.hasPosition = progress.next, progress.hasNext
+	}
+}
+
+func (p *consumerWorkerProgress) reportIncomplete(errs chan<- error) {
+	if !p.completed {
+		// runtime.Goexit runs defers without returning from user code. Publish an
+		// authoritative failure rather than treating an absent result as success.
+		// Panics are deliberately not recovered and retain their runtime behavior.
+		errs <- &consumerWorkerAbortedError{position: p.position, hasPosition: p.hasPosition}
+	}
+}
+
+// isConsumerRunCancellation suppresses only wholly cancellation-related errors.
+// errors.Is alone is insufficient for joined partition/finalizer failures: one
+// cancelled branch must never conceal an unrelated sibling application error.
+func isConsumerRunCancellation(ctx context.Context, err error) bool {
+	if ctx == nil || err == nil || ctx.Err() == nil {
+		return false
+	}
+	runErr := ctx.Err()
+	var onlyCancellation func(error) bool
+	onlyCancellation = func(current error) bool {
+		if current == nil {
+			return false
+		}
+		if joined, ok := current.(interface{ Unwrap() []error }); ok {
+			children := joined.Unwrap()
+			if len(children) == 0 {
+				return false
+			}
+			for _, child := range children {
+				if !onlyCancellation(child) {
+					return false
+				}
+			}
+			return true
+		}
+		if wrapped, ok := current.(interface{ Unwrap() error }); ok {
+			if cause := wrapped.Unwrap(); cause != nil {
+				return onlyCancellation(cause)
+			}
+		}
+		return errors.Is(current, runErr)
+	}
+	return onlyCancellation(err)
+}
+
 // awaitConsumerRebalanceHook preserves the original synchronous callback
 // contract while allowing a legacy hook to call Consumer.Close. Close signals
 // closeRequested before it waits for the active run; the driver callback can

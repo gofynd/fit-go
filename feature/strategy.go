@@ -214,7 +214,7 @@ func matchAttributeValue(value string, attribute strategyAttribute) bool {
 		if !ok {
 			return false
 		}
-		return matchString(parsed.Format("2006-01-02"), attribute)
+		return matchString(parsed.UTC().Format("2006-01-02"), attribute)
 	case "DATETIME":
 		parsed, ok := parseFeatureDate(value)
 		if !ok {

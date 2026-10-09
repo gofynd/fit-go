@@ -1637,6 +1637,9 @@ func (cc *ConfluentConsumer) consumeMessages(handler confluentMessageHandler, op
 		} else if err := runConfluentPartitionGroups(ctx, groups, concurrency, func(groupCtx context.Context, group confluentBatchGroup) error {
 			return cc.processAssignedMessageGroup(groupCtx, consumer, group, handler, isAutoCommit, opts)
 		}); err != nil {
+			if isConsumerRunCancellation(ctx, err) {
+				return nil
+			}
 			return cc.prepareHandlerRunRetry(consumer, err)
 		}
 		if deferredReadErr != nil {
@@ -1679,6 +1682,12 @@ func (cc *ConfluentConsumer) processMessageGroup(
 			return nil
 		}
 		payload := group.payload.Messages[i]
+		var next *consumerRecordPosition
+		if i+1 < len(group.messages) {
+			position := confluentRecordPosition(group.messages[i+1])
+			next = &position
+		}
+		setConsumerWorkerPosition(ctx, confluentRecordPosition(message), next)
 		if !isAutoCommit && opts.CommitBeforeHandler {
 			if _, err := consumer.CommitMessage(message); err != nil {
 				cc.logMessageFailure("kafka/confluent: pre-handler commit failed", message, err)
@@ -1687,6 +1696,7 @@ func (cc *ConfluentConsumer) processMessageGroup(
 					confluentRecordPosition(message),
 				)
 			}
+			markConsumerWorkerCommitted(ctx)
 		}
 
 		if opts.OffsetFinalizer != nil {
@@ -1755,7 +1765,7 @@ func (cc *ConfluentConsumer) processMessageGroup(
 				cc.logMessageFailure("kafka/confluent: message handler error", message, handlerErr)
 				continue
 			}
-			if ctx.Err() != nil {
+			if isConsumerRunCancellation(ctx, handlerErr) {
 				return nil
 			}
 			cc.logMessageFailure("kafka/confluent: message handler error", message, handlerErr)
@@ -1905,7 +1915,25 @@ func (cc *ConfluentConsumer) consumeBatches(handler confluentBatchHandler, opts 
 				if ctx.Err() != nil {
 					return nil
 				}
-				return fmt.Errorf("kafka/confluent: consume batch error: %w", err)
+				pollErr := fmt.Errorf("kafka/confluent: consume batch error: %w", err)
+				if !cc.legacy && len(messages) > 0 {
+					// ReadMessage has advanced past the collected records, but none
+					// reached a handler. Preserve their exact offsets before returning
+					// the poll error, so a retry cannot commit beyond skipped work.
+					var failures []error
+					for _, group := range groupConfluentBatchMessagesWithAssignments(messages, assignments) {
+						release := cc.beginPartitionDispatch(group)
+						if release == nil {
+							continue // A rebalance has already removed this assignment.
+						}
+						failures = append(failures, withConsumerRewindPosition(pollErr, confluentRecordPosition(group.messages[0])))
+						release()
+					}
+					if len(failures) > 0 {
+						return cc.prepareHandlerRunRetry(consumer, errors.Join(failures...))
+					}
+				}
+				return pollErr
 			}
 			messages = append(messages, message)
 			if !cc.legacy {
@@ -1935,6 +1963,9 @@ func (cc *ConfluentConsumer) consumeBatches(handler confluentBatchHandler, opts 
 		} else if err := runConfluentPartitionGroups(ctx, groups, concurrency, func(groupCtx context.Context, group confluentBatchGroup) error {
 			return cc.processAssignedBatchGroup(groupCtx, consumer, group, handler, isAutoCommit, opts)
 		}); err != nil {
+			if isConsumerRunCancellation(ctx, err) {
+				return nil
+			}
 			return cc.prepareHandlerRunRetry(consumer, err)
 		}
 	}
@@ -1969,6 +2000,9 @@ func (cc *ConfluentConsumer) processBatchGroup(
 		ctx, cleanup = enterConsumerCallback(ctx, cc)
 		defer cleanup()
 	}
+	if len(group.messages) > 0 {
+		setConsumerWorkerPosition(ctx, confluentRecordPosition(group.messages[0]), nil)
+	}
 	if !isAutoCommit && opts.CommitBeforeHandler {
 		if _, err := consumer.CommitMessage(group.lastMessage); err != nil {
 			cc.logBatchFailure("kafka/confluent: pre-handler batch commit failed", group.payload, err)
@@ -1977,6 +2011,7 @@ func (cc *ConfluentConsumer) processBatchGroup(
 				confluentRecordPosition(group.messages[0]),
 			)
 		}
+		markConsumerWorkerCommitted(ctx)
 	}
 	if err := handler(ctx, group.payload); err != nil {
 		if cc.legacy {
@@ -1986,7 +2021,7 @@ func (cc *ConfluentConsumer) processBatchGroup(
 			cc.logBatchFailure("kafka/confluent: batch handler error", group.payload, err)
 			return err
 		}
-		if ctx.Err() != nil {
+		if isConsumerRunCancellation(ctx, err) {
 			return nil
 		}
 		cc.logBatchFailure("kafka/confluent: batch handler error", group.payload, err)
@@ -2340,7 +2375,16 @@ func runConfluentPartitionGroups(
 		go func(current confluentBatchGroup) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if err := handler(ctx, current); err != nil {
+			var position *consumerRecordPosition
+			if len(current.messages) > 0 {
+				first := confluentRecordPosition(current.messages[0])
+				position = &first
+			}
+			workerCtx, progress := newConsumerWorkerContext(ctx, position)
+			defer progress.reportIncomplete(errs)
+			err := handler(workerCtx, current)
+			progress.completed = true
+			if err != nil {
 				errs <- err
 			}
 		}(group)

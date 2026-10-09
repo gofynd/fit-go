@@ -124,6 +124,16 @@ the existing reply/replay ledger must reconcile those outcomes first. Empty
 offline `Quit` can use the existing immediate shutdown path. This does not
 change retry limits, ambiguous-replay policy, or the default go-redis client.
 
+The `v0.2.0-rc.5` remediation makes public `Quit(ctx)` an ordered
+control operation, not a routed application command. It stops new admissions,
+drains previously accepted commands, sends QUIT to every connected Cluster node,
+and closes all owned connections. The first caller's context bounds its wait and
+final QUIT exchanges; it does not cancel already accepted commands. Repeated
+calls observe the same terminal result. Server rejection, connection failure and
+cancellation also finish the lifecycle instead of leaving the client closing
+forever. Raw `Submit("QUIT")` remains rejected. These changes are contained in
+rc.5, not the earlier immutable rc.4 tag.
+
 The following remain adoption gates:
 
 - live Node 22.22.0/ioredis 5.11.1 versus Go record/replay for connect loss before

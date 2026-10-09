@@ -48,6 +48,7 @@ func RunBoundary(ctx context.Context, options BoundaryOptions, operation func(co
 	if err != nil {
 		return err
 	}
+	completed := false
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			if span != nil {
@@ -61,7 +62,11 @@ func RunBoundary(ctx context.Context, options BoundaryOptions, operation func(co
 			panic(recovered)
 		}
 		if span != nil {
-			if err != nil {
+			if !completed {
+				// Goexit runs defers without returning an error or a panic. Do not
+				// report an operation that never returned as successful.
+				span.SetStatus(StatusError, "boundary terminated")
+			} else if err != nil {
 				span.SetAttribute("error.type", fmt.Sprintf("%T", err))
 				span.SetStatus(StatusError, "boundary failed")
 			} else {
@@ -73,7 +78,9 @@ func RunBoundary(ctx context.Context, options BoundaryOptions, operation func(co
 			span.End()
 		}
 	}()
-	return operation(ctx)
+	err = operation(ctx)
+	completed = true
+	return err
 }
 
 // RunBoundaryWithResult is RunBoundary for operations returning a result.

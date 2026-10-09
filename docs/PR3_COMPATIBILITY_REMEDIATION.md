@@ -2,7 +2,162 @@
 
 ## Status and scope
 
-### 2026-10-09 publication target: `v0.2.0-rc.4`
+### 2026-10-09 cumulative runtime remediation (`v0.2.0-rc.5`)
+
+Release candidate `v0.2.0-rc.5` packages this repair pass on top of published
+`9269ce6` / immutable `v0.2.0-rc.4`, compared with official main `df96a28`.
+Existing tags are not rewritten. Metroplex must select the new remote tag and
+verify its checksum and tests with `GOWORK=off`; the earlier temporary-workspace
+results below are pre-publication evidence, not proof of a remote-module pin.
+Metroplex's application-owned Sentry repair remains a separate local change.
+Publishing this candidate does not deploy either repository or certify the PR
+as merge-ready. No Kubernetes operation or remote PR-description edit is included.
+
+| Review finding | Scoped correction | Required regression boundary |
+|---|---|---|
+| Kafka partition worker exits without a result | Private worker checkpoints report abnormal termination and retain the first unresolved offset; already successful pre-handler commits are not undone | Message/batch, both backends, Goexit in handler/finalizer/commit, multi-partition waves, all commit modes, repeated retry and legacy synchronous behavior |
+| Shutdown hides real errors | Suppress cancellation only if every joined error branch is cancellation-related; advanced Confluent no longer discards arbitrary handler failures | Pure cancellation, joined application/cancellation errors, independent sibling failures, message/batch, legacy error identity |
+| Advanced Confluent partial batch poll loses fetched records | Rewind owned collected records before returning a subsequent poll error | Retry on the same consumer, exact fetched offsets and ownership; original-main legacy collection behavior remains unchanged |
+| Cluster public Quit never completes | Graceful control operation drains accepted commands and settles the lifecycle across success, failure and cancellation | Ready/offline, cluster/standalone, repeated Quit, queued commands and real Redis topology tests |
+| FeatureHub event limit only bounds lines | Shared accumulator bounds aggregate event fields in both streaming and Build snapshots | Multiline/empty/metadata fields, exact bounds, oversized events, reset, CR/LF/BOM framing and unfinished EOF |
+| DATE rollout timezone mismatch | Convert supplied DATE values to UTC before comparison, as the pinned JS SDK does | Positive/negative timezone crossings and DATE/DATETIME controls; original polling unchanged |
+| Managed slog restoration leaves stdlib logs behind | Snapshot and restore the standard writer/flags with the slog ownership chain, preserving independent replacements | All owner restore orders, repeat cycles, external logger/writer/flags, prefix and minimum Go version |
+| Metroplex owns a separate breadcrumb race | Copy event fields that its sanitizer mutates before applying the existing privacy rules | Shared breadcrumbs, actual SDK cloned hubs, immutable inputs and concurrent capture under race |
+| Health stop waits behind filesystem I/O | Atomic stop signalling and context-bounded cleanup waiting; legacy background-context cleanup remains synchronous | Concurrent stops, pending writes/checks, reset/replacement, deadline and unbounded controls |
+| Non-HTTP boundary reports Goexit as successful | Only mark successful after the operation actually returns | Original returned-error/panic identity, ended span, restored active context and Goexit status |
+
+Compatibility constraints: exported APIs and official-main constructor defaults
+remain unchanged; no HTTP/event/data/Redis-key schema change or new consumer
+adoption is introduced. New Kafka recovery applies only to additive consumers.
+The inherited **legacy** Confluent partial-batch polling limitation stays intact.
+The runtime fixes do not approve a module minimum-Go upgrade, relax privacy,
+change commit-before-handler into at-least-once delivery, or expand unsupported
+ioredis command modes.
+
+An OS filesystem syscall cannot be cancelled by a Go context. Deadline-bound
+health callers now stop waiting without acquiring the filesystem writer's I/O
+lock; framework initialization/shutdown still hold their lifecycle mutex around
+the bounded reset. An already admitted write/remove can finish after the error
+return. Graceful background
+stops still join writes. A permanently blocked OS cleanup can retain its one
+cleanup goroutine; callers must not treat a timed-out reset as completed file
+cleanup. This is an explicit operating-system limit, not a cancellation guarantee.
+
+Validation of this final runtime tree is recorded below after implementation and
+independent cross-review. The Go/dependency security decision remains separate:
+preserve Go 1.25.10 unless a Go 1.26 minimum is explicitly approved. Live UAT/prod
+and organization-wide reverse-dependency validation remain distinct release gates.
+
+#### Final-source library validation
+
+The runtime source was frozen before the following whole-tree checks. Reports
+are retained in `/tmp/fitgo-final-validation.9flRuD/`; these checks include the
+uncommitted source and new regression files, not just commit `9269ce6`.
+
+| Check | Result / evidence |
+|---|---|
+| Minimum supported toolchain | Go 1.25.10, `GOWORK=off`: full tests, build and vet pass |
+| Full race suite | Go 1.26.9, `GOWORK=off`: all 32 test-bearing packages pass, no test skips; `fitgo-final-race.json` |
+| Full ordinary suite | All 32 test-bearing packages pass, no test skips; `fitgo-final-tests.json` |
+| Real Kafka and mixed membership | All eight live Kafka test families run inside both full suites, using isolated Kafka 7.3.2 and the installed KafkaJS 2.2.4; includes transactions/control records, offset metadata, multi-partition transient failures, real ownership loss, drain and Node/Go mixed groups |
+| Real Redis topologies | Sentinel and three-node Cluster tests run inside both full suites, including accepted-command drain and repeated public Quit |
+| Adversarial review probes | The pre-fix aggregate SSE, UTC DATE, Cluster Quit, stdlib-log restoration and Metroplex shared-breadcrumb probes pass unchanged under race |
+| Official-main exported API | `apidiff -m -incompatible` against main `df96a28`: zero incompatible changes; `candidate.exp`. Positional-layout/default-contract guard tests also pass |
+| Module hygiene | Minimum-toolchain `go mod tidy -diff`, `go mod verify`, gofmt and `git diff --check` pass; actual `go.mod`/`go.sum` remain unchanged |
+| Metroplex final-source integration | Isolated workspace: full suite passes all 270 test-bearing packages, with 106 conditional test/subtest skips; `metroplex-final-tests.json`. Build/vet and targeted composition-root, consumer, repository, scheduler, Redis and observability race suites pass |
+| Metroplex published-pin control | `GOWORK=off`, Go 1.26.9: full suite passes the same 270 packages with 106 conditional skips, then build/vet pass; `metroplex-published-pin-tests.json`. Application-owned Sentry race tests also pass with the published dependency |
+
+Coverage is measured for the affected packages, not claimed for every package
+in Commerce: FeatureHub 80.6%, health 88.8%, Kafka 83.4%, logging 89.2%, Redis
+86.3%, tracing 90.5%, and Metroplex shared observability 87.3%. Profiles are
+`fitgo-affected-coverage.out`, `feature-final-coverage.out` and
+`metroplex-sentry-coverage.out`. This measurement omits the live fixture env;
+the earlier full live suites supply that separate evidence. Coverage is a
+discovery signal, not a claim of universal parity.
+
+After the live runs, a test-only fixture added 31 DATE/DATETIME positive,
+negative, invalid-input, comparison and fallback cases. Every expected result
+was checked against `MatcherRegistry` in installed FeatureHub JavaScript SDK
+1.4.0, using `feature/testdata/date_strategy_fixture.json`; the public Go context
+evaluation is also asserted. No runtime source or live harness changed.
+FeatureHub's normal/coverage and race reruns pass, including the new fixture.
+Final whole-tree offline reruns are recorded separately below and must not be
+confused with the no-skip live-fixture runs above.
+
+After that test-only addition, Go 1.25.10 full ordinary tests and Go 1.26.9 full
+race tests pass all 32 test-bearing packages, with 10 expected live-infrastructure
+test/subtest skips because the isolated fixtures have been removed. Reports:
+`fitgo-final-offline-tests.json` and `fitgo-final-offline-race.json`. Final vet and
+diff checks also pass. The same unchanged runtime source passed those ten live
+paths in both full suites before fixture cleanup; the new pure date fixture
+passes against the isolated security-upgrade copy as well.
+
+The fixtures use only newly created, uniquely named Docker resources. No
+existing local service, shared broker, cluster or datastore is used or altered.
+This is runtime/library regression evidence, not universal FIT.js parity or
+live UAT/prod certification. Local socket/mock tests and real dependency tests
+are distinguished from deployment and reverse-consumer gates.
+
+Command ledger (run from the fit-go worktree; live fixtures must be provisioned
+before reuse, because this pass removes its isolated containers after testing):
+
+```sh
+export FIT_GO_KAFKA_RUNTIME_BROKER=127.0.0.1:29097
+export FIT_GO_KAFKAJS_NODE_MODULE=/home/user/brunt/Commerce/services/sentinel/node_modules/kafkajs
+export FIT_GO_KAFKAJS_EXPECTED_VERSION=2.2.4
+export FIT_GO_REDIS_SENTINEL_LIVE_URI='redis-sentinel://127.0.0.1:27315/0?master=primary'
+export FIT_GO_REDIS_CLUSTER_LIVE_URI='redis://127.0.0.1:27311/0?sharded_db=true'
+GOWORK=off GOTOOLCHAIN=go1.25.10 GOMAXPROCS=2 go test -p=2 -count=1 -json ./...
+GOWORK=off GOTOOLCHAIN=go1.25.10 GOMAXPROCS=2 go build -p=2 ./...
+GOWORK=off GOTOOLCHAIN=go1.25.10 GOMAXPROCS=2 go vet -p=2 ./...
+GOWORK=off GOTOOLCHAIN=go1.26.9 GOMAXPROCS=2 go test -p=2 -race -count=1 -json ./...
+```
+
+The Kafka broker is a newly created plaintext Kafka 7.3.2/ZooKeeper pair. Redis
+7 fixtures use Cluster ports 27311–27313, primary 27314 and Sentinel 27315;
+all bind only to localhost. Never substitute a shared or production endpoint
+for these write-producing tests. Metroplex candidate tests use the explicit
+temporary workspace described above, Go 1.26.9 and `go test -p=2 -count=1 -json
+./...`; published-pin controls use `GOWORK=off` instead. The original consumer
+workspace is never rewritten.
+
+#### Security compatibility decision (not silently applied)
+
+With the patched Go 1.26.9 build toolchain, the unchanged dependency graph still
+has five reachable `golang.org/x/net` advisories: GO-2026-6603, GO-2026-6610,
+GO-2026-6611, GO-2026-6612 and GO-2026-6617. There are no reachable standard-
+library findings on that toolchain. The JSON report
+`vulnerabilities-compatible.json` contains findings despite its successful tool
+exit; that exit must not be interpreted as a clean scan.
+
+A disposable copy with minimum Go 1.26.0, `x/net` v0.60.0, `x/crypto` v0.57.0,
+`x/sync` v0.23.0, `x/sys` v0.48.0 and `x/text` v0.42.0 scans with **zero reachable
+findings** using Go 1.26.9 (`vulnerabilities-upgraded.json`). It is not the actual
+library dependency graph. Its full fit-go tests (including the live fixtures),
+build/vet and Metroplex build/vet pass; `security-candidate-tests.json` records 32
+test-bearing packages with no skips. Applying it requires an explicit minimum-Go decision;
+retaining Go 1.25.10 does not make the current graph security-clean. On 2026-10-09
+the user explicitly chose to retain the existing dependencies and Go minimum and
+publish a new candidate; the security upgrade is deferred, not fixed or waived
+as a merge-readiness claim. Do not call this PR security-clean or merge-ready
+while that gate is unresolved. The current primary
+advisory is [GO-2026-6617](https://pkg.go.dev/vuln/GO-2026-6617); release engineering
+must use a patched build toolchain, independently of the module's Go directive.
+
+#### Candidate publication checks
+
+The rc.5 publication reruns use the unchanged runtime and regression files above,
+with `GOWORK=off`. Go 1.25.10 full tests, build/vet, `go mod tidy -diff` and
+`go mod verify` pass. The Go 1.26.9 full race rerun also passes. Both test suites
+pass all 32 test-bearing packages and report ten expected live-infrastructure
+test/subtest skips; the earlier isolated live evidence is recorded separately.
+An additional API export comparison against official main `df96a28` reports zero
+incompatible changes. Reports are in `/tmp/fitgo-rc5-publication.8CRMsk/`.
+The actual `go.mod` and `go.sum` are unchanged. Published-tag download/checksum
+and Metroplex `GOWORK=off` results belong in Metroplex's local library document
+after the new remote tag is available; they are not asserted in advance here.
+
+### Published baseline: `v0.2.0-rc.4` (historical findings before this local pass)
 
 This release candidate packages the follow-ups to `11f29d2` below. Their
 "local only"/"not published" headings and validation entries are historical

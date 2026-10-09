@@ -887,15 +887,14 @@ func (c *Client) consumeStream(ctx context.Context, revision uint64) (bool, erro
 	}
 
 	scanner := newFeatureSSEScanner(resp.Body)
-	var eventName string
-	var data []string
+	var event featureSSEEvent
 	dispatch := func() error {
-		if eventName == "" && len(data) == 0 {
+		if event.empty() {
+			event.reset()
 			return nil
 		}
-		err := c.handleEvent(eventName, strings.Join(data, "\n"), revision)
-		eventName = ""
-		data = data[:0]
+		err := c.handleEvent(event.name, event.data.String(), revision)
+		event.reset()
 		return err
 	}
 	for scanner.Scan() {
@@ -906,20 +905,8 @@ func (c *Client) consumeStream(ctx context.Context, revision uint64) (bool, erro
 			}
 			continue
 		}
-		if strings.HasPrefix(line, ":") {
-			continue
-		}
-		field, value, found := strings.Cut(line, ":")
-		if !found {
-			field, value = line, ""
-		} else {
-			value = strings.TrimPrefix(value, " ")
-		}
-		switch field {
-		case "event":
-			eventName = value
-		case "data":
-			data = append(data, value)
+		if err := event.appendLine(line); err != nil {
+			return false, err
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -1021,29 +1008,18 @@ func (c *Client) consumeEvaluationSnapshot(ctx context.Context, attributes map[s
 	}
 
 	scanner := newFeatureSSEScanner(resp.Body)
-	var eventName string
-	var data []string
+	var event featureSSEEvent
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line != "" {
-			if strings.HasPrefix(line, ":") {
-				continue
-			}
-			field, value, found := strings.Cut(line, ":")
-			if found {
-				value = strings.TrimPrefix(value, " ")
-			}
-			switch field {
-			case "event":
-				eventName = value
-			case "data":
-				data = append(data, value)
+			if err := event.appendLine(line); err != nil {
+				return nil, false, err
 			}
 			continue
 		}
 
-		payload := strings.Join(data, "\n")
-		switch eventName {
+		payload := event.data.String()
+		switch event.name {
 		case "features":
 			var states []*featureState
 			if err := json.Unmarshal([]byte(payload), &states); err != nil {
@@ -1057,7 +1033,7 @@ func (c *Client) consumeEvaluationSnapshot(ctx context.Context, attributes map[s
 			}
 			return features, false, nil
 		case "failure", "error":
-			return nil, false, fmt.Errorf("FeatureHub emitted %s", eventName)
+			return nil, false, fmt.Errorf("FeatureHub emitted %s", event.name)
 		case "config":
 			var config map[string]json.RawMessage
 			if err := json.Unmarshal([]byte(payload), &config); err == nil {
@@ -1071,8 +1047,7 @@ func (c *Client) consumeEvaluationSnapshot(ctx context.Context, attributes map[s
 		case "bye":
 			return nil, false, io.EOF
 		}
-		eventName = ""
-		data = data[:0]
+		event.reset()
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, false, err

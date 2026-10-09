@@ -50,7 +50,7 @@ func TestReviewKafkaJSWaveDoesNotLetRewoundSentinelHideSiblingFailure(t *testing
 		{{Topic: "orders", Partition: 0, Offset: 1}},
 		{{Topic: "orders", Partition: 1, Offset: 2}},
 	}
-	err := runKafkaJSRecordGroups(context.Background(), groups, 2, func(group []*kgo.Record) error {
+	err := runKafkaJSRecordGroups(context.Background(), groups, 2, func(_ context.Context, group []*kgo.Record) error {
 		if group[0].Partition == 0 {
 			return errKafkaJSUnresolvedRecordRewound
 		}

@@ -142,6 +142,7 @@ items are deliberate and pinned by guard tests
 | Tracer re-init (`tracing/tracing.go`, `initWithOptions`) | `sync.Once`: `Init` → `Shutdown` → `Init` returned the shut-down tracer; a failed init was never retried | Same (`9b8754c`). Only the additive `InitSDK` creates a fresh tracer after shutdown or retries |
 | Released tracer instrumentation scope (`tracing/tracing.go`) | `fit.go/<Options.ServiceName>`, independent of resource `service.name` | Same, including when an attribute overrides resource identity. Resolved-resource scope naming is limited to opt-in SDK constructors |
 | Span lookup helpers (`tracing/tracing.go`, `SpanFromContext`, `TraceIDFromContext`, `SpanIDFromContext`) | fit-go context keys only | Also fall back to (and prefer) a valid native OTel span context, e.g. one created by otelgin/otelgrpc. `ContextWithTrace` values keep their precedence |
+| Trace decorators (`tracing.Decorators.Trace`, `TraceWithResult`) | Did not publish goroutine-local context | When a real OTel tracer is available, publish the child context for the duration of the operation and restore the prior context; this changes implicit correlation and adds goroutine-ID lookup overhead. Failed-SDK/in-memory paths still skip that store |
 | `kafka.TracedMessageHandler` with tracing enabled (`kafka/tracing.go`) | Span `kafka.consume <topic>`; parent from a hand-parsed `traceparent`; four `messaging.*` attributes; raw status message | Span `process <topic>`; parent extracted through the installed global propagator (`traceparent`, `tracestate`, baggage; remote parent); extra `messaging.destination.name`, `messaging.operation.*`, `messaging.destination.partition.id`, `messaging.kafka.offset` attributes; span context published as the goroutine-local active context for the handler; status message redacted |
 | Legacy `ConfluentProducer.Close` (`kafka/confluent.go`, `closeLegacy`) | Synchronous `Flush(15s)` then `Close` under the producer lock | Total wait capped at 15 s; if exceeded it logs a warning and returns `nil` while flush/close continue in the background. Concurrent `Close` callers wait for the same completion |
 | `utils.HTTPClient.Do` (`utils/http.go`) | Always generated a new request ID for its log line; `http.DefaultTransport.(*http.Transport)` assertion panicked if the default transport was replaced | Reuses a caller-supplied `x-request-id` in the log line (the wire header is not added on this path); a replaced `http.DefaultTransport` is used as-is with the `ProxyURL`/proxy-list setting ignored instead of panicking |
@@ -353,12 +354,14 @@ BSON/error-classification rollout gate.
 
 Metroplex's local `internal/app.go` uses `GetDecodedSecretFromGSM` and
 `UseHealthRouteMiddleware`. Its previous remote replacement is
-`v0.2.0-rc.3` at `11f29d2`. The next publication target, `v0.2.0-rc.4`,
-packages the follow-up corrections without moving existing tags. Repin
+`v0.2.0-rc.4` at `9269ce6`. The next publication target, `v0.2.0-rc.5`,
+packages the cumulative runtime corrections without moving existing tags. Repin
 Metroplex locally to that immutable remote candidate and rerun with
 `GOWORK=off`; preserve its existing application edits. Record the published-
 pin evidence in Metroplex's library document. The candidate does not close
-the remaining issues listed in the remediation ledger's publication status.
+the security and deployment/reverse-consumer gates listed in the remediation
+ledger's publication status. Its dependencies and Go minimum remain unchanged
+by explicit user decision.
 An official
 release after upstream merge is a separate pin migration; the fork replacement
 must remain until that official immutable tag is available and validated.

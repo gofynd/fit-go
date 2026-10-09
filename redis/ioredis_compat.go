@@ -288,6 +288,7 @@ type ioredisRequest struct {
 	commands         [][]string
 	pipeline         bool
 	quit             bool
+	quitContext      context.Context
 	exclusive        bool
 	replays          int
 	ambiguousReplays int
@@ -338,6 +339,7 @@ type IORedisCompatClient struct {
 	ready         bool
 	retryAttempts int
 	firstReadyErr error
+	quitFuture    *ioredisFutureState
 }
 
 // NewIORedisCompatClient starts the eager connection and reconnect loop.
@@ -614,18 +616,30 @@ func parseIORedisXReadPrefix(command []string) (streamsIndex int, blocking, boun
 // Quit appends QUIT after every already accepted command and waits for its
 // settlement. New commands are rejected once Quit begins. If no connection and
 // no queued command exist, it resolves locally like ioredis's offline QUIT
-// special case.
+// special case. The context bounds waiting and the final QUIT operation, not
+// commands admitted earlier. Repeated callers observe the same shutdown result.
 func (c *IORedisCompatClient) Quit(ctx context.Context) error {
 	if c == nil {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	request := &ioredisRequest{
-		commands: [][]string{{"quit"}},
-		quit:     true,
-		future:   newIORedisFutureState(),
-		span:     startIORedisCompatibilitySpan(ctx, [][]string{{"quit"}}, false),
+		commands:    [][]string{{"quit"}},
+		quit:        true,
+		exclusive:   true,
+		quitContext: ctx,
+		future:      newIORedisFutureState(),
+		span:        startIORedisCompatibilitySpan(ctx, [][]string{{"quit"}}, false),
 	}
 	c.mu.Lock()
+	if c.quitFuture != nil {
+		future := c.quitFuture
+		c.mu.Unlock()
+		finishIORedisCompatibilitySpan(request.span, nil, nil)
+		return c.waitForQuit(ctx, future)
+	}
 	if c.closed {
 		c.mu.Unlock()
 		finishIORedisCompatibilitySpan(request.span, nil, nil)
@@ -643,20 +657,54 @@ func (c *IORedisCompatClient) Quit(ctx context.Context) error {
 		}
 	}
 	c.closing = true
+	c.quitFuture = request.future
 	if len(c.queue) == 0 && !c.ready {
 		c.disconnecting = true
 		c.mu.Unlock()
 		c.complete(request, []IORedisReply{{Value: "OK"}}, nil)
 		c.cancel()
 		c.signal()
-		return nil
+		return c.waitForQuit(ctx, request.future)
 	}
 	c.queue = append(c.queue, request)
 	c.mu.Unlock()
 	c.signal()
-	future := &IORedisFuture{state: request.future}
-	_, err := future.Wait(ctx)
-	return err
+	return c.waitForQuit(ctx, request.future)
+}
+
+func (c *IORedisCompatClient) waitForQuit(ctx context.Context, state *ioredisFutureState) error {
+	_, err := (&IORedisFuture{state: state}).Wait(ctx)
+	select {
+	case <-c.done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// A Quit failure is terminal: unlike ordinary commands, it must not leave a
+// closing client with an empty queue and a reconnect loop that can never end.
+func (c *IORedisCompatClient) stopAfterQuitFailure() {
+	c.mu.Lock()
+	c.disconnecting = true
+	c.mu.Unlock()
+	c.cancel()
+	c.signal()
+}
+
+func ioredisRequestContext(parent context.Context, request *ioredisRequest) (context.Context, func()) {
+	if !request.quit || request.quitContext == nil {
+		return parent, func() {}
+	}
+	ctx, cancel := context.WithCancel(request.quitContext)
+	stopParent := context.AfterFunc(parent, cancel)
+	if parent.Err() != nil {
+		cancel()
+	}
+	return ctx, func() {
+		stopParent()
+		cancel()
+	}
 }
 
 // Disconnect immediately stops reconnecting and settles every accepted item
@@ -780,9 +828,30 @@ func (c *IORedisCompatClient) run() {
 			}
 		}
 
-		exchange := transport.Exchange(c.ctx, request.commands)
+		exchangeContext, finishContext := ioredisRequestContext(c.ctx, request)
+		exchange := transport.Exchange(exchangeContext, request.commands)
+		finishContext()
 		if exchange.Error == nil && len(exchange.Replies) != len(request.commands) {
 			exchange.Error = fmt.Errorf("ioredis transport returned %d replies for %d commands", len(exchange.Replies), len(request.commands))
+		}
+		if request.quit {
+			quitErr := exchange.Error
+			if quitErr == nil {
+				quitErr = exchange.Replies[0].Error
+				if quitErr == nil && exchange.Replies[0].Value != "OK" {
+					quitErr = errors.New("redis: ioredis QUIT returned an invalid reply")
+				}
+			}
+			if closeErr := transport.Close(); quitErr == nil {
+				quitErr = closeErr
+			}
+			transport = nil
+			if quitErr != nil {
+				quitErr = newIORedisSafeError("redis: ioredis QUIT failed", quitErr)
+			}
+			c.pop(request)
+			c.complete(request, exchange.Replies, quitErr)
+			return
 		}
 		if exchange.Error == nil {
 			c.pop(request)
@@ -791,11 +860,6 @@ func (c *IORedisCompatClient) run() {
 				commandErr = exchange.Replies[0].Error
 			}
 			c.complete(request, exchange.Replies, commandErr)
-			if request.quit {
-				_ = transport.Close()
-				transport = nil
-				return
-			}
 			continue
 		}
 		if terminal, ok := asIORedisTerminalError(exchange.Error); ok {
@@ -870,7 +934,7 @@ type ioredisInFlight struct {
 func (c *IORedisCompatClient) runDuplexSession(transport ioredisDuplexTransport) (bool, error) {
 	writeRequests := make(chan *ioredisRequest)
 	writeResults := make(chan ioredisDuplexWriteResult, 1)
-	readRequests := make(chan struct{})
+	readRequests := make(chan *ioredisRequest)
 	readResults := make(chan ioredisDuplexReadResult, 1)
 	sessionCtx, cancel := context.WithCancel(c.ctx)
 	defer cancel()
@@ -879,7 +943,9 @@ func (c *IORedisCompatClient) runDuplexSession(transport ioredisDuplexTransport)
 		for {
 			select {
 			case request := <-writeRequests:
-				exchange := transport.writeCommands(sessionCtx, request.commands)
+				requestContext, finishContext := ioredisRequestContext(sessionCtx, request)
+				exchange := transport.writeCommands(requestContext, request.commands)
+				finishContext()
 				writeResults <- ioredisDuplexWriteResult{request: request, exchange: exchange}
 			case <-sessionCtx.Done():
 				return
@@ -889,8 +955,10 @@ func (c *IORedisCompatClient) runDuplexSession(transport ioredisDuplexTransport)
 	go func() {
 		for {
 			select {
-			case <-readRequests:
-				reply, err := transport.readReply(sessionCtx)
+			case request := <-readRequests:
+				requestContext, finishContext := ioredisRequestContext(sessionCtx, request)
+				reply, err := transport.readReply(requestContext)
+				finishContext()
 				readResults <- ioredisDuplexReadResult{reply: reply, err: err}
 			case <-sessionCtx.Done():
 				return
@@ -912,9 +980,11 @@ func (c *IORedisCompatClient) runDuplexSession(transport ioredisDuplexTransport)
 				writeRequestChannel = writeRequests
 			}
 		}
-		var readRequestChannel chan struct{}
+		var readRequestChannel chan *ioredisRequest
+		var nextRead *ioredisRequest
 		if !reading && ioredisOutstandingReplies(inFlight) > 0 {
 			readRequestChannel = readRequests
+			nextRead = inFlight[0].request
 		}
 		var idleCloseChannel <-chan struct{}
 		if writing == nil && !reading && len(inFlight) == 0 {
@@ -949,14 +1019,18 @@ func (c *IORedisCompatClient) runDuplexSession(transport ioredisDuplexTransport)
 					}
 				}
 				if writeResult.request.exclusive && writeResult.exchange.MayHaveExecuted {
-					c.settleDuplexTerminalFailure(inFlight, writeResult.request, fmt.Errorf("redis: bounded blocking command was not replayed after an ambiguous write failure: %w", writeResult.exchange.Error))
+					err := fmt.Errorf("redis: bounded blocking command was not replayed after an ambiguous write failure: %w", writeResult.exchange.Error)
+					if writeResult.request.quit {
+						err = newIORedisSafeError("redis: ioredis QUIT failed", writeResult.exchange.Error)
+					}
+					c.settleDuplexTerminalFailure(inFlight, writeResult.request, err)
 					return false, nil
 				}
 				c.reconcileDuplexFailure(inFlight, writeResult.request, writeResult.exchange)
 				return false, writeResult.exchange.Error
 			}
 			inFlight = append(inFlight, &ioredisInFlight{request: writeResult.request})
-		case readRequestChannel <- struct{}{}:
+		case readRequestChannel <- nextRead:
 			reading = true
 		case readResult := <-readResults:
 			reading = false
@@ -980,7 +1054,11 @@ func (c *IORedisCompatClient) runDuplexSession(transport ioredisDuplexTransport)
 					return false, nil
 				}
 				if len(inFlight) > 0 && inFlight[0].request.exclusive {
-					c.settleDuplexTerminalFailure(inFlight, nil, fmt.Errorf("redis: bounded blocking command was not replayed after a read failure: %w", readResult.err))
+					err := fmt.Errorf("redis: bounded blocking command was not replayed after a read failure: %w", readResult.err)
+					if inFlight[0].request.quit {
+						err = newIORedisSafeError("redis: ioredis QUIT failed", readResult.err)
+					}
+					c.settleDuplexTerminalFailure(inFlight, nil, err)
 					return false, nil
 				}
 				c.reconcileDuplexFailure(inFlight, nil, IORedisExchange{})
@@ -1016,16 +1094,22 @@ func ioredisExclusiveInFlight(inFlight []*ioredisInFlight) bool {
 
 func (c *IORedisCompatClient) settleDuplexTerminalFailure(inFlight []*ioredisInFlight, writing *ioredisRequest, err error) {
 	seen := make(map[*ioredisRequest]struct{}, len(inFlight)+1)
+	quitFailed := false
 	for _, entry := range inFlight {
+		quitFailed = quitFailed || entry.request.quit
 		seen[entry.request] = struct{}{}
 		c.remove(entry.request)
 		c.complete(entry.request, nil, err)
 	}
 	if writing != nil {
+		quitFailed = quitFailed || writing.quit
 		if _, exists := seen[writing]; !exists {
 			c.remove(writing)
 			c.complete(writing, nil, err)
 		}
+	}
+	if quitFailed {
+		c.stopAfterQuitFailure()
 	}
 }
 
@@ -1041,6 +1125,17 @@ func (c *IORedisCompatClient) applyDuplexReply(transport ioredisDuplexTransport,
 	var commandErr error
 	if !entry.request.pipeline && len(entry.replies) == 1 {
 		commandErr = entry.replies[0].Error
+	}
+	if entry.request.quit {
+		if commandErr == nil && entry.replies[0].Value != "OK" {
+			commandErr = errors.New("redis: ioredis QUIT returned an invalid reply")
+		}
+		if closeErr := transport.Close(); commandErr == nil {
+			commandErr = closeErr
+		}
+		if commandErr != nil {
+			commandErr = newIORedisSafeError("redis: ioredis QUIT failed", commandErr)
+		}
 	}
 	c.complete(entry.request, entry.replies, commandErr)
 	if ioredisOutstandingReplies(inFlight) == 0 {
@@ -1072,7 +1167,14 @@ func (c *IORedisCompatClient) firstUnscheduled(scheduled map[*ioredisRequest]boo
 
 func (c *IORedisCompatClient) reconcileDuplexFailure(inFlight []*ioredisInFlight, writing *ioredisRequest, writeExchange IORedisExchange) {
 	retryRequests := make([]*ioredisRequest, 0, len(inFlight)+1)
+	quitFailed := false
 	for _, entry := range inFlight {
+		if entry.request.quit {
+			c.pop(entry.request)
+			c.complete(entry.request, nil, newIORedisSafeError("redis: ioredis QUIT failed", IORedisConnectionClosedError{}))
+			quitFailed = true
+			continue
+		}
 		if entry.request.pipeline && len(entry.replies) > 0 {
 			replies := append([]IORedisReply(nil), entry.replies...)
 			for len(replies) < len(entry.request.commands) {
@@ -1087,13 +1189,22 @@ func (c *IORedisCompatClient) reconcileDuplexFailure(inFlight []*ioredisInFlight
 		retryRequests = append(retryRequests, entry.request)
 	}
 	if writing != nil {
-		writing.replays++
-		if writeExchange.MayHaveExecuted {
-			writing.ambiguousReplays++
+		if writing.quit {
+			c.pop(writing)
+			c.complete(writing, nil, newIORedisSafeError("redis: ioredis QUIT failed", writeExchange.Error))
+			quitFailed = true
+		} else {
+			writing.replays++
+			if writeExchange.MayHaveExecuted {
+				writing.ambiguousReplays++
+			}
+			retryRequests = append(retryRequests, writing)
 		}
-		retryRequests = append(retryRequests, writing)
 	}
 	c.markRequestFailures(retryRequests)
+	if quitFailed {
+		c.stopAfterQuitFailure()
+	}
 }
 
 func (c *IORedisCompatClient) setNotReady() {
@@ -1171,6 +1282,9 @@ func (c *IORedisCompatClient) markRequestFailures(requests []*ioredisRequest) {
 			continue
 		}
 		c.complete(request, nil, IORedisMaxRetriesError{})
+		if request.quit {
+			c.stopAfterQuitFailure()
+		}
 	}
 }
 

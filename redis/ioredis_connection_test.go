@@ -487,6 +487,23 @@ func TestIORedisV4CompatibilityLiveTopologies(t *testing.T) {
 			key := "fit-go:topology-live:" + test.name
 			assertIORedisTopologyFuture(t, raw.Submit("SETEX", key, "60", "verified"), "OK")
 			assertIORedisTopologyFuture(t, raw.Submit("GET", key), "verified")
+			// Public Quit must drain already admitted commands, close every node
+			// for Cluster mode, and complete exactly once. Raw QUIT stays rejected.
+			set := raw.Submit("SETEX", key, "60", "drained")
+			get := raw.Submit("GET", key)
+			remove := raw.Submit("DEL", key)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := raw.Quit(ctx); err != nil {
+				t.Fatalf("public %s Quit: %v", test.name, err)
+			}
+			assertIORedisTopologyFuture(t, set, "OK")
+			assertIORedisTopologyFuture(t, get, "drained")
+			assertIORedisTopologyFuture(t, remove, int64(1))
+			assertQuitLifecycleFinished(t, raw)
+			if err := raw.Quit(ctx); err != nil {
+				t.Fatalf("repeated public %s Quit: %v", test.name, err)
+			}
 		})
 	}
 }

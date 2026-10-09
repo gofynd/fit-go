@@ -38,9 +38,7 @@ func TestConcurrentStopHonorsOwnDeadline(t *testing.T) {
 	t.Cleanup(func() { close(release); <-first; _ = os.Remove("/tmp/_healthz") })
 	until := time.Now().Add(time.Second)
 	for {
-		state.mu.Lock()
-		stopped := state.stopped
-		state.mu.Unlock()
+		stopped := state.stopped.Load()
 		if stopped {
 			break
 		}
@@ -82,9 +80,7 @@ func TestResetSupersedesPendingManagedReplacement(t *testing.T) {
 	t.Cleanup(func() { c.StopPeriodicCheck(); _ = os.Remove("/tmp/_healthz") })
 	until := time.Now().Add(time.Second)
 	for {
-		state.mu.Lock()
-		stopped := state.stopped
-		state.mu.Unlock()
+		stopped := state.stopped.Load()
 		if stopped {
 			break
 		}

@@ -21,6 +21,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -44,8 +45,7 @@ type Checker struct {
 }
 
 type periodicCheckState struct {
-	mu      sync.Mutex
-	stopped bool
+	stopped atomic.Bool
 }
 
 // NewChecker creates a new health checker.
@@ -214,9 +214,10 @@ func (c *Checker) StopPeriodicCheckContext(ctx context.Context) error {
 // concurrent callers also wait for checks signalled by an earlier stop.
 func (c *Checker) stopPeriodicCheckLocked() []chan struct{} {
 	for _, state := range c.periodicStates {
-		state.mu.Lock()
-		state.stopped = true
-		state.mu.Unlock()
+		// Signalling a stop must never wait for the writer's filesystem I/O.
+		// The loop owns its writes; joining its done channel below remains the
+		// barrier for an already admitted write on an unbounded graceful stop.
+		state.stopped.Store(true)
 	}
 	for _, stop := range c.periodicStops {
 		close(stop)
@@ -254,19 +255,47 @@ func (c *Checker) Reset() {
 }
 
 // ResetContext resets the checker while bounding the wait for an in-flight
-// periodic check by ctx. Registered checks and the liveness file are cleared
-// even if the wait reaches its deadline.
+// periodic check and file cleanup by ctx. Registered checks are cleared even if
+// the wait reaches its deadline. Already admitted filesystem I/O cannot be
+// cancelled by Go and may finish later; cleanup is best-effort in that case.
 func (c *Checker) ResetContext(ctx context.Context) error {
 	if c == nil {
 		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	err := c.StopPeriodicCheckContext(ctx)
 	c.mu.Lock()
 	c.checks = nil
 	c.skipCounter = 0
 	c.mu.Unlock()
-	_ = os.Remove("/tmp/_healthz")
+	cleanupErr := runHealthFileCleanup(ctx, func() { _ = os.Remove("/tmp/_healthz") })
+	if err == nil {
+		return cleanupErr
+	}
 	return err
+}
+
+// Preserve synchronous cleanup on the original unbounded Reset path. A managed
+// caller with cancellation waits only for its own deadline, not for a stalled
+// filesystem syscall. There is no polling goroutine or shared mutable hook.
+func runHealthFileCleanup(ctx context.Context, cleanup func()) error {
+	if ctx.Done() == nil {
+		cleanup()
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cleanup()
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // writeHealthFile writes to /tmp/_healthz if healthy.
@@ -282,9 +311,7 @@ func (c *Checker) writeHealthFile() {
 
 func (c *Checker) writeHealthFileIfActive(state *periodicCheckState) bool {
 	errs := c.Check()
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if state.stopped {
+	if state.stopped.Load() {
 		return false
 	}
 	if len(errs) == 0 {

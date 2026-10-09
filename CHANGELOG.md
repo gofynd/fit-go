@@ -7,10 +7,12 @@ the module follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Release candidate publication
-- Target immutable fork tag `v0.2.0-rc.4` packages the Sentry, Franz recovery,
-  Redis routing/idle lifecycle, SSE framing, health/migration cleanup and
-  tracing-scope corrections below. It does not change the Go 1.25.10 floor
-  or dependencies. The remaining runtime, security and live-validation gates
+- Target immutable fork tag `v0.2.0-rc.5` packages the cumulative corrections
+  below, including worker-exit recovery, aggregate SSE bounds, Cluster Quit,
+  standard-log restoration, bounded health cleanup and aborted boundary spans.
+  It does not change the Go 1.25.10 floor or dependencies, including `x/net`
+  v0.58.0, as explicitly requested. The deferred security upgrade and remaining
+  deployment and reverse-consumer gates
   are recorded in `docs/PR3_COMPATIBILITY_REMEDIATION.md`; publication is not
   merge-readiness or deployment certification.
 
@@ -36,6 +38,21 @@ the module follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `InitSentryWithHooks` path supports retryable startup.
 
 ### Fixed
+- Follow-up to `v0.2.0-rc.4`: fail closed on abnormal Kafka
+  partition-worker exits, preserve independent errors joined with shutdown
+  cancellation, and recover collected advanced Confluent batches after a poll
+  error without changing original-main legacy collection behavior.
+- Bound complete FeatureHub SSE events on streaming and snapshot paths, and
+  evaluate DATE strategies in UTC to match the JavaScript SDK.
+- Settle the public ioredis Cluster `Quit` lifecycle on every terminal path,
+  without permitting raw QUIT through the general command API.
+- Restore standard-log writer and flags alongside managed slog ownership;
+  preserve independently replaced process loggers and standard-log fields.
+- Signal health stops without waiting on filesystem I/O; bound cancellable
+  cleanup waits while retaining synchronous background-context cleanup.
+  Already admitted OS I/O cannot be forcibly cancelled.
+- Do not mark an aborted non-HTTP boundary successful during `runtime.Goexit`;
+  preserve normal return values, panic behavior and span/context cleanup.
 - Discard unfinished FeatureHub SSE events at EOF on the opt-in streaming
   path, matching the blank-line boundary already used by isolated snapshots.
   Completed events and legacy polling are unchanged.
