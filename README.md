@@ -29,6 +29,8 @@ A batteries-included Go framework for building scalable microservices. Provides 
 | `migration` | Compiled, checkpointed migrations with local, GCS, and S3 state stores |
 | `protofetch` | Safe `fitproto`-compatible contract fetching and Go generation |
 | `utils` | HTTP client, string helpers, and input sanitization |
+| `httpclient` | Explicitly instrumented `net/http` transport with trace propagation, request IDs, and optional logs/metrics |
+| `redact` | Bounded text, URL, header, and credential redaction helpers; not a universal PII detector |
 
 ## Quick Start
 
@@ -78,7 +80,19 @@ func main() {
 }
 ```
 
-See [`examples/`](examples) for complete, runnable programs covering each module.
+This quick start intentionally uses the original `fit.Init` and `server.New`
+contracts. Upgrading the library does not automatically select the managed
+lifecycle or instrument the legacy server. For new opt-in capabilities, use
+`fit.InitManaged` with the relevant module constructor, such as
+`server.NewRuntime`, `kafka.NewProducer`, or `utils.NewInstrumentedHTTPClient`.
+See [API names](docs/API_NAMING.md) and the
+[compatibility migration map](docs/UPSTREAM_INTEGRATION_MIGRATION.md).
+
+See [`examples/`](examples) for complete programs covering selected modules.
+Documentation describes this source tree; an immutable published tag can
+precede local fixes. Check the [changelog](CHANGELOG.md) and
+[remediation ledger](docs/PR3_COMPATIBILITY_REMEDIATION.md) for publication status,
+accepted limitations, and outstanding release/security gates.
 
 ## Examples
 
@@ -91,8 +105,10 @@ go run ./examples/01-quickstart
 
 Most are configured through environment variables (the header comment in each
 `main.go` lists the relevant ones). Examples that talk to external systems
-(databases, Kafka, Pyroscope) need those services reachable to do real work,
-but all of them compile and start without extra setup.
+(databases, Kafka, Pyroscope) need their dependencies and credentials configured
+to run successfully. Compiling an example does not prove connectivity or runtime
+behavior. Use disposable local systems, not production, for examples that write
+data or produce/consume messages.
 
 | Example | Module(s) | What it shows |
 |---|---|---|
@@ -155,6 +171,12 @@ if err != nil { return err }
 
 Application-specific Convict/Pydantic formats still require an explicit
 `SchemaField.Parser`; fit-go does not guess language-specific coercion.
+
+For Google Secret Manager, `config.GetSecretFromGSM(name, version)` retains the
+original **base64-encoded** transport payload. Use the additive
+`config.GetDecodedSecretFromGSM(name, version)` when you need the decoded secret;
+do not decode its result again. Both require access to the configured GCP project
+and credentials. Never log either return value.
 
 ## Platform Boundaries And Tooling
 
@@ -303,6 +325,88 @@ conn := client.Service("cache")
 write := conn.Write // Connection for writes
 ```
 
+`redis.InitDefault` retains the original go-redis implementation. Protocol,
+retry, strict TLS, and ioredis compatibility controls are explicit:
+
+```go
+client, err := redis.InitWithCompatibility(redis.CompatibilityOptions{
+    Context: ctx,
+    DialWithSettings: redis.DefaultConfiguredDialFunc(),
+    ClusterWithSettings: redis.DefaultConfiguredClusterDialFunc(),
+    SentinelWithSettings: redis.DefaultConfiguredSentinelDialFunc(),
+    ProtocolByService: map[string]redis.RedisProtocol{
+        "cache": redis.RedisProtocolRESP2,
+    },
+    IORedisCompatibility: map[string]redis.IORedisCompatibilityProfile{
+        "cache": redis.IORedisCompatibilityV5,
+    },
+})
+if err != nil { return err }
+defer client.Close()
+```
+
+Selecting a protocol alone does not enable the owned ioredis transport; the
+per-service profile does. This is not a general drop-in ioredis replacement:
+transactions, SELECT, subscription modes, unbounded blocking operations, and
+cross-node pipelines are rejected. The owned RESP decoder has fixed size/value
+limits, and replay of an ambiguous non-idempotent command can duplicate its
+side effects. Review the [full compatibility boundary](docs/IOREDIS_COMPATIBILITY.md)
+before adoption; the default go-redis path is unaffected.
+
+## HTTP Server And Clients
+
+Use `server.NewRuntime` when you explicitly want automatic request IDs, OTel
+server spans/active-context bridging, and adoption of the process-default FIT
+metrics registry. Tracing and metrics still require their respective enablement
+settings. `server.New` preserves original-main behavior instead.
+
+```go
+framework, err := fit.InitManaged(ctx)
+if err != nil { return err }
+defer framework.Shutdown(ctx)
+
+srv := server.NewRuntime(server.RuntimeConfig{
+    Config: server.Config{Port: "8080", HealthChecker: framework.Health},
+})
+if err := srv.Init(
+    map[server.ServerType]http.Handler{server.ServerTypeDefault: engine},
+    nil, nil,
+); err != nil { return err }
+```
+
+Start and stop the HTTP server explicitly; the framework does not own this
+separately constructed server. Pass `framework.Health` explicitly to use its
+checks; a nil checker selects the server package's separate default. Use a
+dedicated bounded shutdown context, not an already cancelled request context.
+`RuntimeConfig` also controls CORS, independent
+readiness, timeouts, logging, and profiling. Only exact registered health routes
+receive the default health exception. Applications needing legacy case/slash/
+HEAD/OPTIONS variants can call `UseHealthRouteMiddleware` **before `Init`**;
+that application-owned middleware must call `Next` for every request it does not
+own. It is not a blanket health-path auth bypass.
+
+For a standard `*http.Client`, choose an explicit instrumented transport:
+
+```go
+client := httpclient.NewHTTPClientWithTimeout(10 * time.Second)
+// Or instrument an existing transport without changing its client timeout:
+existingClient.Transport = httpclient.WrapTransport(existingClient.Transport)
+```
+
+`httpclient.NewHTTPClient()` itself has no overall request timeout; choose the
+timeout constructor or a request deadline. `WithLogger` opts into safe outbound
+logs; `WithMetrics(nil)` explicitly disables process-default metrics for that
+transport. Requests and headers are cloned, explicit span contexts remain
+authoritative, and caller-supplied propagation fields are replaced by default.
+`WithCallerPropagationHeaders` is a trusted-forwarding opt-in, not suitable for
+untrusted inbound headers. Logs/spans omit bodies and query values and sanitize
+URLs/errors; do not put secrets in arbitrary identifiers or telemetry labels.
+
+For FIT-style request helpers and interceptors, use
+`utils.NewInstrumentedHTTPClient(utils.HTTPClientOptions{Timeout: 10 * time.Second})`.
+The original `utils.NewHTTPClient` remains uninstrumented and does not
+automatically adopt process-default metrics.
+
 ## gRPC
 
 Use the fit-go client helper for every outbound gRPC connection. Calling
@@ -355,7 +459,10 @@ string representations for 64-bit integers and enums, byte slices, collection
 defaults, oneof discriminator fields, and JSON-compatible Struct/Value/ListValue
 well-known types. Unknown response keys are ignored so additive application data
 does not break an older wire contract. Internal, Unknown, and DataLoss status text
-is sanitized before it crosses the network.
+is sanitized before it crosses the dynamic RPC network boundary. The original
+in-process callback API retains its detailed handler/validation/panic messages;
+`InitWithOptions` selects the hardened callback behavior. Generated handlers
+registered directly through `GRPCServer()` retain their own error policy.
 Companion `.type.json` files are optional validation input rather than a
 runtime requirement; descriptor validation remains authoritative.
 
@@ -376,10 +483,14 @@ client, err := kafka.NewConfluentClient(&kafka.Config{
     Brokers:  []string{"localhost:9092"},
     ClientID: "my-service",
 })
+if err != nil { return err }
 defer client.Close()
 
-producer, err := client.Producer(kafka.ProducerConfig{})
+// Explicit options constructor: per-call acknowledgements and raw tracing.
+producer, err := kafka.NewProducer(client, kafka.ProducerOptions{Acks: -1})
+if err != nil { return err }
 defer producer.Close()
+if err := producer.Connect(); err != nil { return err }
 
 // acks: -1 = all in-sync replicas, 1 = leader only, 0 = fire-and-forget.
 // ProduceCtx creates one producer span per message and injects the configured
@@ -387,23 +498,37 @@ defer producer.Close()
 err = kafka.ProduceCtx(producer, ctx, "my-topic", []kafka.Message{
     {Key: []byte("k"), Value: []byte(`{"hello":"world"}`)},
 }, -1)
+if err != nil { return err }
 ```
 
 Use `ProduceCtx`, `ProduceBatchCtx`, and `ConsumeCtx` for application code. For
 batch handlers, call `kafka.ConsumeBatchCtx(consumer, handler, opts)`; it works
 with the built-in Confluent consumer and adapts alternate drivers without
-changing the base interface. The raw `Produce`, `ProduceBatch`, `Consume`, and
-`ConsumeBatch` methods are compatibility escape hatches: when called in the
-same goroutine as a fit-go callback they discover its active trace, while calls
-outside a fit-go boundary start or receive an independent boundary.
+changing the base interface. Tracing is constructor- and driver-dependent:
+original Confluent `client.Producer`/`client.Consumer` raw methods remain
+untraced. Options-based producers and consumers add raw-call tracing and adopt
+the same-goroutine active FIT boundary. Context helpers prefer native driver
+extensions; producer helpers fall back to raw methods on older drivers and do
+not promise tracing or context support that those drivers lack.
 
-The Confluent driver honors the `acks` argument on every produce call. Because
+Options-based Confluent producers honor the per-call `acks` argument. Because
 librdkafka configures acknowledgements per producer rather than per request,
 fit-go caches one otherwise-identical producer per requested acknowledgement
 level and closes all of them during shutdown. When the producer's default must
 explicitly be `0`, construct it with `NewProducer` and set
 `ProducerOptions.AcksSet=true`; a zero-value original `ProducerConfig`
 keeps the safe `-1` default.
+
+The original `client.Producer(ProducerConfig)` retains its configured
+acknowledgement level, including through `ProduceCtx`; it does not allocate
+alternate producers for per-call `acks`. Original Confluent single-message
+consumers log and continue after handler errors. Use
+`kafka.NewConsumer(client, ConsumerSettings)`
+and `ConsumeCtxWithOptions`/`ConsumeBatchCtxWithOptions` for explicit offset,
+finalizer, concurrency, and backend controls. Unsupported controls fail rather
+than being silently ignored. The KafkaJS-compatible franz backend is opt-in;
+rebalance hooks, commit timing, rewind, and shutdown limitations are documented
+in the [migration map](docs/UPSTREAM_INTEGRATION_MIGRATION.md).
 
 ## Observability
 
@@ -429,6 +554,10 @@ to opt into the TraceClue envelope; that entry point also honors
 3.1.3 (`debug-only`); use `always` for TraceClue 3.0.5/2.1.x or `non-debug` for
 pyfit 1.10 queue formatting. See
 [TraceClue compatibility](docs/TRACECLUE_COMPATIBILITY.md).
+
+Ordinary application string fields remain caller-owned: using a logger does not
+make arbitrary payloads safe to log. Keep credentials and PII out of log values;
+use bounded `redact` helpers at explicit boundaries, not as a universal detector.
 
 ### Tracing
 
@@ -475,8 +604,11 @@ legacy TraceClue processes that reported `unknown_service:*` when only the FIT
 application identity was configured.
 
 Calling `fit.InitManaged` twice without an intervening `Shutdown` returns an
-error. Shutdown restores process-global tracing, propagation, metrics, and slog
-state, stops periodic health work, clears lifecycle-owned
+error. Managed shutdown restores owned tracing-provider, metrics, and slog
+state without overwriting independent replacements. The stateless propagator
+is deliberately retained during graceful drain; a `tracing.SetGlobal` restore
+callback restores its own propagation ownership separately. Managed shutdown
+stops periodic health work, clears lifecycle-owned
 connections/errors/checks, and permits a clean reinitialization. Repeated
 original `fit.Init` calls retain official-main behavior. Switching between
 original and managed lifecycle modes requires `Shutdown` first.
@@ -517,10 +649,11 @@ FIT_PROMETHEUS_TEXTFILE_ENABLED=true
 ```
 
 ```go
-framework, _ := fit.InitManaged(ctx)
+framework, err := fit.InitManaged(ctx)
+if err != nil { return err }
 defer framework.Shutdown(ctx)
 
-// fit.InitManaged installs the enabled registry for fit servers and both HTTP clients.
+// NewRuntime servers and explicitly instrumented HTTP clients adopt the registry.
 client := httpclient.NewHTTPClient()
 ```
 
@@ -555,9 +688,15 @@ PROFILING_SAMPLE_RATE=10
 
 `PROFILING_SAMPLE_RATE` is retained as a legacy requested value. The current
 `pyroscope-go` runtime samples at a fixed effective 100 Hz and ignores its
-deprecated sample-rate field, so profiler status reports `requested`,
+deprecated sample-rate field. `profiling.NewRuntime(profiling.DefaultRuntimeConfig())`
+and the managed framework profiler report `requested`,
 `effective`, and `configurable=false` separately instead of claiming the legacy
 value changed collection behavior.
+
+Original `profiling.New`/`NewFromEnv` status retains its historical JSON shape.
+Use `GetRuntimeConfig` for the full runtime configuration. Profiling control
+routes are not a public API: mount/enable them explicitly behind authentication
+and a restricted operational network.
 
 Use `profiling.TagWrapper` to attach scoped Pyroscope and pprof labels to a
 work unit without mutating process-global profiling state.
@@ -583,6 +722,17 @@ and breadcrumbs. It clones the request hub so concurrent requests do not share
 scope mutation. Capture methods retain the original Go error object for Sentry
 grouping and application control flow.
 
+The sanitizer rebuilds SDK serialization caches so pre-serialized fields cannot
+bypass sanitization while retaining safe correlation IDs. The post-rc.5
+hardening included in release candidate `v0.2.0-rc.6` additionally masks credential-key components such as `pwd`,
+`pass`, `pin`, `otp`, `cvv`, `cvc`, `pan`, and compound card-number labels before
+examining their values, including numeric values. This additional masking changes
+diagnostic output, not application return values; the older immutable rc.5 does
+not contain it. An application that
+initializes Sentry directly must install its own sanitizer; a library upgrade
+cannot attach fit-go hooks to an independently configured SDK client. See the
+[publication and privacy ledger](docs/PR3_COMPATIBILITY_REMEDIATION.md).
+
 ## Encryption
 
 AES-256-GCM encryption with pluggable key providers (HashiCorp Vault, GCP KMS):
@@ -602,6 +752,11 @@ decrypted, _ := mgr.Decrypt(encrypted)
 
 ## Feature Flags
 
+Original `feature.Init()` retains synchronous initial fetching and polling.
+`feature.InitStreaming()` explicitly selects SSE; unless initial state is
+required, it returns before the stream is ready. Handle initialization errors
+and use a bounded readiness wait before depending on the values:
+
 ```bash
 FEATURE_FLAG_ENABLED=true
 # A trailing /features or /features/ is also accepted, as in the JS SDK.
@@ -615,17 +770,34 @@ FEATURE_FLAG_REQUIRE_INITIAL_STATE=false
 ```
 
 ```go
-client, _ := feature.InitStreaming()
+client, err := feature.InitStreaming()
+if err != nil { return err }
+if client == nil { return nil } // Disabled or optional configuration absent.
 defer client.Stop()
+
+ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+defer cancel()
+if err := client.WaitReady(ctx); err != nil { return err }
 if client.IsEnabled("dark-mode") {
     // feature is on
 }
 
-ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-defer cancel()
 requestFlags := client.NewContext().UserKey("user-123").Attribute("plan", "gold")
-if err := requestFlags.Build(ctx); err != nil { ... }
+if err := requestFlags.Build(ctx); err != nil { return err }
+if requestFlags.IsEnabled("dark-mode") {
+    // Evaluate this request's isolated context, not the client-wide user.
+}
 ```
+
+Do not evaluate a changed request context until `Build` succeeds. Server-evaluated
+`Build` fetches a separate SSE snapshot; it does not reuse another user's values.
+The SDK key is part of the URL path, and server-evaluation context is also sent
+in the query string for JS compatibility: protect proxy/access logs accordingly.
+Permanent 4xx responses, including 404 (but excluding transient statuses such as
+408 and 429), terminate the shared stream and notify
+waiters; transient failures use bounded backoff. These and the per-Build
+connection trade-off are detailed in the
+[migration and readiness notes](docs/UPSTREAM_INTEGRATION_MIGRATION.md).
 
 ## Health Checks
 
@@ -644,13 +816,28 @@ checker.StartPeriodicCheck(30)
 defer checker.StopPeriodicCheck()
 ```
 
-`Fit.Shutdown` calls `Health.Reset` automatically. Direct checker owners can
-call `Reset` to stop periodic work, remove registered checks, and clear the
-health file before reusing the checker.
+Only the managed framework lifecycle calls `Health.ResetContext(ctx)` during
+shutdown; original `fit.Init` retains its historical tracer/metrics-only
+shutdown. Direct checker owners can use `ResetContext(shutdownCtx)` or
+`StopPeriodicCheckContext(shutdownCtx)` to bound the wait for in-flight checks.
+`Reset`/`StopPeriodicCheck` use an unbounded background context. Stopping cannot
+forcibly terminate a user check or filesystem operation already running; checks
+must provide their own bounds. Unbounded `Reset` waits for cleanup and removes
+registered checks and the health file. `ResetContext` clears registered checks,
+but file cleanup is best-effort after a deadline; handle its error and do not
+assume cleanup has finished before reusing the checker.
 
 ## Requirements
 
-- Go 1.25+
+- Go **1.25.10** or newer (the module minimum).
+- A supported CGO/C toolchain for the bundled Confluent/librdkafka integration;
+  platform-specific builds may require additional librdkafka setup.
+
+The module minimum is a compatibility contract, not a security certification.
+Build releases with a current patched Go toolchain and check the actual module
+graph with `govulncheck`. Outstanding dependency advisories and intentionally
+deferred upgrades are recorded in the
+[remediation ledger](docs/PR3_COMPATIBILITY_REMEDIATION.md).
 
 ## License
 

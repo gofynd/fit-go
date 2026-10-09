@@ -609,7 +609,11 @@ func sanitizeSentryEvent(event *sentrylib.Event) *sentrylib.Event {
 		event.Request.Data = redact.Mask
 		event.Request.Cookies = redact.Mask
 		for key, value := range event.Request.Headers {
-			event.Request.Headers[key] = redact.HeaderValue(key, redact.Text(value))
+			if sensitiveSentryKey(key) {
+				event.Request.Headers[key] = redact.Mask
+			} else {
+				event.Request.Headers[key] = redact.HeaderValue(key, redact.Text(value))
+			}
 		}
 		for key, value := range event.Request.Env {
 			if sensitiveSentryKey(key) {
@@ -882,6 +886,62 @@ func seenSentryReference(value reflect.Value, visited map[sentryVisit]struct{}) 
 	return false
 }
 
+// sensitiveSentryCredentialAlias recognizes short credential names as complete
+// label components, not substrings: "paymentCVV" is sensitive, while "shipping"
+// and "span_id" are not. Scan forward once with at most two preceding components
+// so arbitrary user-supplied keys cannot introduce an unbounded look-back.
+func sensitiveSentryCredentialAlias(key string) bool {
+	var previous, beforePrevious string
+	componentSensitive := func(component string) bool {
+		for _, alias := range [...]string{
+			"pwd", "pass", "passphrase", "pin", "otp", "cvv", "cvc", "pan",
+			"cardnumber", "creditcardnumber", "primaryaccountnumber", "verificationcode", "onetimepassword",
+		} {
+			if strings.EqualFold(component, alias) {
+				return true
+			}
+		}
+		if strings.EqualFold(component, "number") &&
+			(strings.EqualFold(previous, "card") ||
+				strings.EqualFold(previous, "account") && strings.EqualFold(beforePrevious, "primary")) {
+			return true
+		}
+		if strings.EqualFold(component, "code") && strings.EqualFold(previous, "verification") {
+			return true
+		}
+		beforePrevious, previous = previous, component
+		return false
+	}
+	word := func(b byte) bool {
+		return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
+	}
+	upper := func(b byte) bool { return b >= 'A' && b <= 'Z' }
+	lower := func(b byte) bool { return b >= 'a' && b <= 'z' }
+	start := -1
+	for index := 0; index < len(key); index++ {
+		if !word(key[index]) {
+			if start >= 0 && componentSensitive(key[start:index]) {
+				return true
+			}
+			start = -1
+			continue
+		}
+		if start < 0 {
+			start = index
+			continue
+		}
+		// Split lowerUpper and ACRONYMWord while retaining an all-caps alias.
+		if upper(key[index]) && (lower(key[index-1]) ||
+			upper(key[index-1]) && index+1 < len(key) && lower(key[index+1])) {
+			if componentSensitive(key[start:index]) {
+				return true
+			}
+			start = index
+		}
+	}
+	return start >= 0 && componentSensitive(key[start:])
+}
+
 func sensitiveSentryKey(key string) bool {
 	normalized := strings.NewReplacer("-", "", "_", "", ".", "").Replace(strings.ToLower(strings.TrimSpace(key)))
 	if normalized == "raw" || normalized == "query" || normalized == "querystring" ||
@@ -897,5 +957,5 @@ func sensitiveSentryKey(key string) bool {
 			return true
 		}
 	}
-	return false
+	return sensitiveSentryCredentialAlias(key)
 }

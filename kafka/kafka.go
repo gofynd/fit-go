@@ -243,14 +243,16 @@ type KafkaProducer interface {
 	// Connect establishes the producer connection to the brokers.
 	Connect() error
 
-	// Produce sends messages to a single topic. When FIT has installed an active
-	// goroutine context it receives the same automatic producer tracing as legacy
-	// KafkaJS; use ProduceCtx when cancellation or explicit context propagation is
-	// required.
+	// Produce sends messages to a single topic. Tracing depends on the driver and
+	// constructor: the original Confluent Producer keeps its untraced behavior;
+	// ProducerWithOptions enables automatic producer spans and its configured
+	// trace-header policy. Use ProduceCtx for explicit context propagation when
+	// the driver supports KafkaProducerCtx; older drivers use the raw fallback.
 	Produce(topic string, messages []Message, acks int) error
 
-	// ProduceBatch sends messages to multiple topics with the same automatic
-	// tracing behavior as Produce.
+	// ProduceBatch sends messages to multiple topics with the same driver- and
+	// constructor-dependent tracing behavior as Produce. ProduceBatchCtx provides
+	// the corresponding explicit-context entry point.
 	ProduceBatch(topicMessages []TopicMessages, acks int) error
 
 	// Close disconnects the producer gracefully.
@@ -294,13 +296,16 @@ type KafkaConsumer interface {
 	// Connect subscribes to the given topics and starts the consumer.
 	Connect(topics []TopicConfig) error
 
-	// Consume processes messages with automatic consumer spans. The active FIT
-	// goroutine context is installed around the handler for source-compatible raw
-	// handlers; use ConsumeCtx when the handler needs the context value directly.
+	// Consume processes messages one at a time. The original Confluent Consumer
+	// keeps its untraced behavior; consumers created with ConsumerWithSettings
+	// add consumer spans and install the active handler context. Other drivers
+	// define their own tracing behavior. Use ConsumeCtx when the handler needs
+	// the context explicitly; drivers without that extension use a traced adapter.
 	Consume(handler MessageHandler, opts ConsumerOptions) error
 
-	// ConsumeBatch processes messages in batches with automatic batch tracing but
-	// does not expose the span context. Use ConsumeBatchCtx when the handler needs it.
+	// ConsumeBatch processes batches with the same driver- and constructor-
+	// dependent tracing behavior as Consume. Use ConsumeBatchCtx when the handler
+	// needs the context explicitly.
 	ConsumeBatch(handler BatchHandler, opts ConsumerOptions) error
 
 	// Close disconnects the consumer gracefully.

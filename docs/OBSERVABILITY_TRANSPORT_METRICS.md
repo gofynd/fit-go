@@ -62,17 +62,19 @@ Matching is case-insensitive. This prevents a propagator change from forwarding
 two competing parents. A no-op propagator (`OTEL_PROPAGATORS=none`) is therefore
 a real propagation opt-out; unrelated headers remain unchanged.
 
-`utils.NewHTTPClient` retains its public API, timeout, proxy, logging,
-interceptors, default headers, and optional custom metric recorder. Its existing
-transport is now wrapped by `httpclient.WrapTransport`, so old callers receive
-the same tracing and propagation. Supplying a custom metric recorder disables
+`utils.NewHTTPClient` retains its original public API, timeout, proxy, logging,
+interceptors, default headers, and optional custom metric recorder; it remains
+uninstrumented. Explicit `utils.NewInstrumentedHTTPClient` wraps its transport
+with `httpclient.WrapTransport` to add tracing, propagation, and process-default
+metrics. Supplying a custom metric recorder disables
 the process-default recorder for that client to prevent duplicate observations.
 Access/client logs retain method, safe scheme/host/path, status, request ID, and
 duration. Query values, URL userinfo, opted-in sensitive header values, and raw
 transport/provider errors are redacted; callers still receive the original error.
 
-All fit-go outbound HTTP, Mongo, Redis, MySQL, PostgreSQL, gRPC, and explicit
-Kafka producer entry points use the same active-context rule. A valid span on
+Instrumented fit-go HTTP, Mongo, Redis, MySQL, PostgreSQL, gRPC, and explicit
+Kafka producer entry points use the same active-context rule; legacy constructors
+do not automatically opt into command tracing. A valid span on
 the caller-supplied context is authoritative. When that context has no span and
 the operation is running inside a fit-go consumer or process boundary, the
 client adopts the same-goroutine active span and baggage while retaining the
@@ -87,8 +89,10 @@ Context-aware producer and consumer APIs preserve the configured OTel wire
 format, including Jaeger `uberctx-*` baggage. Produce operations drain every
 delivery report accepted by librdkafka, never close a channel still owned by the
 driver, coordinate in-flight sends with shutdown, and fail shutdown when
-`Flush` reports outstanding records. Per-call `acks` selects a compatible
-cached producer rather than silently ignoring the call contract.
+`Flush` reports outstanding records. On options-based Confluent producers,
+per-call `acks` selects a compatible cached producer. Original
+`client.Producer(ProducerConfig)` retains its configured acknowledgement level,
+including through `ProduceCtx`, and raw original methods remain untraced.
 
 Consumer options are validated before polling. `PollTimeout` reaches the driver;
 unsupported partition concurrency and an auto-commit mode that conflicts with

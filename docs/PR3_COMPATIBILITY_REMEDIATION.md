@@ -2,6 +2,99 @@
 
 ## Status and scope
 
+### 2026-10-09 release candidate `v0.2.0-rc.6`
+
+This candidate packages the post-rc.5 Sentry credential-key and HTTP abnormal-
+exit fixes, regression tests, Kafka interface documentation and README/example
+corrections detailed below. It is prepared as a new immutable tag on the PR #3
+source branch, not a rewrite of rc.5. Publication must be verified against the
+remote tag and its downloaded checksum before a consumer pin is accepted.
+Metroplex's separate SDK sanitizer changes remain local to Commerce and are not
+contained in the library release.
+
+Original-main APIs, constructor defaults, Kafka offsets/acknowledgements, Redis
+support, dependencies and the Go 1.25.10 minimum are unchanged by this candidate.
+The deliberately retained `x/net` v0.58.0 security decision and outstanding
+live/reverse-consumer/deployment gates remain in force. Publication is not a
+merge-readiness or security-clean certification.
+
+The dated local status and evidence below describe the preparation stages;
+their references to uncommitted/unpublished source are historical after rc.6
+publication. Current remote-module Metroplex validation must be recorded in its
+canonical library document, independently of earlier workspace results.
+
+Fresh candidate validation used `GOWORK=off`: full build, vet and tests on Go
+1.25.10, and the full race suite on Go 1.26.9, passed. Both test runs covered
+33 test-bearing packages with zero failures and ten conditional infrastructure
+skips (eight live Kafka tests and Redis live Sentinel/Cluster subtests).
+`go mod tidy -diff` was clean; `go mod verify` passed. Module API comparison
+against official main `df96a28` found zero incompatible exported changes.
+Artifacts are retained in `/tmp/fitgo-rc6-publication.ymCQ4R/` as
+`fitgo-tests.json`, `fitgo-race.json` and `candidate.exp`. These checks do not
+replace live-broker/topology or organization-wide reverse-consumer testing.
+
+### 2026-10-09 post-rc.5 review follow-up (historical local preparation)
+
+The published PR head remains `2ab9e42cd9b08121194dde3271bdc535679cb970`
+and the immutable fork tag remains `v0.2.0-rc.5`. The corrections in this
+section are pending local changes, **not included in that tag or remote PR
+diff**. Updating the PR description does not publish these source changes.
+
+| Finding | Local correction | Blast-radius boundary |
+|---|---|---|
+| Structured Sentry fields lost credential-key context, allowing strings and numeric CVV/OTP/PIN/card values through | Mask complete credential components (`pwd`, `pass`, `passphrase`, `pin`, `otp`, `cvv`, `cvc`, `pan`) and compound card/account/verification labels before inspecting the value; apply the same classification to request headers | Preserve existing long-name rules; no short-substring matching of `compass`, `shipping`, `span_id`, `cardinality` or `card_count`; actual SDK event/transaction tests cover 12 map surfaces and opaque trace IDs |
+| Metroplex initializes Sentry independently, and some string-map/frame fields and pre-serialized SDK caches bypassed key classification | Mirror the private credential-key policy, sanitize cloned tags/user metadata/request/frame maps, and project a fresh SDK event to rebuild cached JSON | Application-owned change, not supplied by the library tag; no new library API requirement, so Metroplex still builds with `GOWORK=off` against rc.5; preserve public SDK fields, safe sampling metadata, trace IDs and immutable caller maps |
+| An instrumented HTTP transport left its span recording after panic or `runtime.Goexit` | Install deferred span cleanup immediately after creation; use fixed safe error status on abnormal exit | Do not recover, change panic identity, return a synthetic error or expose panic values; normal response/error identity and span-end ordering before logs/metrics are retained |
+| Kafka interface comments overstated automatic tracing on released raw constructors | Describe constructor-dependent tracing and explicit-context helpers | Documentation-only; no Kafka runtime, offset, acknowledgement or subscription change |
+
+No public API, constructor default, HTTP/event/data schema, datastore operation,
+deployment manifest, dependency or Go-minimum change is part of this follow-up.
+The intentional output change is additional credential masking in Sentry; tags
+that previously contained such credentials can change, but operational values
+and trace correlation controls are tested separately. Ambiguous complete labels
+such as `pin` are treated as sensitive, regardless of their value type. This is
+not a claim that arbitrary unlabeled data or every possible credential spelling
+is identifiable. Generic text redaction and previously accepted transport
+limitations are unchanged.
+
+Final-source validation artifacts for this follow-up are retained in
+`/tmp/fitgo-rc5-remediation.wZm9hA/`. Minimum-Go ordinary tests/build/vet and the
+Go 1.26.9 full race suite pass all 32 test-bearing fit-go packages, with ten
+expected live-infrastructure test/subtest skips. Export comparison against
+official main `df96a28` reports zero incompatible changes. Focused repeated
+race suites and independent transport/SDK export probes pass. Coverage is
+84.9% for `errors` (both key classifiers 100%), 91.6% for `httpclient`, and
+88.4% for Metroplex shared observability. Metroplex full published-pin and
+candidate-workspace tests/build/vet pass: 270 test-bearing packages and 106
+conditional test/subtest skips per graph. Targeted candidate HTTP/Sentry/
+scheduler race checks pass nine packages with zero skips. Exact evidence is
+recorded separately in its library document; the existing workfile is unchanged.
+Existing no-skip broker/topology evidence below predates this follow-up; live
+fixtures, UAT/prod and organization-wide reverse consumers were not rerun here.
+
+A fresh Go 1.26.9 `govulncheck` on this local source still reports the five
+reachable `x/net` advisories listed below. The user-requested v0.58.0 dependency
+and Go 1.25.10 minimum are unchanged. Security-clean/merge-ready certification
+is not claimed. Publication of these local fixes requires a new commit and
+immutable tag followed by a fresh Metroplex pin test; rc.5 must not be moved.
+
+The subsequent local README/example follow-up corrects constructor-dependent
+Kafka tracing/acknowledgements and connection setup, adds explicit runtime HTTP
+and Redis adoption, and documents FeatureHub readiness, GSM decoding, health
+ownership and profiler status. The directly linked transport/metrics notes are
+aligned with those constructor boundaries. Only documentation and the Kafka
+example/helper tests change in this follow-up; library behavior, dependencies,
+Metroplex source/pin and published tags remain untouched.
+
+Validation for this documentation/example follow-up: Go 1.25.10
+`GOWORK=off go test ./examples/...` and `go vet ./examples/...` pass; the four
+Kafka example shutdown tests pass under Go 1.26.9 `-race -count=20`, covering idle
+topics, early failure, shutdown errors and timer races. New Redis/server/HTTP/
+Kafka/FeatureHub README API snippets compile on Go 1.25.10; snippet compilation
+does not execute their external dependencies. Local Markdown link-target and
+`git diff --check` checks pass. The full-suite counts above predate the new
+example test file; no new full-suite or live-broker run is claimed here.
+
 ### 2026-10-09 cumulative runtime remediation (`v0.2.0-rc.5`)
 
 Release candidate `v0.2.0-rc.5` packages this repair pass on top of published

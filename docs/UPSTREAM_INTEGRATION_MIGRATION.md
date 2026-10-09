@@ -66,6 +66,17 @@ hook that never returns still retains its goroutine. Confluent consumers reject
 
 ## Intentional security hardening
 
+The post-rc.5 correction included in release candidate `v0.2.0-rc.6` additionally masks structured credential
+aliases such as `pwd`, `pass`, `passphrase`, `otp`, `pin`, `cvv`, `cvc`, `pan` and
+card-number labels, including typed numeric values and request headers. Short
+aliases match complete delimiter/camelCase components, not arbitrary substrings
+in operational keys such as `shipping` or `span_id`. Original constructors still
+use the mandatory export boundary; no caller API migration is needed. These
+changes are **not in the older immutable rc.5**; select rc.6 or a subsequent
+revision containing the correction and verify its remote publication/checksum.
+Metroplex's directly initialized SDK needs its separate application sanitizer
+fix; replacing the library alone does not apply that policy to its SDK client.
+
 Privacy/security output hardening is deliberately not reverted. Sentry now
 applies mandatory export sanitization even through the original
 `InitSentryWithConfig` path: user PII, request query/body/cookies, sensitive
@@ -339,12 +350,15 @@ BSON/error-classification rollout gate.
 
 ## Release and downstream order
 
-1. Merge and tag this integration in the official `gofynd/fit-go` repository
-   as a new immutable release (recommended: `v0.2.0`). Do not reuse a fork tag.
-2. Run an authenticated organization-wide reverse-dependency search and compile
+1. Publish and validate the pending reviewed source under a new immutable
+   candidate; resolve the dependency-security decision before sign-off. Run an
+   authenticated organization-wide reverse-dependency search and compile
    every consumer. The integration now keeps every pre-existing all-exported
    struct layout exact and locks those layouts with a compatibility test because
    Go's standard API checker alone does not detect positional-literal breakage.
+2. After these gates and review approval, merge and tag the integration in the
+   official `gofynd/fit-go` repository as a new immutable release (recommended:
+   `v0.2.0`). Do not reuse a fork tag.
 3. Update fork consumers using the table above and test them against the local
    integration worktree.
 4. Replace local paths and `github.com/swapnilfynd/fit-go` replacements with the
@@ -353,12 +367,16 @@ BSON/error-classification rollout gate.
    `go.mod` still contains a local filesystem replacement.
 
 Metroplex's local `internal/app.go` uses `GetDecodedSecretFromGSM` and
-`UseHealthRouteMiddleware`. Its previous remote replacement is
-`v0.2.0-rc.4` at `9269ce6`. The next publication target, `v0.2.0-rc.5`,
-packages the cumulative runtime corrections without moving existing tags. Repin
-Metroplex locally to that immutable remote candidate and rerun with
-`GOWORK=off`; preserve its existing application edits. Record the published-
-pin evidence in Metroplex's library document. The candidate does not close
+`UseHealthRouteMiddleware`. Its pre-rc.6 replacement is published rc.5 at
+`2ab9e42`; all older tags remain immutable. The post-rc.5 Sentry and HTTP
+corrections are packaged in release candidate `v0.2.0-rc.6`; Metroplex also has
+separate application-owned Sentry fixes that the library tag does not supply.
+After verifying the remote rc.6 publication, repin and repeat Metroplex
+`GOWORK=off` checks while preserving existing application integration. The
+exact current local pin and evidence belong in Metroplex's library document.
+The original workfile must not be
+used as proof of a remote pin. Record both candidate-workspace and published-
+pin evidence separately in Metroplex's library document. Neither closes
 the security and deployment/reverse-consumer gates listed in the remediation
 ledger's publication status. Its dependencies and Go minimum remain unchanged
 by explicit user decision.

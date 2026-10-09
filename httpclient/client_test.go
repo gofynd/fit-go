@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +33,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/baggage"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
@@ -134,6 +136,115 @@ func spanAttributes(span tracetest.SpanStub) map[string]any {
 		attrs[string(attr.Key)] = attr.Value.AsInterface()
 	}
 	return attrs
+}
+
+type lifecycleRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f lifecycleRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestRoundTrip_SpanLifecyclePreservesTransportOutcome(t *testing.T) {
+	transportErr := errors.New("synthetic transport failure")
+	panicValue := &struct{ secret string }{secret: "synthetic-private-panic"}
+	for _, scenario := range []string{"success", "error", "panic", "goexit"} {
+		t.Run(scenario, func(t *testing.T) {
+			_, exporter := recordingHTTPTracer(t)
+			callerCtx := context.WithValue(context.Background(), struct{}{}, "caller-context")
+			req := httptest.NewRequest(http.MethodGet, "http://example.test/path", nil).WithContext(callerCtx)
+			req.Header.Set("x-caller", "unchanged")
+			response := &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}
+			var captured trace.Span
+			wrapped := WrapTransport(lifecycleRoundTripper(func(forwarded *http.Request) (*http.Response, error) {
+				captured = trace.SpanFromContext(forwarded.Context())
+				if forwarded.Context().Value(struct{}{}) != "caller-context" {
+					t.Error("forwarded context lost the caller's value")
+				}
+				if !captured.IsRecording() {
+					t.Error("span was ended before the base transport ran")
+				}
+				switch scenario {
+				case "error":
+					return nil, transportErr
+				case "panic":
+					panic(panicValue)
+				case "goexit":
+					runtime.Goexit()
+				}
+				return response, nil
+			}), WithMetrics(func(string, string, int, time.Duration) {
+				if captured.IsRecording() || len(exporter.GetSpans()) != 1 {
+					t.Error("normal span did not end before metrics ran")
+				}
+			}))
+			done := make(chan struct{})
+			var gotResponse *http.Response
+			var gotErr error
+			var recovered any
+			returned := false
+			go func() {
+				defer close(done)
+				defer func() { recovered = recover() }()
+				gotResponse, gotErr = wrapped.RoundTrip(req)
+				returned = true
+			}()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("transport did not finish")
+			}
+			if captured == nil || captured.IsRecording() || len(exporter.GetSpans()) != 1 {
+				t.Fatalf("transport span did not end exactly once: span=%v exported=%d", captured, len(exporter.GetSpans()))
+			}
+			span := exportedHTTPSpan(t, exporter, "HTTP GET")
+			switch scenario {
+			case "success":
+				if !returned || gotResponse != response || gotErr != nil || recovered != nil || span.Status.Code != codes.Unset {
+					t.Fatalf("success changed: returned=%v response=%v err=%v panic=%v status=%v", returned, gotResponse, gotErr, recovered, span.Status)
+				}
+			case "error":
+				if !returned || gotResponse != nil || gotErr != transportErr || recovered != nil || span.Status.Code != codes.Error {
+					t.Fatalf("error changed: returned=%v response=%v err=%v panic=%v status=%v", returned, gotResponse, gotErr, recovered, span.Status)
+				}
+			default:
+				if returned || scenario == "panic" && recovered != panicValue || scenario == "goexit" && recovered != nil {
+					t.Fatalf("abnormal exit changed: returned=%v panic=%v", returned, recovered)
+				}
+				if span.Status.Code != codes.Error || span.Status.Description != "HTTP client operation aborted" {
+					t.Fatalf("abnormal span status = %v", span.Status)
+				}
+				if len(span.Events) != 0 {
+					t.Fatalf("abnormal exit exposed event details: %v", span.Events)
+				}
+			}
+			if req.Header.Get(requestIDHeader) != "" || req.Header.Get(traceparentHeader) != "" || req.Header.Get("x-caller") != "unchanged" || req.Context() != callerCtx {
+				t.Fatal("caller-owned request was changed")
+			}
+		})
+	}
+}
+
+func TestRoundTrip_PostTransportPanicDoesNotChangeCompletedSpan(t *testing.T) {
+	_, exporter := recordingHTTPTracer(t)
+	panicValue := &struct{}{}
+	wrapped := WrapTransport(&fakeRT{}, WithMetrics(func(string, string, int, time.Duration) {
+		panic(panicValue)
+	}))
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		_, _ = wrapped.RoundTrip(httptest.NewRequest(http.MethodGet, "http://example.test/path", nil))
+	}()
+	if recovered != panicValue {
+		t.Fatalf("metrics panic changed: %v", recovered)
+	}
+	if len(exporter.GetSpans()) != 1 {
+		t.Fatalf("completed span exported %d times", len(exporter.GetSpans()))
+	}
+	span := exportedHTTPSpan(t, exporter, "HTTP GET")
+	if span.Status.Code != codes.Unset || spanAttributes(span)["http.response.status_code"] != int64(http.StatusOK) {
+		t.Fatalf("post-transport panic changed completed HTTP span: %v", span)
+	}
 }
 
 func TestRoundTrip_GeneratesRequestID(t *testing.T) {

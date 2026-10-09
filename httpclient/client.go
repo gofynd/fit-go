@@ -169,9 +169,19 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// scheme+host+path span; the wrapper exists for the fit/axios parity behaviours
 	// (proxy, x-request-id, safe logging) regardless. Do not swap to otelhttp.
 	var span *tracing.Span
+	spanEnded := false
 	if tracer := tracing.Global(); t.traceRequests && tracer != nil && tracer.IsEnabled() {
 		ctx, s := tracer.StartSpan(req.Context(), "HTTP "+req.Method, tracing.SpanKindClient)
 		span = s
+		defer func() {
+			if !spanEnded {
+				// Both panic and runtime.Goexit run deferred cleanup. Do not
+				// recover or expose the panic value: preserve the original exit
+				// while finishing the span with a fixed, privacy-safe failure.
+				span.SetStatus(tracing.StatusError, "HTTP client operation aborted")
+				span.End()
+			}
+		}()
 		req = req.WithContext(ctx)
 		// Use the configured process propagator rather than formatting traceparent
 		// ourselves. This carries traceparent, tracestate, baggage, and any future
@@ -210,6 +220,7 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		case httpClientStatusIsError(status):
 			span.SetStatus(tracing.StatusError, http.StatusText(status))
 		}
+		spanEnded = true
 		span.End()
 	}
 

@@ -7,8 +7,12 @@ the module follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Release candidate publication
-- Target immutable fork tag `v0.2.0-rc.5` packages the cumulative corrections
-  below, including worker-exit recovery, aggregate SSE bounds, Cluster Quit,
+- Release candidate `v0.2.0-rc.6` packages structured Sentry credential masking,
+  abnormal-exit HTTP span cleanup, and the README/example corrections below.
+  It is a new immutable candidate on top of rc.5; no older tag is moved.
+- Published immutable fork tag `v0.2.0-rc.5` at `2ab9e42` packages the cumulative
+  corrections preceding the rc.6 follow-up below, including
+  worker-exit recovery, aggregate SSE bounds, Cluster Quit,
   standard-log restoration, bounded health cleanup and aborted boundary spans.
   It does not change the Go 1.25.10 floor or dependencies, including `x/net`
   v0.58.0, as explicitly requested. The deferred security upgrade and remaining
@@ -17,6 +21,11 @@ the module follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   merge-readiness or deployment certification.
 
 ### Changed
+- Documentation/example follow-up in rc.6: align README guidance with
+  original versus opt-in constructors, Redis compatibility limits, FeatureHub
+  readiness, GSM decoding, managed health ownership and profiler status. The
+  Kafka demo requests shutdown using an external timer even on idle topics;
+  library runtime defaults and dependencies are unchanged; older tags remain immutable.
 - Default-path log and Sentry output is redacted for existing main users with
   no API or wire change: `logging` error values, the mandatory Sentry
   `BeforeSend`/`BeforeSendTransaction` sanitizer on `InitSentry`/
@@ -38,6 +47,18 @@ the module follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `InitSentryWithHooks` path supports retryable startup.
 
 ### Fixed
+- Follow-up to published `v0.2.0-rc.5`, included in rc.6: mask structured Sentry
+  credential aliases and numeric CVV/OTP/PIN/card values, including request
+  headers, without matching harmless short-name substrings or changing opaque
+  trace identifiers. Actual SDK error/transaction export regressions cover the
+  supported structured surfaces. This is additional intentional privacy output
+  hardening, not an API change; older rc.5 does not contain it.
+- Follow-up included in rc.6: end instrumented HTTP-client spans when a transport
+  or propagation stage panics or calls `runtime.Goexit`, using fixed safe error
+  text without recovering or changing the original exit. Normal response/error
+  identity and span completion before logging/metrics remain unchanged.
+- Correct Kafka interface documentation to distinguish untraced released raw
+  constructors from opt-in tracing and explicit-context helper behavior.
 - Follow-up to `v0.2.0-rc.4`: fail closed on abnormal Kafka
   partition-worker exits, preserve independent errors joined with shutdown
   cancellation, and recover collected advanced Confluent batches after a poll

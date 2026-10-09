@@ -16,6 +16,7 @@ package errors
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -56,6 +57,204 @@ func (t *mockTransport) Events() []*sentrylib.Event {
 // newTestSentry creates a fresh reporter independent of the package global.
 func newTestSentry() *sentrySdk {
 	return &sentrySdk{}
+}
+
+func TestSentryCredentialAliasClassification(t *testing.T) {
+	for _, key := range []string{
+		"pwd", "pass", "passphrase", "pin", "otp", "cvv", "cvc", "pan",
+		"card_number", "cardNumber", "cardnumber", "CARDNUMBER", "creditCardNumber",
+		"creditcardnumber", "CREDITCARDNUMBER", "primary_account_number", "primaryaccountnumber", "PRIMARYACCOUNTNUMBER",
+		"verification_code", "one_time_password", "userPwd", "paymentCVV", "user.pwd",
+		"payment_cvv", "customer-passphrase", "primaryAccountNumber", "verificationCode", "verificationcode", "VERIFICATIONCODE",
+		"pwd_hash", "pwdDigest", "CVVCode",
+		"PASSWORD", "access_token", "clientSecret",
+	} {
+		t.Run(key, func(t *testing.T) {
+			if !sensitiveSentryKey(key) {
+				t.Fatalf("credential label %q was not classified as sensitive", key)
+			}
+		})
+	}
+	for _, key := range []string{
+		"compass", "bypass", "spinning", "pinning", "shipping", "span_id", "trace_id",
+		"cardinality", "card_count", "paymentCount", "account_number_count", "postcardnumber", "cardnumbers", "---",
+	} {
+		t.Run(key, func(t *testing.T) {
+			if sensitiveSentryKey(key) {
+				t.Fatalf("operational label %q was classified as sensitive", key)
+			}
+		})
+	}
+}
+
+func TestSentrySDKExportMasksStructuredCredentialAliases(t *testing.T) {
+	previous := sentrylib.CurrentHub().Client()
+	defer sentrylib.CurrentHub().BindClient(previous)
+	transport := &mockTransport{}
+	reporter := newTestSentry()
+	if err := reporter.InitWithAdvancedConfig(SentryAdvancedConfig{SentryConfig: SentryConfig{
+		DSN: "https://public@example.com/1", SampleRate: 1, TracesSampleRate: 1, Transport: transport,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	hub := sentrylib.NewHub(sentrylib.CurrentHub().Client(), sentrylib.NewScope())
+	defer hub.Client().Close()
+	traceID := sentrylib.TraceID{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}
+	spanID := sentrylib.SpanID{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}
+	hub.Scope().SetPropagationContext(sentrylib.PropagationContext{TraceID: traceID, SpanID: spanID})
+	aliases := map[string]interface{}{
+		"pwd": "hunter2Secret", "pass": "opaquePassSecret", "passphrase": "phraseSecret",
+		"pin": int32(654321), "otp": uint32(456789), "cvv": 123, "cvc": float64(321),
+		"pan": int64(4111111111111111), "card_number": int64(4111111111111111),
+		"cardNumber": uint64(4111111111111111), "creditCardNumber": "4111111111111111",
+		"primary_account_number": int64(4111111111111111), "verification_code": 123456,
+		"one_time_password": 234567, "userPwd": "camelCaseSecret", "paymentCVV": 987,
+	}
+	negatives := map[string]interface{}{
+		"compass": "north", "bypass": "disabled", "spinning": 2, "pinning": 3, "shipping": 4,
+		"cardinality": 5, "card_count": 6,
+		"trace_id": "0123456789abcdef0123456789abcdef", "span_id": "0123456789abcdef",
+	}
+	fixture := func() map[string]interface{} {
+		values := make(map[string]interface{}, len(aliases)+len(negatives))
+		for key, value := range aliases {
+			values[key] = value
+		}
+		for key, value := range negatives {
+			values[key] = value
+		}
+		return values
+	}
+	stringFixture := func() map[string]string {
+		values := make(map[string]string, len(aliases)+len(negatives))
+		for key, value := range fixture() {
+			values[key] = fmt.Sprint(value)
+		}
+		return values
+	}
+	errorEvent := sentrylib.NewEvent()
+	errorEvent.Message = "safe"
+	errorEvent.Extra = fixture()
+	errorEvent.Extra["nested"] = fixture()
+	errorEvent.Contexts = map[string]sentrylib.Context{"business": fixture()}
+	errorEvent.Tags = stringFixture()
+	errorEvent.Request = &sentrylib.Request{Headers: stringFixture(), Env: stringFixture()}
+	errorEvent.Breadcrumbs = []*sentrylib.Breadcrumb{{Message: "safe", Data: fixture()}}
+	errorEvent.Exception = []sentrylib.Exception{{Value: "safe",
+		Mechanism:  &sentrylib.Mechanism{Data: fixture()},
+		Stacktrace: &sentrylib.Stacktrace{Frames: []sentrylib.Frame{{Vars: fixture()}}},
+	}}
+	errorEvent.Threads = []sentrylib.Thread{{Stacktrace: &sentrylib.Stacktrace{Frames: []sentrylib.Frame{{Vars: fixture()}}}}}
+	hub.CaptureEvent(errorEvent)
+	transaction := sentrylib.NewEvent()
+	transaction.Type = "transaction"
+	transaction.Transaction = "safe"
+	transaction.StartTime = time.Now().Add(-time.Millisecond)
+	transaction.Spans = []*sentrylib.Span{{TraceID: traceID, SpanID: spanID, Data: fixture(), Tags: stringFixture()}}
+	hub.CaptureEvent(transaction)
+	events := transport.Events()
+	if len(events) != 2 {
+		t.Fatalf("exported %d events, want error and transaction", len(events))
+	}
+	checked := make(map[string]int)
+	var inspect func(interface{})
+	inspect = func(value interface{}) {
+		switch values := value.(type) {
+		case map[string]interface{}:
+			for key, nested := range values {
+				if _, sensitive := aliases[key]; sensitive {
+					checked[key]++
+					if nested != redact.Mask {
+						t.Errorf("exported credential %s = %#v, want mask", key, nested)
+					}
+				}
+				if expected, safe := negatives[key]; safe {
+					// JSON numbers decode as float64, whereas tags are strings.
+					if fmt.Sprint(nested) != fmt.Sprint(expected) {
+						t.Errorf("operational field %s = %#v, want %v", key, nested, expected)
+					}
+				}
+				inspect(nested)
+			}
+		case []interface{}:
+			for _, nested := range values {
+				inspect(nested)
+			}
+		}
+	}
+	for _, event := range events {
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var exported interface{}
+		if err := json.Unmarshal(encoded, &exported); err != nil {
+			t.Fatal(err)
+		}
+		inspect(exported)
+	}
+	for key := range aliases {
+		if checked[key] != 12 {
+			t.Errorf("checked %s in %d exported maps, want 12", key, checked[key])
+		}
+	}
+}
+
+func TestSentryCredentialAliasesInsideTypedCollections(t *testing.T) {
+	type payment struct {
+		CVV        uint16  `json:"cvv"`
+		PIN        int32   `json:"pin"`
+		CardNumber uint64  `json:"cardNumber"`
+		Pwd        string  `json:"pwd"`
+		Compass    string  `json:"compass"`
+		Count      uint16  `json:"count"`
+		Active     bool    `json:"active"`
+		Latency    float32 `json:"latency"`
+		Hidden     string  `json:"-"`
+		private    string
+	}
+	input := payment{CVV: 123, PIN: 654321, CardNumber: 4111111111111111,
+		Pwd: "typed-secret-marker", Compass: "north", Count: 42, Active: true, Latency: 1.5,
+		Hidden: "not-exported-marker", private: "private-marker"}
+	for _, test := range []struct {
+		name  string
+		value interface{}
+	}{
+		{"struct", input}, {"pointer", &input}, {"slice", []payment{input}},
+		{"array", [1]payment{input}}, {"typed_map", map[string]payment{"payment": input}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result := sanitizeSentryValue("metadata", test.value)
+			encoded, err := json.Marshal(result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, secret := range []string{"123", "654321", "4111111111111111", "typed-secret-marker", "not-exported-marker", "private-marker"} {
+				if strings.Contains(string(encoded), secret) {
+					t.Errorf("typed credential/hidden field leaked: %s", encoded)
+				}
+			}
+			for _, safe := range []string{`"compass":"north"`, `"count":42`, `"active":true`, `"latency":1.5`} {
+				if !strings.Contains(string(encoded), safe) {
+					t.Errorf("safe typed field lost: %s", encoded)
+				}
+			}
+		})
+	}
+	var nilPayment *payment
+	var nilPayments []payment
+	var nilMap map[string]payment
+	for _, value := range []interface{}{nilPayment, nilPayments, nilMap} {
+		if result := sanitizeSentryValue("metadata", value); result != nil {
+			t.Errorf("nil non-sensitive collection should stay nil, got %#v", result)
+		}
+		if result := sanitizeSentryValue("pwd", value); result != redact.Mask {
+			t.Errorf("sensitive key must win over a nil/typed value, got %#v", result)
+		}
+	}
+	if result := sanitizeSentryValue("metadata", map[int]interface{}{1: input}); result != redact.Mask {
+		t.Errorf("map without inspectable field names was not masked: %#v", result)
+	}
 }
 
 // ---------------------------------------------------------------------------
