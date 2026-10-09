@@ -16,7 +16,6 @@
 package feature
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -887,8 +886,7 @@ func (c *Client) consumeStream(ctx context.Context, revision uint64) (bool, erro
 		}
 	}
 
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 64<<10), maxSSEEventSize)
+	scanner := newFeatureSSEScanner(resp.Body)
 	var eventName string
 	var data []string
 	dispatch := func() error {
@@ -927,9 +925,8 @@ func (c *Client) consumeStream(ctx context.Context, revision uint64) (bool, erro
 	if err := scanner.Err(); err != nil {
 		return false, err
 	}
-	if err := dispatch(); err != nil {
-		return false, err
-	}
+	// EOF does not terminate an SSE event. Only a blank line dispatches the
+	// accumulated fields; discard an unfinished event when the stream closes.
 	return false, io.EOF
 }
 
@@ -1023,8 +1020,7 @@ func (c *Client) consumeEvaluationSnapshot(ctx context.Context, attributes map[s
 		}
 	}
 
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 64<<10), maxSSEEventSize)
+	scanner := newFeatureSSEScanner(resp.Body)
 	var eventName string
 	var data []string
 	for scanner.Scan() {

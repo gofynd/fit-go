@@ -35,10 +35,12 @@ type Checker struct {
 	// skipCounter is used for adaptive health checking to reduce load
 	skipCounter int
 
-	periodicMu     sync.Mutex
-	periodicStops  []chan struct{}
-	periodicDones  []chan struct{}
-	periodicStates []*periodicCheckState
+	periodicStartMu    sync.Mutex
+	periodicMu         sync.Mutex
+	periodicGeneration uint64
+	periodicStops      []chan struct{}
+	periodicDones      []chan struct{}
+	periodicStates     []*periodicCheckState
 }
 
 type periodicCheckState struct {
@@ -110,10 +112,33 @@ func (c *Checker) startPeriodicCheck(interval time.Duration) {
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}
-
 	c.periodicMu.Lock()
-	_ = c.stopPeriodicCheckLocked(context.Background())
-	c.startPeriodicCheckLocked(interval)
+	generation := c.periodicGeneration
+	c.periodicMu.Unlock()
+	c.startPeriodicCheckAtGeneration(interval, generation)
+}
+
+func (c *Checker) startPeriodicCheckAtGeneration(interval time.Duration, generation uint64) {
+	// Serialize managed replacements, but never hold periodicMu while waiting
+	// for user checks. Deadline-bound stops must be able to signal and wait too.
+	c.periodicStartMu.Lock()
+	defer c.periodicStartMu.Unlock()
+	c.periodicMu.Lock()
+	// Include replacements already queued behind another managed start when
+	// deciding whether an intervening stop/reset superseded this request.
+	if c.periodicGeneration != generation {
+		c.periodicMu.Unlock()
+		return
+	}
+	dones := c.stopPeriodicCheckLocked()
+	c.periodicMu.Unlock()
+	_ = waitForPeriodicChecks(context.Background(), dones)
+	c.periodicMu.Lock()
+	// A stop/reset that happened while the replacement waited takes priority.
+	// It must not be followed by a late liveness loop from that old start.
+	if c.periodicGeneration == generation {
+		c.startPeriodicCheckLocked(interval)
+	}
 	c.periodicMu.Unlock()
 }
 
@@ -179,12 +204,15 @@ func (c *Checker) StopPeriodicCheckContext(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	c.periodicMu.Lock()
-	err := c.stopPeriodicCheckLocked(ctx)
+	c.periodicGeneration++
+	dones := c.stopPeriodicCheckLocked()
 	c.periodicMu.Unlock()
-	return err
+	return waitForPeriodicChecks(ctx, dones)
 }
 
-func (c *Checker) stopPeriodicCheckLocked(ctx context.Context) error {
+// stopPeriodicCheckLocked only signals work. Keep unfinished done channels so
+// concurrent callers also wait for checks signalled by an earlier stop.
+func (c *Checker) stopPeriodicCheckLocked() []chan struct{} {
 	for _, state := range c.periodicStates {
 		state.mu.Lock()
 		state.stopped = true
@@ -193,10 +221,21 @@ func (c *Checker) stopPeriodicCheckLocked(ctx context.Context) error {
 	for _, stop := range c.periodicStops {
 		close(stop)
 	}
-	dones := c.periodicDones
 	c.periodicStops = nil
-	c.periodicDones = nil
 	c.periodicStates = nil
+	dones := make([]chan struct{}, 0, len(c.periodicDones))
+	for _, done := range c.periodicDones {
+		select {
+		case <-done:
+		default:
+			dones = append(dones, done)
+		}
+	}
+	c.periodicDones = dones
+	return dones
+}
+
+func waitForPeriodicChecks(ctx context.Context, dones []chan struct{}) error {
 	for _, done := range dones {
 		select {
 		case <-done:

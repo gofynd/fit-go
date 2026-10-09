@@ -521,7 +521,10 @@ func validateIORedisQueuedCommand(command []string) (bool, error) {
 			strings.EqualFold(command[1], "tracking") || strings.EqualFold(command[1], "caching") ||
 			strings.EqualFold(command[1], "pause"))
 	case "XREAD", "XREADGROUP":
-		blocking, bounded := ioredisXReadBlockingMode(command)
+		_, blocking, bounded, err := parseIORedisXReadPrefix(command)
+		if err != nil {
+			return false, err
+		}
 		if blocking && bounded {
 			return true, nil
 		}
@@ -557,29 +560,55 @@ func ioredisBoundedBlockingCommand(command []string) bool {
 	return err == nil && timeout > 0 && !math.IsInf(timeout, 0) && !math.IsNaN(timeout)
 }
 
-func ioredisXReadBlockingMode(command []string) (blocking, bounded bool) {
-	streamsIndex := len(command)
-	for index := 1; index < len(command); index++ {
-		if strings.EqualFold(command[index], "streams") {
-			streamsIndex = index
-			break
-		}
+// Parse only the option prefix: group/consumer names and option values are
+// caller data, even when they equal STREAMS or BLOCK. Keys and IDs after the
+// delimiter must never be inspected for blocking options.
+func parseIORedisXReadPrefix(command []string) (streamsIndex int, blocking, bounded bool, err error) {
+	verb := strings.ToUpper(command[0])
+	invalid := func() (int, bool, bool, error) {
+		return -1, blocking, false, fmt.Errorf("redis: ioredis command %s has an invalid STREAMS option prefix", verb)
 	}
-	for index := 1; index < streamsIndex; index++ {
+	index := 1
+	groupSeen := false
+	bounded = true
+	for index < len(command) {
 		switch strings.ToUpper(command[index]) {
+		case "STREAMS":
+			if verb == "XREADGROUP" && !groupSeen {
+				return invalid()
+			}
+			return index, blocking, bounded, nil
 		case "GROUP":
-			index += 2
+			if verb != "XREADGROUP" || index+2 >= len(command) {
+				return invalid()
+			}
+			// Redis accepts GROUP anywhere in the option prefix, including
+			// repeated GROUP clauses. Its two arguments are always data.
+			groupSeen = true
+			index += 3
 		case "COUNT":
-			index++
+			if index+1 >= len(command) {
+				return invalid()
+			}
+			index += 2
 		case "BLOCK":
-			if index+1 >= streamsIndex {
-				return true, false
+			blocking = true
+			if index+1 >= len(command) {
+				return invalid()
 			}
 			timeout, err := strconv.ParseFloat(command[index+1], 64)
-			return true, err == nil && timeout > 0 && !math.IsInf(timeout, 0) && !math.IsNaN(timeout)
+			bounded = bounded && err == nil && timeout > 0 && !math.IsInf(timeout, 0) && !math.IsNaN(timeout)
+			index += 2
+		case "NOACK":
+			if verb != "XREADGROUP" {
+				return invalid()
+			}
+			index++
+		default:
+			return invalid()
 		}
 	}
-	return false, false
+	return invalid()
 }
 
 // Quit appends QUIT after every already accepted command and waits for its
@@ -887,6 +916,13 @@ func (c *IORedisCompatClient) runDuplexSession(transport ioredisDuplexTransport)
 		if !reading && ioredisOutstandingReplies(inFlight) > 0 {
 			readRequestChannel = readRequests
 		}
+		var idleCloseChannel <-chan struct{}
+		if writing == nil && !reading && len(inFlight) == 0 {
+			// The RESP reader observes remote EOF even without outstanding
+			// commands. Only handle it directly when idle: active readers and
+			// writers must retain their reply/replay reconciliation boundaries.
+			idleCloseChannel = transport.Closed()
+		}
 
 		select {
 		case writeRequestChannel <- nextWrite:
@@ -959,6 +995,8 @@ func (c *IORedisCompatClient) runDuplexSession(transport ioredisDuplexTransport)
 			if stop {
 				return true, nil
 			}
+		case <-idleCloseChannel:
+			return false, errors.New("ioredis transport closed")
 		case <-c.wake:
 			continue
 		case <-c.ctx.Done():

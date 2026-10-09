@@ -518,6 +518,17 @@ func sanitizeSentryEvent(event *sentrylib.Event) *sentrylib.Event {
 	if event == nil {
 		return nil
 	}
+	// The SDK freezes dynamic sampling context before BeforeSend and keeps it
+	// outside the JSON event. Redacting Transaction alone does not redact the
+	// envelope header. Its public getter returns a copy, with no direct setter.
+	// Omit private metadata only for unsafe contexts; never mutate shared SDK
+	// maps or use unsafe reflection. The event and its trace IDs remain intact.
+	for key, value := range event.GetDynamicSamplingContext() {
+		if redact.Text(key) != key || sanitizeSentryValue(key, value) != value {
+			event = sentryEventWithoutPrivateMetadata(event)
+			break
+		}
+	}
 	event.Message = redact.Text(event.Message)
 	for i := range event.Exception {
 		event.Exception[i].Value = redact.Text(event.Exception[i].Value)
@@ -608,7 +619,52 @@ func sanitizeSentryEvent(event *sentrylib.Event) *sentrylib.Event {
 			}
 		}
 	}
-	return event
+	return rebuildSanitizedSentryEvent(event)
+}
+
+// rebuildSanitizedSentryEvent discards SDK serialization caches, which can have
+// been populated before capture or by a caller hook. MakeSerializationSafe on
+// the old event cannot clear a cached user after User is emptied, and MarshalJSON
+// otherwise prefers those stale bytes over our sanitized public fields.
+func rebuildSanitizedSentryEvent(event *sentrylib.Event) *sentrylib.Event {
+	sampling := event.GetDynamicSamplingContext()
+	rebuilt := sentryEventWithoutPrivateMetadata(event)
+	if len(sampling) != 0 {
+		// An empty scope with no client or processors installs only the vetted DSC.
+		// ApplyToEvent also installs its propagation trace context; temporarily
+		// detach ours so that operation cannot overwrite or mutate the event's
+		// existing correlation IDs or add a trace context where none existed.
+		contexts := rebuilt.Contexts
+		rebuilt.Contexts = nil
+		scope := sentrylib.NewScope()
+		scope.SetPropagationContext(sentrylib.PropagationContext{
+			DynamicSamplingContext: sentrylib.DynamicSamplingContext{Entries: sampling, Frozen: true},
+		})
+		scope.ApplyToEvent(rebuilt, nil, nil)
+		rebuilt.Contexts = contexts
+	}
+	rebuilt.MakeSerializationSafe()
+	return rebuilt
+}
+
+// sentryEventWithoutPrivateMetadata preserves every public SDK event field
+// while discarding frozen sampling metadata and cached JSON. Safe sampling is
+// restored separately by rebuildSanitizedSentryEvent; unsafe sampling is omitted.
+// Keep this projection covered by the SDK-field regression test on SDK updates.
+func sentryEventWithoutPrivateMetadata(e *sentrylib.Event) *sentrylib.Event {
+	return &sentrylib.Event{
+		Breadcrumbs: e.Breadcrumbs, Contexts: e.Contexts, Dist: e.Dist,
+		Environment: e.Environment, EventID: e.EventID, Extra: e.Extra,
+		Fingerprint: e.Fingerprint, Level: e.Level, Message: e.Message,
+		Platform: e.Platform, Release: e.Release, Sdk: e.Sdk,
+		ServerName: e.ServerName, Threads: e.Threads, Tags: e.Tags,
+		Timestamp: e.Timestamp, Transaction: e.Transaction, User: e.User,
+		Logger: e.Logger, Modules: e.Modules, Request: e.Request,
+		Exception: e.Exception, DebugMeta: e.DebugMeta, Attachments: e.Attachments,
+		Type: e.Type, StartTime: e.StartTime, Spans: e.Spans,
+		TransactionInfo: e.TransactionInfo, CheckIn: e.CheckIn,
+		MonitorConfig: e.MonitorConfig, Logs: e.Logs, Metrics: e.Metrics,
+	}
 }
 
 func cloneSentryBreadcrumb(original *sentrylib.Breadcrumb) *sentrylib.Breadcrumb {
@@ -680,7 +736,17 @@ func sanitizeSentryValueDepth(key string, value interface{}, visited map[sentryV
 		return redact.Mask
 	}
 	switch typed := value.(type) {
+	case sentrylib.TraceID:
+		return typed.String()
+	case sentrylib.SpanID:
+		return typed.String()
 	case string:
+		// A caller hook is followed by a second sanitization pass. Preserve only
+		// correctly sized hex identifiers under the SDK's correlation keys; do
+		// not exempt arbitrary byte arrays, strings, or Stringer implementations.
+		if validSentryCorrelationID(key, typed) {
+			return typed
+		}
 		return redact.Text(typed)
 	case error:
 		return redact.Text(typed.Error())
@@ -689,6 +755,27 @@ func sanitizeSentryValueDepth(key string, value interface{}, visited map[sentryV
 	default:
 		return sanitizeReflectedSentryValue(reflect.ValueOf(value), visited, depth)
 	}
+}
+
+func validSentryCorrelationID(key, value string) bool {
+	length := 0
+	switch key {
+	case "trace_id":
+		length = 32
+	case "span_id", "parent_span_id":
+		length = 16
+	default:
+		return false
+	}
+	if len(value) != length {
+		return false
+	}
+	for _, digit := range value {
+		if !(digit >= '0' && digit <= '9' || digit >= 'a' && digit <= 'f' || digit >= 'A' && digit <= 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 func sanitizeReflectedSentryValue(value reflect.Value, visited map[sentryVisit]struct{}, depth int) interface{} {

@@ -667,7 +667,8 @@ func (runner *Runner) withLock(ctx context.Context, operation func(context.Conte
 	runCtx := ctx
 	var unlock UnlockFunc
 	cancelRun := func() {}
-	defer cancelRun()
+	// Resolve the cleanup at return time: the lease branch replaces cancelRun.
+	defer func() { cancelRun() }()
 	if leaseLocker, ok := runner.locker.(LeaseLocker); ok {
 		lease, err := leaseLocker.LockLease(ctx)
 		if err != nil {

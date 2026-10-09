@@ -78,6 +78,19 @@ warnings do not serialize raw tracing or metrics initialization errors. See
 [Behaviour differences for existing main users](#behaviour-differences-for-existing-main-users)
 for every affected default path.
 
+The local follow-up to `11f29d2` also covers SDK-frozen Sentry envelope dynamic
+sampling context. Unsafe sampling metadata is omitted because the SDK exposes
+no safe setter; safe metadata, transaction delivery and opaque body trace/span
+IDs are retained. This privacy-only envelope change is not an API or sampling
+rate change. See the local follow-up table in
+[the remediation ledger](PR3_COMPATIBILITY_REMEDIATION.md#local-review-follow-up-to-11f29d2-2026-10-08-not-published)
+for the focused Kafka/Redis/FeatureHub/lifecycle corrections and boundaries.
+
+The 2026-10-09 local follow-up also rebuilds the SDK's private serialization
+snapshots after sanitizing, so pre-serialized events and hook-produced cached
+fields cannot bypass redaction. Safe sampling metadata is restored through
+public SDK APIs without changing sanitized trace contexts or sampling rates.
+
 Two inherited compatibility boundaries are deliberately not presented as
 security hardening. `server.New` still records the decoded URL path unchanged;
 applications must not put credentials or PII in path segments. The encryption
@@ -127,6 +140,7 @@ items are deliberate and pinned by guard tests
 | Sentry export sanitizer (`errors/sentry.go`, `sanitizeSentryEvent`) | Events sent as captured | Mandatory `BeforeSend`/`BeforeSendTransaction` sanitizer: `event.User` cleared; request query, body and cookies replaced by the mask, request URL/headers/env redacted; message, exceptions (incl. mechanism), breadcrumbs, tags (sensitive keys masked), extras, contexts, spans, threads and stack frames redacted; `Fingerprint` and `Transaction` passed through `redact.Text`, so issue grouping and transaction names can change; attachments, logs and metrics dropped |
 | Tracer after `Shutdown` (`tracing/tracing.go`, `IsEnabled`) | `IsEnabled()` stayed `true` | `IsEnabled()` is `false` once `Shutdown` starts, so decorators, `kafka.TracedMessageHandler` and other instrumentation stop creating spans during the drain. The global propagator (and, for `Init`/`New` tracers, the shut-down provider) stays installed, so propagation continues |
 | Tracer re-init (`tracing/tracing.go`, `initWithOptions`) | `sync.Once`: `Init` → `Shutdown` → `Init` returned the shut-down tracer; a failed init was never retried | Same (`9b8754c`). Only the additive `InitSDK` creates a fresh tracer after shutdown or retries |
+| Released tracer instrumentation scope (`tracing/tracing.go`) | `fit.go/<Options.ServiceName>`, independent of resource `service.name` | Same, including when an attribute overrides resource identity. Resolved-resource scope naming is limited to opt-in SDK constructors |
 | Span lookup helpers (`tracing/tracing.go`, `SpanFromContext`, `TraceIDFromContext`, `SpanIDFromContext`) | fit-go context keys only | Also fall back to (and prefer) a valid native OTel span context, e.g. one created by otelgin/otelgrpc. `ContextWithTrace` values keep their precedence |
 | `kafka.TracedMessageHandler` with tracing enabled (`kafka/tracing.go`) | Span `kafka.consume <topic>`; parent from a hand-parsed `traceparent`; four `messaging.*` attributes; raw status message | Span `process <topic>`; parent extracted through the installed global propagator (`traceparent`, `tracestate`, baggage; remote parent); extra `messaging.destination.name`, `messaging.operation.*`, `messaging.destination.partition.id`, `messaging.kafka.offset` attributes; span context published as the goroutine-local active context for the handler; status message redacted |
 | Legacy `ConfluentProducer.Close` (`kafka/confluent.go`, `closeLegacy`) | Synchronous `Flush(15s)` then `Close` under the producer lock | Total wait capped at 15 s; if exceeded it logs a warning and returns `nil` while flush/close continue in the background. Concurrent `Close` callers wait for the same completion |
@@ -265,7 +279,13 @@ failures without letting one partition hide a sibling failure. With
 `CommitBeforeHandler`, a record whose pre-handler commit succeeded is not
 replayed when its handler fails, but later fetched records of that partition
 group are rewound rather than skipped. Recovery does not replace
-`FromBeginning=false` with an earliest-retention fallback. Confluent seeks only
+`FromBeginning=false` with an earliest-retention fallback. Franz remembers
+known unresolved positions across real ownership loss and driver recreation;
+after broker offset lookup it applies them only to assigned partitions with no
+committed offset. Broker commits remain authoritative. This recovery state is
+local to the consumer object, not durable across process crashes or shared with
+another group member. Successful processing/pre-handler commits clear the
+relevant remembered position. Confluent seeks only
 partitions the member still owns and drops rewinds for revoked partitions; if
 an exact seek fails, the rewind stays pending and every later `Consume` call
 returns an error without reading until the seek succeeds. The consumer is never
@@ -332,10 +352,13 @@ BSON/error-classification rollout gate.
    `go.mod` still contains a local filesystem replacement.
 
 Metroplex's local `internal/app.go` uses `GetDecodedSecretFromGSM` and
-`UseHealthRouteMiddleware`. These follow-up fixes target new immutable fork
-tag `v0.2.0-rc.3`, after the `rc.2` baseline at `15f19406`. Publish the
-candidate without moving `rc.2`, then repin Metroplex's local module
-replacement, checksum, and pin test and rerun with `GOWORK=off`. Record the
-published-pin evidence in Metroplex's library document and PR #3. An official
+`UseHealthRouteMiddleware`. Its previous remote replacement is
+`v0.2.0-rc.3` at `11f29d2`. The next publication target, `v0.2.0-rc.4`,
+packages the follow-up corrections without moving existing tags. Repin
+Metroplex locally to that immutable remote candidate and rerun with
+`GOWORK=off`; preserve its existing application edits. Record the published-
+pin evidence in Metroplex's library document. The candidate does not close
+the remaining issues listed in the remediation ledger's publication status.
+An official
 release after upstream merge is a separate pin migration; the fork replacement
 must remain until that official immutable tag is available and validated.

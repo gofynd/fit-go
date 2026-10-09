@@ -2,6 +2,24 @@
 
 ## Status and scope
 
+### 2026-10-09 publication target: `v0.2.0-rc.4`
+
+This release candidate packages the follow-ups to `11f29d2` below. Their
+"local only"/"not published" headings and validation entries are historical
+snapshots, not the current publication target. Existing immutable tags must
+not move. Metroplex must select the new remote tag and rerun its checks with
+`GOWORK=off`; its local repin is not a deployment.
+
+This candidate is **not merge-ready certification**. The latest review left
+these issues open: abnormal Kafka worker exit (`runtime.Goexit`) can bypass
+recovery; advanced Confluent can suppress an unrelated handler error during
+shutdown; SSE limits bound lines rather than aggregate events; and stalled
+health-file I/O can defeat a stop deadline. Metroplex's separate, application-
+owned Sentry breadcrumb race is not repaired by this library publication.
+The dependency/toolchain security upgrade and live Kafka/Redis validation
+remain separate release gates. No new runtime remediation or dependency-floor
+change is included in this publication step.
+
 This ledger records the remediation on top of PR head
 `98619a6156e0cd2854b71e03e8149bab9cac69d5`, compared with official main
 `df96a2884f700d0ebf71ad9afa79727978f73869`:
@@ -20,6 +38,7 @@ This ledger records the remediation on top of PR head
 | `4d45fdf` | Legacy `ConsumeBatch` error identity and `InjectTraceHeaders` parity |
 | `15f1940` (`v0.2.0-rc.2`) | Documentation refresh for the three parity fixes |
 | `v0.2.0-rc.3` follow-up | Final correctness fixes on top of immutable `v0.2.0-rc.2` |
+| Local, unpublished follow-up to `11f29d2` | Mixed Kafka poll recovery, Sentry envelope privacy/trace IDs, Redis routing, SSE framing, and lifecycle cleanup |
 
 It separates verified behavior from accepted limitations so a release
 description does not promise more than the code and tests provide.
@@ -39,6 +58,113 @@ The compatibility objective is:
   official immutable fit-go tag exists.
 
 ## Changes made
+
+### Local review follow-up to `11f29d2` (2026-10-08; not published)
+
+The target branch remains official main `df96a28`. This follow-up changes no
+exported API, module dependency, topic/schema, datastore TLS default, tracing
+initializer, JWT verifier, or Metroplex source/pin. It uses additive-path
+regressions plus original-main default guards to bound the blast radius.
+
+| Confirmed defect | Correction and compatibility boundary |
+|---|---|
+| Franz poll returns records and a transient error | Preserve the earliest fetched position for each topic/partition, rewind under the existing rebalance gate, and retain the member. No record is handled or committed from the failed poll. No-record transient failures keep the existing rebuild path; `FromBeginning=false` does not become earliest |
+| Empty Franz values/headers become nil | Use the existing nullable deep-copy helper, preserving tombstone/null versus empty distinctions and caller isolation |
+| Sentry envelope retains raw transaction sampling text | Check the SDK's private dynamic sampling context before both mandatory sanitizer passes. If unsafe, project all public event fields to a fresh event without that private envelope metadata. Safe metadata is retained; transaction delivery, body trace identity, hooks, transport selection, and first-call initialization remain intact |
+| Sentry trace/span ID byte arrays are masked | Preserve known SDK ID types and correctly sized hexadecimal strings under `trace_id`, `span_id`, and `parent_span_id`. Sensitive keys still win, and ordinary byte arrays remain opaque/masked |
+| Redis counted-key arithmetic can overflow and panic | Compare declared counts against remaining arguments before addition/slicing; retain existing zero-key and cross-slot policies |
+| XREADGROUP group/consumer names can be mistaken for STREAMS/BLOCK | Share grammar-aware prefix parsing between routing and blocking checks, skipping group/consumer names and option values as data |
+| Redis discovered IPv6 addresses are invalid | Use `net.JoinHostPort` for Sentinel and Cluster discovery, preserving IPv4/hostname/fallback behavior |
+| FeatureHub ignores valid CR-only or BOM-prefixed SSE | Share a bounded line splitter across continuous streaming and isolated Build snapshots. Accept LF/CRLF/CR and one leading BOM, including split reads; retain existing limits and dispatch behavior. Legacy polling is unchanged |
+| A background health stop defeats another caller's deadline | Signal under the bookkeeping lock, wait outside it, and retain unfinished done channels for concurrent callers. An intervening stop/reset supersedes a pending managed replacement. Original public multi-start behavior and stopped-check file-write guards remain |
+| Migration lease cleanup captures the initial no-op | Resolve the cancellation closure at return time, releasing the execution context and caller cancellation registration on success, operation/unlock error, and panic; fencing/unlock semantics remain |
+
+The Sentry metadata projection is a deliberate privacy trade-off: for an
+unsafe sampling context only, envelope-level dynamic sampling fields are
+omitted rather than mutated through unsafe/private SDK access. Safe sampling
+metadata and all public event fields remain, with an SDK-field coverage test
+to catch future dependency additions. This is not a change to sampling rates.
+
+Regression evidence includes both actual Sentry HTTP export transports and
+six real Franz client/Kafka-protocol-broker cases (message/batch; uncommitted,
+committed, automatic marks), normal and race. The protocol-broker harness
+uses a temporary modfile/overlay, not a new library dependency. Real external
+Kafka brokers and live Redis Sentinel/Cluster remain release gates.
+
+### Ownership-loss, serialization-cache and option-order follow-up (2026-10-09; local only)
+
+The next review found two inherited gaps in the protections above and one new
+Redis parsing regression. The fixes stay local on `11f29d2`; no published tag,
+Metroplex pin/source, public signature, dependency or legacy default is changed.
+
+| Confirmed issue | Narrow correction | Regression boundary |
+|---|---|---|
+| Franz `SetOffsets` recovery is discarded after genuine ownership loss | Remember exact unresolved positions across assignments and driver recreation. After broker offset lookup, substitute a remembered position only for a currently assigned partition with no committed offset. Clear boundaries after successful processing/pre-handler commit; broker commits remain authoritative | Real broker-triggered member loss, new latest-start group, committed-offset and from-beginning controls; assignment/commit/pre-handler-commit unit tests |
+| Sentry private serialized fields override sanitized public fields | Project every sanitized event to a cache-free public event, restore vetted safe DSC through an empty SDK scope, retain the original sanitized contexts, then rebuild serialization snapshots | HTTP export through sync/async transports, errors/transactions, pre-capture/hook serialization, safe/unsafe sampling metadata, cleared fields and public-field coverage |
+| XREADGROUP requires GROUP at argument 1 locally | Recognize GROUP anywhere in the option prefix and skip its two data arguments, including repeated clauses | COUNT/BLOCK/NOACK before GROUP, keyword-valued names, duplicate clauses, malformed prefixes and unchanged unsafe-BLOCK rejection |
+
+Kafka recovery state is in-memory and belongs to this consumer object; it is
+not a substitute for durable broker commits across process crashes, nor does it
+force another group member to replay an uncommitted boundary. It never resets
+the entire topic to earliest or processes an unowned partition. Original
+`client.Consumer` behavior and Confluent recovery are unchanged in this round.
+
+The Sentry correction deliberately prevents cached PII from being exported;
+it does not change sampling rates, drop transactions, alter hook ordering or
+remove vetted safe sampling metadata. The public-field projection and empty
+scope behavior are covered by tests and must be revalidated on SDK upgrades.
+Nested pointer/collection forms beyond the existing canonical trace-context ID
+tests are not a new guarantee of this serialization-cache fix.
+
+Redis's default go-redis path is untouched. Malformed prefixes and every
+non-positive/invalid BLOCK clause remain rejected on ioredis paths, including
+a zero BLOCK followed by a positive duplicate. Full ioredis parity for the
+previously documented rejected modes is not claimed.
+
+### SSE, idle-RESP, batch-unwind and scope follow-up (2026-10-09; local only)
+
+Four independently reproduced defects were repaired without changing public
+signatures, dependencies, the Go 1.25.10 directive, Metroplex source/pin, or
+Kafka offset policy. Official main remains `df96a28`.
+
+| Confirmed issue | Correction | Compatibility boundary |
+|---|---|---|
+| Continuous FeatureHub SSE applied an unfinished event at clean EOF | Dispatch only after a blank line; discard pending fields on EOF | Completed full/incremental/delete events are retained; isolated Build already uses this boundary; legacy polling is unchanged |
+| Idle owned RESP close left readiness stale until a command arrived | Observe transport closure only with no writer, reader or in-flight request, then use the existing reconnect loop | Buffered replies, partial pipelines and ambiguous replay reconciliation remain authoritative; empty offline Quit settles; main's go-redis is untouched |
+| Kafka batch panic/Goexit leaked receive/process spans | Defer span cleanup without recovering or serializing a panic, leaving abnormal status unset | Normal success/error status and exact returned error identity are unchanged; no handler retry/commit change |
+| Legacy tracer scope followed resource identity instead of Options | Limit resolved-resource scope naming to opt-in SDK constructors | Released constructors again use `fit.go/<Options.ServiceName>` as main does; SDK resource identity remains unchanged |
+
+Tests cover 116 SSE boundary cases, a pinned EventSource 2.0.2 oracle, fresh
+net.Pipe RESP reconnects, buffered reply/EOF and partial pipeline boundaries,
+in-flight replay, empty offline Quit and Disconnect, panic(nil)/Goexit and
+normal Kafka errors, and legacy versus SDK resource/scope identity. The scope
+probe also passes against a clean official-main copy.
+
+Two existing initialization/retry test fixtures closed their successful SSE
+connections immediately, making readiness transient under the Go 1.25.10
+single-threaded scheduler. Their successful responses now flush and remain
+open until cancellation, like a healthy SSE edge; error responses and
+intentional disconnect tests are unchanged. Both fixtures pass 50 repetitions,
+and full FeatureHub tests pass 10 normal and 3 race repetitions. Production
+readiness was not relaxed. Existing wall-clock redaction growth and short Redis
+dial tests were also sensitive to concurrent compiler/test load; the growth
+guard and production redactor were not weakened or changed in this round.
+
+The security upgrade is a separate compatibility decision: `x/net` v0.60.0
+declares Go 1.26.0 and upgrades related `x/*` modules. Applying it directly
+would raise the minimum version for existing main consumers. These fixes keep
+Go 1.25.10 and actual dependency files unchanged; a disposable Go 1.26.9
+dependency candidate is validated separately, not published or adopted by
+Metroplex. This is not a clean security-release claim.
+
+The disposable candidate uses Go 1.26.9, `x/net` v0.60.0, `x/crypto` v0.57.0,
+`x/sync` v0.23.0, `x/sys` v0.48.0 and `x/text` v0.42.0. Its full fit-go
+tests/vet pass, `govulncheck ./...` reports zero reachable vulnerabilities
+(one imported-package and one required-module advisory are uncalled), and
+Metroplex builds/passes vet using a separate temporary workspace. These checks
+do not establish compatibility for consumers still building with Go 1.25;
+adopting the higher floor requires a separate release decision and downstream
+validation. The real `go.mod`, `go.sum` and Metroplex pin are unchanged.
 
 ### Tracing legacy lifecycle parity (`9b8754c`)
 
@@ -282,27 +408,31 @@ Effect of the parity fixes on Metroplex:
   next record of its group, so later fetched records are not skipped
   (`69129e4`).
 
-Metroplex's local `internal/app.go` uses `GetDecodedSecretFromGSM` and
-`UseHealthRouteMiddleware`. The release target for these fixes is the new
-immutable fork tag `github.com/swapnilfynd/fit-go v0.2.0-rc.3`, following the
-`rc.2` baseline at `15f19406`. Publish the candidate without moving `rc.2`,
-then repin Metroplex's local module replacement, checksum, and pin test and
-rerun its full suite with `GOWORK=off`. Workspace validation before publication
-does not prove the published dependency pin. Publication and consuming-module
-validation results are recorded in PR #3 and Metroplex's library document.
+Metroplex's existing local `internal/app.go` uses `GetDecodedSecretFromGSM` and
+`UseHealthRouteMiddleware`, and its module replacement already uses the
+published immutable fork tag `github.com/swapnilfynd/fit-go v0.2.0-rc.3` at
+`11f29d2`. The follow-up described above is unpublished and is validated with
+a temporary workspace only. All six pre-existing Metroplex dirty files are
+preserved; this follow-up does not repin or change them. Publish a new
+immutable candidate before repinning; never move `rc.2` or `rc.3`. Workspace
+validation is not evidence that the published tag contains these fixes.
 
 ## Validation
 
 On this host loopback listeners are allowed, so the full `go test ./...` and
 `go test -race ./...` suites run, including miniredis, `httptest`, gRPC, and
-librdkafka mock-broker tests. Only 8 live-infrastructure tests skip: the 6
-`*Live` Kafka broker tests and 2 Redis Sentinel/Cluster live subtests.
+librdkafka mock-broker tests. The local follow-ups add two disposable-broker
+Kafka tests: 10 live-infrastructure cases skip without external configuration
+(8 Kafka tests and 2 Redis Sentinel/Cluster live subtests). The added Kafka
+fixtures were separately executed against a local protocol broker as noted below.
 
-Candidate-tree verification on 2026-10-08
+Historical candidate-tree verification on 2026-10-08 (published `11f29d2`;
+the separate local follow-up rerun is recorded below)
 
 - `gofmt -l`, `git diff --check`, `go build ./...`, and `go vet ./...` are clean.
 - `go test -count=1 ./...` and `go test -race -count=1 ./...` pass with only the
-  8 live-infrastructure skips listed above.
+  8 live-infrastructure skips at that published head (6 Kafka tests and
+  2 Redis Sentinel/Cluster live subtests).
 - `GOTOOLCHAIN=go1.25.10 go test -count=1 ./...` and `go vet ./...` pass, so
   the module's declared toolchain remains supported.
 - `go mod tidy -diff` is clean. The only module changes from the PR head are
@@ -319,7 +449,111 @@ Candidate-tree verification on 2026-10-08
   That workspace run preceded the published `rc.3` repin; it used the existing
   local `rc.2` replacement and checksum without modifying them.
 
-Remaining release gates:
+### Local follow-up validation
+
+Local follow-up rerun on 2026-10-08 (working branch
+`fix/pr3-final-remediation`, uncommitted on `11f29d2`):
+
+- fit-go format/diff, build, vet, full tests, full race suite, `go mod
+  tidy -diff`, and `go mod verify` pass. No dependency/directive change from
+  `11f29d2`; full tests/vet also pass with `GOTOOLCHAIN=go1.25.10`.
+- `apidiff -m -incompatible` against official main `df96a28` is empty.
+- `GOTOOLCHAIN=go1.26.7 govulncheck ./...` reports zero reachable
+  vulnerabilities; one imported-package and three required-module findings
+  remain uncalled. This does not clear standard-library advisories when
+  building with an older toolchain.
+- The original Redis/FeatureHub and Sentry privacy/trace-ID probes pass, with
+  focused race coverage. Sentry fixtures exercise sync and default async
+  HTTP transports, unsafe inbound sampling keys/values, safe sampling
+  metadata, and unchanged source maps. Health tests cover concurrent stop,
+  an in-flight replacement, and an already queued replacement versus reset.
+- The six Franz protocol-broker cases pass normally and under race with a
+  temporary kfake modfile/overlay. New committed/uncommitted/automatic cases
+  preserve historical latest-start behavior and the exact fetched records.
+- Metroplex build/vet/full tests pass through
+  `/tmp/fitgo-local-remediation-validation.WjFz8q/go.work`; targeted race
+  tests pass for Promotions/Extensions consumers, shared Redis/observability,
+  scheduler, and internal Kafka/Redis/tracing/shutdown tests. Its published
+  `GOWORK=off` `rc.3` build/vet and dependency-pin checks pass as a separate
+  control, not as evidence of these unpublished fixes.
+- Metroplex's six pre-existing modified files retain their initial SHA-256
+  checksums. No cluster activity, commit, push, tag, PR update or repin.
+
+### Final local follow-up validation (2026-10-09)
+
+Tree: `fix/pr3-final-remediation`, uncommitted on `11f29d2`, including the
+ownership-loss/cache/option-order changes above; official main remains
+`df96a28`. This evidence supersedes the older validation for this local tree.
+
+- `GOWORK=off go build ./...`, `go vet ./...`, `go test -count=1 ./...`
+  and `go test -race -count=1 ./...` pass. Full tests/vet also pass with
+  `GOTOOLCHAIN=go1.25.10`. The 10 external-infrastructure skips above are
+  explicitly enumerated by the JSON test output, not counted as proof.
+- `go mod tidy -diff`, `go mod verify`, formatting and diff checks pass.
+  `go.mod`/`go.sum` are unchanged from `11f29d2`. Fresh module export data
+  compared with official main reports zero incompatible exported API changes.
+- Independently reproduced regressions pass under race: the original real
+  Heartbeat/UnknownMemberID ownership-loss probe (uncommitted/latest,
+  committed/latest and beginning), the six mixed-poll broker cases, cached
+  Sentry HTTP/direct-user probes and the 24 Redis option permutations. The
+  checked-in Sentry HTTP suite covers 16 error/transaction, sync/async,
+  pre-cache/hook and safe/unsafe-DSC cases.
+- The checked-in real LeaveGroup ownership-loss broker fixture passes all
+  12 message/batch cases normally and under race using the temporary protocol
+  broker: uncommitted/latest, committed/latest, uncommitted/beginning,
+  automatic, pre-handler commit and a newer authoritative broker commit.
+  It skips historical latest-start records and retries the failed offset
+  only when that offset is not already durably committed.
+- Metroplex build/vet/full tests pass through the existing temporary
+  `/tmp/fitgo-local-remediation-validation.WjFz8q/go.work`. Targeted race tests
+  pass for internal Kafka/health/GSM/shutdown/Sentry/Redis, all four affected
+  consumer registries, shared observability and shared Redis. Its published
+  `GOWORK=off` rc.3 pin test passes as a separate control, not as evidence
+  that rc.3 contains these unpublished fixes. All six original dirty-file
+  checksums are unchanged.
+- **Security release gate is not clean.** A fresh
+  `GOTOOLCHAIN=go1.26.7 govulncheck ./...` exits 3 and identifies 11 reachable
+  advisory IDs: GO-2026-6599, 6600, 6603, 6605, 6607, 6608, 6610, 6611, 6612,
+  6613 and 6617. The database now lists Go 1.26.9 and `golang.org/x/net`
+  v0.60.0 as the relevant patched versions; GO-2026-6617 affects both.
+  See the [official advisory](https://pkg.go.dev/vuln/GO-2026-6617).
+  The earlier zero-reachable report is historical and must not be used for
+  publication today. No dependency, module directive or release toolchain
+  upgrade is bundled into these three compatibility fixes; assess that
+  separate security patch against upstream-main and reverse dependencies.
+- No commit, push, tag move, PR update, Metroplex repin or cluster activity.
+
+### Latest four-fix validation (2026-10-09)
+
+Tree: uncommitted `fix/pr3-final-remediation` on `11f29d2`, including the four
+SSE/idle-RESP/batch-unwind/scope fixes and the two test-fixture corrections.
+This evidence supersedes the preceding local validation for this tree.
+
+- Full Go 1.25.10 tests pass with `GOMAXPROCS=1`, `-p=1`, `-count=1`:
+  all 32 test-bearing packages pass. Go 1.25.10 vet also passes.
+- Full host-toolchain race tests pass with `-p=1`, `-count=1`: all 32
+  test-bearing packages pass. Build, vet, formatting, diff checks, module
+  verification and `go mod tidy -diff` pass.
+- Both JSON runs enumerate the same 10 external-infrastructure skips:
+  eight Kafka live tests and the live Redis Sentinel/Cluster subtests. No
+  skipped workload is counted as verified. Initial timing/fixture failures
+  and their controlled reruns are described above.
+- Fresh `apidiff -m -incompatible` against official main `df96a28` is empty.
+  The independent incomplete-SSE and batch-panic probes pass under race;
+  the independent legacy-scope probe passes on both candidate and clean main.
+  Redis idle lifecycle tests pass 20 race repetitions with fresh sockets,
+  buffered/partial replies, in-flight replay and shutdown controls.
+- Metroplex full tests/build/vet pass against the actual local fit-go candidate
+  through the existing temporary workspace. Targeted race tests pass for its
+  internal integration, all four affected consumer registries, shared Redis
+  and shared observability. Its `GOWORK=off` published rc.3 pin checks pass
+  separately; rc.3 does not contain these unpublished repairs.
+- All six original Metroplex dirty-file checksums and fit-go dependency
+  checksums are unchanged. No commit, push, tag, PR update, repin or cluster
+  activity. The security gate remains open in the actual dependency graph;
+  the separately validated Go 1.26.9 dependency candidate above is not adopted.
+
+### Release gates (unchanged by local-only validation)
 
 1. Repeat format/diff, build, vet, full and race suites in CI after commit.
 2. Run live-broker Kafka recovery/rebalance tests, including multi-partition

@@ -147,7 +147,7 @@ func ioredisSentinelMasterAddress(value any) (string, error) {
 	if !ok || port <= 0 || port > 65535 {
 		return "", errors.New("redis: invalid Sentinel master port")
 	}
-	return host + ":" + strconv.FormatInt(port, 10), nil
+	return net.JoinHostPort(host, strconv.FormatInt(port, 10)), nil
 }
 
 func dialIORedisCompatibleCluster(ctx context.Context, profile IORedisCompatibilityProfile, options ioredisClusterOptions) (Connection, error) {
@@ -260,7 +260,7 @@ func parseIORedisClusterSlots(value any, seedAddress string) ([]ioredisClusterSl
 			return nil, errors.New("redis: invalid CLUSTER SLOTS node")
 		}
 		ranges = append(ranges, ioredisClusterSlotRange{
-			first: int(first), last: int(last), address: host + ":" + strconv.FormatInt(port, 10),
+			first: int(first), last: int(last), address: net.JoinHostPort(host, strconv.FormatInt(port, 10)),
 		})
 	}
 	return ranges, nil
@@ -573,7 +573,7 @@ func (t *ioredisClusterTransport) routeEval(command []string, keyCountIndex int)
 		return "", fmt.Errorf("redis: ioredis Cluster command %s has an invalid key count", verb)
 	}
 	firstKeyIndex := keyCountIndex + 1
-	if len(command) < firstKeyIndex+keyCount {
+	if keyCount > len(command)-firstKeyIndex {
 		return "", fmt.Errorf("redis: ioredis Cluster command %s declares %d keys but provides %d arguments", verb, keyCount, len(command)-firstKeyIndex)
 	}
 	if keyCount == 0 {
@@ -590,15 +590,9 @@ func (t *ioredisClusterTransport) routeEval(command []string, keyCountIndex int)
 
 func (t *ioredisClusterTransport) routeXRead(command []string) (string, error) {
 	verb := strings.ToUpper(command[0])
-	streamsIndex := -1
-	for index := 1; index < len(command); index++ {
-		if strings.EqualFold(command[index], "streams") {
-			streamsIndex = index
-			break
-		}
-	}
-	if streamsIndex < 0 || streamsIndex+2 > len(command) {
-		return "", fmt.Errorf("redis: ioredis Cluster command %s has no STREAMS key list", verb)
+	streamsIndex, _, _, err := parseIORedisXReadPrefix(command)
+	if err != nil {
+		return "", err
 	}
 	remaining := len(command) - streamsIndex - 1
 	if remaining%2 != 0 {
@@ -617,7 +611,7 @@ func (t *ioredisClusterTransport) routeCountedKeys(command []string, keyCountInd
 		return "", fmt.Errorf("redis: ioredis Cluster command %s is missing its key count", verb)
 	}
 	keyCount, err := strconv.Atoi(command[keyCountIndex])
-	if err != nil || keyCount <= 0 || len(command) < firstKeyIndex+keyCount {
+	if err != nil || keyCount <= 0 || firstKeyIndex > len(command) || keyCount > len(command)-firstKeyIndex {
 		return "", fmt.Errorf("redis: ioredis Cluster command %s has an invalid key count", verb)
 	}
 	return t.routeKeys(command[firstKeyIndex : firstKeyIndex+keyCount])

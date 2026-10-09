@@ -1265,8 +1265,13 @@ func (t *Tracer) initOTel(ctx context.Context, opts AdvancedOptions, upstreamDef
 	tp := sdktrace.NewTracerProvider(providerOpts...)
 
 	t.provider = tp
-	if serviceName, ok := res.Set().Value(semconv.ServiceNameKey); ok {
-		t.serviceName = serviceName.AsString()
+	if !upstreamDefaults {
+		// Released constructors name their instrumentation scope from Options,
+		// independently of the resource's service.name. Only the opt-in SDK path
+		// uses the fully resolved resource identity for its scope.
+		if serviceName, ok := res.Set().Value(semconv.ServiceNameKey); ok {
+			t.serviceName = serviceName.AsString()
+		}
 	}
 	t.otelTracer = tp.Tracer("fit.go/" + t.serviceName)
 	t.propagator = propagator

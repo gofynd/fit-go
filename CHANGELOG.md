@@ -6,6 +6,14 @@ the module follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Release candidate publication
+- Target immutable fork tag `v0.2.0-rc.4` packages the Sentry, Franz recovery,
+  Redis routing/idle lifecycle, SSE framing, health/migration cleanup and
+  tracing-scope corrections below. It does not change the Go 1.25.10 floor
+  or dependencies. The remaining runtime, security and live-validation gates
+  are recorded in `docs/PR3_COMPATIBILITY_REMEDIATION.md`; publication is not
+  merge-readiness or deployment certification.
+
 ### Changed
 - Default-path log and Sentry output is redacted for existing main users with
   no API or wire change: `logging` error values, the mandatory Sentry
@@ -28,6 +36,40 @@ the module follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `InitSentryWithHooks` path supports retryable startup.
 
 ### Fixed
+- Discard unfinished FeatureHub SSE events at EOF on the opt-in streaming
+  path, matching the blank-line boundary already used by isolated snapshots.
+  Completed events and legacy polling are unchanged.
+- Observe idle owned-RESP disconnects and reconnect without waiting for a
+  command. Preserve in-flight reply/replay reconciliation and let empty offline
+  `Quit` finish through the existing shutdown path; default go-redis is unchanged.
+- End Kafka batch receive/process spans during panic or `runtime.Goexit`
+  without recovering, exporting the panic value, or marking the batch successful.
+  Normal handler error identity and offset handling are unchanged.
+- Restore released tracing constructors' instrumentation scope to
+  `fit.go/<Options.ServiceName>`, independently of resource `service.name`,
+  matching official main. Opt-in SDK resource-based scope resolution is unchanged.
+- Preserve exact fetched boundaries on mixed record/transient-error polls in
+  the opt-in Franz KafkaJS consumer, without resetting new groups to earliest;
+  preserve empty versus nil values and headers in its payload copies.
+- Retain known unresolved Franz recovery positions across real ownership loss
+  and client recreation. Apply them only to newly assigned partitions with no
+  committed offset; broker commits remain authoritative, and successful
+  processing or pre-handler commits clear the relevant remembered boundary.
+- Omit unsafe Sentry envelope dynamic sampling metadata that the SDK freezes
+  before sanitization, while retaining safe metadata and public event fields;
+  preserve opaque SDK trace/span IDs across both mandatory sanitizer passes.
+- Rebuild Sentry serialization snapshots after each sanitizer pass so events
+  pre-serialized by callers or hooks cannot export stale PII. Preserve vetted
+  sampling metadata and sanitized public fields through public SDK APIs.
+- Prevent counted-key overflow in opt-in Redis Cluster routing, parse
+  XREADGROUP names/options as data, and bracket discovered IPv6 addresses.
+- Accept XREADGROUP GROUP clauses anywhere before STREAMS, including after
+  COUNT, bounded BLOCK or NOACK, without relaxing blocking-command restrictions.
+- Accept CR-only and BOM-prefixed FeatureHub SSE on both the streaming and
+  request-scoped snapshot paths, without changing legacy polling or size limits.
+- Honor concurrent health-stop deadlines without waiting under the bookkeeping
+  lock, prevent a pending managed start from outliving reset, and release lease
+  execution/caller cancellation state after migration runs on all exit paths.
 - Allow `Stop` or a deadline-based `ShutdownContext` to force an in-progress
   legacy gRPC graceful drain while leaving plain legacy `Shutdown` unbounded.
 - Match main's repeated released-tracer shutdown result (first exporter error,

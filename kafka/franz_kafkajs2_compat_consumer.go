@@ -69,6 +69,13 @@ type franzKafkaJS2CompatConsumer struct {
 	closeErr  error
 	closeDone chan struct{}
 
+	// pendingRecovery outlives an assignment and even a rebuilt driver. SetOffsets
+	// only rewinds the current member; franz-go clears that state on ownership
+	// loss. Keep known unresolved boundaries until processing succeeds or a
+	// broker-committed offset makes the boundary durable on the next assignment.
+	// All access is protected by mu.
+	pendingRecovery []consumerRecordPosition
+
 	// closeRequested is closed as soon as Close (or a lifecycle close request)
 	// starts, so legacy rebalance hooks stop blocking the franz-go callback.
 	closeRequested chan struct{}
@@ -225,6 +232,7 @@ func (c *franzKafkaJS2CompatConsumer) clientOptions(topics []TopicConfig) ([]kgo
 		opts = append(opts, kgo.SASL(mechanism))
 	}
 	opts = append(opts,
+		kgo.AdjustFetchOffsetsFn(c.adjustRecoveryOffsets),
 		kgo.OnPartitionsAssigned(func(_ context.Context, _ *kgo.Client, assigned map[string][]int32) {
 			parts := flattenAssignments(assigned)
 			c.logger.Info("kafka/kafkajs: partitions assigned", "groupId", c.config.GroupID, "partitions", formatAssignments(parts))
@@ -438,6 +446,7 @@ func (c *franzKafkaJS2CompatConsumer) consumeMessages(handler kafkaJSMessageHand
 					}
 					return withConsumerRewindPosition(err, kafkaJSRecordPosition(record))
 				}
+				c.completeRecoveryPosition(kafkaJSRecordPosition(record))
 			}
 			return nil
 		}); errors.Is(err, errKafkaJSUnresolvedRecordRewound) {
@@ -478,11 +487,35 @@ func pollKafkaJSRecords(ctx context.Context, client franzKafkaJS2CompatClient, t
 		if errors.Is(fetchErr.Err, context.DeadlineExceeded) || errors.Is(fetchErr.Err, context.Canceled) {
 			continue
 		}
-		return fetches, classifyKafkaJSTransientConsumerError(
+		err := classifyKafkaJSTransientConsumerError(
 			fmt.Errorf("kafka/kafkajs: consume error: %w", fetchErr.Err),
 		)
+		if IsTransientConsumerError(err) && fetches.NumRecords() > 0 {
+			// PollRecords advances every returned partition even when a sibling
+			// fetch or group notification failed. None of these records reached
+			// application code. Preserve their exact retry boundaries while the
+			// poll's rebalance gate still protects the active assignment; rebuilding
+			// a group with no committed offset and FromBeginning=false loses them.
+			positions := make([]consumerRecordPosition, 0, fetches.NumRecords())
+			fetches.EachRecord(func(record *kgo.Record) {
+				positions = append(positions, kafkaJSRecordPosition(record))
+			})
+			err = &kafkaJSPollRewindError{cause: err, positions: positions}
+		}
+		return fetches, err
 	}
 	return fetches, nil
+}
+
+type kafkaJSPollRewindError struct {
+	cause     error
+	positions []consumerRecordPosition
+}
+
+func (e *kafkaJSPollRewindError) Error() string { return e.cause.Error() }
+func (e *kafkaJSPollRewindError) Unwrap() error { return e.cause }
+func (e *kafkaJSPollRewindError) consumerRewindPositions() []consumerRecordPosition {
+	return e.positions
 }
 
 func groupKafkaJSRecords(records []*kgo.Record) [][]*kgo.Record {
@@ -568,6 +601,10 @@ func (c *franzKafkaJS2CompatConsumer) processRecord(
 				fmt.Errorf("kafka/kafkajs: pre-handler commit failed: %w", err),
 			)
 		}
+		// A previously failed commit may have left a retry boundary. Once this
+		// pre-handler commit succeeds, at-most-once must never replay the record,
+		// including when its handler fails while the member loses ownership.
+		c.completeRecoveryPosition(kafkaJSRecordPosition(record))
 	}
 	if opts.OffsetFinalizer != nil {
 		return runTracedMessageLifecycle(ctx, payload, MessageHandlerCtx(handler), func(messageCtx context.Context, handlerErr error) error {
@@ -592,6 +629,7 @@ func (c *franzKafkaJS2CompatConsumer) processRecord(
 				return resolveKafkaJSRecord(messageCtx, client, record, isAutoCommit, c.config.AutoCommit, opts.NullOffsetCommitMetadata)
 			}
 			if handlerErr != nil && opts.RedeliverUnresolvedFinalizer {
+				c.rememberRecoveryPositions([]consumerRecordPosition{kafkaJSRecordPosition(record)})
 				client.SetOffsets(map[string]map[int32]kgo.EpochOffset{
 					record.Topic: {record.Partition: {Epoch: record.LeaderEpoch, Offset: record.Offset}},
 				})
@@ -619,11 +657,11 @@ func (c *franzKafkaJS2CompatConsumer) processRecord(
 func kafkaJSPayload(record *kgo.Record) MessagePayload {
 	headers := make([]Header, len(record.Headers))
 	for i, header := range record.Headers {
-		headers[i] = Header{Key: header.Key, Value: append([]byte(nil), header.Value...)}
+		headers[i] = Header{Key: header.Key, Value: cloneNullableBytes(header.Value)}
 	}
 	return MessagePayload{
 		Topic: record.Topic, Partition: int(record.Partition), Offset: record.Offset,
-		Key: cloneNullableBytes(record.Key), Value: append([]byte(nil), record.Value...),
+		Key: cloneNullableBytes(record.Key), Value: cloneNullableBytes(record.Value),
 		Headers: headers, Timestamp: record.Timestamp,
 	}
 }
@@ -758,9 +796,9 @@ func classifyKafkaJSTransientConsumerError(err error) error {
 
 // isKafkaJSGroupRejoinError mirrors KafkaJS' consumer runner rather than
 // Kafka's per-request retriable flag. Reissuing the failed request with the
-// same member identity cannot succeed; ending the run and rebuilding the
-// franz-go client creates a fresh member that can join and resume from the
-// committed offset. Keep this list deliberately narrow so authorization and
+// same member identity cannot succeed; franz-go's group management rejoins the
+// group, or a no-record run failure rebuilds the client from the committed
+// offset. Keep this list deliberately narrow so authorization and
 // configuration failures are never hidden behind a reconnect loop.
 func isKafkaJSGroupRejoinError(err error) bool {
 	return errors.Is(err, kerr.UnknownMemberID) ||
@@ -835,10 +873,14 @@ func (c *franzKafkaJS2CompatConsumer) consumeBatches(handler kafkaJSBatchHandler
 				}
 			}
 			if len(visible) == 0 {
-				return withConsumerRewindPosition(
+				resolutionErr := withConsumerRewindPosition(
 					resolveKafkaJSRecord(runCtx, client, lastFetched, isAutoCommit, c.config.AutoCommit, false),
 					kafkaJSRecordPosition(lastFetched),
 				)
+				if resolutionErr == nil {
+					c.completeRecoveryPosition(kafkaJSRecordPosition(lastFetched))
+				}
+				return resolutionErr
 			}
 			firstPosition := kafkaJSRecordPosition(visible[0])
 			messages := make([]MessagePayload, len(visible))
@@ -851,6 +893,7 @@ func (c *franzKafkaJS2CompatConsumer) consumeBatches(handler kafkaJSBatchHandler
 						fmt.Errorf("kafka/kafkajs: pre-handler batch commit failed: %w", err),
 					), firstPosition)
 				}
+				c.completeRecoveryPosition(kafkaJSRecordPosition(lastFetched))
 			}
 			lastVisible := visible[len(visible)-1]
 			payload := BatchPayload{
@@ -874,10 +917,14 @@ func (c *franzKafkaJS2CompatConsumer) consumeBatches(handler kafkaJSBatchHandler
 			if !isAutoCommit && opts.CommitBeforeHandler {
 				return nil
 			}
-			return withConsumerRewindPosition(
+			resolutionErr := withConsumerRewindPosition(
 				resolveKafkaJSRecord(runCtx, client, lastFetched, isAutoCommit, c.config.AutoCommit, false),
 				firstPosition,
 			)
+			if resolutionErr == nil {
+				c.completeRecoveryPosition(kafkaJSRecordPosition(lastFetched))
+			}
+			return resolutionErr
 		}); err != nil {
 			if isKafkaJSRunCancellation(runCtx, err) {
 				// Do not turn an expected shutdown cancellation into a pod
@@ -968,8 +1015,8 @@ func (c *franzKafkaJS2CompatConsumer) beginRun() (franzKafkaJS2CompatClient, con
 }
 
 // prepareTransientRunRetry applies the complete rewind plan collected for a
-// failed poll wave. Handler, finalizer, and commit failures retain the healthy
-// group member and rewind every affected partition. Transport/group failures
+// failed poll wave. Handler, finalizer, commit, and mixed poll failures retain
+// the group member and rewind every affected partition. Transport/group failures
 // without a known record boundary still discard the client and rebuild from the
 // broker's committed boundary. CommitBeforeHandler failures carry an explicit
 // empty plan because their offsets were committed before user code ran.
@@ -980,6 +1027,7 @@ func (c *franzKafkaJS2CompatConsumer) prepareTransientRunRetry(runClient franzKa
 	}
 	if rewindDecided {
 		if len(positions) > 0 {
+			c.rememberRecoveryPositions(positions)
 			offsets := make(map[string]map[int32]kgo.EpochOffset)
 			for _, failed := range positions {
 				partitions := offsets[failed.topic]
@@ -1007,6 +1055,62 @@ func (c *franzKafkaJS2CompatConsumer) prepareTransientRunRetry(runClient franzKa
 	// from deadlocking before the outer retry can create a new group member.
 	runClient.CloseAllowingRebalance()
 	return err
+}
+
+func (c *franzKafkaJS2CompatConsumer) rememberRecoveryPositions(positions []consumerRecordPosition) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.closed {
+		c.pendingRecovery = mergeConsumerRewindPositions(c.pendingRecovery, positions)
+	}
+}
+
+func (c *franzKafkaJS2CompatConsumer) completeRecoveryPosition(completed consumerRecordPosition) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	kept := c.pendingRecovery[:0]
+	for _, pending := range c.pendingRecovery {
+		if pending.topic != completed.topic || pending.partition != completed.partition || pending.offset > completed.offset {
+			kept = append(kept, pending)
+		}
+	}
+	c.pendingRecovery = kept
+}
+
+// adjustRecoveryOffsets runs after the broker's OffsetFetch, before franz-go
+// starts fetching the newly assigned partitions. Only partitions present in
+// offsets belong to this assignment. Preserve any real committed boundary;
+// otherwise a remembered exact position replaces the symbolic earliest/latest
+// fallback. A newer owner may have committed beyond our failure in the meantime.
+func (c *franzKafkaJS2CompatConsumer) adjustRecoveryOffsets(
+	ctx context.Context,
+	offsets map[string]map[int32]kgo.Offset,
+) (map[string]map[int32]kgo.Offset, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	kept := c.pendingRecovery[:0]
+	for _, pending := range c.pendingRecovery {
+		partitions := offsets[pending.topic]
+		current, assigned := partitions[pending.partition]
+		if assigned {
+			committed := current.EpochOffset().Offset
+			if committed >= 0 {
+				// The coordinator already provides durable replay, or another
+				// owner has legitimately completed this record. Never rewind it.
+				if committed >= pending.offset {
+					continue
+				}
+			} else {
+				partitions[pending.partition] = kgo.NewOffset().At(pending.offset).WithEpoch(pending.leaderEpoch)
+			}
+		}
+		kept = append(kept, pending)
+	}
+	c.pendingRecovery = kept
+	return offsets, nil
 }
 
 func (c *franzKafkaJS2CompatConsumer) Close() error {

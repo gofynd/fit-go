@@ -117,6 +117,13 @@ ambiguous replay on each Go future.
 
 ## Deliberate fail-closed limits
 
+The owned RESP transport observes remote closure while idle and enters its
+existing reconnect loop even when no command is submitted. Direct closure
+observation is disabled while a write, read or in-flight request is active:
+the existing reply/replay ledger must reconcile those outcomes first. Empty
+offline `Quit` can use the existing immediate shutdown path. This does not
+change retry limits, ambiguous-replay policy, or the default go-redis client.
+
 The following remain adoption gates:
 
 - live Node 22.22.0/ioredis 5.11.1 versus Go record/replay for connect loss before
@@ -140,6 +147,11 @@ The following remain adoption gates:
   FLUSHDB, FLUSHALL and RANDOMKEY in Cluster mode (rejected rather than run on
   the node owning their first argument's slot; the error names only the verb),
   and cross-node pipelines.
+  XREADGROUP accepts GROUP anywhere before STREAMS, including after COUNT,
+  BLOCK or NOACK; group/consumer names and option values are data, not option
+  keywords. Malformed prefixes are rejected locally. Every BLOCK clause must
+  be finite and strictly positive, even if a later duplicate would override
+  an earlier zero timeout on Redis. This conservative restriction is unchanged.
   Finite-timeout blocking operations use an exclusive,
   no-ambiguous-replay boundary. Multi-key commands such as MGET/DEL are routed
   by their first key rather than fanned out. Commands whose key follows a

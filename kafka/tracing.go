@@ -550,7 +550,22 @@ func runTracedBatchHandler(base context.Context, batch BatchPayload, handler Bat
 	if receiveSpan == nil {
 		return handler(ctx, batch)
 	}
-	err := handler(ctx, batch)
-	endBatchConsumerSpans(receiveSpan, processSpans, err)
+	var err error
+	returned := false
+	defer func() {
+		if returned {
+			endBatchConsumerSpans(receiveSpan, processSpans, err)
+			return
+		}
+		// A panic (including panic(nil)) or Goexit must end every span without
+		// recovering, exporting the panic value, or incorrectly reporting OK.
+		// Leave status unset, matching the message handler's deferred End.
+		for _, span := range processSpans {
+			span.End()
+		}
+		receiveSpan.End()
+	}()
+	err = handler(ctx, batch)
+	returned = true
 	return err
 }

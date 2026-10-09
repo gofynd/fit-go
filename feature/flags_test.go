@@ -252,7 +252,7 @@ func TestLegacyPollingRefreshesFeatureValues(t *testing.T) {
 func TestRequiredInitialStateRetriesTooManyRequests(t *testing.T) {
 	var requests atomic.Int32
 	version := int64(1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if requests.Add(1) == 1 {
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
@@ -261,6 +261,10 @@ func TestRequiredInitialStateRetriesTooManyRequests(t *testing.T) {
 		_, _ = fmt.Fprintf(w, "event: features\ndata: %s\n\n", mustJSON(t, []*featureState{{
 			ID: "id", Key: "flag", Version: &version, Type: featureTypeBoolean, Value: true,
 		}}))
+		// The recovered connection remains healthy until client shutdown; EOF
+		// here would race the initializer observing its ready state.
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
 	}))
 	defer server.Close()
 
@@ -312,7 +316,7 @@ func TestInitialStreamEventsRetryBeforeFeatures(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			var requests atomic.Int32
 			version := int64(1)
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				if requests.Add(1) == 1 {
 					_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", test.event, test.data)
@@ -321,6 +325,10 @@ func TestInitialStreamEventsRetryBeforeFeatures(t *testing.T) {
 				_, _ = fmt.Fprintf(w, "event: features\ndata: %s\n\n", mustJSON(t, []*featureState{{
 					ID: "id", Key: "flag", Version: &version, Type: featureTypeBoolean, Value: true,
 				}}))
+				// A successful SSE connection stays open. Closing here would make
+				// readiness transient and race the initializer's WaitReady call.
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
 			}))
 			defer server.Close()
 
