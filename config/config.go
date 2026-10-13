@@ -30,6 +30,7 @@ package config
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,46 +38,51 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/joho/godotenv"
+	"gopkg.in/yaml.v3"
 )
 
 // Config holds all configuration values loaded from environment variables and
 // config files. It provides type-safe getters with defaults and is safe for
 // concurrent access.
 type Config struct {
-	mu     sync.RWMutex
-	values map[string]string
+	mu      sync.RWMutex
+	values  map[string]string
+	envKeys map[string]struct{}
+	strict  bool
 }
 
 // New creates a new empty Config instance.
 func New() *Config {
 	return &Config{
-		values: make(map[string]string),
+		values:  make(map[string]string),
+		envKeys: make(map[string]struct{}),
 	}
 }
 
-// Load initializes a Config by loading environment variables first, then
-// overlaying values from the provided config file paths. Files are applied in
-// order, so later files override earlier ones. Environment variables always
-// take precedence over file values.
+// Load initializes a Config using fit-go's released precedence: environment
+// variables win, and the first config file defining a key wins over later
+// files. Use LoadStrict for documented last-file-wins overlays.
 //
 // Supported file formats: .json.yaml.yml. The .env format is also loaded
 // automatically if a .env file exists in the working directory.
 func Load(paths ...string) (*Config, error) {
 	cfg := New()
 
-	// 1. Load .env file if present.
-	if err := cfg.loadDotenv(); err != nil {
-		// Non-fatal: .env file is optional.
-		_ = err
-	}
+	// Preserve the original best-effort dotenv contract. In particular, dotenv
+	// parse/read errors do not turn an otherwise valid service configuration into
+	// a startup failure.
+	_ = cfg.loadDotenvLegacy()
 
 	// 2. Load all environment variables.
 	cfg.loadEnvVars()
 
-	// 3. Overlay config files in order. File values do NOT override env vars
-	// that are already set, matching the convict behavior where env always wins.
+	// 3. Preserve the original first-file-wins implementation. Although the old
+	// comment said later files overrode earlier files, released fit-go versions
+	// only filled keys which were not already present.
 	for _, path := range paths {
-		if err := cfg.loadFile(path); err != nil {
+		if err := cfg.loadFileLegacy(path); err != nil {
 			return nil, fmt.Errorf("config: failed to load %s: %w", path, err)
 		}
 	}
@@ -84,74 +90,97 @@ func Load(paths ...string) (*Config, error) {
 	return cfg, nil
 }
 
-// loadDotenv reads a .env file from the current directory or the path specified
-// by DOTENV_PATH. Lines are parsed as KEY=VALUE pairs. Lines starting with #
-// are treated as comments.
-func (c *Config) loadDotenv() error {
+// LoadStrict loads configuration with strict dotenv errors, full YAML parsing,
+// explicit-empty environment preservation, and documented last-file-wins
+// precedence. These post-main semantics are opt-in so Load remains compatible
+// with already released consumers.
+func LoadStrict(paths ...string) (*Config, error) {
+	cfg := New()
+	cfg.strict = true
+	if err := cfg.loadDotenv(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("config: failed to load dotenv: %w", err)
+	}
+	cfg.loadEnvVars()
+	for _, path := range paths {
+		if err := cfg.loadFileStrict(path); err != nil {
+			return nil, fmt.Errorf("config: failed to load %s: %w", path, err)
+		}
+	}
+	return cfg, nil
+}
+
+func (c *Config) loadDotenvLegacy() error {
 	dotenvPath := os.Getenv("DOTENV_PATH")
 	if dotenvPath == "" {
 		dotenvPath = ".env"
 	}
-
 	f, err := os.Open(dotenvPath)
 	if err != nil {
-		return err // file doesn't exist, that's fine
+		return err
 	}
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-
-		// Skip empty lines and comments.
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-
 		key, value, ok := parseDotenvLine(line)
 		if !ok {
 			continue
 		}
-
-		// Only set in the process environment if not already set,
-		// matching dotenv behavior.
 		if os.Getenv(key) == "" {
-			os.Setenv(key, value)
+			_ = os.Setenv(key, value)
+		}
+	}
+	return scanner.Err()
+}
+
+// loadDotenv reads a .env file from the current directory or the path specified
+// by DOTENV_PATH. Existing process environment variables, including explicitly
+// empty values, are never overwritten.
+func (c *Config) loadDotenv() error {
+	dotenvPath := os.Getenv("DOTENV_PATH")
+	if dotenvPath == "" {
+		dotenvPath = ".env"
+	}
+
+	values, err := godotenv.Read(dotenvPath)
+	if err != nil {
+		return err
+	}
+
+	for key, value := range values {
+		if _, exists := os.LookupEnv(key); !exists {
+			if err := os.Setenv(key, value); err != nil {
+				return fmt.Errorf("set %s: %w", key, err)
+			}
 		}
 	}
 
-	return scanner.Err()
+	return nil
 }
 
 // parseDotenvLine parses a single line from a .env file. It handles quoted
 // values (single and double quotes) and inline comments.
 func parseDotenvLine(line string) (key, value string, ok bool) {
-	// Split on first '='.
 	idx := strings.IndexByte(line, '=')
 	if idx < 0 {
 		return "", "", false
 	}
-
 	key = strings.TrimSpace(line[:idx])
 	value = strings.TrimSpace(line[idx+1:])
-
 	if key == "" {
 		return "", "", false
 	}
-
-	// Handle 'export KEY=VALUE' syntax.
 	if strings.HasPrefix(key, "export ") {
-		key = strings.TrimSpace(strings.TrimPrefix(key, "export"))
+		key = strings.TrimSpace(strings.TrimPrefix(key, "export "))
 	}
-
-	// Strip surrounding quotes.
-	if len(value) >= 2 {
-		if (value[0] == '"' && value[len(value)-1] == '"') ||
-			(value[0] == '\'' && value[len(value)-1] == '\'') {
-			value = value[1 : len(value)-1]
-		}
+	if len(value) >= 2 && ((value[0] == '"' && value[len(value)-1] == '"') ||
+		(value[0] == '\'' && value[len(value)-1] == '\'')) {
+		value = value[1 : len(value)-1]
 	}
-
 	return key, value, true
 }
 
@@ -168,13 +197,14 @@ func (c *Config) loadEnvVars() {
 		key := env[:idx]
 		value := env[idx+1:]
 		c.values[key] = value
+		c.envKeys[key] = struct{}{}
 	}
 }
 
 // loadFile loads a config file and merges its values into the config. Values
 // from the file only apply if the key is not already set (environment variables
 // take precedence).
-func (c *Config) loadFile(path string) error {
+func (c *Config) loadFileLegacy(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -183,69 +213,70 @@ func (c *Config) loadFile(path string) error {
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
 	case ".json":
-		return c.loadJSON(data)
+		return c.loadJSONLegacy(data)
 	case ".yaml", ".yml":
-		return c.loadYAML(data)
+		return c.loadYAMLLegacy(data)
 	default:
 		return fmt.Errorf("unsupported config file format: %s", ext)
+	}
+}
+
+func (c *Config) loadFileStrict(path string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".json":
+		return c.loadJSONStrict(data)
+	case ".yaml", ".yml":
+		return c.loadYAMLStrict(data)
+	default:
+		return fmt.Errorf("unsupported config file format: %s", strings.ToLower(filepath.Ext(path)))
 	}
 }
 
 // loadJSON parses JSON config data. Supports flat key-value objects and nested
 // objects which are flattened with underscore separators (e.g., {"db": {"host": "x"}}
 // becomes DB_HOST).
-func (c *Config) loadJSON(data []byte) error {
+func (c *Config) loadJSONLegacy(data []byte) error {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return fmt.Errorf("invalid JSON: %w", err)
 	}
 
-	flat := flattenMap("", raw)
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for k, v := range flat {
-		// Only set if not already present (env vars win).
-		if _, exists := c.values[k]; !exists {
-			c.values[k] = v
-		}
-	}
-
+	c.applyLegacyFileValues(flattenMapLegacy("", raw))
 	return nil
 }
 
-// loadYAML parses a subset of YAML (simple key: value pairs and one level of
-// nesting). This avoids pulling in a YAML dependency. For full YAML support,
-// use JSON config files or set values via environment variables.
-func (c *Config) loadYAML(data []byte) error {
+func (c *Config) loadJSONStrict(data []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("invalid JSON: %w", err)
+	}
+	c.applyFileValues(flattenMap("", raw))
+	return nil
+}
+
+func (c *Config) loadYAMLLegacy(data []byte) error {
 	result := make(map[string]interface{})
 	var currentSection string
-
 	scanner := bufio.NewScanner(strings.NewReader(string(data)))
 	for scanner.Scan() {
 		line := scanner.Text()
 		trimmed := strings.TrimSpace(line)
-
-		// Skip empty lines and comments.
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-
-		// Check indentation to determine nesting.
 		indent := len(line) - len(strings.TrimLeft(line, " \t"))
-
 		idx := strings.IndexByte(trimmed, ':')
 		if idx < 0 {
 			continue
 		}
-
 		key := strings.TrimSpace(trimmed[:idx])
 		value := strings.TrimSpace(trimmed[idx+1:])
-
 		if indent == 0 {
 			if value == "" {
-				// Section header.
 				currentSection = key
 				if _, ok := result[currentSection]; !ok {
 					result[currentSection] = make(map[string]interface{})
@@ -263,30 +294,48 @@ func (c *Config) loadYAML(data []byte) error {
 			section[key] = stripYAMLQuotes(value)
 		}
 	}
-
-	flat := flattenMap("", result)
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for k, v := range flat {
-		if _, exists := c.values[k]; !exists {
-			c.values[k] = v
-		}
-	}
-
+	c.applyLegacyFileValues(flattenMapLegacy("", result))
 	return scanner.Err()
 }
 
-// stripYAMLQuotes removes surrounding quotes from a YAML value string.
-func stripYAMLQuotes(s string) string {
-	if len(s) >= 2 {
-		if (s[0] == '"' && s[len(s)-1] == '"') ||
-			(s[0] == '\'' && s[len(s)-1] == '\'') {
-			return s[1 : len(s)-1]
+func stripYAMLQuotes(value string) string {
+	if len(value) >= 2 && ((value[0] == '"' && value[len(value)-1] == '"') ||
+		(value[0] == '\'' && value[len(value)-1] == '\'')) {
+		return value[1 : len(value)-1]
+	}
+	return value
+}
+
+// loadYAMLStrict parses YAML config data, including nested maps, arrays, quoted
+// scalars, comments, and null values.
+func (c *Config) loadYAMLStrict(data []byte) error {
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("invalid YAML: %w", err)
+	}
+	c.applyFileValues(flattenMap("", raw))
+	return nil
+}
+
+func (c *Config) applyLegacyFileValues(values map[string]string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, value := range values {
+		if _, exists := c.values[key]; !exists {
+			c.values[key] = value
 		}
 	}
-	return s
+}
+
+func (c *Config) applyFileValues(values map[string]string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for key, value := range values {
+		if _, fromEnvironment := c.envKeys[key]; !fromEnvironment {
+			c.values[key] = value
+		}
+	}
 }
 
 // flattenMap recursively flattens a nested map into a flat map with
@@ -318,10 +367,49 @@ func flattenMap(prefix string, m map[string]interface{}) map[string]string {
 		case nil:
 			result[fullKey] = ""
 		default:
-			result[fullKey] = fmt.Sprintf("%v", val)
+			encoded, err := json.Marshal(val)
+			if err != nil {
+				result[fullKey] = fmt.Sprintf("%v", val)
+			} else {
+				result[fullKey] = string(encoded)
+			}
 		}
 	}
 
+	return result
+}
+
+// flattenMapLegacy preserves the string representation used by the released
+// Load path for collections and other non-scalar values. LoadStrict uses the
+// JSON representation above so typed string slices can retain embedded commas.
+func flattenMapLegacy(prefix string, values map[string]interface{}) map[string]string {
+	result := make(map[string]string)
+	for key, value := range values {
+		fullKey := strings.ToUpper(key)
+		if prefix != "" {
+			fullKey = prefix + "_" + fullKey
+		}
+		switch typed := value.(type) {
+		case map[string]interface{}:
+			for nestedKey, nestedValue := range flattenMapLegacy(fullKey, typed) {
+				result[nestedKey] = nestedValue
+			}
+		case string:
+			result[fullKey] = typed
+		case float64:
+			if typed == float64(int64(typed)) {
+				result[fullKey] = strconv.FormatInt(int64(typed), 10)
+			} else {
+				result[fullKey] = strconv.FormatFloat(typed, 'f', -1, 64)
+			}
+		case bool:
+			result[fullKey] = strconv.FormatBool(typed)
+		case nil:
+			result[fullKey] = ""
+		default:
+			result[fullKey] = fmt.Sprintf("%v", typed)
+		}
+	}
 	return result
 }
 
@@ -431,6 +519,12 @@ func (c *Config) GetStringSlice(key string, defaultValue []string) []string {
 	defer c.mu.RUnlock()
 
 	if v, ok := c.values[key]; ok && v != "" {
+		if c.strict {
+			var jsonValues []string
+			if strings.HasPrefix(strings.TrimSpace(v), "[") && json.Unmarshal([]byte(v), &jsonValues) == nil {
+				return jsonValues
+			}
+		}
 		parts := strings.Split(v, ",")
 		result := make([]string, 0, len(parts))
 		for _, p := range parts {

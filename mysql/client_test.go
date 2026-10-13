@@ -23,6 +23,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	gomysql "github.com/go-sql-driver/mysql"
 )
 
 // The real "mysql" driver is registered via the side-effect import in client.go.
@@ -168,14 +170,12 @@ func TestApplyPoolSettings(t *testing.T) {
 
 func TestTLSConfig(t *testing.T) {
 	t.Run("returns nil when no certs configured", func(t *testing.T) {
-		for _, k := range []string{
-			"MYSQL_TEST_SSL_CA", "MYSQL_TEST_SSL_CERT", "MYSQL_TEST_SSL_KEY",
-			"MYSQL_TEST_SSL_SERVER_NAME", "MYSQL_SSL_CA", "MYSQL_SSL_CERT", "MYSQL_SSL_KEY",
-		} {
-			os.Unsetenv(k)
-		}
+		clearMySQLTLSEnv(t)
 
-		cfg, serverName := loadMySQLTLSConfig("TEST")
+		cfg, serverName, err := loadMySQLTLSConfig("TEST")
+		if err != nil {
+			t.Fatalf("loadMySQLTLSConfig() error = %v", err)
+		}
 		if cfg != nil {
 			t.Error("Expected nil TLS config without certs")
 		}
@@ -184,15 +184,67 @@ func TestTLSConfig(t *testing.T) {
 		}
 	})
 
-	t.Run("returns nil without server name", func(t *testing.T) {
+	t.Run("fails without server name", func(t *testing.T) {
+		clearMySQLTLSEnv(t)
 		t.Setenv("MYSQL_TEST_SSL_CA", "/tmp/ca.crt")
 		t.Setenv("MYSQL_TEST_SSL_CERT", "/tmp/cert.crt")
 		t.Setenv("MYSQL_TEST_SSL_KEY", "/tmp/key.pem")
-		os.Unsetenv("MYSQL_TEST_SSL_SERVER_NAME")
 
-		cfg, _ := loadMySQLTLSConfig("TEST")
+		cfg, _, err := loadMySQLTLSConfig("TEST")
+		if err == nil || !strings.Contains(err.Error(), "must all be configured") {
+			t.Fatalf("loadMySQLTLSConfig() error = %v, want incomplete configuration error", err)
+		}
 		if cfg != nil {
-			t.Error("Expected nil TLS config without server name")
+			t.Error("Expected nil TLS config on error")
+		}
+	})
+
+	t.Run("legacy mode ignores incomplete config while strict mode rejects it", func(t *testing.T) {
+		clearMySQLTLSEnv(t)
+		t.Setenv("MYSQL_TEST_SSL_CA", "/does/not/exist")
+		if cfg, serverName, err := mysqlTLSConfigForMode("TEST", false); err != nil || cfg != nil || serverName != "" {
+			t.Fatalf("legacy TLS selection = (%v, %q, %v), want nil, empty, nil", cfg, serverName, err)
+		}
+		if _, _, err := mysqlTLSConfigForMode("TEST", true); err == nil {
+			t.Fatal("strict TLS selection accepted incomplete configuration")
+		}
+	})
+
+	t.Run("fails on unreadable material", func(t *testing.T) {
+		clearMySQLTLSEnv(t)
+		t.Setenv("MYSQL_TEST_SSL_CA", "/does/not/exist")
+		t.Setenv("MYSQL_TEST_SSL_CERT", "/does/not/exist")
+		t.Setenv("MYSQL_TEST_SSL_KEY", "/does/not/exist")
+		t.Setenv("MYSQL_TEST_SSL_SERVER_NAME", "mysql.internal")
+
+		_, _, err := loadMySQLTLSConfig("TEST")
+		if err == nil || !strings.Contains(err.Error(), "read CA certificate") {
+			t.Fatalf("loadMySQLTLSConfig() error = %v, want CA read error", err)
+		}
+	})
+
+	t.Run("fails on invalid PEM material", func(t *testing.T) {
+		clearMySQLTLSEnv(t)
+		tempDir := t.TempDir()
+		caPath := tempDir + "/ca.pem"
+		certPath := tempDir + "/cert.pem"
+		keyPath := tempDir + "/key.pem"
+		for path, contents := range map[string]string{
+			caPath:   "not a certificate",
+			certPath: "not a certificate",
+			keyPath:  "not a key",
+		} {
+			if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Setenv("MYSQL_TEST_SSL_CA", caPath)
+		t.Setenv("MYSQL_TEST_SSL_CERT", certPath)
+		t.Setenv("MYSQL_TEST_SSL_KEY", keyPath)
+		t.Setenv("MYSQL_TEST_SSL_SERVER_NAME", "mysql.internal")
+
+		if _, _, err := loadMySQLTLSConfig("TEST"); err == nil {
+			t.Fatal("loadMySQLTLSConfig() error = nil, want invalid material error")
 		}
 	})
 
@@ -223,6 +275,97 @@ func TestTLSConfig(t *testing.T) {
 			t.Error("TLS registrar should not be called when no connections exist")
 		}
 	})
+}
+
+func TestStrictInitFailsBeforeOpeningConnectionWithInvalidTLS(t *testing.T) {
+	clearMySQLEnv(t)
+	t.Setenv("MYSQL_TLSFAIL_READ_WRITE", "mysql://user:pass@localhost:3306/test")
+	t.Setenv("MYSQL_TLSFAIL_SSL_CA", "/does/not/exist")
+
+	_, err := InitWithTLSValidation(ConnectionOptions{})
+	if err == nil || !strings.Contains(err.Error(), "TLS configuration") {
+		t.Fatalf("InitWithTLSValidation() error = %v, want TLS configuration error", err)
+	}
+}
+
+func TestOpenDBTLSRequiresRegistrar(t *testing.T) {
+	tlsConfig := &tls.Config{
+		ServerName: "mysql.internal",
+		MinVersion: tls.VersionTLS12,
+	}
+
+	_, err := openDB(
+		context.Background(),
+		ConnectionOptions{DriverName: "mysql", DSNTransform: DefaultMySQLDSN},
+		"mysql://user:pass@localhost:3306/test",
+		"catalog",
+		"CATALOG",
+		"write",
+		"test-app",
+		tlsConfig,
+		"mysql.internal",
+	)
+	if err == nil || !strings.Contains(err.Error(), "TLSRegistrar is nil") {
+		t.Fatalf("openDB() error = %v, want missing TLSRegistrar error", err)
+	}
+}
+
+func TestOpenDBTLSRegistersConfig(t *testing.T) {
+	tlsConfig := &tls.Config{
+		ServerName: "mysql.internal",
+		MinVersion: tls.VersionTLS12,
+	}
+	var registeredName string
+	var registeredConfig *tls.Config
+	var transformedTLSName string
+	opts := ConnectionOptions{
+		DriverName: "mysql",
+		TLSRegistrar: func(name string, config *tls.Config) error {
+			registeredName = name
+			registeredConfig = config
+			if err := gomysql.RegisterTLSConfig(name, config); err != nil {
+				return err
+			}
+			t.Cleanup(func() { gomysql.DeregisterTLSConfig(name) })
+			return nil
+		},
+		DSNTransform: func(parsed *ParsedURI) string {
+			transformedTLSName = parsed.TLSName
+			return DefaultMySQLDSN(parsed)
+		},
+	}
+
+	db, err := openDB(
+		context.Background(),
+		opts,
+		"mysql://user:pass@localhost:3306/test",
+		"catalog",
+		"CATALOG",
+		"write",
+		"test-app",
+		tlsConfig,
+		"mysql.internal",
+	)
+	if err != nil {
+		t.Fatalf("openDB() error = %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if registeredName != "mysql_catalog_write" || transformedTLSName != registeredName {
+		t.Fatalf("TLS names = registered %q transformed %q, want mysql_catalog_write", registeredName, transformedTLSName)
+	}
+	if registeredConfig != tlsConfig {
+		t.Fatal("TLS registrar did not receive the resolved config")
+	}
+}
+
+func clearMySQLTLSEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{
+		"MYSQL_TEST_SSL_CA", "MYSQL_TEST_SSL_CERT", "MYSQL_TEST_SSL_KEY",
+		"MYSQL_TEST_SSL_SERVER_NAME", "MYSQL_SSL_CA", "MYSQL_SSL_CERT", "MYSQL_SSL_KEY",
+	} {
+		t.Setenv(key, "")
+	}
 }
 
 // ---------------------------------------------------------------------------

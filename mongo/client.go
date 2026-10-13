@@ -195,6 +195,17 @@ var envRegex = regexp.MustCompile(`^MONGO_(.+)_READ_(WRITE|ONLY)$`)
 // Init is safe to call multiple times; only the first call performs initialization.
 // Returns the Client and any error encountered during connection setup.
 func Init(opts ConnectionOptions) (*Client, error) {
+	return initConnections(opts, false)
+}
+
+// InitWithTLSValidation initializes MongoDB connections with fail-closed TLS
+// material validation. Init retains upstream main's best-effort TLS fallback
+// so existing consumers are not changed implicitly.
+func InitWithTLSValidation(opts ConnectionOptions) (*Client, error) {
+	return initConnections(opts, true)
+}
+
+func initConnections(opts ConnectionOptions, strictTLS bool) (*Client, error) {
 	if opts.Dial == nil {
 		return nil, fmt.Errorf("mongo: DialFunc must be provided")
 	}
@@ -289,7 +300,15 @@ func Init(opts ConnectionOptions) (*Client, error) {
 			}
 
 			// Build dial options from env vars and caller overrides.
-			dialOpts := buildDialOptions(j.serviceNameUpper, j.connType, j.serviceName, opts, autoIndex, autoCreate)
+			dialOpts, err := buildDialOptions(j.serviceNameUpper, j.connType, j.serviceName, opts, autoIndex, autoCreate, strictTLS)
+			if err != nil {
+				results <- connResult{
+					serviceName: j.serviceName,
+					connType:    j.connType,
+					err:         fmt.Errorf("mongo: TLS configuration for %s_%s: %w", j.serviceName, j.connType, err),
+				}
+				return
+			}
 
 			connCtx, cancel := context.WithTimeout(ctx, opts.ConnectTimeout)
 			defer cancel()
@@ -453,7 +472,8 @@ func buildDialOptions(
 	serviceNameUpper, connType, serviceName string,
 	opts ConnectionOptions,
 	autoIndex, autoCreate bool,
-) *DialOptions {
+	strictTLS bool,
+) (*DialOptions, error) {
 	envConnType := "READ_WRITE"
 	if connType == "read" {
 		envConnType = "READ_ONLY"
@@ -505,9 +525,19 @@ func buildDialOptions(
 	}
 
 	// Load TLS config.
-	d.TLSConfig = loadTLSConfig("MONGO", serviceNameUpper)
+	tlsConfig, err := loadTLSConfig("MONGO", serviceNameUpper)
+	if err != nil {
+		if strictTLS {
+			return nil, err
+		}
+		// Original main ignored an unparsable CA bundle after successfully
+		// loading the client pair and returned a TLS config with an empty root
+		// pool. Preserve that fail-closed handshake behavior on Init. Errors
+		// which could not construct any config still retain the old nil fallback.
+	}
+	d.TLSConfig = tlsConfig
 
-	return d
+	return d, nil
 }
 
 // applyPoolOverrides merges non-zero PoolOverrides into DialOptions.
@@ -536,14 +566,15 @@ func applyPoolOverrides(d *DialOptions, po *PoolOverrides) {
 }
 
 // loadTLSConfig builds a *tls.Config from SSL environment variables.
-// Returns nil if SSL is not configured.
+// Returns nil if SSL is not configured and an error if it is only partially
+// configured or any configured certificate material is invalid.
 //
 // Env vars checked (service-specific takes precedence):
 //
 //	{dbType}_{SERVICE}_SSL_CA or {dbType}_SSL_CA
 //	{dbType}_{SERVICE}_SSL_CERT or {dbType}_SSL_CERT
 //	{dbType}_{SERVICE}_SSL_KEY or {dbType}_SSL_KEY
-func loadTLSConfig(dbType, serviceNameUpper string) *tls.Config {
+func loadTLSConfig(dbType, serviceNameUpper string) (*tls.Config, error) {
 	caPath := envWithFallback(
 		fmt.Sprintf("%s_%s_SSL_CA", dbType, serviceNameUpper),
 		fmt.Sprintf("%s_SSL_CA", dbType),
@@ -557,29 +588,45 @@ func loadTLSConfig(dbType, serviceNameUpper string) *tls.Config {
 		fmt.Sprintf("%s_SSL_KEY", dbType),
 	)
 
-	if caPath == "" || certPath == "" || keyPath == "" {
-		return nil
+	configuredValues := 0
+	for _, value := range []string{caPath, certPath, keyPath} {
+		if value != "" {
+			configuredValues++
+		}
+	}
+	if configuredValues == 0 {
+		return nil, nil
+	}
+	if configuredValues != 3 {
+		return nil, fmt.Errorf("CA, certificate, and key must all be configured")
 	}
 
 	caCert, err := os.ReadFile(caPath)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("read CA certificate: %w", err)
 	}
 
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("load client certificate: %w", err)
 	}
 
 	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(caCert)
+	if ok := caCertPool.AppendCertsFromPEM(caCert); !ok {
+		return &tls.Config{
+			RootCAs:            caCertPool,
+			Certificates:       []tls.Certificate{cert},
+			InsecureSkipVerify: false,
+			MinVersion:         tls.VersionTLS12,
+		}, fmt.Errorf("CA certificate contains no valid PEM certificates")
+	}
 
 	return &tls.Config{
 		RootCAs:            caCertPool,
 		Certificates:       []tls.Certificate{cert},
 		InsecureSkipVerify: false,
 		MinVersion:         tls.VersionTLS12,
-	}
+	}, nil
 }
 
 // resolveConnectionString resolves a connection string value. If
@@ -630,7 +677,7 @@ var (
 
 // SetGSMResolver configures the function used to fetch secrets from GSM.
 // This must be called before Init when DB_CONNECTION_PROVIDER=GSM.
-// Typically: mongo.SetGSMResolver(config.GetSecretFromGSM)
+// Typically: mongo.SetGSMResolver(config.GetDecodedSecretFromGSM)
 func SetGSMResolver(fn GSMResolverFunc) {
 	gsmMu.Lock()
 	defer gsmMu.Unlock()

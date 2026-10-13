@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package contract;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+enum State {
+  STATE_UNSPECIFIED = 0;
+  STATE_READY = 1;
+}
+
+message ContractMessage {
+  string snake_name = 1;
+  int64 large = 2;
+  bytes raw = 3;
+  State state = 4;
+  repeated int64 ids = 5;
+  map<string, int64> counts = 6;
+
+  oneof choice {
+    string text = 7;
+    int32 number = 8;
+  }
+
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Duration ttl = 10;
+	google.protobuf.Any payload = 11;
+	google.protobuf.Struct metadata = 12;
+	optional string nickname = 13;
+	google.protobuf.Value any_value = 14;
+	google.protobuf.ListValue values = 15;
+	map<int32, string> int32_keys = 16;
+	map<uint32, string> uint32_keys = 17;
+}
+
+service Contract {
+  rpc Execute(ContractMessage) returns (ContractMessage);
+}

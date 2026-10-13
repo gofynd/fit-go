@@ -27,6 +27,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	fithttp "github.com/gofynd/fit-go/httpclient"
+	"github.com/gofynd/fit-go/redact"
 )
 
 // RequestInterceptor is a function that can modify an HTTP request before it is
@@ -111,6 +114,7 @@ type HTTPClient struct {
 	noProxyList          []string
 	requestInterceptors  []RequestInterceptor
 	responseInterceptors []ResponseInterceptor
+	instrumented         bool
 }
 
 // Loggable content types that are safe to include in debug logs.
@@ -126,6 +130,19 @@ var whitelistedContentTypes = []string{
 
 // NewHTTPClient creates a new HTTPClient with the given options.
 func NewHTTPClient(opts HTTPClientOptions) *HTTPClient {
+	return newHTTPClient(opts, false)
+}
+
+// NewHTTPClientAdvanced enables the post-main fit HTTP transport: outbound
+// tracing and propagation, generated request-id forwarding, and process-default
+// metrics. NewHTTPClient intentionally retains the original official-main wire
+// behavior.
+// Deprecated: use NewInstrumentedHTTPClient.
+func NewHTTPClientAdvanced(opts HTTPClientOptions) *HTTPClient {
+	return newHTTPClient(opts, true)
+}
+
+func newHTTPClient(opts HTTPClientOptions, instrumented bool) *HTTPClient {
 	if opts.Timeout == 0 {
 		opts.Timeout = 30 * time.Second
 	}
@@ -155,10 +172,15 @@ func NewHTTPClient(opts HTTPClientOptions) *HTTPClient {
 		}
 	}
 
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	baseTransport := http.DefaultTransport
+	transport, transportConfigurable := http.DefaultTransport.(*http.Transport)
+	if transportConfigurable {
+		transport = transport.Clone()
+		baseTransport = transport
+	}
 
 	// Configure proxy if set.
-	if proxyURL != "" {
+	if proxyURL != "" && transportConfigurable {
 		proxyParsed, err := url.Parse(proxyURL)
 		if err == nil {
 			transport.Proxy = func(req *http.Request) (*url.URL, error) {
@@ -187,10 +209,21 @@ func NewHTTPClient(opts HTTPClientOptions) *HTTPClient {
 		}
 	}
 
+	roundTripper := baseTransport
+	if instrumented {
+		transportOptions := make([]fithttp.Option, 0, 1)
+		if opts.MetricsRecorder != nil {
+			// The explicit recorder below remains authoritative when supplied.
+			// Disable process-default transport metrics to avoid double-counting.
+			transportOptions = append(transportOptions, fithttp.WithMetrics(nil))
+		}
+		roundTripper = fithttp.WrapTransport(baseTransport, transportOptions...)
+	}
+
 	return &HTTPClient{
 		client: &http.Client{
 			Timeout:   opts.Timeout,
-			Transport: transport,
+			Transport: roundTripper,
 		},
 		baseURL:              strings.TrimRight(opts.BaseURL, "/"),
 		defaultHeaders:       opts.Headers,
@@ -201,6 +234,7 @@ func NewHTTPClient(opts HTTPClientOptions) *HTTPClient {
 		noProxyList:          noProxy,
 		requestInterceptors:  opts.RequestInterceptors,
 		responseInterceptors: opts.ResponseInterceptors,
+		instrumented:         instrumented,
 	}
 }
 
@@ -210,6 +244,10 @@ func NewHTTPClient(opts HTTPClientOptions) *HTTPClient {
 //
 // Port of the axios request/response interceptors.
 func (c *HTTPClient) Do(req *http.Request) (*http.Response, error) {
+	if req.Header == nil {
+		req.Header = make(http.Header)
+	}
+
 	// Apply base URL if the request URL is relative.
 	if c.baseURL != "" && !req.URL.IsAbs() {
 		parsed, err := url.Parse(c.baseURL + req.URL.String())
@@ -235,13 +273,22 @@ func (c *HTTPClient) Do(req *http.Request) (*http.Response, error) {
 	}
 
 	// Generate request ID for log correlation.
-	requestID := generateRequestID()
+	requestID := req.Header.Get("x-request-id")
+	if requestID == "" {
+		requestID = generateRequestID()
+		if c.instrumented {
+			req.Header.Set("x-request-id", requestID)
+		}
+	}
 	action := strings.ToUpper(req.Method)
 	externalURL := req.URL.String()
+	// logURL is what we LOG: scheme://host/path, never the query string (outbound
+	// URLs to third parties routinely carry secrets/PII, e.g. ?api_key=/?token=).
+	logURL := redact.SafeURL(req.URL)
 
 	// Log request.
 	if c.logger != nil {
-		c.logger.Debug(fmt.Sprintf("[EXT] Request %s to %s with Request ID: %s", action, externalURL, requestID))
+		c.logger.Debug(fmt.Sprintf("[EXT] Request %s to %s with Request ID: %s", action, logURL, requestID))
 	}
 
 	startTime := time.Now()
@@ -258,10 +305,10 @@ func (c *HTTPClient) Do(req *http.Request) (*http.Response, error) {
 			c.metricsRecorder.RecordHTTPClient(action, host, "0", duration)
 		}
 		if c.logger != nil {
-			c.logger.Error(fmt.Sprintf("[EXT] Failed %s to %s with %s", action, externalURL, requestID),
-				"request_url", externalURL,
+			c.logger.Error(fmt.Sprintf("[EXT] Failed %s to %s with %s", action, logURL, requestID),
+				"request_url", logURL,
 				"request_method", action,
-				"error", err.Error(),
+				"error", redact.ErrorMessage(err),
 			)
 		}
 		return nil, err
@@ -276,8 +323,8 @@ func (c *HTTPClient) Do(req *http.Request) (*http.Response, error) {
 
 	// Log response.
 	if c.logger != nil {
-		c.logger.Info(fmt.Sprintf("[EXT] Successful %s to %s with Request ID: %s", action, externalURL, requestID),
-			"request_url", externalURL,
+		c.logger.Info(fmt.Sprintf("[EXT] Successful %s to %s with Request ID: %s", action, logURL, requestID),
+			"request_url", logURL,
 			"request_method", action,
 			"response_status", resp.StatusCode,
 		)
@@ -286,7 +333,7 @@ func (c *HTTPClient) Do(req *http.Request) (*http.Response, error) {
 		ct := resp.Header.Get("Content-Type")
 		for _, allowed := range whitelistedContentTypes {
 			if strings.Contains(ct, allowed) {
-				c.logger.Debug(fmt.Sprintf("[EXT] Response Data of %s to %s with Request ID: %s", action, externalURL, requestID),
+				c.logger.Debug(fmt.Sprintf("[EXT] Response Data of %s to %s with Request ID: %s", action, logURL, requestID),
 					"content_type", ct,
 				)
 				break

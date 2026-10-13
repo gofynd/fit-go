@@ -15,11 +15,13 @@
 package grpc
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -28,14 +30,20 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/gofynd/fit-go/health"
 )
@@ -47,12 +55,23 @@ import (
 // newTestServer creates a Server with a temp proto file, ready for testing.
 // It uses port "0" so the OS assigns a random available port.
 func newTestServer(t *testing.T) *Server {
+	return newTestServerWithConfig(t, nil)
+}
+
+func newTestServerWithConfig(t *testing.T, configure func(*Config, *ServerOptions)) *Server {
 	t.Helper()
 	tmpDir := t.TempDir()
 	serverType := "testservice"
 	protoDir := filepath.Join(tmpDir, serverType)
 	os.MkdirAll(protoDir, 0755)
-	os.WriteFile(filepath.Join(protoDir, "test.proto"), []byte(`syntax = "proto3";`), 0644)
+	os.WriteFile(filepath.Join(protoDir, "test.proto"), []byte(`
+syntax = "proto3";
+package test;
+import "google/protobuf/struct.proto";
+service Test {
+  rpc GetUser(google.protobuf.Struct) returns (google.protobuf.Struct);
+}
+`), 0644)
 
 	os.Setenv("SERVER_TYPE", serverType)
 	os.Setenv("PORT", "0")
@@ -61,13 +80,46 @@ func newTestServer(t *testing.T) *Server {
 		os.Unsetenv("PORT")
 	})
 
+	cfg := Config{
+		FileName: "test",
+		ProtoDir: tmpDir,
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	opts := ServerOptions{}
+	if configure != nil {
+		configure(&cfg, &opts)
+	}
+	srv, err := InitWithOptions(cfg, opts)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+	return srv
+}
+
+func newLegacyTestServer(t *testing.T) *Server {
+	t.Helper()
+	tmpDir := t.TempDir()
+	serverType := "legacytestservice"
+	protoDir := filepath.Join(tmpDir, serverType)
+	if err := os.MkdirAll(protoDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(protoDir, "test.proto"), []byte(`
+syntax = "proto3";
+package test;
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	t.Setenv("SERVER_TYPE", serverType)
+	t.Setenv("PORT", "0")
 	srv, err := Init(Config{
 		FileName: "test",
 		ProtoDir: tmpDir,
 		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
-		t.Fatalf("Init() error = %v", err)
+		t.Fatalf("Init: %v", err)
 	}
 	return srv
 }
@@ -101,6 +153,50 @@ func startServer(t *testing.T, srv *Server) func() {
 	return func() {
 		srv.Shutdown()
 	}
+}
+
+type blockingService interface {
+	Block(context.Context, *emptypb.Empty) (*emptypb.Empty, error)
+}
+
+type blockingServiceImpl struct {
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingServiceImpl) Block(ctx context.Context, _ *emptypb.Empty) (*emptypb.Empty, error) {
+	s.once.Do(func() { close(s.entered) })
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func blockingServiceHandler(
+	server any,
+	ctx context.Context,
+	decode func(any) error,
+	interceptor grpc.UnaryServerInterceptor,
+) (any, error) {
+	req := new(emptypb.Empty)
+	if err := decode(req); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return server.(blockingService).Block(ctx, req)
+	}
+	info := &grpc.UnaryServerInfo{Server: server, FullMethod: "/fit.test.Blocking/Block"}
+	handler := func(ctx context.Context, req any) (any, error) {
+		return server.(blockingService).Block(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, req, info, handler)
+}
+
+var blockingServiceDescription = grpc.ServiceDesc{
+	ServiceName: "fit.test.Blocking",
+	HandlerType: (*blockingService)(nil),
+	Methods: []grpc.MethodDesc{{
+		MethodName: "Block",
+		Handler:    blockingServiceHandler,
+	}},
 }
 
 // generateRSAKeyPair generates an RSA key pair for testing RS256 JWT.
@@ -294,19 +390,21 @@ func TestInit_CustomConfig(t *testing.T) {
 }
 
 func TestInit_MissingProtoFile(t *testing.T) {
-	os.Setenv("SERVER_TYPE", "testserver")
-	os.Setenv("PORT", "50051")
-	defer func() {
-		os.Unsetenv("SERVER_TYPE")
-		os.Unsetenv("PORT")
-	}()
-
-	_, err := Init(Config{
-		FileName: "nonexistent",
-		ProtoDir: "/tmp/nonexistent",
-	})
-	if err == nil {
-		t.Error("Init() should fail when proto file doesn't exist")
+	cfg := Config{
+		FileName:   "nonexistent",
+		ProtoDir:   "/tmp/nonexistent",
+		ServerType: "testserver",
+		Port:       "0",
+	}
+	if _, err := Init(cfg); err == nil || !strings.Contains(err.Error(), "proto file not found") {
+		t.Fatalf("original Init should eagerly require a source proto: %v", err)
+	}
+	srv, err := InitWithOptions(cfg, ServerOptions{})
+	if err != nil {
+		t.Fatalf("InitWithOptions should allow generated-only setup: %v", err)
+	}
+	if err := srv.AddServiceDefinitions(ServiceImplementation{}); err == nil || !strings.Contains(err.Error(), "proto file not found") {
+		t.Fatalf("dynamic registration should require a source proto: %v", err)
 	}
 }
 
@@ -338,6 +436,61 @@ func TestInit_WithProtoFile(t *testing.T) {
 	if server.ProtoPath() != protoFile {
 		t.Errorf("ProtoPath() = %q, want %q", server.ProtoPath(), protoFile)
 	}
+}
+
+func TestOriginalInitRetainsOfficialHealthAndRegistrationDefaults(t *testing.T) {
+	root := t.TempDir()
+	serverType := "legacy"
+	dir := filepath.Join(root, serverType)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "legacy.proto"), []byte(`syntax = "proto3";`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	checker := health.NewChecker()
+	checker.AddCheck(func() string { return "dependency unavailable" })
+	server, err := Init(Config{
+		ServerType:    serverType,
+		Port:          "0",
+		FileName:      "legacy",
+		ProtoDir:      root,
+		HealthChecker: checker,
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	initial, err := server.healthServer.Check(context.Background(), &healthpb.HealthCheckRequest{})
+	if err != nil {
+		t.Fatalf("initial health Check: %v", err)
+	}
+	if initial.Status != healthpb.HealthCheckResponse_SERVING {
+		t.Fatalf("initial health = %s, want official-main SERVING", initial.Status)
+	}
+	if err := server.AddServiceDefinitions(ServiceImplementation{}); err != nil {
+		t.Fatalf("original AddServiceDefinitions should not compile the proto: %v", err)
+	}
+	if _, ok := server.Services()["legacy"]; !ok {
+		t.Fatal("original AddServiceDefinitions did not store handlers by file name")
+	}
+	afterRegistration, err := server.healthServer.Check(context.Background(), &healthpb.HealthCheckRequest{})
+	if err != nil {
+		t.Fatalf("health Check after registration: %v", err)
+	}
+	if afterRegistration.Status != healthpb.HealthCheckResponse_NOT_SERVING {
+		t.Fatalf("health after registration = %s, want NOT_SERVING", afterRegistration.Status)
+	}
+
+	server.mu.Lock()
+	server.running = true
+	server.mu.Unlock()
+	if err := server.AddServiceDefinitions(ServiceImplementation{}); err != nil {
+		t.Fatalf("original AddServiceDefinitions after Start changed behavior: %v", err)
+	}
+	server.mu.Lock()
+	server.running = false
+	server.mu.Unlock()
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +585,165 @@ func TestServer_ShutdownWithoutStart(t *testing.T) {
 	}
 }
 
+func TestServer_ShutdownDeadlineForcesActiveRPC(t *testing.T) {
+	srv := newTestServer(t)
+	srv.shutdownTimeout = 40 * time.Millisecond
+	service := &blockingServiceImpl{entered: make(chan struct{})}
+	srv.GRPCServer().RegisterService(&blockingServiceDescription, service)
+	cleanup := startServer(t, srv)
+	defer cleanup()
+
+	conn, err := grpc.NewClient(
+		srv.Listener().Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+
+	callDone := make(chan error, 1)
+	go func() {
+		callDone <- conn.Invoke(
+			context.Background(),
+			"/fit.test.Blocking/Block",
+			&emptypb.Empty{},
+			&emptypb.Empty{},
+		)
+	}()
+	select {
+	case <-service.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocking RPC did not start")
+	}
+
+	started := time.Now()
+	err = srv.Shutdown()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("forced shutdown took %v, want bounded completion", elapsed)
+	}
+	select {
+	case <-callDone:
+	case <-time.After(time.Second):
+		t.Fatal("forced stop did not cancel the active RPC")
+	}
+}
+
+func TestLegacyServer_StopForcesInProgressGracefulShutdown(t *testing.T) {
+	srv, callDone := startLegacyBlockingRPC(t)
+
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- srv.Shutdown() }()
+	waitForGracefulDrain(t, srv)
+
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("legacy Shutdown returned before the active RPC completed: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	if err := srv.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("legacy Shutdown after forced stop: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not release the in-progress legacy graceful shutdown")
+	}
+	select {
+	case <-callDone:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not cancel the active legacy RPC")
+	}
+}
+
+func TestLegacyServer_ShutdownContextBoundsInProgressGracefulShutdown(t *testing.T) {
+	srv, callDone := startLegacyBlockingRPC(t)
+
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- srv.Shutdown() }()
+	waitForGracefulDrain(t, srv)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := srv.ShutdownContext(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ShutdownContext error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("ShutdownContext took %v, want bounded completion", elapsed)
+	}
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("legacy Shutdown after context forced stop: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ShutdownContext did not release the in-progress legacy graceful shutdown")
+	}
+	select {
+	case <-callDone:
+	case <-time.After(time.Second):
+		t.Fatal("ShutdownContext did not cancel the active legacy RPC")
+	}
+}
+
+func startLegacyBlockingRPC(t *testing.T) (*Server, <-chan error) {
+	t.Helper()
+	srv := newLegacyTestServer(t)
+	service := &blockingServiceImpl{entered: make(chan struct{})}
+	srv.GRPCServer().RegisterService(&blockingServiceDescription, service)
+	cleanup := startServer(t, srv)
+	t.Cleanup(cleanup)
+
+	conn, err := grpc.NewClient(
+		srv.Listener().Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	callDone := make(chan error, 1)
+	go func() {
+		callDone <- conn.Invoke(
+			context.Background(),
+			"/fit.test.Blocking/Block",
+			&emptypb.Empty{},
+			&emptypb.Empty{},
+		)
+	}()
+	select {
+	case <-service.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocking legacy RPC did not start")
+	}
+	return srv, callDone
+}
+
+func waitForGracefulDrain(t *testing.T, srv *Server) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		srv.mu.Lock()
+		stopping := srv.stopping
+		srv.mu.Unlock()
+		if stopping {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("server did not enter graceful drain")
+}
+
 // ---------------------------------------------------------------------------
 // Health check tests
 // ---------------------------------------------------------------------------
@@ -465,6 +777,51 @@ func TestServer_HealthCheck(t *testing.T) {
 	if resp.Status != healthpb.HealthCheckResponse_SERVING {
 		t.Errorf("health status = %v, want SERVING", resp.Status)
 	}
+}
+
+func TestServer_HealthCheckReflectsCurrentDependencyState(t *testing.T) {
+	srv := newTestServer(t)
+	checker := health.NewChecker()
+	var unhealthy atomic.Bool
+	checker.AddCheck(func() string {
+		if unhealthy.Load() {
+			return "database unavailable"
+		}
+		return ""
+	})
+	srv.healthChecker = checker
+	cleanup := startServer(t, srv)
+	defer cleanup()
+
+	conn, err := grpc.NewClient(
+		srv.Listener().Addr().String(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+	client := healthpb.NewHealthClient(conn)
+
+	check := func(service string, want healthpb.HealthCheckResponse_ServingStatus) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		resp, err := client.Check(ctx, &healthpb.HealthCheckRequest{Service: service})
+		if err != nil {
+			t.Fatalf("Health.Check(%q): %v", service, err)
+		}
+		if resp.Status != want {
+			t.Fatalf("Health.Check(%q) = %s, want %s", service, resp.Status, want)
+		}
+	}
+
+	check("", healthpb.HealthCheckResponse_SERVING)
+	unhealthy.Store(true)
+	check("", healthpb.HealthCheckResponse_NOT_SERVING)
+	check("test", healthpb.HealthCheckResponse_NOT_SERVING)
+	unhealthy.Store(false)
+	check("test", healthpb.HealthCheckResponse_SERVING)
 }
 
 func TestServer_HealthCheckHandler_Healthy(t *testing.T) {
@@ -543,6 +900,170 @@ func TestServer_AddServiceDefinitions(t *testing.T) {
 
 	if _, ok := services["grpc.health.v1.Health"]; !ok {
 		t.Error("Health service should be auto-registered")
+	}
+}
+
+func TestServer_AddServiceDefinitionsRejectsDuplicateRegistration(t *testing.T) {
+	srv := newTestServer(t)
+	implementation := ServiceImplementation{
+		"GetUser": {func(_ *CallInfo, callback Callback, _ NextFunc) {
+			callback(nil, map[string]interface{}{})
+		}},
+	}
+	if err := srv.AddServiceDefinitions(implementation); err != nil {
+		t.Fatalf("first registration: %v", err)
+	}
+	if err := srv.AddServiceDefinitions(implementation); err == nil {
+		t.Fatal("duplicate registration unexpectedly succeeded")
+	}
+}
+
+func TestServer_AddServiceDefinitionsServesDynamicUnaryWithJWT(t *testing.T) {
+	srv := newTestServer(t)
+	const secret = "dynamic-grpc-secret"
+	token := createHS256Token(t, jwt.MapClaims{
+		"company_id": float64(42),
+		"exp":        float64(time.Now().Add(time.Hour).Unix()),
+	}, secret)
+
+	err := srv.AddServiceDefinitions(ServiceImplementation{
+		"GetUser": {
+			AuthorizeJWTToken(JWTConfig{Secret: secret}),
+			func(call *CallInfo, callback Callback, _ NextFunc) {
+				if call.Decoded == nil {
+					t.Error("JWT middleware did not attach decoded claims")
+				}
+				callback(nil, map[string]interface{}{
+					"company_id": call.Request["company_id"],
+					"name":       "dynamic-user",
+				})
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AddServiceDefinitions: %v", err)
+	}
+	cleanup := startServer(t, srv)
+	defer cleanup()
+
+	conn, err := grpc.NewClient(srv.Listener().Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+	request, _ := structpb.NewStruct(map[string]interface{}{"company_id": float64(42)})
+	response := new(structpb.Struct)
+	ctx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs("authorization", "Bearer "+token))
+	if err := conn.Invoke(ctx, "/test.Test/GetUser", request, response); err != nil {
+		t.Fatalf("dynamic RPC: %v", err)
+	}
+	if got := response.AsMap()["name"]; got != "dynamic-user" {
+		t.Fatalf("response name = %v", got)
+	}
+}
+
+func TestServer_DynamicErrorsAndPanicsAreSanitized(t *testing.T) {
+	tests := []struct {
+		name    string
+		handler HandlerFunc
+	}{
+		{name: "error", handler: func(_ *CallInfo, _ Callback, next NextFunc) { next(fmt.Errorf("database password leaked")) }},
+		{name: "panic", handler: func(_ *CallInfo, _ Callback, _ NextFunc) { panic("provider token leaked") }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newTestServer(t)
+			if err := srv.AddServiceDefinitions(ServiceImplementation{"GetUser": {tt.handler}}); err != nil {
+				t.Fatalf("AddServiceDefinitions: %v", err)
+			}
+			cleanup := startServer(t, srv)
+			defer cleanup()
+			conn, err := grpc.NewClient(srv.Listener().Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				t.Fatalf("grpc.NewClient: %v", err)
+			}
+			defer conn.Close()
+			err = conn.Invoke(context.Background(), "/test.Test/GetUser", &structpb.Struct{}, &structpb.Struct{})
+			if status.Code(err) != codes.Internal {
+				t.Fatalf("status = %v, want Internal", status.Code(err))
+			}
+			if strings.Contains(err.Error(), "password") || strings.Contains(err.Error(), "token") {
+				t.Fatalf("internal detail leaked to client: %v", err)
+			}
+		})
+	}
+}
+
+func TestServer_DynamicErrorHandlerMapsExpectedError(t *testing.T) {
+	srv := newTestServer(t)
+	err := srv.AddServiceDefinitionsWithOptions(ServiceImplementation{
+		"GetUser": {func(_ *CallInfo, _ Callback, next NextFunc) { next(fmt.Errorf("not allowed")) }},
+	}, ServiceRegistrationOptions{
+		ErrorHandler: func(_ error, _ *CallInfo, callback Callback) {
+			callback(&RPCError{Code: Unauthenticated, Message: "Unauthorized"}, nil)
+		},
+	})
+	if err != nil {
+		t.Fatalf("AddServiceDefinitionsWithOptions: %v", err)
+	}
+	cleanup := startServer(t, srv)
+	defer cleanup()
+	conn, err := grpc.NewClient(srv.Listener().Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+	err = conn.Invoke(context.Background(), "/test.Test/GetUser", &structpb.Struct{}, &structpb.Struct{})
+	if status.Code(err) != codes.Unauthenticated || status.Convert(err).Message() != "Unauthorized" {
+		t.Fatalf("mapped error = %v", err)
+	}
+}
+
+func TestServer_ConfiguredUnaryAndStreamInterceptorsAreInstalled(t *testing.T) {
+	var unaryCalls atomic.Int32
+	var streamCalls atomic.Int32
+	srv := newTestServerWithConfig(t, func(_ *Config, opts *ServerOptions) {
+		opts.UnaryInterceptors = []grpc.UnaryServerInterceptor{
+			func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+				unaryCalls.Add(1)
+				return handler(ctx, req)
+			},
+		}
+		opts.StreamInterceptors = []grpc.StreamServerInterceptor{
+			func(srv any, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+				streamCalls.Add(1)
+				return handler(srv, stream)
+			},
+		}
+	})
+	if err := srv.AddServiceDefinitions(ServiceImplementation{
+		"GetUser": {func(_ *CallInfo, callback Callback, _ NextFunc) { callback(nil, map[string]interface{}{}) }},
+	}); err != nil {
+		t.Fatalf("AddServiceDefinitions: %v", err)
+	}
+	cleanup := startServer(t, srv)
+	defer cleanup()
+	conn, err := grpc.NewClient(srv.Listener().Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("grpc.NewClient: %v", err)
+	}
+	defer conn.Close()
+	if err := conn.Invoke(context.Background(), "/test.Test/GetUser", &structpb.Struct{}, &structpb.Struct{}); err != nil {
+		t.Fatalf("dynamic unary invoke: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	watch, err := healthpb.NewHealthClient(conn).Watch(ctx, &healthpb.HealthCheckRequest{})
+	if err != nil {
+		cancel()
+		t.Fatalf("health watch: %v", err)
+	}
+	_, _ = watch.Recv()
+	cancel()
+	if unaryCalls.Load() == 0 {
+		t.Fatal("configured unary interceptor was not called")
+	}
+	if streamCalls.Load() == 0 {
+		t.Fatal("configured stream interceptor was not called")
 	}
 }
 
@@ -663,6 +1184,127 @@ func TestMiddlewareChain(t *testing.T) {
 			t.Errorf("executed = %v, want only [first]", executed)
 		}
 	})
+}
+
+func TestMiddlewareDefaultErrorsPreserveOnlyLegacyContract(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		advanced bool
+		want     string
+	}{
+		{name: "legacy", want: "legacy detail"},
+		{name: "advanced", advanced: true, want: "Internal Server Error, Please try again!"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			server := &Server{
+				advanced: test.advanced,
+				logger:   slog.New(slog.NewTextHandler(&logs, nil)),
+			}
+			var got error
+			server.executeChain([]HandlerFunc{
+				func(_ *CallInfo, _ Callback, next NextFunc) { next(errors.New("legacy detail")) },
+			}, &CallInfo{FullMethod: "/test"}, func(err error, _ map[string]interface{}) { got = err })
+			rpcErr, ok := got.(*RPCError)
+			if !ok || rpcErr.Message != test.want {
+				t.Fatalf("middleware error = %#v, want message %q", got, test.want)
+			}
+			// The released Init server emitted no log line for next(err).
+			logged := strings.Contains(logs.String(), "gRPC middleware failed")
+			if logged != test.advanced {
+				t.Fatalf("middleware log present = %v, want %v; log=%q", logged, test.advanced, logs.String())
+			}
+		})
+	}
+}
+
+func TestMiddlewareEmptyPanicPreservesOnlyLegacyContract(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		advanced bool
+		want     string
+	}{
+		{name: "legacy empty panic", want: ""},
+		{name: "advanced empty panic", advanced: true, want: "Internal Server Error, Please try again!"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			server := &Server{
+				advanced: test.advanced,
+				logger:   slog.New(slog.NewTextHandler(&logs, nil)),
+			}
+			var got error
+			server.executeChain([]HandlerFunc{
+				func(_ *CallInfo, _ Callback, _ NextFunc) { panic("") },
+			}, &CallInfo{FullMethod: "/test"}, func(err error, _ map[string]interface{}) { got = err })
+			rpcErr, ok := got.(*RPCError)
+			if !ok || rpcErr.Code != Internal || rpcErr.Message != test.want {
+				t.Fatalf("panic error = %#v, want message %q", got, test.want)
+			}
+			if !strings.Contains(logs.String(), "panic in gRPC handler") {
+				t.Fatalf("panic was not logged: %q", logs.String())
+			}
+		})
+	}
+}
+
+func TestMiddlewarePanicMessageLegacyVsAdvanced(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		advanced bool
+		want     string
+	}{
+		{name: "legacy", want: "boom detail"},
+		{name: "advanced", advanced: true, want: "Internal Server Error, Please try again!"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := &Server{advanced: test.advanced, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			var got error
+			server.executeChain([]HandlerFunc{
+				func(_ *CallInfo, _ Callback, _ NextFunc) { panic("boom detail") },
+			}, &CallInfo{FullMethod: "/test"}, func(err error, _ map[string]interface{}) { got = err })
+			if rpcErr, ok := got.(*RPCError); !ok || rpcErr.Message != test.want {
+				t.Fatalf("panic error = %#v, want message %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestResponseValidationErrorTextLegacyVsAdvanced(t *testing.T) {
+	schema := &ProtoTypeSchema{Schema: map[string]MethodSchema{
+		"getthing": {ResponseSchema: map[string]string{"count": "int32"}},
+	}}
+	wantLegacy := validateResponse(map[string]interface{}{"count": "not-a-number"}, schema.Schema["getthing"].ResponseSchema, "", false)
+	if wantLegacy == nil {
+		t.Fatal("test schema did not produce a validation error")
+	}
+	for _, test := range []struct {
+		name     string
+		advanced bool
+		want     string
+	}{
+		{name: "legacy", want: wantLegacy.Error()},
+		{name: "advanced", advanced: true, want: "Internal Server Error, Please try again!"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := &Server{
+				advanced:       test.advanced,
+				responseSchema: schema,
+				logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+			}
+			chain := server.wrapWithResponseEncoding("GetThing", []HandlerFunc{
+				func(_ *CallInfo, callback Callback, _ NextFunc) {
+					callback(nil, map[string]interface{}{"count": "not-a-number"})
+				},
+			})
+			var got error
+			server.executeChain(chain, &CallInfo{FullMethod: "/svc/GetThing"}, func(err error, _ map[string]interface{}) { got = err })
+			rpcErr, ok := got.(*RPCError)
+			if !ok || rpcErr.Code != Internal || rpcErr.Message != test.want {
+				t.Fatalf("validation error = %#v, want message %q", got, test.want)
+			}
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------
